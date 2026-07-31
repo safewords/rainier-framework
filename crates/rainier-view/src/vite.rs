@@ -97,6 +97,15 @@ impl Vite {
         self
     }
 
+    /// The web root this resolver watches — where `hot` and the build live.
+    ///
+    /// For the code around the directive that must agree with it: the route
+    /// serving the built files, a test writing a manifest to exercise the
+    /// built branch.
+    pub fn public_root(&self) -> &std::path::Path {
+        &self.public
+    }
+
     /// Whether a frontend is present at all — a dev server running or a
     /// build compiled.
     ///
