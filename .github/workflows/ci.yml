@@ -25,12 +25,40 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all --check
+
+      - run: cargo fmt --all
+
+      # On main, drift is repaired rather than reported — the same shape as
+      # the badge commit below, `[skip ci]` included, because the formatted
+      # tree is token-identical to the one this very run is testing. On a
+      # pull request or a scheduled run this stays a failing check: CI has no
+      # business rewriting a contributor's branch, and the diff in the log is
+      # a better error than `--check`'s.
+      - name: Commit the formatting on main, or fail anywhere else
+        run: |
+          if git diff --quiet; then
+            echo "already formatted"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -am "style: cargo fmt [skip ci]"
+            # The badge bot or another push may land while this run is going;
+            # a formatting commit rebases over anything.
+            git pull --rebase origin main
+            git push
+          else
+            git diff
+            exit 1
+          fi
 
   clippy:
     name: clippy
@@ -226,6 +254,10 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .github/badges/tests.json
           git commit -m "chore: refresh the test count badge [skip ci]"
+          # The fmt job may have pushed a formatting commit earlier in this
+          # same run, which would make this push non-fast-forward; the badge
+          # commit rebases over anything.
+          git pull --rebase origin main
           git push
 
   wasm:
