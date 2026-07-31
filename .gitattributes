@@ -1,0 +1,4 @@
+# Shell hooks must stay LF: a CRLF bash script dies on its own line
+# endings ($'': command not found) on every platform including
+# Git Bash on Windows.
+/.githooks/* text eol=lf

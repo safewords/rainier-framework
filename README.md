@@ -451,6 +451,18 @@ of a recording one.
 
 See [Testing](docs/testing.md).
 
+Both gates also run as a committed pre-commit hook, so a failing lint is
+caught where the fix is cheapest — enable it once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The hook formats the staged files (and re-stages them) and runs the same
+clippy invocation CI does. `git commit --no-verify` bypasses it once;
+`SKIP_CLIPPY=1 git commit …` skips only the lint, for mid-refactor commits
+whose warnings land fixed in the next one.
+
 ## Changelog
 
 [CHANGELOG.md](CHANGELOG.md), in

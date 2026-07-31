@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Pre-commit: auto-format staged Rust files and run clippy on the workspace
+# before the commit lands — the same two gates CI runs, moved to where the
+# fix is cheapest. Enable once per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# Only runs when a *.rs or Cargo.* file is staged, so a docs-only commit is
+# not blocked on a compile. Bypass once with `git commit --no-verify`, or
+# skip only clippy with `SKIP_CLIPPY=1 git commit …` — useful mid-refactor
+# when the intermediate state has known warnings that land in the next
+# commit.
+set -euo pipefail
+
+# Staged added / copied / modified files that can change what compiles.
+mapfile -t files < <(git diff --cached --name-only --diff-filter=ACM -- '*.rs' 'Cargo.toml' 'Cargo.lock' '*/Cargo.toml' || true)
+
+if [[ ${#files[@]} -eq 0 ]]; then
+    exit 0
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not on PATH — install via rustup" >&2
+    exit 1
+fi
+
+# ---- rustfmt ----------------------------------------------------------------
+#
+# `cargo fmt`, not `rustfmt` on files directly: it reads the workspace's own
+# edition from Cargo.toml, which is also exactly what CI runs. CI would
+# self-heal drift on main anyway — this catches it before it becomes a bot
+# commit on top of yours.
+if ! cargo fmt --all; then
+    echo "pre-commit: cargo fmt failed; fix the errors above or commit with --no-verify" >&2
+    exit 1
+fi
+
+# Re-stage the formatted versions, so what lands is what was formatted. Only
+# staged files, and only ones that still exist — a partially staged file's
+# unstaged half stays unstaged.
+for f in "${files[@]}"; do
+    [[ -f "$f" ]] && git add -- "$f"
+done
+
+# ---- clippy -----------------------------------------------------------------
+if [[ "${SKIP_CLIPPY:-0}" == "1" ]]; then
+    echo "pre-commit: SKIP_CLIPPY=1 — skipping cargo clippy"
+    exit 0
+fi
+
+# `--all-features`, matching CI: a lint only fires in code that is compiled,
+# and the driver crates are behind features.
+echo "pre-commit: cargo clippy --workspace --all-targets --all-features -- -D warnings"
+if ! cargo clippy --workspace --all-targets --all-features --quiet -- -D warnings; then
+    echo "pre-commit: clippy failed — fix the warnings above, or commit with SKIP_CLIPPY=1 / --no-verify" >&2
+    exit 1
+fi
