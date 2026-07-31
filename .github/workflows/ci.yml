@@ -65,6 +65,8 @@ jobs:
     runs-on: safewords-runners
     steps:
       - uses: actions/checkout@v4
+      # The ARC runner image has no C toolchain; see the action.
+      - uses: ./.github/actions/system-deps
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -155,6 +157,8 @@ jobs:
           --health-retries 12
     steps:
       - uses: actions/checkout@v4
+      # The ARC runner image has no C toolchain; see the action.
+      - uses: ./.github/actions/system-deps
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -181,6 +185,8 @@ jobs:
     runs-on: safewords-runners
     steps:
       - uses: actions/checkout@v4
+      # The ARC runner image has no C toolchain; see the action.
+      - uses: ./.github/actions/system-deps
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -205,6 +211,8 @@ jobs:
     runs-on: safewords-runners
     steps:
       - uses: actions/checkout@v4
+      # The ARC runner image has no C toolchain; see the action.
+      - uses: ./.github/actions/system-deps
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -235,6 +243,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      # The ARC runner image has no C toolchain; see the action.
+      - uses: ./.github/actions/system-deps
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -265,6 +275,8 @@ jobs:
     runs-on: safewords-runners
     steps:
       - uses: actions/checkout@v4
+      # The ARC runner image has no C toolchain; see the action.
+      - uses: ./.github/actions/system-deps
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown

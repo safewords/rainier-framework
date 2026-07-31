@@ -1,0 +1,26 @@
+name: system dependencies
+description: >
+  The ARC runner image is a bare Ubuntu: no C toolchain, no cmake, no
+  pkg-config. Everything a `cargo build` of this workspace links against is
+  installed here, once, so every compiling job starts with this step instead
+  of growing its own apt lines. The list is deliberately short — the lockfile
+  has no openssl-sys and Kafka is rskafka (pure Rust), so the only native code
+  is what `cc` and aws-lc-sys (cmake) build.
+runs:
+  using: composite
+  steps:
+    - name: apt-get the build toolchain
+      shell: bash
+      run: |
+        # Skip the apt dance when the image already has everything — hosted
+        # runners do, and so would a future runner image with this baked in.
+        if command -v cc >/dev/null && command -v cmake >/dev/null \
+          && command -v pkg-config >/dev/null && command -v zstd >/dev/null; then
+          echo "toolchain already present"
+          exit 0
+        fi
+        sudo apt-get update -qq
+        # zstd is not for the build: actions/cache compresses with it when it
+        # exists and falls back to the much slower gzip when it does not.
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+          build-essential cmake pkg-config zstd
