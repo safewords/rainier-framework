@@ -66,7 +66,7 @@ redis-cluster = ["redis", "rainier-cache/redis-cluster"]
 memcached = ["rainier-cache/memcached"]
 # Read `$2y$` password hashes written by a PHP or Rails application, so a
 # ported users table logs everybody in while it converts.
-bcrypt = ["rainier-auth/bcrypt"]
+bcrypt = ["rainier-crypt/bcrypt", "rainier-auth/bcrypt"]
 # Cloudflare Workers KV as a cache. Read `rainier_cache::kv` first: it is
 # eventually consistent and cannot hold a lock.
 cloudflare-kv = ["rainier-cache/cloudflare-kv"]

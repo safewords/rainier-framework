@@ -9,17 +9,15 @@ repository.workspace = true
 
 [dependencies]
 rainier-support = { workspace = true }
+# For the `Hasher` port the guards and user providers consume. Hashing is
+# cryptography, so it lives with the rest of it.
+rainier-crypt = { workspace = true }
 rainier-http = { workspace = true }
 rainier-middleware = { workspace = true }
 rainier-database = { workspace = true }
 rainier-session = { workspace = true }
 rainier-cache = { workspace = true }
 rainier-orm = { workspace = true }
-argon2 = { workspace = true }
-password-hash = { workspace = true }
-# Only for reading hashes an application inherited — see `legacy`. Optional
-# because an application with no legacy table should not compile it.
-bcrypt = { workspace = true, optional = true }
 rand = { workspace = true }
 subtle = { workspace = true }
 async-trait = { workspace = true }
@@ -29,8 +27,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [features]
-# Read `$2a$`/`$2b$`/`$2y$` hashes written by a PHP or Rails application.
-bcrypt = ["dep:bcrypt"]
+# The bcrypt driver and legacy verifier, forwarded to `rainier-crypt`.
+bcrypt = ["rainier-crypt/bcrypt"]
 
 [dev-dependencies]
 tokio = { workspace = true }

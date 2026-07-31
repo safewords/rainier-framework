@@ -31,11 +31,13 @@
 //! reset token, a "remember this choice" cookie — encrypting those makes them
 //! opaque in your own logs for no gain.
 //!
-//! ## This is not password hashing
+//! ## Encryption is not password hashing
 //!
-//! Passwords are hashed, never encrypted, and that lives in `rainier-auth`'s
-//! `Hasher`. If you can get the value back out, it is the wrong tool for a
-//! password — see the [hashing docs](https://github.com/safewords/rainier-framework/blob/main/docs/hashing.md).
+//! Passwords are hashed, never encrypted — that is the [`hash`] module: the
+//! [`Hasher`] port, Argon2id and bcrypt drivers, and the [`HashManager`] that
+//! selects which algorithm writes. If you can get the value back out, it is
+//! the wrong tool for a password — see the
+//! [hashing docs](https://github.com/safewords/rainier-framework/blob/main/docs/hashing.md).
 //!
 //! ## Rotation is designed in
 //!
@@ -65,12 +67,17 @@
 pub mod asymmetric;
 pub mod cipher;
 pub mod encrypter;
+pub mod hash;
 #[cfg(feature = "jwt")]
 pub mod jwt;
 pub mod key;
 pub mod php;
 pub mod signer;
 pub mod url;
+
+#[cfg(feature = "bcrypt")]
+pub use hash::{BcryptHasher, BcryptVerifier};
+pub use hash::{Argon2Hasher, HashDriver, HashManager, Hasher, LegacyVerifier};
 
 pub use asymmetric::{
     BoxKeyPair, BoxPublicKey, Ed25519Signer, SealedBox, SigningKeyPair, VerifyingPublicKey,

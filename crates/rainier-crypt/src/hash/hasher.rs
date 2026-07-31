@@ -4,7 +4,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use rainier_support::{Error, Result};
 
-use crate::legacy::{LegacySchemes, LegacyVerifier};
+use super::legacy::{LegacySchemes, LegacyVerifier};
 use rand::rngs::OsRng;
 
 /// Hashes and verifies passwords.
@@ -72,6 +72,18 @@ pub trait Hasher: Send + Sync + 'static {
     /// Whether this stored value is [`unusable`](Self::unusable).
     fn is_unusable(&self, hashed: &str) -> bool {
         hashed == UNUSABLE || hashed.is_empty()
+    }
+
+    /// Whether this hasher's own algorithm wrote `hashed`.
+    ///
+    /// Almost always a prefix test — `$argon2`, `$2y$` — and it must be cheap
+    /// and total, because [`HashManager`](crate::HashManager) calls it on
+    /// every login to decide which driver a stored hash belongs to. A driver
+    /// that leaves the default cannot be dispatched to, so anything meant to
+    /// live in the manager implements it.
+    fn recognises(&self, hashed: &str) -> bool {
+        let _ = hashed;
+        false
     }
 }
 
@@ -217,6 +229,12 @@ impl Hasher for Argon2Hasher {
             || params.t_cost() < self.iterations
             || params.p_cost() < self.parallelism
     }
+
+    fn recognises(&self, hashed: &str) -> bool {
+        // `$argon2id$`, `$argon2i$`, `$argon2d$` — this driver reads all
+        // three, whatever variant wrote the row.
+        hashed.starts_with("$argon2")
+    }
 }
 
 #[cfg(test)]
@@ -349,7 +367,7 @@ mod tests {
     /// A scheme standing in for one an application inherited.
     struct Rot13;
 
-    impl crate::legacy::LegacyVerifier for Rot13 {
+    impl super::super::legacy::LegacyVerifier for Rot13 {
         fn name(&self) -> &'static str {
             "rot13"
         }

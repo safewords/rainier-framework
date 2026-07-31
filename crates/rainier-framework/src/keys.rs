@@ -75,7 +75,7 @@
 
 use rainier_cache::CacheDriver;
 use rainier_config::{config_keys, AppEnv};
-use rainier_crypt::CryptScheme;
+use rainier_crypt::{CryptScheme, HashDriver};
 use rainier_mail::{MailDriver, MailEncryption};
 use rainier_queue::QueueDriver;
 use rainier_session::SessionDriver;
@@ -208,6 +208,16 @@ config_keys! {
     /// which is what you want without having to say so. Set it explicitly to
     /// read production logs by eye for an afternoon.
     pub LOG_FORMAT: LogFormat = "telemetry.log_format";
+
+    // --- hashing -----------------------------------------------------------
+
+    /// Which algorithm password hashing writes — `argon2id` or `bcrypt`.
+    ///
+    /// Verification is deliberately not governed by this: a stored hash names
+    /// its own algorithm, and every registered driver's rows keep verifying
+    /// whatever is selected. Changing it is a deploy, and rows convert on the
+    /// next successful login.
+    pub HASH_DRIVER: HashDriver = "hashing.driver";
 
     // --- database ----------------------------------------------------------
 
@@ -384,6 +394,7 @@ mod tests {
             ("SERVER", SERVER_REQUEST_TIMEOUT_SECS.path()),
             ("SERVER", SERVER_COMPRESSION.path()),
             ("DATABASE", DATABASE_URL.path()),
+            ("HASHING", HASH_DRIVER.path()),
             ("CACHE", CACHE_DRIVER.path()),
             ("CACHE", CACHE_REDIS_URL.path()),
             ("CACHE", CACHE_MEMCACHED_URL.path()),
@@ -438,6 +449,7 @@ mod tests {
             SERVER_REQUEST_TIMEOUT_SECS.path(),
             SERVER_COMPRESSION.path(),
             DATABASE_URL.path(),
+            HASH_DRIVER.path(),
             CACHE_DRIVER.path(),
             CACHE_REDIS_URL.path(),
             CACHE_MEMCACHED_URL.path(),

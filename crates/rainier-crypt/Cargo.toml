@@ -27,6 +27,11 @@ hkdf = { workspace = true }
 jsonwebtoken = { workspace = true, optional = true }
 rsa = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }
+# Password hashing — see `hash`. Argon2id always; bcrypt optional, as a
+# writable driver and as the legacy read for a table PHP or Rails filled.
+argon2 = { workspace = true }
+password-hash = { workspace = true }
+bcrypt = { workspace = true, optional = true }
 hmac = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
@@ -45,6 +50,8 @@ serde = { workspace = true }
 [features]
 # RS256/ES256 signing, verification and a JWKS document.
 jwt = ["dep:jsonwebtoken", "dep:rsa", "dep:p256"]
+# The bcrypt hash driver, and the legacy verifier for inherited tables.
+bcrypt = ["dep:bcrypt"]
 
 [lints]
 workspace = true

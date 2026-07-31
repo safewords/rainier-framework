@@ -3156,12 +3156,10 @@ dependencies = [
 name = "rainier-auth"
 version = "2.0.0"
 dependencies = [
- "argon2",
  "async-trait",
- "bcrypt",
  "chrono",
- "password-hash",
  "rainier-cache",
+ "rainier-crypt",
  "rainier-database",
  "rainier-http",
  "rainier-middleware",
@@ -3246,7 +3244,9 @@ dependencies = [
  "aes",
  "aes-gcm",
  "aes-gcm-siv",
+ "argon2",
  "base64 0.22.1",
+ "bcrypt",
  "cbc",
  "chacha20poly1305",
  "ed25519-dalek",
@@ -3254,6 +3254,7 @@ dependencies = [
  "hmac 0.12.1",
  "jsonwebtoken",
  "p256",
+ "password-hash",
  "rainier-support",
  "rand 0.8.7",
  "rsa",

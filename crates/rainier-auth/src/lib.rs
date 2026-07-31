@@ -7,7 +7,7 @@
 //! |---|---|
 //! | [`Authenticatable`] | what the framework needs to know about a user model |
 //! | [`UserProvider`] / [`RepositoryUserProvider`] | how users are found and their credentials verified |
-//! | [`Hasher`] / [`Argon2Hasher`] | password hashing |
+//! | [`Hasher`] / [`HashManager`] | password hashing — `rainier-hashing`'s, re-exported |
 //! | [`Guard`] / [`TokenGuard`] / [`SessionGuard`] | how a request is tied to a user |
 //! | [`AuthManager`] | named guards — `auth:api` |
 //! | [`Authenticate`] | the middleware that enforces it |
@@ -45,21 +45,26 @@ pub mod challenge;
 pub mod confirm;
 pub mod gate;
 pub mod guard;
-pub mod hashing;
-pub mod legacy;
 pub mod middleware;
 pub mod session;
 pub mod user;
+
+// Hashing is cryptography, so it lives in `rainier-crypt` — the guards
+// *consume* the `Hasher` port, they do not own it. Re-exported here because a
+// user provider is constructed with a hasher, and making callers add a second
+// dependency for that would be ceremony. `rainier_crypt::hash` (or
+// `rainier_framework::crypt::hash`) is the canonical path.
+pub use rainier_crypt::hash as hashing;
+pub use rainier_crypt::hash::legacy;
 
 pub use abilities::Abilities;
 pub use challenge::Challenges;
 pub use confirm::{confirm_password, ConfirmPassword};
 pub use gate::{Actor, Gate};
 pub use guard::{AuthManager, Guard, GuardExt, SessionGuard, StatefulGuard, TokenGuard};
-pub use hashing::{Argon2Hasher, Hasher};
 #[cfg(feature = "bcrypt")]
-pub use legacy::BcryptVerifier;
-pub use legacy::LegacyVerifier;
+pub use rainier_crypt::hash::{BcryptHasher, BcryptVerifier};
+pub use rainier_crypt::hash::{Argon2Hasher, HashDriver, HashManager, Hasher, LegacyVerifier};
 pub use middleware::{
     AbilitiesRequestExt, Authenticate, AuthenticatedUser, RedirectIfAuthenticated, RequireAbility,
     TokenAbilities,

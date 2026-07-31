@@ -105,6 +105,16 @@ facade!(
 );
 
 facade!(
+    /// Password hashing, with the algorithm behind a selection.
+    ///
+    /// `Hash::instance().hash(..)` writes with the driver `HASH_DRIVER`
+    /// selected; `verify` dispatches on the stored hash's own prefix, so any
+    /// registered algorithm's rows keep verifying whatever is selected. Bind
+    /// a [`HashManager`](rainier_crypt::HashManager) in a provider first.
+    Hash => rainier_crypt::HashManager
+);
+
+facade!(
     /// Notifications.
     Notify => rainier_notify::Notifier
 );

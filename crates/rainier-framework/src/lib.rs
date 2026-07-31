@@ -192,8 +192,8 @@ pub use rainier_database::bind_executor;
 pub mod prelude {
     pub use crate::bootstrap::Rainier;
     pub use crate::facades::{
-        Broadcast, Cache, Config, Crypt, Event, Mail, Middleware, Notify, Queue, Session, Storage,
-        Url, View, Views, DB,
+        Broadcast, Cache, Config, Crypt, Event, Hash, Mail, Middleware, Notify, Queue, Session,
+        Storage, Url, View, Views, DB,
     };
 
     pub use rainier_container::{Application, Container, Facade, ServiceProvider};
