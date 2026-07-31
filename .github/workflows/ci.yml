@@ -20,11 +20,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Every job picks its runner by trust: a pull request is outside code and
+  # runs on GitHub-hosted runners, never inside the cluster — a fork PR needs
+  # no secrets to be dangerous when the runner shares a network with
+  # production. Trusted refs (push to main, the schedule, dispatch) use the
+  # in-cluster fleet.
   # --- the fast ones, so a typo does not wait on a full test run -------------
 
   fmt:
     name: rustfmt
-    runs-on: safewords-runners
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'safewords-runners' }}
     permissions:
       contents: write
     steps:
@@ -62,7 +67,7 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: safewords-runners
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'safewords-runners' }}
     steps:
       - uses: actions/checkout@v4
       # The ARC runner image has no C toolchain; see the action.
@@ -81,7 +86,7 @@ jobs:
 
   test:
     name: test (${{ matrix.name }})
-    runs-on: safewords-runners
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'safewords-runners' }}
     strategy:
       # Let every combination report, rather than cancelling the rest on the
       # first failure — knowing whether it is one feature or all of them is
@@ -182,7 +187,7 @@ jobs:
 
   msrv:
     name: minimum supported Rust (1.88, default features)
-    runs-on: safewords-runners
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'safewords-runners' }}
     steps:
       - uses: actions/checkout@v4
       # The ARC runner image has no C toolchain; see the action.
@@ -208,7 +213,7 @@ jobs:
 
   docs:
     name: rustdoc
-    runs-on: safewords-runners
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'safewords-runners' }}
     steps:
       - uses: actions/checkout@v4
       # The ARC runner image has no C toolchain; see the action.
@@ -234,7 +239,7 @@ jobs:
   # so CI counts it and commits the endpoint the badge reads.
   test-count:
     name: test count badge
-    runs-on: safewords-runners
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'safewords-runners' }}
     # Only on main: a pull request cannot push, and the count from a branch is
     # not the one the README should be claiming.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -272,7 +277,7 @@ jobs:
 
   wasm:
     name: wasm32 target
-    runs-on: safewords-runners
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'safewords-runners' }}
     steps:
       - uses: actions/checkout@v4
       # The ARC runner image has no C toolchain; see the action.
