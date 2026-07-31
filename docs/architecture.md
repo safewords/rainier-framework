@@ -28,7 +28,7 @@ graph TD
     http[rainier-http<br/><i>requests, responses, uploads</i>]
     view[rainier-view<br/><i>the template engine</i>]
 
-    crypt[rainier-crypt<br/><i>ciphers, signing, keys</i>]
+    crypt[rainier-crypt<br/><i>ciphers, signing, keys, hashing</i>]
     drivers[rainier-drivers<br/><i>Redis, Memcached, Kafka, AWS, SQL executors</i>]
 
     middleware[rainier-middleware<br/><i>the pipeline</i>]
@@ -40,7 +40,7 @@ graph TD
     filesystem[rainier-filesystem<br/><i>local, memory, S3/R2</i>]
 
     session[rainier-session<br/><i>the bag, stores, middleware</i>]
-    auth[rainier-auth<br/><i>guards, gates, hashing</i>]
+    auth[rainier-auth<br/><i>guards, gates</i>]
     queue[rainier-queue<br/><i>jobs, drivers, worker</i>]
     mail[rainier-mail<br/><i>mailables, transports</i>]
     notify[rainier-notify<br/><i>notifications, channels</i>]
@@ -165,7 +165,7 @@ in drivers; the port crates are adapters over it.**
 | `rainier-validation` | rules, the validator, request contracts |
 | `rainier-view` | the template engine |
 | `rainier-database` | Rainier ORM integration, models, repositories |
-| `rainier-auth` | guards, user providers, hashing, gates, abilities, challenges |
+| `rainier-auth` | guards, user providers, gates, abilities, challenges |
 | `rainier-queue` | jobs, queue drivers, the worker |
 | `rainier-mail` | mailables, the mailer, transports |
 | `rainier-notify` | notifications, notifiables, channels |
@@ -176,7 +176,7 @@ in drivers; the port crates are adapters over it.**
 | `rainier-telemetry` | W3C trace context, and OTLP behind a feature |
 | `rainier-server` | the HTTP kernel and the hyper server |
 | `rainier-console` | the console: commands, arguments, the kernel |
-| `rainier-crypt` | encryption, signing, key rotation |
+| `rainier-crypt` | encryption, signing, key rotation, password hashing |
 | `rainier-session` | the session bag, stores, the middleware |
 | `rainier-cache` | the cache port, its drivers, and atomic locks |
 | `rainier-scheduler` | cron expressions, the schedule, and its locks |

@@ -351,7 +351,7 @@ payload names none — but that is a decrypt attempt per retired key rather than
 a lookup, which is worth knowing before keeping ten of them.
 
 The shape that works is the same one [legacy password
-hashes](hashing.md#reading-hashes-this-application-did-not-write) use: read
+hashes](hashing.md#a-scheme-with-no-driver) use: read
 with this, write with the native encrypter, and let the rows convert as they
 are touched.
 

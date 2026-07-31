@@ -52,13 +52,13 @@
 //! | [`validation`] | rules, the validator, and **request contracts** |
 //! | [`view`] | the template engine |
 //! | [`database`] | Rainier ORM integration, models, repositories |
-//! | [`auth`] | guards, user providers, hashing, gates |
+//! | [`auth`] | guards, user providers, gates |
 //! | [`queue`] | jobs, queue drivers, the worker |
 //! | [`mail`] | mailables, the mailer, transports |
 //! | [`server`] | the HTTP kernel and the hyper server |
 //! | [`console`] | the console and its commands |
 //! | [`cache`] | the cache port and its drivers |
-//! | [`crypt`] | encryption and message signing |
+//! | [`crypt`] | encryption, message signing, password hashing |
 //! | [`drivers`] | shared Redis, Memcached and AWS transports |
 //! | [`filesystem`] | file storage: local, memory, S3/R2 |
 //! | [`notify`] | notifications: a message to a recipient, over their channels |

@@ -75,7 +75,7 @@ hyper.
 | `rainier-validation` | rules, the validator, **request contracts** | http |
 | `rainier-view` | the template engine, escaped by default | support |
 | `rainier-database` | models, **repositories**, **relationships**, the ORM seam | support, events, orm |
-| `rainier-auth` | **guards**, user providers, hashing, gates | http, middleware, database |
+| `rainier-auth` | **guards**, user providers, gates | http, middleware, database, crypt |
 | `rainier-queue` | **jobs**, queue drivers, the worker | container, events, database |
 | `rainier-mail` | **mailables**, the mailer, transports | view, events |
 | `rainier-notify` | **notifications**, notifiables, channels | mail, support |
@@ -86,7 +86,7 @@ hyper.
 | `rainier-telemetry` | **trace context**, and OTLP behind a feature | middleware |
 | `rainier-server` | the HTTP kernel and the hyper server | routing, middleware |
 | `rainier-console` | the console kernel and its commands | container |
-| `rainier-crypt` | **ciphers**, signing, key rotation | support |
+| `rainier-crypt` | **ciphers**, signing, key rotation, **password hashing** | support |
 | `rainier-drivers` | Redis / Redis Cluster / Memcached / Kafka / AWS **transports** | support |
 | `rainier-cache` | the **cache** port, its drivers, and **atomic locks** | support, drivers |
 | `rainier-filesystem` | the **storage** port — local, memory, S3/R2 | support, drivers |

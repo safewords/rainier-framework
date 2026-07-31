@@ -46,6 +46,33 @@ the release as a whole and names the crate it landed in.
   `mailgun`, `sendgrid` and `resend` variants; `MailDriver::delivers()`
   still answers `false` for everything a forgotten `MAIL_DRIVER` can select.
 
+- **`HashManager` — the algorithm behind a selection** (`rainier-crypt`).
+  Argon2 and bcrypt are different algorithms, not an algorithm and its poor
+  relation: each is a full `Hasher` driver, `HASH_DRIVER=argon2id|bcrypt` (or
+  an explicit constructor argument) names the one `hash` writes with, and
+  **verification never consults the selection** — a stored hash names its own
+  algorithm in its own prefix, the `password_verify` contract. So changing
+  algorithm is a deploy, and `needs_rehash` converts rows on the next
+  successful login, in either direction.
+- **`BcryptHasher`** (feature `bcrypt`) — bcrypt as a writable peer driver at
+  cost 12, for an application sharing its users table with a PHP application
+  that still writes rows. `BcryptVerifier` remains for standalone hashers,
+  but inside the manager the driver reads all three prefixes itself.
+- **The `Hash` facade**, and `keys::HASH_DRIVER`.
+- **`Hasher::recognises`** — a driver claims its own format, which is how the
+  manager dispatches. Defaulted, so nothing implementing the port breaks.
+- **A format nothing recognises now fails at full cost.** The manager pads a
+  corrupt or hand-filled password column with a `dummy_verify` at the
+  selected driver's cost, the way the unusable sentinel already was — a rare
+  row that answered quickly could be singled out of a timing profile.
+
+### Changed
+
+- **Password hashing moved from `rainier-auth` to `rainier-crypt::hash`** —
+  hashing is cryptography, and the guards *consume* the `Hasher` port rather
+  than owning it. Not breaking: `rainier-auth` re-exports the whole surface
+  at its old paths, and its `bcrypt` feature forwards.
+
 ## [2.0.0] - 2026-07-31
 
 This release removes third-party branding from the project: the

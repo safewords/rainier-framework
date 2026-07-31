@@ -182,7 +182,7 @@ concept as you know it, and where it lives here.
 | token abilities | [`Abilities` + `RequireAbility`](authentication.md#token-abilities) |
 | throttling keyed by input | [`.keyed_by(..).named(..)`](middleware.md#throttlerequests) |
 | a model factory | [`User::factory()`](testing.md#factories) |
-| rehashing across hash schemes | [`with_legacy(..)`](hashing.md#reading-hashes-this-application-did-not-write) |
+| rehashing across hash schemes | [`HashManager`](hashing.md#selection-governs-writing-never-verification) |
 | a JWKS document | [`Jwt` + `JwtKeyRing`](encryption.md#jwts-and-a-jwks-document) |
 | reading rows a PHP application encrypted | [`APP_CIPHER=php`](encryption.md#reading-what-a-php-application-encrypted) |
 | session access | [`request.session()`](sessions.md#the-session-is-on-the-request-not-on-the-facade) |
