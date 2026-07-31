@@ -36,8 +36,9 @@
 //! feature, and the compiler pointing at a non-exhaustive `match`, are the
 //! authorities there.
 //!
-//! Consume it from an `xtask` in your workspace, or install the
-//! [`cargo-rainier`] subcommand and run `cargo rainier features` anywhere.
+//! Install the [`cargo-rainier`] subcommand and run `cargo rainier
+//! features` anywhere — or consume this library from an `xtask` if your
+//! workspace prefers no globally-installed tools.
 //!
 //! [`cargo-rainier`]: https://github.com/safewords/rainier-framework/tree/main/crates/cargo-rainier
 

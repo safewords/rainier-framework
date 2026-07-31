@@ -17,9 +17,10 @@
 //! defaults with `--env .env.example` when that is what you mean.
 //!
 //! The logic — and the reasoning about why cargo cannot do this by itself —
-//! is [`rainier_features`]; this is the standalone door to it. A workspace
-//! that prefers no globally-installed tools can put a thin `xtask` over the
-//! same library instead, which is what the sample project does.
+//! is [`rainier_features`]; this is the door to it — what the sample
+//! project's Dockerfile installs, pinned to the framework revision its
+//! lockfile pins. A workspace that prefers no globally-installed tools can
+//! put a thin `xtask` over the same library instead.
 
 use std::path::PathBuf;
 use std::process::Command;

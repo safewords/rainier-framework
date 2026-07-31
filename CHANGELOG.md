@@ -30,8 +30,9 @@ the release as a whole and names the crate it landed in.
   emits the bare comma-separated set for scripts and Dockerfiles, where an
   unforwarded selection is always fatal. `cargo install cargo-rainier` for
   the standalone door (`cargo rainier features [--check|--list]`, `cargo
-  rainier build`); a workspace that prefers no global tools puts a thin
-  xtask over the library, which is what the sample project does.
+  rainier build`), and what the sample project's Dockerfile installs —
+  pinned to the framework revision its lockfile pins. A workspace that
+  prefers no global tools can put a thin xtask over the library instead.
 
 - **The PHP envelope's GCM variant** (`rainier-crypt`).
   `PhpEncrypter::new(keys).writing(PhpCipher::Aes256Gcm)` writes the
