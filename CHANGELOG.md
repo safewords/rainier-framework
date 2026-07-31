@@ -23,11 +23,15 @@ the release as a whole and names the crate it landed in.
   `Http` facade) and answers with the minimal feature list, with reasons.
   The mapping lives in the framework because it is knowledge *about* the
   framework: tests pin it against every driver enum, so a new driver breaks
-  this crate until the table learns it, in the same commit. `cargo install
-  cargo-rainier` for the standalone door (`cargo rainier features
-  [--check]`, `cargo rainier build`); a workspace that prefers no global
-  tools puts a five-line xtask over the library, which is what the sample
-  project does.
+  this crate until the table learns it, in the same commit. An environment
+  file is **required** — explicit `--env`, or `.env` — with no fallback to
+  `.env.example`: sizing from the example's defaults would shape the binary
+  like the documentation rather than the deployment, silently. `--list`
+  emits the bare comma-separated set for scripts and Dockerfiles, where an
+  unforwarded selection is always fatal. `cargo install cargo-rainier` for
+  the standalone door (`cargo rainier features [--check|--list]`, `cargo
+  rainier build`); a workspace that prefers no global tools puts a thin
+  xtask over the library, which is what the sample project does.
 
 - **The PHP envelope's GCM variant** (`rainier-crypt`).
   `PhpEncrypter::new(keys).writing(PhpCipher::Aes256Gcm)` writes the

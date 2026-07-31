@@ -170,6 +170,35 @@ pub fn compute(env: &[(String, String)], sources: &str) -> Report {
     report
 }
 
+/// The environment file a sizing run should read — strictly.
+///
+/// An explicit path must exist; with none given, `.env` must. There is **no
+/// fallback to `.env.example`**: sizing a build from the example's defaults
+/// would produce a binary shaped like the documentation rather than the
+/// deployment, silently. Previewing against the example is one flag away —
+/// `--env .env.example` — and saying so is this error's job.
+pub fn resolve_env(explicit: Option<std::path::PathBuf>) -> Result<std::path::PathBuf, String> {
+    match explicit {
+        Some(path) => {
+            if path.exists() {
+                Ok(path)
+            } else {
+                Err(format!("{} does not exist", path.display()))
+            }
+        }
+        None => {
+            let dot_env = std::path::PathBuf::from(".env");
+            if dot_env.exists() {
+                Ok(dot_env)
+            } else {
+                Err("sizing a build needs the deployment's environment: pass --env <file> or \
+                     create .env (preview against the defaults with --env .env.example)"
+                    .to_string())
+            }
+        }
+    }
+}
+
 /// Parse `KEY=VALUE` lines — later lines win, comments and blanks skipped,
 /// single and double quotes stripped.
 pub fn parse_env(text: &str) -> Vec<(String, String)> {
@@ -366,6 +395,19 @@ mod tests {
     }
 
     // --- parsing -------------------------------------------------------------
+
+    #[test]
+    fn a_missing_environment_is_an_error_and_the_error_teaches_the_preview() {
+        // No fallback to `.env.example`: sizing from the example's defaults
+        // would shape the binary like the documentation, silently.
+        let err = resolve_env(Some("no-such-file.env".into())).unwrap_err();
+        assert!(err.contains("no-such-file.env"), "{err}");
+
+        // `None` in a directory with no `.env` — this test runs in the crate
+        // root, which has none.
+        let err = resolve_env(None).unwrap_err();
+        assert!(err.contains(".env.example"), "the fix should be in the error: {err}");
+    }
 
     #[test]
     fn quotes_and_comments_are_not_values() {
