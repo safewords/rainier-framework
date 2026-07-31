@@ -111,6 +111,20 @@ jobs:
           --health-timeout 10s
           --health-retries 12
           --health-start-period 30s
+      # And an SMTP server that keeps what it receives, for the mail
+      # transport. The interesting properties of SMTP delivery — that the
+      # envelope, not the headers, decides who receives a message — only a
+      # real conversation can check.
+      mailpit:
+        image: axllent/mailpit
+        ports:
+          - 1025:1025
+          - 8025:8025
+        options: >-
+          --health-cmd "wget -q -O /dev/null http://localhost:8025/api/v1/info"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -128,6 +142,11 @@ jobs:
           # Kafka code in it, and demanding a broker there would fail a job
           # that never had one to use.
           KAFKA_REQUIRED: ${{ matrix.name == 'all features' && '1' || '' }}
+          MAIL_SMTP_HOST: localhost:1025
+          MAIL_SMTP_API: http://localhost:8025
+          # Same rule as Kafka: the SMTP transport only exists in the
+          # all-features build.
+          MAIL_SMTP_REQUIRED: ${{ matrix.name == 'all features' && '1' || '' }}
 
   msrv:
     name: minimum supported Rust (1.88, default features)

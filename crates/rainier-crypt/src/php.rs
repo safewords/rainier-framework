@@ -363,8 +363,7 @@ mod tests {
         let payload = encrypter.encrypt("secret").unwrap();
 
         let corrupt = B64.encode("{}");
-        let wrong_key =
-            PhpEncrypter::new(KeyRing::new(Key::generate())).encrypt("secret").unwrap();
+        let wrong_key = PhpEncrypter::new(KeyRing::new(Key::generate())).encrypt("secret").unwrap();
         let _ = payload;
 
         assert_eq!(

@@ -8,6 +8,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Every crate in the workspace shares one version, so an entry here applies to
 the release as a whole and names the crate it landed in.
 
+## [Unreleased]
+
+### Added
+
+- **Mail transports that actually send** (`rainier-mail`). The page that said
+  "implement `Transport` yourself" now ships them: `SmtpTransport` (lettre
+  over rustls, feature `smtp`), `SesTransport` (the AWS default chain,
+  feature `ses`), and `PostmarkTransport` / `MailgunTransport` /
+  `SendGridTransport` / `ResendTransport` (features `postmark`, `mailgun`,
+  `sendgrid`, `resend`) — one cargo feature per destination, because "we send
+  through Postmark" is one fact about a deployment.
+
+  Every sender carries the same message: `render_eml`'s MIME document travels
+  whole over SMTP, SES and Mailgun, and the JSON APIs are fed from the same
+  fields it renders. `Bcc` stays blind by construction on every path — the
+  headers never carry it; the envelope, destination list or API field does.
+
+  The HTTP providers ride the framework's own HTTP transport port, so their
+  tests hand them the `FakeTransport` and pin the exact request each provider
+  documents. The SMTP transport is tested against a real server —
+  [Mailpit](https://mailpit.axllent.org) in CI, the same container the docs
+  suggest for development — including the property only a live SMTP
+  conversation can check: a blind copy is delivered by the envelope while the
+  headers other recipients read never name it.
+
+- **`rainier_framework::mail::transport` and `mail::mailer`** — the step
+  between `MAIL_*` in an environment file and a running `Mailer`, in the
+  image of the `kafka` module. The exhaustive match over `MailDriver`:
+  selecting a sender the build did not enable fails the boot naming the
+  cargo feature, and a driver missing a setting fails naming the variable.
+
+- **`MAIL_*` configuration** — host, port, credentials, `MAIL_ENCRYPTION`
+  (`starttls` — required, not opportunistic — `tls`, or `none`),
+  `MAIL_TIMEOUT`, `MAIL_ALWAYS_TO`, `MAIL_FILE_PATH`, and one credential
+  setting per API provider. `MailDriver` gained the `ses`, `postmark`,
+  `mailgun`, `sendgrid` and `resend` variants; `MailDriver::delivers()`
+  still answers `false` for everything a forgotten `MAIL_DRIVER` can select.
+
 ## [2.0.0] - 2026-07-31
 
 This release removes third-party branding from the project: the
@@ -342,4 +380,5 @@ First release. Thirty-one crates, published together.
 - **Observability** — Prometheus metrics, an OpenAPI document, and OpenTelemetry
   tracing with W3C context propagation. All three optional and off by default.
 
+[Unreleased]: https://github.com/safewords/rainier-framework/compare/v2.0.0...HEAD
 [2.0.0]: https://github.com/safewords/rainier-framework/releases/tag/v2.0.0

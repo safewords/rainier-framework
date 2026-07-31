@@ -238,7 +238,7 @@ worth asking about it:
 | [`CacheDriver`](cache.md) | `memory` `redis` `redis-cluster` `memcached` `dynamodb` | `is_shared()`, `feature()` |
 | [`SessionDriver`](sessions.md) | `memory` `database` `cache` `cookie` | `is_revocable()`, `is_durable()`, `is_shared()` |
 | [`QueueDriver`](queues.md) | `sync` `memory` `database` `sqs` | `is_deferred()`, `needs_a_worker()`, `survives_a_restart()` |
-| [`MailDriver`](mail.md) | `log` `file` `memory` `smtp` | `delivers()`, `is_inspectable()` |
+| [`MailDriver`](mail.md) | `log` `file` `memory` `smtp` `ses` `postmark` `mailgun` `sendgrid` `resend` | `delivers()`, `is_inspectable()` |
 | `FilesystemDriver` | `local` `memory` `s3` | `is_shared()`, `is_durable()` |
 | `AppEnv` | `production` `staging` `local` `testing` | `is_developing()`, `is_serving_users()` |
 
@@ -368,6 +368,20 @@ differ:
 | `keys::MAIL_DRIVER` | `MailDriver` | `MAIL_DRIVER` | `log` |
 | `keys::MAIL_FROM_ADDRESS` | `String` | `MAIL_FROM` | `hello@example.com` |
 | `keys::MAIL_FROM_NAME` | `String` | `MAIL_FROM_NAME` | `Rainier` |
+| `keys::MAIL_ALWAYS_TO` | `String` | `MAIL_ALWAYS_TO` | *(empty)* |
+| `keys::MAIL_FILE_PATH` | `String` | `MAIL_FILE_PATH` | `storage/mail` |
+| `keys::MAIL_HOST` | `String` | `MAIL_HOST` | *(empty)* |
+| `keys::MAIL_PORT` | `i64` | `MAIL_PORT` | `0` — by encryption |
+| `keys::MAIL_USERNAME` | `String` | `MAIL_USERNAME` | *(empty)* |
+| `keys::MAIL_PASSWORD` | `String` | `MAIL_PASSWORD` | *(empty)* |
+| `keys::MAIL_ENCRYPTION` | `MailEncryption` | `MAIL_ENCRYPTION` | `starttls` |
+| `keys::MAIL_TIMEOUT` | `i64` | `MAIL_TIMEOUT` | `30` |
+| `keys::MAIL_POSTMARK_TOKEN` | `String` | `MAIL_POSTMARK_TOKEN` | *(empty)* |
+| `keys::MAIL_MAILGUN_DOMAIN` | `String` | `MAIL_MAILGUN_DOMAIN` | *(empty)* |
+| `keys::MAIL_MAILGUN_SECRET` | `String` | `MAIL_MAILGUN_SECRET` | *(empty)* |
+| `keys::MAIL_MAILGUN_ENDPOINT` | `String` | `MAIL_MAILGUN_ENDPOINT` | *(empty)* — the US endpoint |
+| `keys::MAIL_SENDGRID_KEY` | `String` | `MAIL_SENDGRID_KEY` | *(empty)* |
+| `keys::MAIL_RESEND_KEY` | `String` | `MAIL_RESEND_KEY` | *(empty)* |
 
 The three new in 1.0.1 are worth a word each:
 

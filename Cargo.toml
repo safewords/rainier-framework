@@ -117,6 +117,12 @@ aws-credential-types = "1"
 aws-sdk-s3 = "1"
 aws-sdk-sqs = "1"
 aws-sdk-dynamodb = "1"
+aws-sdk-sesv2 = "1"
+# SMTP. Async over tokio, TLS over rustls — no native TLS, for the same reason
+# the Kafka client is pure Rust. No `pool`: a pooled transport's Drop wants a
+# tokio runtime and aborts without one, and a mailer's volume does not need a
+# warm connection.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "hostname", "tokio1", "tokio1-rustls-tls"] }
 # Kafka. Pure Rust, so no C toolchain and no CMake â€” see `rainier_drivers::kafka`.
 rskafka = { version = "0.6", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

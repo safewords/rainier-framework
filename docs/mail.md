@@ -125,38 +125,120 @@ flowchart LR
 
 ```rust
 pub trait Transport: Send + Sync + 'static {
+    fn name(&self) -> &str;
     fn send(&self, message: &Message) -> BoxFuture<'_, Result<()>>;
 }
 ```
 
-| Transport | Does |
-|---|---|
-| `LogTransport` | writes the message to the log |
-| `FileTransport` | writes an `.eml` per message |
-| `MemoryTransport` | keeps them in memory, for tests |
+| Transport | Goes to | Cargo feature |
+|---|---|---|
+| `LogTransport` | the log | — |
+| `FileTransport` | `.eml` files | — |
+| `MemoryTransport` | memory, for tests | — |
+| `SmtpTransport` | an SMTP server | `mail-smtp` |
+| `SesTransport` | Amazon SES | `mail-ses` |
+| `PostmarkTransport` | the Postmark API | `mail-postmark` |
+| `MailgunTransport` | the Mailgun API | `mail-mailgun` |
+| `SendGridTransport` | the SendGrid API | `mail-sendgrid` |
+| `ResendTransport` | the Resend API | `mail-resend` |
 
-```env
-MAIL_DRIVER=log
-MAIL_DRIVER=file
-```
+The first three deliver nothing, and the default is the log — a deployment
+that forgot to configure mail fails to send it rather than mailing real
+people from a staging database. The senders are one cargo feature each,
+because "we send through Postmark" is a single fact about a deployment and
+the other providers' dependencies should cost it nothing.
+
+**Every sender carries the same message.** The MIME document `render_eml`
+produces travels whole over SMTP, SES and Mailgun; the JSON APIs are fed from
+the same `Message` fields it renders. So the `.eml` you double-click in
+development is what production delivers, whoever delivers it.
+
+**`Bcc` stays blind by construction.** The rendered headers never contain
+`Bcc`; blind recipients ride the SMTP envelope, the SES destination list, or
+the API's own `Bcc` field — the split that *is* the mechanism of a blind
+copy, decided in the framework rather than trusted to the server.
+
+### Selecting one
+
+`rainier_framework::mail::transport` is the exhaustive match over
+`MAIL_DRIVER`, and `mail::mailer` is the whole provider:
 
 ```rust
-FileTransport::new("storage/mail")?
+// app/providers/app_provider.rs
+let mailer = mail::mailer(&config, Arc::clone(views.engine()))
+    .await?
+    .with_events(container.resolve::<Dispatcher>()?);
 ```
 
-`.eml` files open in any mail client, which makes "did the template render
-correctly" a question you answer by double-clicking rather than by reading
-escaped HTML in a log line.
+Selecting a driver the build did not enable **fails the boot naming the
+feature**, and a driver missing a setting it needs fails naming the variable
+— because "mail is not working" should take one read of the boot log to
+diagnose, not an afternoon.
 
-Rainier ships no SMTP transport — implement `Transport` over `lettre`, SES,
-Postmark, or whatever you send with. It is one method.
+### Configuration
+
+```env
+MAIL_DRIVER=smtp            # log | file | memory | smtp | ses | postmark | mailgun | sendgrid | resend
+MAIL_FROM=hello@example.com
+MAIL_FROM_NAME="My App"
+MAIL_ALWAYS_TO=             # set in staging: every message goes here instead
+MAIL_FILE_PATH=storage/mail # where the file driver writes
+
+# smtp
+MAIL_HOST=smtp.example.com
+MAIL_PORT=0                 # 0 = whatever MAIL_ENCRYPTION's arrangement uses
+MAIL_USERNAME=
+MAIL_PASSWORD=
+MAIL_ENCRYPTION=starttls    # starttls | tls | none
+MAIL_TIMEOUT=30
+
+# the API providers
+MAIL_POSTMARK_TOKEN=
+MAIL_MAILGUN_DOMAIN=
+MAIL_MAILGUN_SECRET=
+MAIL_MAILGUN_ENDPOINT=      # https://api.eu.mailgun.net for an EU domain
+MAIL_SENDGRID_KEY=
+MAIL_RESEND_KEY=
+```
+
+The `ses` driver has no variables of its own on purpose: region and
+credentials come from the AWS default chain — `AWS_REGION`, a profile, IMDS —
+exactly as the other AWS drivers resolve theirs.
+
+`MAIL_ENCRYPTION=starttls` is a **required** upgrade, not an opportunistic
+one: a server that will not upgrade is an error, never a plaintext session
+that looks like a secure one. `none` exists for a capture container on
+localhost and nothing else.
+
+### Developing against a real SMTP server
+
+```sh
+docker run --rm -p 1025:1025 -p 8025:8025 axllent/mailpit
+```
+
+```env
+MAIL_DRIVER=smtp
+MAIL_HOST=localhost
+MAIL_PORT=1025
+MAIL_ENCRYPTION=none
+```
+
+[Mailpit](https://mailpit.axllent.org) accepts everything, delivers nothing,
+and shows the result at `http://localhost:8025` — the file transport with a
+web page. The framework's own SMTP tests run against exactly this, in CI and
+locally, and skip when nothing is listening.
+
+### The failure path
 
 ```rust
 MemoryTransport::failing("connection refused")
 ```
 
 is there for testing the path where sending fails, which is the one nobody
-tests until it happens.
+tests until it happens. The real senders distinguish the retryable failure
+from the final one: a provider's `5xx` or `429` comes back as
+service-unavailable — what a queued job's retry policy keys on — while a
+`4xx` means this message or these credentials, which retrying will not fix.
 
 ## `always_to`
 

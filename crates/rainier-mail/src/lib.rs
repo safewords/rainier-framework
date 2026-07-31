@@ -45,6 +45,22 @@
 //! | [`LogTransport`] | the log | development — the default, so nothing escapes |
 //! | [`MemoryTransport`] | memory | tests |
 //! | [`FileTransport`] | `.eml` files | opening the real rendered HTML in a browser |
+//! | `SmtpTransport` | an SMTP server | feature `smtp` — lettre over rustls |
+//! | `SesTransport` | Amazon SES | feature `ses` — the AWS default chain |
+//! | `PostmarkTransport` | the Postmark API | feature `postmark` |
+//! | `MailgunTransport` | the Mailgun API | feature `mailgun` |
+//! | `SendGridTransport` | the SendGrid API | feature `sendgrid` |
+//! | `ResendTransport` | the Resend API | feature `resend` |
+//!
+//! Every sender carries the same message: [`render_eml`]'s MIME document
+//! travels whole over SMTP, SES and Mailgun, and the JSON APIs are fed from
+//! the same [`Message`] fields it renders — so what a `.eml` shows in
+//! development is what production delivers.
+//!
+//! The HTTP API transports are built over the framework's own HTTP transport
+//! port (`rainier_http_client::Transport`), which is what makes them
+//! assertable: hand one a `FakeTransport` and the exact outbound request is a
+//! test fixture rather than a network capture.
 //!
 //! ## Two safety valves
 //!
@@ -56,14 +72,40 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+#[cfg(any(feature = "postmark", feature = "mailgun", feature = "sendgrid", feature = "resend"))]
+mod api;
 pub mod driver;
 pub mod mailable;
 pub mod mailer;
+#[cfg(feature = "mailgun")]
+pub mod mailgun;
 pub mod message;
+#[cfg(feature = "postmark")]
+pub mod postmark;
+#[cfg(feature = "resend")]
+pub mod resend;
+#[cfg(feature = "sendgrid")]
+pub mod sendgrid;
+#[cfg(feature = "ses")]
+pub mod ses;
+#[cfg(feature = "smtp")]
+pub mod smtp;
 pub mod transport;
 
-pub use driver::MailDriver;
+pub use driver::{MailDriver, MailEncryption};
 pub use mailable::Mailable;
 pub use mailer::{Mailer, MessageSending, MessageSent, ORIGINAL_TO};
+#[cfg(feature = "mailgun")]
+pub use mailgun::MailgunTransport;
 pub use message::{Address, Attachment, Content, Envelope, Message};
+#[cfg(feature = "postmark")]
+pub use postmark::PostmarkTransport;
+#[cfg(feature = "resend")]
+pub use resend::ResendTransport;
+#[cfg(feature = "sendgrid")]
+pub use sendgrid::SendGridTransport;
+#[cfg(feature = "ses")]
+pub use ses::SesTransport;
+#[cfg(feature = "smtp")]
+pub use smtp::{SmtpBuilder, SmtpTransport};
 pub use transport::{render_eml, FileTransport, LogTransport, MemoryTransport, Transport};

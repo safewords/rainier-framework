@@ -97,14 +97,15 @@ notice.
 ## Mail
 
 ```env
-MAIL_DRIVER=log     # writes to the log
-MAIL_DRIVER=file    # writes .eml files you can open in a browser
+MAIL_DRIVER=smtp    # or ses | postmark | mailgun | sendgrid | resend
 ```
 
-Neither sends anything. Implement [`Transport`](mail.md#transports) over your
-provider — it is one method.
+The default is `log`, which sends nothing — switch before you deploy, and
+enable the sender's cargo feature (`mail-smtp`, `mail-ses`, …), or the boot
+fails naming it. Each sender's settings are listed under
+[Mail — configuration](mail.md#configuration).
 
-**In staging, set [`always_to`](mail.md#always_to).** It redirects every
+**In staging, set [`MAIL_ALWAYS_TO`](mail.md#always_to).** It redirects every
 message to one address, and it is the difference between testing a flow against
 a copy of production data and emailing all of those customers.
 

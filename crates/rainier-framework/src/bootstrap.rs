@@ -613,6 +613,20 @@ fn default_config(env: &Env, base_path: &std::path::Path) -> Result<Config> {
     config.set(keys::MAIL_DRIVER, env.setting("MAIL_DRIVER")?)?;
     config.set(keys::MAIL_FROM_ADDRESS, env.string("MAIL_FROM", "hello@example.com"))?;
     config.set(keys::MAIL_FROM_NAME, env.string("MAIL_FROM_NAME", "Rainier"))?;
+    config.set(keys::MAIL_ALWAYS_TO, env.string("MAIL_ALWAYS_TO", ""))?;
+    config.set(keys::MAIL_FILE_PATH, env.string("MAIL_FILE_PATH", "storage/mail"))?;
+    config.set(keys::MAIL_HOST, env.string("MAIL_HOST", ""))?;
+    config.set(keys::MAIL_PORT, env.int("MAIL_PORT", 0))?;
+    config.set(keys::MAIL_USERNAME, env.string("MAIL_USERNAME", ""))?;
+    config.set(keys::MAIL_PASSWORD, env.string("MAIL_PASSWORD", ""))?;
+    config.set(keys::MAIL_ENCRYPTION, env.setting("MAIL_ENCRYPTION")?)?;
+    config.set(keys::MAIL_TIMEOUT, env.int("MAIL_TIMEOUT", 30))?;
+    config.set(keys::MAIL_POSTMARK_TOKEN, env.string("MAIL_POSTMARK_TOKEN", ""))?;
+    config.set(keys::MAIL_MAILGUN_DOMAIN, env.string("MAIL_MAILGUN_DOMAIN", ""))?;
+    config.set(keys::MAIL_MAILGUN_SECRET, env.string("MAIL_MAILGUN_SECRET", ""))?;
+    config.set(keys::MAIL_MAILGUN_ENDPOINT, env.string("MAIL_MAILGUN_ENDPOINT", ""))?;
+    config.set(keys::MAIL_SENDGRID_KEY, env.string("MAIL_SENDGRID_KEY", ""))?;
+    config.set(keys::MAIL_RESEND_KEY, env.string("MAIL_RESEND_KEY", ""))?;
 
     Ok(config)
 }

@@ -76,6 +76,18 @@ jwt = ["rainier-crypt/jwt"]
 # A real transport for `Http::`. Off by default: the client API and its fake
 # are always there, and only the socket costs a TLS stack.
 http-client = ["rainier-http-client/reqwest-transport"]
+# The mail transports that leave the machine, one feature per destination —
+# because "we send through Postmark" is one fact about a deployment, and the
+# other five providers' dependencies should cost it nothing. The log, file and
+# memory transports need no feature; see `rainier_framework::mail`.
+mail-smtp = ["rainier-mail/smtp"]
+mail-ses = ["rainier-mail/ses"]
+# The HTTP providers ride the framework's outbound client, so each brings its
+# socket.
+mail-postmark = ["rainier-mail/postmark", "http-client"]
+mail-mailgun = ["rainier-mail/mailgun", "http-client"]
+mail-sendgrid = ["rainier-mail/sendgrid", "http-client"]
+mail-resend = ["rainier-mail/resend", "http-client"]
 # Amazon SQS, for a queue somebody else operates.
 sqs = ["rainier-queue/sqs"]
 # Kafka: broadcasting over a topic, the relay that fans it back out to this

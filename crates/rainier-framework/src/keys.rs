@@ -76,7 +76,7 @@
 use rainier_cache::CacheDriver;
 use rainier_config::{config_keys, AppEnv};
 use rainier_crypt::CryptScheme;
-use rainier_mail::MailDriver;
+use rainier_mail::{MailDriver, MailEncryption};
 use rainier_queue::QueueDriver;
 use rainier_session::SessionDriver;
 use rainier_telemetry::LogFormat;
@@ -300,6 +300,57 @@ config_keys! {
 
     /// The default `From` display name.
     pub MAIL_FROM_NAME: String = "mail.from.name";
+
+    /// Redirect **every** message here instead of to its real recipients.
+    ///
+    /// Set it in staging and leave it set. Empty means "do not".
+    pub MAIL_ALWAYS_TO: String = "mail.always_to";
+
+    /// Where the `file` transport writes its `.eml` files.
+    pub MAIL_FILE_PATH: String = "mail.file_path";
+
+    /// The SMTP server. Required by the `smtp` driver, ignored by the rest.
+    pub MAIL_HOST: String = "mail.host";
+
+    /// The SMTP port. `0` — the default — means "whatever `MAIL_ENCRYPTION`'s
+    /// arrangement conventionally uses": 587, 465 or 25.
+    pub MAIL_PORT: i64 = "mail.port";
+
+    /// The SMTP username. Empty means the server wants no authentication —
+    /// a capture container, an internal relay.
+    pub MAIL_USERNAME: String = "mail.username";
+
+    /// The SMTP password.
+    pub MAIL_PASSWORD: String = "mail.password";
+
+    /// How the SMTP connection is secured: `starttls`, `tls` or `none`.
+    pub MAIL_ENCRYPTION: MailEncryption = "mail.encryption";
+
+    /// Seconds before an unanswered send is a failed one.
+    pub MAIL_TIMEOUT: i64 = "mail.timeout";
+
+    /// The Postmark server token. Required by the `postmark` driver.
+    pub MAIL_POSTMARK_TOKEN: String = "mail.postmark.token";
+
+    /// The Mailgun sending domain. Required by the `mailgun` driver.
+    pub MAIL_MAILGUN_DOMAIN: String = "mail.mailgun.domain";
+
+    /// The Mailgun API key. Required by the `mailgun` driver.
+    pub MAIL_MAILGUN_SECRET: String = "mail.mailgun.secret";
+
+    /// The Mailgun API base — `https://api.eu.mailgun.net` for an EU-region
+    /// domain. Empty means the US endpoint.
+    pub MAIL_MAILGUN_ENDPOINT: String = "mail.mailgun.endpoint";
+
+    /// The SendGrid API key. Required by the `sendgrid` driver.
+    pub MAIL_SENDGRID_KEY: String = "mail.sendgrid.key";
+
+    /// The Resend API key. Required by the `resend` driver.
+    pub MAIL_RESEND_KEY: String = "mail.resend.key";
+
+    // The `ses` driver has no keys here on purpose: region and credentials
+    // come from the AWS default chain — `AWS_REGION`, a profile, IMDS —
+    // exactly as the other AWS drivers resolve theirs.
 }
 
 #[cfg(test)]
@@ -349,6 +400,20 @@ mod tests {
             ("MAIL", MAIL_DRIVER.path()),
             ("MAIL", MAIL_FROM_ADDRESS.path()),
             ("MAIL", MAIL_FROM_NAME.path()),
+            ("MAIL", MAIL_ALWAYS_TO.path()),
+            ("MAIL", MAIL_FILE_PATH.path()),
+            ("MAIL", MAIL_HOST.path()),
+            ("MAIL", MAIL_PORT.path()),
+            ("MAIL", MAIL_USERNAME.path()),
+            ("MAIL", MAIL_PASSWORD.path()),
+            ("MAIL", MAIL_ENCRYPTION.path()),
+            ("MAIL", MAIL_TIMEOUT.path()),
+            ("MAIL", MAIL_POSTMARK_TOKEN.path()),
+            ("MAIL", MAIL_MAILGUN_DOMAIN.path()),
+            ("MAIL", MAIL_MAILGUN_SECRET.path()),
+            ("MAIL", MAIL_MAILGUN_ENDPOINT.path()),
+            ("MAIL", MAIL_SENDGRID_KEY.path()),
+            ("MAIL", MAIL_RESEND_KEY.path()),
         ];
 
         for (section, path) in pairs {
@@ -394,6 +459,20 @@ mod tests {
             MAIL_DRIVER.path(),
             MAIL_FROM_ADDRESS.path(),
             MAIL_FROM_NAME.path(),
+            MAIL_ALWAYS_TO.path(),
+            MAIL_FILE_PATH.path(),
+            MAIL_HOST.path(),
+            MAIL_PORT.path(),
+            MAIL_USERNAME.path(),
+            MAIL_PASSWORD.path(),
+            MAIL_ENCRYPTION.path(),
+            MAIL_TIMEOUT.path(),
+            MAIL_POSTMARK_TOKEN.path(),
+            MAIL_MAILGUN_DOMAIN.path(),
+            MAIL_MAILGUN_SECRET.path(),
+            MAIL_MAILGUN_ENDPOINT.path(),
+            MAIL_SENDGRID_KEY.path(),
+            MAIL_RESEND_KEY.path(),
         ];
 
         let unique: std::collections::BTreeSet<_> = paths.iter().collect();
