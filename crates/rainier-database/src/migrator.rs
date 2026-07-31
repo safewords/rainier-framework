@@ -307,6 +307,18 @@ impl std::fmt::Debug for Step {
 /// The table recording which migrations have run, and in which batch.
 const LEDGER: &str = "rainier_migrations";
 
+/// Whether an error is "that index is already there".
+///
+/// Matched on the driver's own words rather than a code, because the error
+/// arrives as a rendered string by the time it reaches here. MySQL and
+/// MariaDB say `1061 (42000): Duplicate key name`; the wording is stable and
+/// the pairing of "duplicate" with "key name" is specific enough that no
+/// other failure reads like it.
+fn is_duplicate_index(error: &Error) -> bool {
+    let message = error.message().to_ascii_lowercase();
+    message.contains("duplicate key name") || message.contains("1061")
+}
+
 /// Runs an ordered list of [`Migration`]s, skipping any already applied.
 #[derive(Default)]
 pub struct Migrator {
@@ -529,12 +541,28 @@ impl Migrator {
     }
 
     async fn execute(&self, db: &Database, name: &str, sql: &str, what: &str) -> Result<()> {
-        db.statement(sql).await.map(|_| ()).map_err(|e| {
-            Error::internal(format!(
+        match db.statement(sql).await {
+            Ok(_) => Ok(()),
+            // An index that is already there is the state the statement was
+            // asking for. This matters for the one case the whole
+            // `IF NOT EXISTS` style exists to serve — a schema step run
+            // against a database that already has the table — because MySQL
+            // rejects `CREATE INDEX IF NOT EXISTS` outright, so the index
+            // half of a `CREATE TABLE IF NOT EXISTS` step cannot be written
+            // idempotently in SQL at all. SQLite and Postgres say it in the
+            // statement and never reach here.
+            Err(e) if is_duplicate_index(&e) => {
+                tracing::debug!(
+                    migration = name,
+                    "an index already existed; treating the step as applied"
+                );
+                Ok(())
+            }
+            Err(e) => Err(Error::internal(format!(
                 "{what} `{name}` failed on `{}`: {e}",
                 rainier_support::str::limit(sql, 80, "…")
-            ))
-        })
+            ))),
+        }
     }
 
     /// Every ledger row, as `(name, batch)`.
@@ -733,6 +761,25 @@ mod tests {
         );
 
         assert_eq!(migrator.irreversible(Dialect::Sqlite), vec!["0002_drop_legacy"]);
+    }
+
+    #[test]
+    fn an_already_present_index_is_not_a_failure() {
+        // The one error a schema step may hit on a database that already has
+        // the table: MySQL rejects `CREATE INDEX IF NOT EXISTS`, so the index
+        // cannot say it in SQL and says it here instead.
+        assert!(is_duplicate_index(&Error::internal(
+            "error returned from database: 1061 (42000): Duplicate key name              'idx_identity_sessions_user_id'"
+        )));
+
+        // Everything else still fails, loudly.
+        for other in [
+            "error returned from database: 1146 (42S02): Table 'x' doesn't exist",
+            "error returned from database: 1054 (42S22): Unknown column 'y'",
+            "connection refused",
+        ] {
+            assert!(!is_duplicate_index(&Error::internal(other)), "{other}");
+        }
     }
 
     #[tokio::test]
