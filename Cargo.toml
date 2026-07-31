@@ -33,6 +33,8 @@ members = [
     "crates/rainier-filesystem",
     "crates/rainier-orm",
     "crates/rainier-orm-macros",
+    "crates/rainier-features",
+    "crates/cargo-rainier",
 ]
 
 # A local checkout of an upstream dependency (see `.cargo/config.toml`) is its
@@ -81,6 +83,7 @@ rainier-cache = { path = "crates/rainier-cache", version = "2.0.0" }
 rainier-filesystem = { path = "crates/rainier-filesystem", version = "2.0.0" }
 rainier-orm = { path = "crates/rainier-orm", version = "2.0.0" }
 rainier-orm-macros = { path = "crates/rainier-orm-macros", version = "2.0.0" }
+rainier-features = { path = "crates/rainier-features", version = "2.0.0" }
 rainier-framework = { path = "crates/rainier-framework", version = "2.0.0" }
 
 # --- third party ------------------------------------------------------------

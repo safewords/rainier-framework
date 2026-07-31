@@ -984,6 +984,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cargo-rainier"
+version = "2.0.0"
+dependencies = [
+ "rainier-features",
+]
+
+[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3315,6 +3322,18 @@ dependencies = [
  "rainier-support",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rainier-features"
+version = "2.0.0"
+dependencies = [
+ "rainier-cache",
+ "rainier-crypt",
+ "rainier-filesystem",
+ "rainier-mail",
+ "rainier-queue",
+ "rainier-support",
 ]
 
 [[package]]

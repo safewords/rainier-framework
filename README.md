@@ -87,6 +87,8 @@ hyper.
 | `rainier-server` | the HTTP kernel and the hyper server | routing, middleware |
 | `rainier-console` | the console kernel and its commands | container |
 | `rainier-crypt` | **ciphers**, signing, key rotation, **password hashing** | support |
+| `rainier-features` | computes the feature set a deployment needs | — |
+| `cargo-rainier` | the `cargo rainier` subcommand over it | features |
 | `rainier-drivers` | Redis / Redis Cluster / Memcached / Kafka / AWS **transports** | support |
 | `rainier-cache` | the **cache** port, its drivers, and **atomic locks** | support, drivers |
 | `rainier-filesystem` | the **storage** port — local, memory, S3/R2 | support, drivers |

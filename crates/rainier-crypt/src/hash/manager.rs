@@ -170,6 +170,7 @@ impl HashManager {
     /// driver this build does not carry, rather than hashing with something
     /// the configuration did not say.
     pub fn new(selected: HashDriver) -> Result<Self> {
+        #[cfg_attr(not(feature = "bcrypt"), allow(unused_mut))]
         let mut drivers: Vec<(HashDriver, Arc<dyn Hasher>)> =
             vec![(HashDriver::Argon2id, Arc::new(Argon2Hasher::new()))];
 
@@ -184,6 +185,7 @@ impl HashManager {
     /// Hashing at production cost is the point of a KDF, and it is also what
     /// turns a suite that creates fifty users into a slow one.
     pub fn insecure_for_tests(selected: HashDriver) -> Result<Self> {
+        #[cfg_attr(not(feature = "bcrypt"), allow(unused_mut))]
         let mut drivers: Vec<(HashDriver, Arc<dyn Hasher>)> =
             vec![(HashDriver::Argon2id, Arc::new(Argon2Hasher::insecure_for_tests()))];
 

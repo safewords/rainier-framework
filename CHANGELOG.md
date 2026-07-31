@@ -12,6 +12,23 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **`rainier-features` and the `cargo rainier` subcommand.** Cargo cannot
+  enable features from code — they resolve before anything compiles, they
+  are additive, and a build script cannot add one — and dead-code
+  elimination cannot size the binary either, because a well-built
+  application's driver matches are deliberately exhaustive, so every
+  compiled driver is referenced. So the feature set is *computed*: the
+  library reads a deployment's environment file (every runtime driver
+  selection) and its source tree (the compile-time choices: `Jwt`, the
+  `Http` facade) and answers with the minimal feature list, with reasons.
+  The mapping lives in the framework because it is knowledge *about* the
+  framework: tests pin it against every driver enum, so a new driver breaks
+  this crate until the table learns it, in the same commit. `cargo install
+  cargo-rainier` for the standalone door (`cargo rainier features
+  [--check]`, `cargo rainier build`); a workspace that prefers no global
+  tools puts a five-line xtask over the library, which is what the sample
+  project does.
+
 - **The PHP envelope's GCM variant** (`rainier-crypt`).
   `PhpEncrypter::new(keys).writing(PhpCipher::Aes256Gcm)` writes the
   `{iv, value, mac: "", tag}` shape a GCM-configured PHP application

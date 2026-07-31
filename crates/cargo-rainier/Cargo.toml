@@ -1,0 +1,18 @@
+[package]
+name = "cargo-rainier"
+description = "The `cargo rainier` subcommand: compute and build with the feature set a Rainier deployment needs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-features = { workspace = true }
+
+[[bin]]
+name = "cargo-rainier"
+path = "src/main.rs"
+
+[lints]
+workspace = true

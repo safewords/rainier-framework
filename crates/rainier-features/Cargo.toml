@@ -1,0 +1,26 @@
+[package]
+name = "rainier-features"
+description = "Computes the cargo feature set a Rainier deployment needs, from its environment file and source tree."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately no dependencies: this is the crate a dev-tool builds before it
+# can trim anything, and it parses an env file and greps for a handful of
+# markers. The mapping it encodes is pinned against the real driver enums in
+# the tests below, which is where the heaviness belongs — dev-dependencies
+# compile for `cargo test` here and for nobody else.
+[dependencies]
+
+[dev-dependencies]
+rainier-support = { workspace = true }
+rainier-cache = { workspace = true }
+rainier-queue = { workspace = true }
+rainier-mail = { workspace = true }
+rainier-filesystem = { workspace = true }
+rainier-crypt = { workspace = true }
+
+[lints]
+workspace = true
