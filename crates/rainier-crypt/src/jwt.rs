@@ -285,12 +285,13 @@ pub struct Jwt {
     issuer: Option<String>,
     audience: Vec<String>,
     leeway: u64,
+    require_nbf: bool,
 }
 
 impl Jwt {
     /// Sign and verify with `ring`.
     pub fn new(ring: JwtKeyRing) -> Self {
-        Self { ring, issuer: None, audience: Vec::new(), leeway: 60 }
+        Self { ring, issuer: None, audience: Vec::new(), leeway: 60, require_nbf: false }
     }
 
     /// Set the `iss` this service claims, and require it when verifying.
@@ -319,6 +320,18 @@ impl Jwt {
     #[must_use = "this returns a configured signer rather than configuring in place"]
     pub fn leeway(mut self, seconds: u64) -> Self {
         self.leeway = seconds;
+        self
+    }
+
+    /// Require `nbf` to be present, and validate it.
+    ///
+    /// Off by default: plenty of third-party issuers mint no `nbf`, and
+    /// requiring it would refuse every token they sign. An issuer verifying
+    /// its **own** tokens — which always carry it — turns this on, so a token
+    /// doctored to start in the future is refused rather than read.
+    #[must_use = "this returns a configured signer rather than configuring in place"]
+    pub fn require_not_before(mut self) -> Self {
+        self.require_nbf = true;
         self
     }
 
@@ -379,6 +392,11 @@ impl Jwt {
         let mut validation = Validation::new(key.algorithm.as_jsonwebtoken());
         validation.leeway = self.leeway;
 
+        if self.require_nbf {
+            validation.validate_nbf = true;
+            validation.required_spec_claims.insert("nbf".to_string());
+        }
+
         if let Some(issuer) = &self.issuer {
             validation.set_issuer(&[issuer]);
         }
@@ -435,6 +453,8 @@ mod tests {
         sub: String,
         exp: i64,
         #[serde(skip_serializing_if = "Option::is_none")]
+        nbf: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         iss: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         aud: Option<String>,
@@ -446,7 +466,7 @@ mod tests {
     }
 
     fn claims() -> Claims {
-        Claims { sub: "user-42".into(), exp: in_an_hour(), iss: None, aud: None }
+        Claims { sub: "user-42".into(), exp: in_an_hour(), nbf: None, iss: None, aud: None }
     }
 
     /// 2048 bits, generated once per test binary: RSA key generation is slow
@@ -658,6 +678,25 @@ mod tests {
         let token = jwt.sign(&Claims { aud: Some("api".into()), ..claims() }).unwrap();
 
         assert!(jwt.verify::<Claims>(&token).is_ok());
+    }
+
+    #[test]
+    fn nbf_is_enforced_only_when_asked_for() {
+        // Third-party issuers often mint no `nbf`, so the default accepts its
+        // absence; an issuer verifying its own tokens opts in and gets both
+        // halves — the claim must exist, and it must have arrived.
+        let lax = rsa_jwt();
+        let strict = rsa_jwt().require_not_before();
+
+        let without = lax.sign(&claims()).unwrap();
+        assert!(lax.verify::<Claims>(&without).is_ok());
+        assert!(strict.verify::<Claims>(&without).is_err(), "nbf is required");
+
+        let future = lax.sign(&Claims { nbf: Some(in_an_hour()), ..claims() }).unwrap();
+        assert!(strict.verify::<Claims>(&future).is_err(), "not valid yet");
+
+        let valid = lax.sign(&Claims { nbf: Some(0), ..claims() }).unwrap();
+        assert!(strict.verify::<Claims>(&valid).is_ok());
     }
 
     #[test]
