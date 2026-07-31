@@ -1,0 +1,36 @@
+[package]
+name = "rainier-queue"
+description = "Jobs, queue drivers and the worker loop for the Rainier framework."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-cache = { workspace = true }
+rainier-container = { workspace = true }
+rainier-events = { workspace = true }
+rainier-database = { workspace = true }
+rainier-drivers = { workspace = true, optional = true }
+rainier-orm = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+# Jobs on Amazon SQS.
+sqs = ["dep:rainier-drivers", "rainier-drivers/aws-sqs"]
+# Jobs on Redis streams. Read the `redis` module docs before choosing it.
+redis = ["dep:rainier-drivers", "rainier-drivers/redis-driver"]
+# Jobs on a Kafka topic. Read the `kafka` module docs first — a log is not a
+# queue, and the differences are the kind that cost money.
+kafka = ["dep:rainier-drivers", "rainier-drivers/kafka"]
+
+[lints]
+workspace = true

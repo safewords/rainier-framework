@@ -1,0 +1,42 @@
+[package]
+name = "rainier-http-client"
+description = "An outbound HTTP client for the Rainier framework, with a fake for tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/rainier-http-client"
+keywords = ["http", "client", "rainier", "fake", "testing"]
+categories = ["web-programming::http-client", "web-programming"]
+
+[dependencies]
+rainier-support = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# Only the timer and `rt`, so this crate does not drag `net` — and mio — in
+# behind a caller that only wants the fake.
+tokio = { version = "1", default-features = false, features = ["time", "rt"] }
+# The transport. Optional: a test suite that only uses `Http::fake()` should
+# not compile a TLS stack.
+reqwest = { workspace = true, optional = true }
+
+[features]
+# Nothing by default, deliberately. `reqwest` brings a TLS stack, an HTTP/2
+# implementation and an IDNA table, and a build that only needs the client API
+# and the fake — a test suite, a Worker, a crate taking a `Transport` as an
+# argument — should not pay for any of it.
+default = []
+# A real transport, over reqwest with rustls.
+reqwest-transport = ["dep:reqwest"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+rainier-support = { workspace = true }
+
+[lints]
+workspace = true

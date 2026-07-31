@@ -1,0 +1,22 @@
+[package]
+name = "rainier-validation"
+description = "Validation rules, the validator, and form request contracts for Rainier."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-http = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

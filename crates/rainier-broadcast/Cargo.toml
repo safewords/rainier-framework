@@ -1,0 +1,34 @@
+[package]
+name = "rainier-broadcast"
+description = "Broadcasting for Rainier: events pushed to WebSocket channels, and the authorisation that guards them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-drivers = { workspace = true, optional = true }
+
+async-trait = { workspace = true }
+futures-util = { workspace = true, optional = true }
+hmac = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+# Publish over Redis pub/sub — what soketi and other Pusher-protocol servers consume.
+redis = ["dep:rainier-drivers", "rainier-drivers/redis-driver"]
+# Publish to a Kafka topic, and relay it back to whoever holds the sockets.
+kafka = ["dep:rainier-drivers", "rainier-drivers/kafka", "dep:futures-util"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+chrono = { workspace = true }
+
+[lints]
+workspace = true

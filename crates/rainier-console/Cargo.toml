@@ -1,0 +1,24 @@
+[package]
+name = "rainier-console"
+description = "The console kernel for the Rainier framework."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-container = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+# Reading a password without echoing it needs the terminal's own API — termios
+# on Unix, SetConsoleMode on Windows. Not optional: a `secret` that sometimes
+# echoes is worse than no `secret` at all.
+rpassword = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

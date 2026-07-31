@@ -1,0 +1,402 @@
+//! The configuration keys Rainier itself reads — a typed index of the tree.
+//!
+//! Some frameworks answer "what can I configure?" with a shipped file to read
+//! through. Rainier's answer is this module: every key the framework writes
+//! or reads, with the type stored at it.
+//!
+//! ```
+//! use rainier_framework::config::Config;
+//! use rainier_framework::keys;
+//!
+//! let config = Config::new();
+//! config.set(keys::APP_NAME, "My App".to_string()).unwrap();
+//!
+//! assert_eq!(config.get(keys::APP_NAME).as_deref(), Some("My App"));
+//! ```
+//!
+//! Using them is optional — every `Config` method still takes a `&str` — but
+//! it is what turns two classes of silent mistake into compile errors:
+//!
+//! ```compile_fail
+//! # use rainier_framework::{config::Config, keys};
+//! # let config = Config::new();
+//! // The port is a u16, so this does not compile.
+//! config.set(keys::SERVER_PORT, "8000").unwrap();
+//! ```
+//!
+//! ```compile_fail
+//! # use rainier_framework::{config::Config, keys};
+//! # let config = Config::new();
+//! // Neither does a driver spelled as a string.
+//! config.set(keys::CACHE_DRIVER, "redis").unwrap();
+//! ```
+//!
+//! ## Reading a driver
+//!
+//! The driver keys hold [settings](rainier_support::Setting) — closed sets with
+//! their own parser. Read them with [`Config::setting`], which distinguishes
+//! *unset* (use the default) from *set to nonsense* (fail, and list what was
+//! expected):
+//!
+//! ```
+//! use rainier_framework::cache::CacheDriver;
+//! use rainier_framework::config::Config;
+//! use rainier_framework::keys;
+//!
+//! let config = Config::new();
+//! config.set(keys::CACHE_DRIVER, CacheDriver::Redis).unwrap();
+//!
+//! match config.setting(keys::CACHE_DRIVER).unwrap() {
+//!     CacheDriver::Memory => { /* … */ }
+//!     CacheDriver::Redis | CacheDriver::RedisCluster => { /* … */ }
+//!     CacheDriver::Memcached => { /* … */ }
+//!     CacheDriver::DynamoDb => { /* … */ }
+//!     // A `_` arm is worth having: a driver added to the framework is a new
+//!     // variant, and a new variant stops an exhaustive match compiling.
+//!     other => panic!("this application does not build a {other}"),
+//! }
+//! ```
+//!
+//! [`Config::setting`]: rainier_config::Config::setting
+//!
+//! ## Adding your own
+//!
+//! An application declares its keys the same way, next to the section that
+//! writes them:
+//!
+//! ```
+//! use rainier_framework::config::config_keys;
+//!
+//! config_keys! {
+//!     /// How many posts a listing shows.
+//!     pub POSTS_PER_PAGE: u64 = "posts.per_page";
+//! }
+//! ```
+
+use rainier_cache::CacheDriver;
+use rainier_config::{config_keys, AppEnv};
+use rainier_crypt::CryptScheme;
+use rainier_mail::MailDriver;
+use rainier_queue::QueueDriver;
+use rainier_session::SessionDriver;
+use rainier_telemetry::LogFormat;
+
+config_keys! {
+    // --- app ---------------------------------------------------------------
+
+    /// The application's display name, in page titles and mail.
+    pub APP_NAME: String = "app.name";
+
+    /// Which deployment this is.
+    ///
+    /// Defaults to [`AppEnv::Production`] when `APP_ENV` is unset — the safe
+    /// direction to be wrong in.
+    pub APP_ENV: AppEnv = "app.env";
+
+    /// Whether a failure may show its internals to the client.
+    ///
+    /// Separate from [`APP_ENV`] because they drift the moment someone debugs
+    /// staging.
+    pub APP_DEBUG: bool = "app.debug";
+
+    /// The application's canonical base URL, used to generate absolute links.
+    pub APP_URL: String = "app.url";
+
+    /// The directory the application was started from. Set by the framework;
+    /// there is no environment variable for it.
+    pub APP_BASE_PATH: String = "app.base_path";
+
+    // --- server ------------------------------------------------------------
+
+    /// The interface the HTTP server binds to.
+    pub SERVER_HOST: String = "server.host";
+
+    /// The port the HTTP server binds to.
+    pub SERVER_PORT: u16 = "server.port";
+
+    /// The largest request body that will be buffered, in bytes.
+    pub SERVER_MAX_BODY_BYTES: u64 = "server.max_body_bytes";
+
+    /// How long a handler may take before the request is cancelled and
+    /// answered `408`, in seconds. `0` turns it off.
+    ///
+    /// Off by default, because the right ceiling is a fact about your
+    /// application and a wrong one cancels work that was going to succeed.
+    /// `30` is a reasonable first answer for an API; a route that legitimately
+    /// takes longer should carry its own
+    /// [`Timeout`](rainier_middleware::Timeout) rather than raising this for
+    /// everything.
+    ///
+    /// This bounds the **handler**, not the response body — a streaming or
+    /// server-sent-events route returns its response immediately and streams
+    /// afterwards, so it is unaffected.
+    pub SERVER_REQUEST_TIMEOUT_SECS: u64 = "server.request_timeout_secs";
+
+    /// Whether to gzip text responses on the way out.
+    ///
+    /// Off by default: a deployment behind nginx, a CDN or a load balancer
+    /// usually compresses there, and doing it twice is CPU spent to produce
+    /// the same bytes. Turn it on when Rainier is the thing clients talk to.
+    ///
+    /// See [`Compress`](rainier_middleware::Compress) for what it will and
+    /// will not compress.
+    pub SERVER_COMPRESSION: bool = "server.compression";
+
+    // --- observability ------------------------------------------------------
+    //
+    // All three are off by default. Each costs something a request pays for —
+    // a lock and a timer, a document rendered at boot, a span per request —
+    // and an application that has not asked for them should not pay it.
+
+    /// Whether to record Prometheus metrics.
+    pub METRICS_ENABLED: bool = "metrics.enabled";
+
+    /// The path the scrape endpoint is served at.
+    ///
+    /// Configurable because it is the one endpoint you may want somewhere
+    /// unguessable, on a deployment where it cannot be put behind auth.
+    pub METRICS_PATH: String = "metrics.path";
+
+    /// Whether to serve the OpenAPI document.
+    pub OPENAPI_ENABLED: bool = "openapi.enabled";
+
+    /// The path the document is served at.
+    pub OPENAPI_PATH: String = "openapi.path";
+
+    /// The `info.title` of the document.
+    pub OPENAPI_TITLE: String = "openapi.title";
+
+    /// The `info.version` of the document — your API's version, not the
+    /// framework's.
+    pub OPENAPI_VERSION: String = "openapi.version";
+
+    /// The base URL clients should use, if the document should name one.
+    pub OPENAPI_SERVER: String = "openapi.server";
+
+    /// Whether to join and propagate W3C trace context.
+    ///
+    /// Cheap: no exporter, no collector, just the `traceparent` header and a
+    /// trace id on every log line. Worth having on even without OTLP.
+    pub TELEMETRY_ENABLED: bool = "telemetry.enabled";
+
+    /// The OTLP collector's gRPC endpoint — `http://localhost:4317`.
+    ///
+    /// Absent unless set, and absent means spans are not exported. Needs the
+    /// `otlp` feature.
+    pub TELEMETRY_ENDPOINT: String = "telemetry.endpoint";
+
+    /// What this service calls itself in a trace.
+    pub TELEMETRY_SERVICE_NAME: String = "telemetry.service_name";
+
+    /// What fraction of traces this service *starts* to record, `0.0` to
+    /// `1.0`.
+    ///
+    /// A trace that arrives with a decision keeps it, whatever this says.
+    pub TELEMETRY_SAMPLE_RATIO: f64 = "telemetry.sample_ratio";
+
+    /// Which encryption envelope this application writes — `native` or
+    /// `php`.
+    ///
+    /// `php` exists for a database a PHP application already filled, and
+    /// is a migration position rather than a destination: it cannot rotate a
+    /// key without re-encrypting, because its payload names no key.
+    pub APP_CIPHER: CryptScheme = "app.cipher";
+
+    /// The shape of a log line — `auto`, `pretty`, `compact`, `json`.
+    ///
+    /// `auto` is JSON in production and staging and pretty everywhere else,
+    /// which is what you want without having to say so. Set it explicitly to
+    /// read production logs by eye for an afternoon.
+    pub LOG_FORMAT: LogFormat = "telemetry.log_format";
+
+    // --- database ----------------------------------------------------------
+
+    /// The database DSN — `sqlite::memory:`, `mysql://…`, `postgres://…`.
+    pub DATABASE_URL: String = "database.url";
+
+    // --- cache -------------------------------------------------------------
+
+    /// Which cache store to build.
+    pub CACHE_DRIVER: CacheDriver = "cache.driver";
+
+    /// The Redis DSN, or a comma-separated seed list for a cluster.
+    pub CACHE_REDIS_URL: String = "cache.redis_url";
+
+    /// `host:port` of the Memcached server.
+    pub CACHE_MEMCACHED_URL: String = "cache.memcached_url";
+
+    /// Prepended to every cache key, so two applications can share a server.
+    pub CACHE_PREFIX: String = "cache.prefix";
+
+    // --- session -----------------------------------------------------------
+
+    /// Where session state lives.
+    pub SESSION_DRIVER: SessionDriver = "session.driver";
+
+    /// How long a session survives without a request, in seconds.
+    pub SESSION_LIFETIME: i64 = "session.lifetime";
+
+    /// The name of the session cookie.
+    pub SESSION_COOKIE: String = "session.cookie";
+
+    /// Whether the session cookie is `Secure`. Must be true over HTTPS.
+    pub SESSION_SECURE: bool = "session.secure";
+
+    // --- queue -------------------------------------------------------------
+
+    /// Where queued jobs wait.
+    pub QUEUE_DRIVER: QueueDriver = "queue.driver";
+
+    /// The queue a job goes on when it does not name one.
+    pub QUEUE_DEFAULT: String = "queue.default";
+
+    // --- kafka -------------------------------------------------------------
+
+    /// The bootstrap brokers, comma-separated — `kafka-1:9092,kafka-2:9092`.
+    ///
+    /// Empty means no cluster is configured, which is what an application that
+    /// does not use Kafka leaves it as.
+    pub KAFKA_BROKERS: String = "kafka.brokers";
+
+    /// Which set of cursors this deployment shares.
+    ///
+    /// A consumer group by another name. Two deployments reading one topic
+    /// under different groups each get every record; under the same group they
+    /// share it out. Changing it makes a worker start over from the beginning
+    /// of the topic, so it is not a name to tidy up later.
+    pub KAFKA_GROUP: String = "kafka.group";
+
+    /// Prefixes every topic this application produces to or reads from.
+    pub KAFKA_TOPIC_PREFIX: String = "kafka.topic_prefix";
+
+    /// The topic broadcasts are published to.
+    pub KAFKA_BROADCAST_TOPIC: String = "kafka.broadcast_topic";
+
+    /// Whether to connect over TLS. Needs the `kafka-tls` feature.
+    pub KAFKA_TLS: bool = "kafka.tls";
+
+    /// The SASL username, if the cluster wants one.
+    pub KAFKA_USERNAME: String = "kafka.username";
+
+    /// The SASL password.
+    ///
+    /// Read from the environment like every other secret, and never written to
+    /// a config file that a repository can hold.
+    pub KAFKA_PASSWORD: String = "kafka.password";
+
+    /// Which SASL mechanism the username and password are for.
+    ///
+    /// `plain`, `scram-sha-256` or `scram-sha-512`. `PLAIN` sends the password
+    /// in the clear and belongs inside TLS.
+    pub KAFKA_SASL_MECHANISM: String = "kafka.sasl_mechanism";
+
+    // --- mail --------------------------------------------------------------
+
+    /// Where mail goes.
+    pub MAIL_DRIVER: MailDriver = "mail.driver";
+
+    /// The default `From` address.
+    pub MAIL_FROM_ADDRESS: String = "mail.from.address";
+
+    /// The default `From` display name.
+    pub MAIL_FROM_NAME: String = "mail.from.name";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rainier_config::Config;
+
+    #[test]
+    fn a_driver_key_round_trips_as_its_wire_spelling() {
+        let config = Config::new();
+        config.set(CACHE_DRIVER, CacheDriver::RedisCluster).unwrap();
+
+        // What a `.env` would hold, and what a config dump should show.
+        assert_eq!(config.string("cache.driver").as_deref(), Some("redis-cluster"));
+        assert_eq!(config.setting(CACHE_DRIVER).unwrap(), CacheDriver::RedisCluster);
+    }
+
+    #[test]
+    fn every_key_is_under_the_section_its_name_says() {
+        // A key filed under the wrong prefix reads fine and writes somewhere
+        // nothing looks. Cheap to assert, and it has caught a paste already.
+        let pairs: &[(&str, &str)] = &[
+            ("APP", APP_NAME.path()),
+            ("APP", APP_ENV.path()),
+            ("APP", APP_DEBUG.path()),
+            ("APP", APP_URL.path()),
+            ("APP", APP_BASE_PATH.path()),
+            ("SERVER", SERVER_HOST.path()),
+            ("SERVER", SERVER_PORT.path()),
+            ("SERVER", SERVER_MAX_BODY_BYTES.path()),
+            ("SERVER", SERVER_REQUEST_TIMEOUT_SECS.path()),
+            ("SERVER", SERVER_COMPRESSION.path()),
+            ("DATABASE", DATABASE_URL.path()),
+            ("CACHE", CACHE_DRIVER.path()),
+            ("CACHE", CACHE_REDIS_URL.path()),
+            ("CACHE", CACHE_MEMCACHED_URL.path()),
+            ("CACHE", CACHE_PREFIX.path()),
+            ("SESSION", SESSION_DRIVER.path()),
+            ("SESSION", SESSION_LIFETIME.path()),
+            ("SESSION", SESSION_COOKIE.path()),
+            ("SESSION", SESSION_SECURE.path()),
+            ("QUEUE", QUEUE_DRIVER.path()),
+            ("QUEUE", QUEUE_DEFAULT.path()),
+            ("KAFKA", KAFKA_BROKERS.path()),
+            ("KAFKA", KAFKA_GROUP.path()),
+            ("KAFKA", KAFKA_TLS.path()),
+            ("MAIL", MAIL_DRIVER.path()),
+            ("MAIL", MAIL_FROM_ADDRESS.path()),
+            ("MAIL", MAIL_FROM_NAME.path()),
+        ];
+
+        for (section, path) in pairs {
+            assert!(
+                path.starts_with(&format!("{}.", section.to_lowercase())),
+                "`{path}` is filed under the wrong section"
+            );
+        }
+    }
+
+    #[test]
+    fn no_two_keys_name_the_same_path() {
+        let paths = [
+            APP_NAME.path(),
+            APP_ENV.path(),
+            APP_DEBUG.path(),
+            APP_URL.path(),
+            APP_BASE_PATH.path(),
+            SERVER_HOST.path(),
+            SERVER_PORT.path(),
+            SERVER_MAX_BODY_BYTES.path(),
+            SERVER_REQUEST_TIMEOUT_SECS.path(),
+            SERVER_COMPRESSION.path(),
+            DATABASE_URL.path(),
+            CACHE_DRIVER.path(),
+            CACHE_REDIS_URL.path(),
+            CACHE_MEMCACHED_URL.path(),
+            CACHE_PREFIX.path(),
+            SESSION_DRIVER.path(),
+            SESSION_LIFETIME.path(),
+            SESSION_COOKIE.path(),
+            SESSION_SECURE.path(),
+            QUEUE_DRIVER.path(),
+            QUEUE_DEFAULT.path(),
+            KAFKA_BROKERS.path(),
+            KAFKA_GROUP.path(),
+            KAFKA_TOPIC_PREFIX.path(),
+            KAFKA_BROADCAST_TOPIC.path(),
+            KAFKA_TLS.path(),
+            KAFKA_USERNAME.path(),
+            KAFKA_PASSWORD.path(),
+            KAFKA_SASL_MECHANISM.path(),
+            MAIL_DRIVER.path(),
+            MAIL_FROM_ADDRESS.path(),
+            MAIL_FROM_NAME.path(),
+        ];
+
+        let unique: std::collections::BTreeSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "two keys share a path: {paths:?}");
+    }
+}

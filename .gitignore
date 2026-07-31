@@ -1,0 +1,23 @@
+# Build artifacts
+/target
+**/*.rs.bk
+
+# Local checkouts of upstream dependencies being worked on alongside Rainier,
+# plus the cargo config that points the build at them. Both are a developer's
+# local setup, not part of the project.
+/dev-dependencies
+/.cargo
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Editors
+/.idea
+/.vscode
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db

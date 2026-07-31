@@ -1,0 +1,22 @@
+[package]
+name = "rainier-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A cron scheduler for Rainier, with atomic locks for withoutOverlapping and onOneServer."
+
+[dependencies]
+rainier-cache = { workspace = true }
+rainier-container = { workspace = true }
+rainier-support = { workspace = true }
+
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

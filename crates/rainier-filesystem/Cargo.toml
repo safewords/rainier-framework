@@ -1,0 +1,30 @@
+[package]
+name = "rainier-filesystem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "File storage for Rainier: a Filesystem port with local, in-memory and S3/R2 drivers."
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-drivers = { workspace = true }
+
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+
+[features]
+default = []
+# S3, Cloudflare R2, MinIO, and anything else that speaks S3.
+s3 = ["rainier-drivers/aws-s3"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

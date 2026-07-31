@@ -1,0 +1,234 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # So a dependency that breaks the build is found on a schedule rather than by
+  # the next person to open a pull request.
+  schedule:
+    - cron: "0 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace on a failing test is the difference between a re-run and a fix.
+  RUST_BACKTRACE: 1
+
+concurrency:
+  # A new push supersedes the run in flight for the same branch.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --- the fast ones, so a typo does not wait on a full test run -------------
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # `--all-features` because a lint only fires in code that is compiled,
+      # and the driver crates are behind features. `-D warnings` because a
+      # warning nobody has to fix is a warning nobody fixes.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # --- the real ones ---------------------------------------------------------
+
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Let every combination report, rather than cancelling the rest on the
+      # first failure — knowing whether it is one feature or all of them is
+      # most of the diagnosis.
+      fail-fast: false
+      matrix:
+        include:
+          # What a wasm target or a minimal application compiles.
+          - name: default features
+            flags: ""
+          # What everybody actually runs.
+          - name: sea-orm-executor
+            flags: "--features sea-orm-executor"
+          # Everything, including the drivers that need a feature to exist.
+          - name: all features
+            flags: "--all-features"
+    # A Redis for the queue and cache drivers to run against. Their tests skip
+    # when none answers, so without this the Redis driver would be reported as
+    # passing by a suite that had never executed a line of it.
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      # And a Kafka, for the same reason: the queue driver's interesting
+      # properties are properties of the log — that acknowledging is a cursor
+      # moving, that a retry is a new record — and none of them can be checked
+      # without a broker. KRaft, so there is no ZooKeeper to wait for.
+      kafka:
+        image: apache/kafka:3.9.0
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          # The tests create the topics they need, with the partition counts
+          # they are about. Auto-creation would give them one partition each
+          # and quietly pass the tests that are about having several.
+          KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+        # Answering a metadata request is the readiness that matters: a broker
+        # that has bound the port but not finished electing itself controller
+        # will refuse to create a topic, which is how this first went red.
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+          --health-start-period 30s
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - run: cargo test --workspace ${{ matrix.flags }}
+        env:
+          REDIS_URL: redis://127.0.0.1/
+          # Turns "no Redis, so skip" into a failure here, which is the only
+          # place that absence means something is wrong.
+          REDIS_REQUIRED: "1"
+          KAFKA_BROKERS: localhost:9092
+          # Only where the driver is compiled: the default-features run has no
+          # Kafka code in it, and demanding a broker there would fail a job
+          # that never had one to use.
+          KAFKA_REQUIRED: ${{ matrix.name == 'all features' && '1' || '' }}
+
+  msrv:
+    name: minimum supported Rust (1.88, default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      # Default features only, and that is the honest scope of the claim.
+      # `rust-version = "1.88"` is the floor for *Rainier's own* code, which is
+      # what the wasm-safe default build compiles. Turning on a driver pulls in
+      # third-party crates with their own, higher floors:
+      #
+      #   default            1.88
+      #   sea-orm-executor   1.88  (via `home`, transitively)
+      #   http-client        1.86  (via `reqwest` -> `url` -> `idna` -> `icu_*`)
+      #   aws-*              1.94  (the AWS SDKs)
+      #
+      # Checking `--all-features` here would just track whichever dependency
+      # bumped its MSRV last, which tells you nothing about this code.
+      - run: cargo check --workspace --all-targets
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Every crate denies `rustdoc::broken_intra_doc_links`, so a stale link
+      # in a doc comment fails here. `-D warnings` catches the rest.
+      #
+      # `cargo build` first: with `--no-deps`, rustdoc still needs each
+      # workspace member's rmeta, and asking for it in the same invocation
+      # races against documenting them.
+      - run: cargo build --workspace --all-features
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # --- the badge -------------------------------------------------------------
+
+  # Keeps the README's test count honest. A static number is wrong the day
+  # after it is written, and shields.io has no way to count a Rust test suite,
+  # so CI counts it and commits the endpoint the badge reads.
+  test-count:
+    name: test count badge
+    runs-on: ubuntu-latest
+    # Only on main: a pull request cannot push, and the count from a branch is
+    # not the one the README should be claiming.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: all features
+
+      - run: bash .github/scripts/count-tests.sh
+
+      # `[skip ci]` so the commit this makes does not start another run of
+      # everything, which would make one of these per push forever.
+      - name: Commit the count if it moved
+        run: |
+          if git diff --quiet .github/badges/tests.json; then
+            echo "the count is unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/badges/tests.json
+          git commit -m "chore: refresh the test count badge [skip ci]"
+          git push
+
+  wasm:
+    name: wasm32 target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+
+      # The claim `rainier-orm` makes about itself: no optional dependencies,
+      # so it compiles for a Worker with no feature dance. An assertion beats a
+      # sentence in a README.
+      - run: cargo check -p rainier-orm --target wasm32-unknown-unknown
+
+      # And the rest of the crates a Worker actually uses. Checking only the
+      # ORM let a dependency reach one of these unnoticed: `tokio` with its
+      # default `net` feature pulls in mio, which does not build for wasm, and
+      # nothing would have said so until somebody tried to deploy.
+      - run: |
+          cargo check --target wasm32-unknown-unknown             -p rainier-support             -p rainier-container             -p rainier-config             -p rainier-http             -p rainier-middleware             -p rainier-routing             -p rainier-console             -p rainier-validation             -p rainier-view             -p rainier-database

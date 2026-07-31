@@ -1,0 +1,37 @@
+[package]
+name = "rainier"
+description = "A batteries-included MVC framework for Rust: container, providers, router, request contracts, guards, jobs, mailables, facades, events."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/rainier"
+keywords = ["framework", "mvc", "web", "fullstack", "http"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[dependencies]
+rainier-framework = { workspace = true }
+
+# Mirrors `rainier-framework` exactly, name for name. Forwarding wholesale
+# would let this crate quietly gain a feature the framework had not been asked
+# about; listing them means `--features redis` here and there are the same
+# request.
+[features]
+default = []
+sea-orm-executor = ["rainier-framework/sea-orm-executor"]
+d1-http = ["rainier-framework/d1-http"]
+libsql-http = ["rainier-framework/libsql-http"]
+redis = ["rainier-framework/redis"]
+redis-cluster = ["rainier-framework/redis-cluster"]
+memcached = ["rainier-framework/memcached"]
+s3 = ["rainier-framework/s3"]
+sqs = ["rainier-framework/sqs"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

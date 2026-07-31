@@ -1,0 +1,390 @@
+//! Composable query scopes — [`Criteria`].
+//!
+//! A repository method cannot take "the filters" as an argument unless filters
+//! are a *value*. `Criteria` is that value: it records predicates, joins,
+//! ordering and paging, and [`statement`](crate::statement) replays them into
+//! SQL at execution time.
+//!
+//! Making the filters data rather than a partially-applied builder buys three
+//! things: a scope can be named and reused, two scopes can be merged by code
+//! that owns neither, and [`Repository`](crate::Repository) stays `dyn`-safe
+//! because its methods take one concrete parameter instead of a closure.
+//!
+//! ```
+//! # use rainier_database::Criteria;
+//! let published = Criteria::new().where_eq("published", true);
+//! let newest = Criteria::new().order_by_desc("created_at").limit(10);
+//!
+//! let front_page = published.merge(newest);
+//! assert_eq!(front_page.limit_value(), Some(10));
+//! ```
+
+use rainier_orm::sea_query::{ColumnRef, Expr, SimpleExpr, Value};
+
+/// One recorded predicate.
+#[derive(Debug, Clone)]
+pub enum Constraint {
+    /// `column = value`.
+    Eq(String, Value),
+    /// `column <> value`.
+    Ne(String, Value),
+    /// `column > value`.
+    Gt(String, Value),
+    /// `column >= value`.
+    Gte(String, Value),
+    /// `column < value`.
+    Lt(String, Value),
+    /// `column <= value`.
+    Lte(String, Value),
+    /// `column LIKE pattern`.
+    Like(String, String),
+    /// `column NOT LIKE pattern`.
+    NotLike(String, String),
+    /// `column IN (values)`.
+    In(String, Vec<Value>),
+    /// `column NOT IN (values)`.
+    NotIn(String, Vec<Value>),
+    /// `column IS NULL`.
+    Null(String),
+    /// `column IS NOT NULL`.
+    NotNull(String),
+}
+
+impl Constraint {
+    /// The column this constraint applies to.
+    pub fn column(&self) -> &str {
+        match self {
+            Constraint::Eq(column, _)
+            | Constraint::Ne(column, _)
+            | Constraint::Gt(column, _)
+            | Constraint::Gte(column, _)
+            | Constraint::Lt(column, _)
+            | Constraint::Lte(column, _)
+            | Constraint::Like(column, _)
+            | Constraint::NotLike(column, _)
+            | Constraint::In(column, _)
+            | Constraint::NotIn(column, _)
+            | Constraint::Null(column)
+            | Constraint::NotNull(column) => column,
+        }
+    }
+
+    /// The `(column, value)` pair if this is an equality, else `None`.
+    ///
+    /// Shard routing keys off equalities specifically: `user_id = 42` names one
+    /// shard, whereas `user_id > 42` could span all of them.
+    pub fn as_equality(&self) -> Option<(&str, &Value)> {
+        match self {
+            Constraint::Eq(column, value) => Some((column, value)),
+            _ => None,
+        }
+    }
+
+    /// Render as a `sea_query` expression against an already-resolved column.
+    pub fn to_expr(&self, column: ColumnRef) -> SimpleExpr {
+        let expr = Expr::col(column);
+        match self {
+            Constraint::Eq(_, value) => expr.eq(value.clone()),
+            Constraint::Ne(_, value) => expr.ne(value.clone()),
+            Constraint::Gt(_, value) => expr.gt(value.clone()),
+            Constraint::Gte(_, value) => expr.gte(value.clone()),
+            Constraint::Lt(_, value) => expr.lt(value.clone()),
+            Constraint::Lte(_, value) => expr.lte(value.clone()),
+            Constraint::Like(_, pattern) => expr.like(pattern.as_str()),
+            Constraint::NotLike(_, pattern) => expr.not_like(pattern.as_str()),
+            Constraint::In(_, values) => expr.is_in(values.clone()),
+            Constraint::NotIn(_, values) => expr.is_not_in(values.clone()),
+            Constraint::Null(_) => expr.is_null(),
+            Constraint::NotNull(_) => expr.is_not_null(),
+        }
+    }
+}
+
+/// A recorded, replayable set of query constraints.
+///
+/// Predicates are AND-combined. A column is `"name"` (qualified to the model's
+/// table) or `"table.name"` (a joined table).
+#[derive(Debug, Clone, Default)]
+pub struct Criteria {
+    constraints: Vec<Constraint>,
+    /// `(table, local_column, foreign_column)`.
+    joins: Vec<(String, String, String)>,
+    /// `(column, descending)`.
+    orders: Vec<(String, bool)>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
+impl Criteria {
+    /// No constraints — every row.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `column = value`.
+    pub fn where_eq(mut self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.constraints.push(Constraint::Eq(column.into(), value.into()));
+        self
+    }
+
+    /// `column <> value`.
+    pub fn where_ne(mut self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.constraints.push(Constraint::Ne(column.into(), value.into()));
+        self
+    }
+
+    /// `column > value`.
+    pub fn where_gt(mut self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.constraints.push(Constraint::Gt(column.into(), value.into()));
+        self
+    }
+
+    /// `column >= value`.
+    pub fn where_gte(mut self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.constraints.push(Constraint::Gte(column.into(), value.into()));
+        self
+    }
+
+    /// `column < value`.
+    pub fn where_lt(mut self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.constraints.push(Constraint::Lt(column.into(), value.into()));
+        self
+    }
+
+    /// `column <= value`.
+    pub fn where_lte(mut self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.constraints.push(Constraint::Lte(column.into(), value.into()));
+        self
+    }
+
+    /// `column LIKE pattern` — use `%` and `_` wildcards.
+    pub fn where_like(mut self, column: impl Into<String>, pattern: impl Into<String>) -> Self {
+        self.constraints.push(Constraint::Like(column.into(), pattern.into()));
+        self
+    }
+
+    /// `column NOT LIKE pattern`.
+    pub fn where_not_like(mut self, column: impl Into<String>, pattern: impl Into<String>) -> Self {
+        self.constraints.push(Constraint::NotLike(column.into(), pattern.into()));
+        self
+    }
+
+    /// `column IN (values)`. An empty set matches nothing.
+    pub fn where_in<V: Into<Value>>(
+        mut self,
+        column: impl Into<String>,
+        values: impl IntoIterator<Item = V>,
+    ) -> Self {
+        let values = values.into_iter().map(Into::into).collect();
+        self.constraints.push(Constraint::In(column.into(), values));
+        self
+    }
+
+    /// `column NOT IN (values)`.
+    pub fn where_not_in<V: Into<Value>>(
+        mut self,
+        column: impl Into<String>,
+        values: impl IntoIterator<Item = V>,
+    ) -> Self {
+        let values = values.into_iter().map(Into::into).collect();
+        self.constraints.push(Constraint::NotIn(column.into(), values));
+        self
+    }
+
+    /// `column IS NULL`.
+    pub fn where_null(mut self, column: impl Into<String>) -> Self {
+        self.constraints.push(Constraint::Null(column.into()));
+        self
+    }
+
+    /// `column IS NOT NULL`.
+    pub fn where_not_null(mut self, column: impl Into<String>) -> Self {
+        self.constraints.push(Constraint::NotNull(column.into()));
+        self
+    }
+
+    /// `INNER JOIN table ON model.local = table.foreign`.
+    ///
+    /// For filtering the root model only — the joined table is not decoded, and
+    /// the join cannot span backends. Compose across entities in your own code
+    /// instead; see Rainier ORM's notes on why relationships stay explicit.
+    pub fn join(
+        mut self,
+        table: impl Into<String>,
+        local: impl Into<String>,
+        foreign: impl Into<String>,
+    ) -> Self {
+        self.joins.push((table.into(), local.into(), foreign.into()));
+        self
+    }
+
+    /// `ORDER BY column ASC`.
+    pub fn order_by(mut self, column: impl Into<String>) -> Self {
+        self.orders.push((column.into(), false));
+        self
+    }
+
+    /// `ORDER BY column DESC`.
+    pub fn order_by_desc(mut self, column: impl Into<String>) -> Self {
+        self.orders.push((column.into(), true));
+        self
+    }
+
+    /// `LIMIT n`.
+    ///
+    /// Clamped to `i64::MAX`. Drivers bind these as a signed 64-bit integer and
+    /// **panic** on anything larger — so `limit(u64::MAX)`, the obvious way to
+    /// write "no limit", used to take the process down inside sea-query rather
+    /// than return an error. No table has more than `i64::MAX` rows, so the
+    /// clamp changes no result.
+    pub fn limit(mut self, n: u64) -> Self {
+        self.limit = Some(n.min(i64::MAX as u64));
+        self
+    }
+
+    /// `OFFSET n`. Clamped like [`limit`](Self::limit), and for the same
+    /// reason.
+    pub fn offset(mut self, n: u64) -> Self {
+        self.offset = Some(n.min(i64::MAX as u64));
+        self
+    }
+
+    /// Combine with `other`: its constraints, joins and orders are appended,
+    /// and its paging wins wherever it sets any.
+    pub fn merge(mut self, other: Criteria) -> Self {
+        self.constraints.extend(other.constraints);
+        self.joins.extend(other.joins);
+        self.orders.extend(other.orders);
+        self.limit = other.limit.or(self.limit);
+        self.offset = other.offset.or(self.offset);
+        self
+    }
+
+    /// Apply `scope` only if `condition` holds.
+    pub fn when(self, condition: bool, scope: impl FnOnce(Self) -> Self) -> Self {
+        if condition {
+            scope(self)
+        } else {
+            self
+        }
+    }
+
+    /// Whether any filter or join is recorded. Ordering and paging alone do
+    /// not make a criteria non-empty.
+    pub fn is_empty(&self) -> bool {
+        self.constraints.is_empty() && self.joins.is_empty()
+    }
+
+    /// The recorded predicates.
+    pub fn constraints(&self) -> &[Constraint] {
+        &self.constraints
+    }
+
+    /// The recorded joins, as `(table, local, foreign)`.
+    pub fn joins(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.joins.iter().map(|(t, l, f)| (t.as_str(), l.as_str(), f.as_str()))
+    }
+
+    /// The recorded ordering, as `(column, descending)`.
+    pub fn orders(&self) -> &[(String, bool)] {
+        &self.orders
+    }
+
+    /// The recorded limit.
+    pub fn limit_value(&self) -> Option<u64> {
+        self.limit
+    }
+
+    /// The recorded offset.
+    pub fn offset_value(&self) -> Option<u64> {
+        self.offset
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn starts_empty() {
+        let criteria = Criteria::new();
+        assert!(criteria.is_empty());
+        assert_eq!(criteria.limit_value(), None);
+        assert!(criteria.constraints().is_empty());
+    }
+
+    #[test]
+    fn a_limit_beyond_what_a_driver_can_bind_is_clamped() {
+        // `u64::MAX` is how you write "everything", and the sqlite and postgres
+        // binders both `unwrap` the conversion to `i64` — so this used to be a
+        // panic from inside the driver, several layers below the caller.
+        let criteria = Criteria::new().limit(u64::MAX).offset(u64::MAX);
+
+        assert_eq!(criteria.limit_value(), Some(i64::MAX as u64));
+        assert_eq!(criteria.offset_value(), Some(i64::MAX as u64));
+    }
+
+    #[test]
+    fn records_constraints_in_order() {
+        let criteria = Criteria::new().where_eq("published", true).where_gt("views", 100_i64);
+
+        assert!(!criteria.is_empty());
+        assert_eq!(criteria.constraints().len(), 2);
+        assert_eq!(criteria.constraints()[0].column(), "published");
+        assert_eq!(criteria.constraints()[1].column(), "views");
+    }
+
+    #[test]
+    fn only_equalities_report_a_routable_pair() {
+        let criteria = Criteria::new().where_eq("user_id", 1_u64).where_gt("user_id", 1_u64);
+
+        assert!(criteria.constraints()[0].as_equality().is_some());
+        assert!(
+            criteria.constraints()[1].as_equality().is_none(),
+            "a range could span every shard"
+        );
+    }
+
+    #[test]
+    fn ordering_and_paging_alone_leave_it_empty() {
+        let criteria = Criteria::new().order_by_desc("id").limit(5);
+        assert!(criteria.is_empty(), "nothing is being filtered");
+        assert_eq!(criteria.limit_value(), Some(5));
+    }
+
+    #[test]
+    fn merge_appends_and_prefers_the_others_paging() {
+        let base = Criteria::new().where_eq("a", 1_i64).limit(5).offset(10);
+        let extra = Criteria::new().where_eq("b", 2_i64).limit(20);
+
+        let merged = base.merge(extra);
+        assert_eq!(merged.constraints().len(), 2);
+        assert_eq!(merged.limit_value(), Some(20), "the merged-in limit wins");
+        assert_eq!(merged.offset_value(), Some(10), "the original offset survives");
+    }
+
+    #[test]
+    fn merge_keeps_the_original_paging_when_the_other_sets_none() {
+        let merged = Criteria::new().limit(5).merge(Criteria::new().where_eq("a", 1_i64));
+        assert_eq!(merged.limit_value(), Some(5));
+    }
+
+    #[test]
+    fn when_applies_a_scope_conditionally() {
+        assert_eq!(Criteria::new().when(true, |c| c.where_eq("a", 1_i64)).constraints().len(), 1);
+        assert!(Criteria::new().when(false, |c| c.where_eq("a", 1_i64)).is_empty());
+    }
+
+    #[test]
+    fn joins_are_recorded_with_both_sides() {
+        let criteria = Criteria::new().join("authors", "author_id", "id");
+        assert!(!criteria.is_empty());
+        assert_eq!(criteria.joins().collect::<Vec<_>>(), vec![("authors", "author_id", "id")]);
+    }
+
+    #[test]
+    fn ordering_records_its_direction() {
+        let criteria = Criteria::new().order_by("a").order_by_desc("b");
+        assert_eq!(criteria.orders(), &[("a".to_string(), false), ("b".to_string(), true)]);
+    }
+}

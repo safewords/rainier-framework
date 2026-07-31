@@ -1,0 +1,30 @@
+[package]
+name = "rainier-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sessions for Rainier: the bag, the store port, and the middleware that persists it."
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-http = { workspace = true }
+rainier-middleware = { workspace = true }
+rainier-database = { workspace = true }
+rainier-cache = { workspace = true }
+rainier-crypt = { workspace = true }
+
+async-trait = { workspace = true }
+chrono = { workspace = true }
+rainier-orm = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

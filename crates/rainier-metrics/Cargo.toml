@@ -1,0 +1,23 @@
+[package]
+name = "rainier-metrics"
+description = "Prometheus metrics for Rainier: a registry, the text exposition format, and request instrumentation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-http = { workspace = true }
+rainier-middleware = { workspace = true }
+rainier-routing = { workspace = true }
+
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,312 @@
+# Database: Getting Started
+
+Rainier's data layer is built on **[Rainier ORM]**, a multi-dialect DBAL where
+one `#[derive(Entity)]` serves SQLite, MySQL and Postgres — and Cloudflare D1,
+which speaks SQLite over HTTP and therefore reports `Dialect::Sqlite`.
+
+Rainier adds the four things a framework needs on top:
+
+| | |
+|---|---|
+| `Connection` / `Database` | a `dyn`-safe port, so a backend can live in the container |
+| [`Model`](models.md) | an entity the framework manages, with lifecycle hooks |
+| [`Repository`](repositories.md) | a contract to depend on, implemented once for every model |
+| [`Criteria`](repositories.md#criteria) / [`Paginated`](pagination.md) | composable scopes and paging |
+
+## Connecting
+
+```rust
+use rainier_orm::{PoolConfig, SeaOrmExecutor};
+use rainier_framework::database::Database;
+
+let url = env.string("DATABASE_URL", "sqlite::memory:");
+let executor = SeaOrmExecutor::connect(&url, &PoolConfig::default()).await?;
+
+Rainier::new(".").with_database(Database::new(executor))
+```
+
+```env
+DATABASE_URL=sqlite::memory:
+DATABASE_URL=sqlite://storage/app.sqlite
+DATABASE_URL=mysql://user:pass@localhost/app
+DATABASE_URL=postgres://user:pass@localhost/app
+```
+
+Nothing else in the application changes between those — that is the ORM's whole
+premise.
+
+### The in-memory SQLite trap
+
+An in-memory SQLite database exists only as long as its connection, so a pool
+of five would give you **five empty databases** and a test that fails
+depending on which connection it drew:
+
+```rust
+let pool = if url.starts_with("sqlite::memory:") {
+    PoolConfig::serverless()      // max = 1
+} else {
+    PoolConfig::default()
+};
+```
+
+## Dialects
+
+```rust
+db.dialect();          // Dialect::Sqlite | MySql | Postgres
+```
+
+The dialect decides SQL rendering — quoting, `LIMIT`/`OFFSET`, upsert syntax,
+DDL types. You rarely name it except in a
+[migration step](migrations.md#a-step-per-dialect) that genuinely differs.
+
+## Executors
+
+`Connection` is the `dyn`-safe port. `Database` holds an `Arc<dyn Connection>`.
+
+### Why the indirection exists
+
+Rainier ORM's `Executor` uses `async fn` in trait and carries no `Send + Sync`
+bound — deliberately, so the same code runs in a single-threaded Cloudflare
+Worker over a `!Send` D1 binding. That makes it unusable as `dyn Executor`,
+which is exactly what a container needs to store.
+
+`Database` resolves it by holding `Arc<dyn Connection>` and **re-implementing
+`Executor` on top of it**. The whole ORM surface therefore works against a
+`Database` unchanged:
+
+```rust
+// Through the repository contract…
+let page = posts.paginate_matching(Criteria::new().where_eq("published", true), 1, 20).await?;
+
+// …or straight through Rainier ORM, because Database is an Executor.
+let newest: Option<Post> = repo::query::<Post>().order_by_desc("id").first(&db).await?;
+```
+
+### Registering a backend
+
+```rust
+rainier_framework::bind_executor!(MyExecutor);
+```
+
+Two constraints, both worth knowing before you reach for it:
+
+1. **The type must be concrete.** Rust cannot prove a generic `E: Executor`
+   produces `Send` futures without return-type notation, which is unstable.
+2. **You may only call it in the crate that defines the trait or the type.**
+   The orphan rule. `Connection` belongs to `rainier-database` and
+   `SeaOrmExecutor` to Rainier ORM, so **an application cannot bind
+   `SeaOrmExecutor` itself** — Rainier ships that impl behind the
+   `sea-orm-executor` feature.
+
+```toml
+rainier-framework = { git = "…", features = ["sea-orm-executor"] }
+```
+
+`bind_executor!` is for executors *you* wrote.
+
+## Running SQL
+
+Most code goes through a [repository](repositories.md). Two lower levels are
+there when you need them.
+
+### `database.query(sql)`
+
+Raw SQL, for the query the criteria builder does not have a shape for: a
+recursive CTE, a window function, a `LATERAL` join, an `EXPLAIN`, a
+migration's one-off backfill.
+
+```rust
+let stale = database
+    .query("DELETE FROM sessions WHERE last_seen_at < ?")
+    .bind(cutoff)
+    .execute()
+    .await?;
+
+let posts: Vec<Post> = database
+    .query("SELECT * FROM posts WHERE author_id = ? ORDER BY published_at DESC")
+    .bind(author_id)
+    .fetch_all()
+    .await?;
+
+let total = database
+    .query("SELECT SUM(weight) AS total FROM widgets")
+    .scalar_i64("total")
+    .await?;
+```
+
+| Terminal | Returns |
+|---|---|
+| `execute()` | `ExecOutcome` — `rows_affected`, `last_insert_id` |
+| `fetch_all::<E>()` / `fetch_one::<E>()` | entities decoded by column name |
+| `fetch(columns)` | `Vec<OwnedRow>`, for a shape no entity has |
+| `scalar_i64(col)` / `scalar_string(col)` | one value from the first row |
+| `column(col)` | one text column from every row |
+| `prepared()` | the `Prepared` it would send, for a log or a test |
+
+`scalar_i64` returns `Option`, and does not flatten `None` to `0`. `SUM` over
+no rows is `NULL`, not zero, and rounding that to zero is how a total silently
+becomes wrong.
+
+#### Placeholders are always `?`
+
+MySQL and SQLite spell a placeholder `?`; Postgres spells it `$1`, `$2`.
+Writing the same statement twice for two dialects is the madness a DBAL exists
+to absorb, so `?` is the spelling here and it is rewritten to `$n` for
+Postgres, in order, skipping anything inside a string literal or a quoted
+identifier.
+
+The one case that bites is Postgres's JSON `?` operator (`data ? 'key'`) and
+its `??`/`?|`/`?&` relatives — genuinely `?` characters that are not
+placeholders. Reach for `.raw_placeholders()` there and write `$1` yourself.
+
+#### On a shard
+
+```rust
+database
+    .query("SELECT * FROM orders WHERE customer_id = ?")
+    .bind(customer_id)
+    .route_by(customer_id)
+    .fetch_all::<Order>()
+    .await?;
+```
+
+`route_by` takes the same values the ORM routes by — a shard-encoded id as-is,
+a string key through the same stable hash — so the same key lands on the same
+shard from any process. Without it a query is `ShardRoute::Global`, which on a
+sharded deployment means it will look in the wrong place and quietly find
+nothing. `on_shard_key(key)` takes an already-resolved key.
+
+#### The one thing that is not safe
+
+**Values** are always bound; a bound value can never be SQL, which is the whole
+point of `bind`. The **statement** is whatever string you passed. Building that
+string out of anything a request supplied is an injection, and no amount of
+binding downstream repairs it:
+
+```rust
+// NEVER
+database.query(&format!("SELECT * FROM {table} WHERE id = ?")).bind(id)
+```
+
+A table or column name that has to vary belongs in a `match` over a closed set.
+
+### `Prepared`, by hand
+
+```rust
+db.statement("PRAGMA foreign_keys = ON").await?;      // no bindings, for DDL
+
+let prepared = statement::select_by_column::<Post>(db.dialect(), "author_id", 7.into());
+let posts: Vec<Post> = db.fetch_all(prepared).await?;
+let count = db.fetch_count(prepared).await?;
+let outcome = db.execute(prepared).await?;      // rows_affected, last_insert_id
+```
+
+`statement::` renders SQL **synchronously**, returning a `Prepared { sql,
+params, route }`. That keeps shard routing and dialect rendering explicit at
+the framework seam — see below.
+
+## Sharding
+
+Rainier ORM routes by shard when the backend does:
+
+```rust
+db.is_sharded();
+db.shard_family();
+```
+
+A `Prepared` carries a `ShardRoute` computed from the value the entity is
+sharded on. `Connection::allocate_id(shard_key)` mints a shard-encoded primary
+key. Single-database backends answer `None` to all of it and nothing changes.
+
+## The `Send` story
+
+Building Rainier surfaced a real incompatibility, since **fixed upstream**. It
+is worth understanding because the same trap catches any async Rust code
+touching `sea-query`.
+
+`sea_query`'s statement types hold `Rc<dyn Iden>`. A value merely *alive across
+an `.await`* is captured by the generated future — so a statement in scope at an
+await point makes the whole future `!Send`, and therefore unusable inside a
+handler a multi-threaded server will `tokio::spawn`.
+
+```mermaid
+flowchart TD
+    subgraph before ["Before — the future is !Send"]
+        A1["build the statement"] --> A2["render it to SQL"]
+        A2 --> A3["await the query"]
+        A3 -.->|"statement still in scope"| A4["the future captures its Rc"]
+    end
+
+    subgraph after ["After — the future is Send"]
+        B1["build and render<br/>inside an inner scope"] --> B2["the scope ends;<br/>the statement is dropped"]
+        B2 --> B3["await the query"]
+        B3 --> B4["the future holds only<br/>a String and a Vec of values"]
+    end
+
+    style A4 fill:#633,stroke:#a66,color:#fff
+    style B4 fill:#353,stroke:#6a6,color:#fff
+```
+
+The fix has two halves:
+
+- **`repo::`** builds and renders each statement inside a scope that ends before
+  the await, so only the rendered `String` and `Vec<Value>` cross it.
+- **`Query`'s terminals** are `fn … -> impl Future` rather than `async fn`.
+  This one is subtle: **an `async fn`'s future captures every argument** whether
+  or not the body moves it out first — and `self` is a `Query<E>`, which holds
+  `Rc`. Consuming `self` outside the `async move` block leaves it out of the
+  future.
+
+`rainier-orm/tests/send_futures.rs` asserts the property at compile time for
+every public async API, so a regression fails the build rather than surfacing as
+a baffling error downstream. Rainier keeps its own live check in
+`rainier-database`'s tests.
+
+### Two things that follow
+
+**A future's *output* need not be `Send` for the future to be `Send`.** The
+value is moved out on the final poll rather than held across a suspension. That
+is why `Connection::fetch_raw` returns `BoxFuture<'_, Result<Vec<Box<dyn Row>>>>`
+even though `Box<dyn Row>` is not `Send` — and it is what lets Rainier ORM'
+`repo::` API work from a request handler. The rows still cannot cross a thread,
+so decode them before the next `await`, which is exactly what
+`Entity::from_row` does.
+
+**One documented exception remains.** `rainier_orm::Migrator::run` boxes each
+step behind `dyn`, which erases auto traits, and the bound cannot be added:
+`CreateTable` implements `Migration<X>` for *every* `X: Executor`, so it would
+have to promise a `Send` future for every executor — unknowable generically
+without return-type notation. Use [`rainier_database::Migrator`](migrations.md)
+instead; it renders DDL synchronously and executes plain strings, so it is
+`Send`.
+
+### Why Rainier still renders synchronously
+
+`rainier-database::statement` prepares SQL before any await. That began as a
+workaround and is now a **design choice**: it keeps shard routing and dialect
+rendering explicit at the framework seam, where you can see and test them.
+`repo::` and the query builder work directly against a `Database` too, and a
+test asserts it.
+
+## Testing
+
+`MemoryConnection` records statements instead of running them:
+
+```rust
+use rainier_framework::database::testing::{fake_database, MemoryConnection};
+
+let (db, connection) = fake_database(
+    MemoryConnection::new(Dialect::Sqlite)
+        .returning([OwnedRow::new().with("id", 1_u64).with("email", "a@b.c")]),
+);
+
+let users = EntityRepository::<User>::new(db);
+let found = users.first_by("email", "a@b.c".into()).await?;
+
+assert!(connection.last_statement().unwrap().contains("users"));
+assert_eq!(connection.statement_count(), 1);
+```
+
+See [Testing](testing.md#the-database-double) for the full API.
+
+[Rainier ORM]: ../crates/rainier-orm

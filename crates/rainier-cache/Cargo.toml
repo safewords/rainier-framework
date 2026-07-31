@@ -1,0 +1,48 @@
+[package]
+name = "rainier-cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A cache port for Rainier, with memory, Redis, Redis Cluster and Memcached drivers."
+
+[dependencies]
+rainier-support = { workspace = true }
+# For the `RateLimitStore` port. The middleware crate defines it; this crate
+# implements it over the cache, which keeps `rainier-middleware` depending on
+# `rainier-http` and nothing else.
+rainier-middleware = { workspace = true }
+rainier-drivers = { workspace = true }
+
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# For `Lock::wait_for`'s poll interval. The `time` feature only — this crate
+# spawns nothing and opens no sockets of its own.
+# The timer and nothing else. Deliberately not the workspace tokio, which
+# carries `net` and pulls in mio, which does not build for wasm.
+tokio = { version = "1", default-features = false, features = ["time", "rt", "sync"] }
+tracing = { workspace = true }
+
+
+[features]
+# Cloudflare Workers KV — a read-heavy, eventually consistent edge store.
+# Read `kv`'s module docs before reaching for it: it cannot hold a lock.
+cloudflare-kv = []
+default = []
+# A single Redis server, or a Sentinel-fronted primary.
+redis-driver = ["rainier-drivers/redis-driver"]
+# A sharded Redis Cluster, where keys are distributed across nodes.
+redis-cluster = ["redis-driver", "rainier-drivers/redis-cluster"]
+# Memcached over its text protocol.
+memcached = ["rainier-drivers/memcached"]
+# A cache in a DynamoDB table — no server to run.
+dynamodb = ["rainier-drivers/aws-dynamodb"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

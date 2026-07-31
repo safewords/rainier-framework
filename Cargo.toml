@@ -1,0 +1,156 @@
+﻿[workspace]
+resolver = "2"
+members = [
+    "crates/rainier-framework",
+    "crates/rainier-support",
+    "crates/rainier-container",
+    "crates/rainier-config",
+    "crates/rainier-events",
+    "crates/rainier-http",
+    "crates/rainier-http-client",
+    "crates/rainier-middleware",
+    "crates/rainier-routing",
+    "crates/rainier-validation",
+    "crates/rainier-database",
+    "crates/rainier-auth",
+    "crates/rainier-queue",
+    "crates/rainier-view",
+    "crates/rainier-mail",
+    "crates/rainier-server",
+    "crates/rainier-console",
+    "crates/rainier-crypt",
+    "crates/rainier",
+    "crates/rainier-broadcast",
+    "crates/rainier-metrics",
+    "crates/rainier-openapi",
+    "crates/rainier-telemetry",
+    "crates/rainier-websocket",
+    "crates/rainier-notify",
+    "crates/rainier-scheduler",
+    "crates/rainier-session",
+    "crates/rainier-drivers",
+    "crates/rainier-cache",
+    "crates/rainier-filesystem",
+    "crates/rainier-orm",
+    "crates/rainier-orm-macros",
+]
+
+# A local checkout of an upstream dependency (see `.cargo/config.toml`) is its
+# own workspace. Without this, cargo would absorb it into ours and its manifest
+# would fail to inherit from its own workspace root. The directory is
+# git-ignored; this entry is harmless when it is absent.
+exclude = ["dev-dependencies"]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/safewords/rainier-framework"
+authors = ["Rainier contributors"]
+
+[workspace.dependencies]
+# --- internal ---------------------------------------------------------------
+rainier-support = { path = "crates/rainier-support", version = "2.0.0" }
+rainier-container = { path = "crates/rainier-container", version = "2.0.0" }
+rainier-config = { path = "crates/rainier-config", version = "2.0.0" }
+rainier-events = { path = "crates/rainier-events", version = "2.0.0" }
+rainier-http = { path = "crates/rainier-http", version = "2.0.0" }
+rainier-http-client = { path = "crates/rainier-http-client", version = "2.0.0" }
+rainier-middleware = { path = "crates/rainier-middleware", version = "2.0.0" }
+rainier-routing = { path = "crates/rainier-routing", version = "2.0.0" }
+rainier-validation = { path = "crates/rainier-validation", version = "2.0.0" }
+rainier-view = { path = "crates/rainier-view", version = "2.0.0" }
+rainier-database = { path = "crates/rainier-database", version = "2.0.0" }
+rainier-auth = { path = "crates/rainier-auth", version = "2.0.0" }
+rainier-queue = { path = "crates/rainier-queue", version = "2.0.0" }
+rainier-mail = { path = "crates/rainier-mail", version = "2.0.0" }
+rainier-server = { path = "crates/rainier-server", version = "2.0.0" }
+rainier-console = { path = "crates/rainier-console", version = "2.0.0" }
+rainier-crypt = { path = "crates/rainier-crypt", version = "2.0.0" }
+rainier-broadcast = { path = "crates/rainier-broadcast", version = "2.0.0" }
+rainier-metrics = { path = "crates/rainier-metrics", version = "2.0.0" }
+rainier-openapi = { path = "crates/rainier-openapi", version = "2.0.0" }
+rainier-telemetry = { path = "crates/rainier-telemetry", version = "2.0.0" }
+rainier-websocket = { path = "crates/rainier-websocket", version = "2.0.0" }
+rainier-notify = { path = "crates/rainier-notify", version = "2.0.0" }
+rainier-scheduler = { path = "crates/rainier-scheduler", version = "2.0.0" }
+rainier-session = { path = "crates/rainier-session", version = "2.0.0" }
+rainier-drivers = { path = "crates/rainier-drivers", version = "2.0.0" }
+rainier-cache = { path = "crates/rainier-cache", version = "2.0.0" }
+rainier-filesystem = { path = "crates/rainier-filesystem", version = "2.0.0" }
+rainier-orm = { path = "crates/rainier-orm", version = "2.0.0" }
+rainier-orm-macros = { path = "crates/rainier-orm-macros", version = "2.0.0" }
+rainier-framework = { path = "crates/rainier-framework", version = "2.0.0" }
+
+# --- third party ------------------------------------------------------------
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+tokio-tungstenite = "0.24"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.28"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+rpassword = "7"
+flate2 = "1"
+form_urlencoded = "1"
+percent-encoding = "2"
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["std"] }
+bcrypt = "0.19"
+rand = "0.8"
+aws-config = "1"
+aws-credential-types = "1"
+aws-sdk-s3 = "1"
+aws-sdk-sqs = "1"
+aws-sdk-dynamodb = "1"
+# Kafka. Pure Rust, so no C toolchain and no CMake â€” see `rainier_drivers::kafka`.
+rskafka = { version = "0.6", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+base64 = "0.22"
+sea-query = { version = "0.32", default-features = false, features = ["derive", "backend-mysql", "backend-postgres", "backend-sqlite", "with-chrono"] }
+sea-orm = { version = "1", default-features = false }
+rust_decimal = { version = "1", default-features = false }
+aes = "0.8"
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
+rsa = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset", "http2"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+cbc = { version = "0.1", features = ["alloc"] }
+aes-gcm = "0.10"
+aes-gcm-siv = "0.11"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+ed25519-dalek = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "aio"] }
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+[workspace.lints.clippy]
+# `unwrap_err()` requires the `Ok` type to be `Debug`, which a `Vec<Arc<dyn
+# Trait>>` cannot be. `result.err().expect("â€¦")` is the way to assert on the
+# error of such a call, and it is used deliberately throughout the tests.
+err_expect = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="240" viewBox="0 0 680 240" role="img" aria-labelledby="title desc">
+  <title id="title">Rainier framework logo</title>
+  <desc id="desc">A rounded dark badge containing a faceted Mount Rainier silhouette with three summit points, a white glacier cap and layered rust-orange rock strata, set beside the wordmark Rainier and the tagline "An MVC framework for Rust".</desc>
+
+  <defs>
+    <clipPath id="peak-dark">
+      <path d="M 12 158 L 44 112 L 64 80 L 74 68 L 86 76 L 102 58 L 113 48 L 128 60 L 139 70 L 152 88 L 172 122 L 188 158 Z"/>
+    </clipPath>
+  </defs>
+
+  <g transform="translate(140,40) scale(0.8)">
+    <!-- The badge is only a shade off a dark page background, so it carries a
+         hairline to keep its corners readable. -->
+    <rect x="1" y="1" width="198" height="198" rx="35" fill="#1F262B" stroke="#333C43" stroke-width="2"/>
+
+    <g transform="translate(0,12)">
+      <path d="M 12 158 L 44 112 L 64 80 L 74 68 L 86 76 L 102 58 L 113 48 L 128 60 L 139 70 L 152 88 L 172 122 L 188 158 Z" fill="#8E3B24"/>
+
+      <g clip-path="url(#peak-dark)">
+        <rect y="132" width="200" height="26" fill="#7E3520"/>
+        <rect y="106" width="200" height="26" fill="#A8452A"/>
+        <rect y="44" width="200" height="62" fill="#C75232"/>
+
+        <path d="M 0 40 H 200 V 82 L 188 90 L 178 82 L 166 94 L 155 86 L 144 98 L 132 88 L 120 100 L 108 90 L 96 102 L 84 92 L 72 100 L 60 90 L 48 100 L 34 92 L 22 98 L 0 90 Z" fill="#EEF4F7"/>
+
+        <path d="M 80 94 L 89 94 L 84 134 Z" fill="#C3D9E6"/>
+        <path d="M 106 98 L 117 98 L 112 142 Z" fill="#C3D9E6"/>
+        <path d="M 140 100 L 149 100 L 144 132 Z" fill="#C3D9E6"/>
+      </g>
+    </g>
+  </g>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif">
+    <text x="330" y="122" font-size="46" font-weight="500" letter-spacing="-0.5" fill="#F2F5F7">Rainier</text>
+    <text x="334" y="150" font-size="18" fill="#9BA5AC">An MVC framework for Rust</text>
+  </g>
+</svg>

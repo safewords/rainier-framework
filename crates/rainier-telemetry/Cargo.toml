@@ -1,0 +1,41 @@
+[package]
+name = "rainier-telemetry"
+description = "OpenTelemetry for Rainier: trace context propagation, and an OTLP exporter behind a feature."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-http = { workspace = true }
+rainier-middleware = { workspace = true }
+
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+# The exporter. Off by default: it is a large dependency tree, and an
+# application that only wants trace headers propagated should not pay for it.
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+default = []
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+]
+
+[dev-dependencies]
+tokio = { workspace = true }
+http-body-util = { workspace = true }
+
+[lints]
+workspace = true

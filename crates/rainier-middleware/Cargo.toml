@@ -1,0 +1,31 @@
+[package]
+name = "rainier-middleware"
+description = "Middleware as values, the request pipeline, and the built-in middleware set."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-container = { workspace = true }
+rainier-support = { workspace = true }
+rainier-http = { workspace = true }
+async-trait = { workspace = true }
+# gzip and deflate for `Compress`. Pure Rust through miniz_oxide, so it stays
+# wasm-safe like the rest of the default build.
+flate2 = { workspace = true }
+serde_json = { workspace = true }
+# Only the timer, and deliberately not the workspace's tokio: that one carries
+# `net` and `signal`, which pull in mio and stop this crate compiling for a
+# wasm target. Nothing here needs a socket.
+tokio = { version = "1", default-features = false, features = ["time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+
+[lints]
+workspace = true

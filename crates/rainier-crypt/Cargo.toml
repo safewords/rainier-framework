@@ -1,0 +1,50 @@
+[package]
+name = "rainier-crypt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Authenticated encryption and message signing for Rainier."
+
+[dependencies]
+rainier-support = { workspace = true }
+
+base64 = { workspace = true }
+# AES-256-CBC, only for reading what a PHP application wrote — see
+# `php`. Not used by anything Rainier writes itself.
+aes = { workspace = true }
+cbc = { workspace = true }
+aes-gcm = { workspace = true }
+aes-gcm-siv = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+# JWTs and JWKS. Pure Rust (`rust_crypto`, not aws-lc-rs) so the crate stays
+# buildable everywhere the rest of it is. Optional: an application that issues
+# no tokens should not compile an RSA implementation.
+jsonwebtoken = { workspace = true, optional = true }
+rsa = { workspace = true, optional = true }
+p256 = { workspace = true, optional = true }
+hmac = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+
+[dev-dependencies]
+# The interop test rebuilds a public key from the JWKS by hand.
+rsa = { workspace = true, features = ["sha2"] }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+
+[features]
+# RS256/ES256 signing, verification and a JWKS document.
+jwt = ["dep:jsonwebtoken", "dep:rsa", "dep:p256"]
+
+[lints]
+workspace = true

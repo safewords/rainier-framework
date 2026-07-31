@@ -1,0 +1,83 @@
+[package]
+name = "rainier-drivers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared connectors for Rainier: Redis, Redis Cluster, Memcached, Kafka and AWS transports."
+
+[dependencies]
+rainier-support = { workspace = true }
+
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+aws-config = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-sdk-dynamodb = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-sdk-sqs = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
+rskafka = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+
+# The SQL executors. `rainier-orm` defines the Executor port; these implement it.
+rainier-orm = { workspace = true, optional = true }
+sea-orm = { workspace = true, optional = true, features = [
+    "sqlx-mysql",
+    "sqlx-sqlite",
+    "sqlx-postgres",
+    "runtime-tokio-rustls",
+    "with-chrono",
+    "with-rust_decimal",
+] }
+rust_decimal = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+# A single Redis server, or a Sentinel-fronted primary.
+redis-driver = ["dep:redis", "dep:tokio"]
+# A sharded Redis Cluster. Implies `redis-driver`.
+redis-cluster = ["redis-driver", "redis/cluster-async"]
+# Memcached over its text protocol.
+memcached = ["dep:tokio"]
+# Apache Kafka: produce, fetch, offsets and topics. Plaintext and SASL, with no
+# C dependency of any kind.
+kafka = ["dep:rskafka", "dep:tokio", "dep:chrono"]
+# ...and over TLS, which is how every managed Kafka is reached. Separate
+# because it pulls in a TLS stack, and a cluster on a private network does not
+# need one.
+kafka-tls = ["kafka", "rskafka/transport-tls", "dep:rustls", "dep:rustls-native-certs"]
+# The shared AWS configuration — credentials resolved once for every service.
+# `aws-sdk-s3` is not optional to `aws` because the error mapping is written
+# against its `SdkError`, which every service crate re-exports the same shape of.
+aws = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-sdk-s3", "dep:tokio"]
+aws-s3 = ["aws"]
+aws-sqs = ["aws", "dep:aws-sdk-sqs"]
+aws-dynamodb = ["aws", "dep:aws-sdk-dynamodb"]
+
+# --- SQL executors ----------------------------------------------------------
+# Shared by every SQL driver: the Executor port and the value plumbing.
+sql = ["dep:rainier-orm", "dep:chrono", "dep:serde", "dep:serde_json", "dep:base64"]
+# Native MySQL / Postgres / SQLite. Not available on wasm32.
+sea-orm-executor = ["sql", "dep:sea-orm", "dep:rust_decimal"]
+# Cloudflare D1 over the HTTP /query API.
+d1-http = ["sql"]
+# Turso / libSQL over the Hrana HTTP /v2/pipeline API.
+libsql-http = ["sql"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

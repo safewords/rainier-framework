@@ -1,0 +1,99 @@
+[package]
+name = "rainier-framework"
+description = "An MVC framework for Rust, built on the Rainier ORM DBAL."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/rainier-framework"
+keywords = ["framework", "mvc", "web", "server", "http"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-container = { workspace = true }
+rainier-config = { workspace = true }
+rainier-events = { workspace = true }
+rainier-http = { workspace = true }
+rainier-http-client = { workspace = true }
+rainier-middleware = { workspace = true }
+rainier-routing = { workspace = true }
+rainier-validation = { workspace = true }
+rainier-view = { workspace = true }
+rainier-database = { workspace = true }
+rainier-auth = { workspace = true }
+rainier-queue = { workspace = true }
+rainier-mail = { workspace = true }
+rainier-server = { workspace = true }
+rainier-console = { workspace = true }
+rainier-cache = { workspace = true }
+rainier-crypt = { workspace = true }
+rainier-drivers = { workspace = true }
+rainier-filesystem = { workspace = true }
+rainier-broadcast = { workspace = true }
+rainier-metrics = { workspace = true }
+rainier-openapi = { workspace = true }
+rainier-telemetry = { workspace = true }
+rainier-websocket = { workspace = true }
+rainier-notify = { workspace = true }
+rainier-scheduler = { workspace = true }
+rainier-session = { workspace = true }
+rainier-orm = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+
+[features]
+default = []
+# The native sea-orm executor (MySQL / Postgres / SQLite).
+sea-orm-executor = ["rainier-database/sea-orm-executor"]
+# Redis, everywhere it can be used: the cache, the queue, and the broadcast
+# fan-out. One feature rather than three, because "I have a Redis" is one fact
+# about a deployment — and because a `redis` feature that gave you a cache and
+# not a queue is the kind of surprise nobody debugs quickly.
+redis = ["rainier-cache/redis-driver", "rainier-queue/redis", "rainier-broadcast/redis"]
+redis-cluster = ["redis", "rainier-cache/redis-cluster"]
+memcached = ["rainier-cache/memcached"]
+# Read `$2y$` password hashes written by a PHP or Rails application, so a
+# ported users table logs everybody in while it converts.
+bcrypt = ["rainier-auth/bcrypt"]
+# Cloudflare Workers KV as a cache. Read `rainier_cache::kv` first: it is
+# eventually consistent and cannot hold a lock.
+cloudflare-kv = ["rainier-cache/cloudflare-kv"]
+# RS256/ES256 tokens and a JWKS document, for an application that issues or
+# verifies them.
+jwt = ["rainier-crypt/jwt"]
+# A real transport for `Http::`. Off by default: the client API and its fake
+# are always there, and only the socket costs a TLS stack.
+http-client = ["rainier-http-client/reqwest-transport"]
+# Amazon SQS, for a queue somebody else operates.
+sqs = ["rainier-queue/sqs"]
+# Kafka: broadcasting over a topic, the relay that fans it back out to this
+# process's sockets, and jobs on a partitioned log. One feature, for the same
+# reason `redis` is one: "we have a Kafka" is a single fact about a deployment.
+kafka = ["rainier-broadcast/kafka", "rainier-queue/kafka", "rainier-drivers/kafka"]
+# ...and TLS, which every managed cluster needs.
+kafka-tls = ["kafka", "rainier-drivers/kafka-tls"]
+# S3, Cloudflare R2, MinIO and anything else that speaks S3.
+s3 = ["rainier-filesystem/s3"]
+d1-http = ["rainier-database/d1-http"]
+libsql-http = ["rainier-database/libsql-http"]
+
+# docs.rs builds with default features, which for this crate is the wasm-safe
+# set — so half the API would be missing from the rendered documentation.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

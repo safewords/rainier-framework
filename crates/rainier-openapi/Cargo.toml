@@ -1,0 +1,25 @@
+[package]
+name = "rainier-openapi"
+description = "An OpenAPI document for Rainier, built from the router and the request contracts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-http = { workspace = true }
+rainier-routing = { workspace = true }
+rainier-validation = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+rainier-container = { workspace = true }
+
+[lints]
+workspace = true

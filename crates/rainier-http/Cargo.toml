@@ -1,0 +1,28 @@
+[package]
+name = "rainier-http"
+description = "HTTP requests, responses, cookies, uploads and extractors for the Rainier framework."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-support = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body = "1"
+http-body-util = { workspace = true }
+futures-core = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+form_urlencoded = { workspace = true }
+percent-encoding = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+futures-util = "0.3"
+
+[lints]
+workspace = true

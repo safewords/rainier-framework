@@ -1,0 +1,22 @@
+[package]
+name = "rainier-notify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Notifications for Rainier: a message to a recipient, over the channels they can be reached on."
+
+[dependencies]
+rainier-mail = { workspace = true }
+rainier-support = { workspace = true }
+
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rainier-view = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

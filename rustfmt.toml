@@ -1,0 +1,8 @@
+# The style the codebase is already written in.
+#
+# `Max` lets a chain, a struct literal or an argument list occupy the whole
+# line rather than defaulting to 60% of it, which is what rustfmt would
+# otherwise insist on — and what would turn a readable one-line call into a
+# four-line one throughout.
+max_width = 100
+use_small_heuristics = "Max"
