@@ -97,6 +97,21 @@ impl Vite {
         self
     }
 
+    /// Whether a frontend is present at all — a dev server running or a
+    /// build compiled.
+    ///
+    /// For the application code that has to *choose*, not render: a
+    /// controller deciding between the page that mounts the frontend and a
+    /// server-rendered fallback asks this, where a template just says
+    /// `@vite` and gets the comment when the answer would have been no.
+    /// Checked fresh every call, like the hot file — this answer's whole
+    /// point is changing while the process runs.
+    pub fn is_active(&self) -> bool {
+        self.hot_origin().is_some()
+            || self.public.join(&self.build).join("manifest.json").is_file()
+            || self.public.join(&self.build).join(".vite").join("manifest.json").is_file()
+    }
+
     /// The tags for `entries`, in order.
     ///
     /// Dev server first: when `public/hot` exists its contents are the
@@ -326,6 +341,21 @@ mod tests {
         assert!(html.starts_with("<!--"), "{html}");
         assert!(html.contains("npm run dev"), "{html}");
         assert!(html.contains("npm run build"), "{html}");
+    }
+
+    #[test]
+    fn activity_tracks_the_artefacts() {
+        let public = temp_dir("activity");
+        let vite = Vite::new(&public);
+        assert!(!vite.is_active(), "an empty public dir has no frontend");
+
+        std::fs::write(public.join("hot"), "http://localhost:5173").unwrap();
+        assert!(vite.is_active(), "a dev server counts");
+        std::fs::remove_file(public.join("hot")).unwrap();
+
+        std::fs::create_dir_all(public.join("build")).unwrap();
+        std::fs::write(public.join("build").join("manifest.json"), "{}").unwrap();
+        assert!(vite.is_active(), "a build counts");
     }
 
     #[test]
