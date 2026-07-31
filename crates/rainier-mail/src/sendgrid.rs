@@ -1,8 +1,8 @@
 //! The SendGrid API — [`SendGridTransport`], behind the `sendgrid` feature.
 //!
 //! One `POST /v3/mail/send` with a bearer key. SendGrid answers `202` with an
-//! empty body on success, which [the shared verdict](crate::api) treats the
-//! same as any other 2xx.
+//! empty body on success, which the shared verdict in the crate's private
+//! `api` module treats the same as any other 2xx.
 
 use std::sync::Arc;
 use std::time::Duration;

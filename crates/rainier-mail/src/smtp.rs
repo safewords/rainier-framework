@@ -10,7 +10,7 @@
 //! Async over tokio and TLS over rustls, so the build stays free of a C
 //! toolchain. The wire client is [`lettre`], which has spent a decade meeting
 //! the servers that disagree about `AUTH`; what Rainier adds is the message
-//! rendering it already owns — [`render_eml`](crate::render_eml) is the `DATA`
+//! rendering it already owns — [`render_eml`](crate::render_eml()) is the `DATA`
 //! payload — and configuration that fails at build time rather than at the
 //! first send.
 //!
@@ -19,7 +19,7 @@
 //! Recipients come from the SMTP envelope — `to`, `cc` **and** `bcc` — while
 //! the rendered headers never contain `Bcc`. That split is the entire
 //! mechanism of a blind copy, and it is decided here and in
-//! [`render_eml`](crate::render_eml), not by the server.
+//! [`render_eml`](crate::render_eml()), not by the server.
 
 use std::time::Duration;
 

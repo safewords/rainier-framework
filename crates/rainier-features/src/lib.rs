@@ -129,12 +129,11 @@ pub fn compute(env: &[(String, String)], sources: &str) -> Report {
         _ => {}
     }
 
-    match get("MAIL_DRIVER") {
-        Some(sender @ ("smtp" | "ses" | "postmark" | "mailgun" | "sendgrid" | "resend")) => {
-            let feature = format!("mail-{sender}");
-            want(&mut report, &feature, format!("MAIL_DRIVER={sender}"));
-        }
-        _ => {}
+    if let Some(sender @ ("smtp" | "ses" | "postmark" | "mailgun" | "sendgrid" | "resend")) =
+        get("MAIL_DRIVER")
+    {
+        let feature = format!("mail-{sender}");
+        want(&mut report, &feature, format!("MAIL_DRIVER={sender}"));
     }
 
     if get("HASH_DRIVER") == Some("bcrypt") {

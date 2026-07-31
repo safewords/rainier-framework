@@ -8,7 +8,7 @@
 //!     .with_events(container.resolve::<Dispatcher>()?);
 //! ```
 //!
-//! [`transport`] is the exhaustive match over [`MailDriver`]. The safe
+//! [`transport()`] is the exhaustive match over [`MailDriver`]. The safe
 //! drivers — `log`, `file`, `memory` — always build. The senders are behind
 //! cargo features, and selecting one the build does not carry **fails the
 //! boot naming the feature**, because the silent version of that mistake is a
@@ -61,7 +61,7 @@ pub fn transport(config: &Config) -> Result<Arc<dyn Transport>> {
     }
 }
 
-/// A [`Mailer`] over [`transport`], with the `mail.from` default applied and
+/// A [`Mailer`] over [`transport()`], with the `mail.from` default applied and
 /// `MAIL_ALWAYS_TO` honoured when set.
 ///
 /// Chain [`Mailer::with_events`] yourself — whether sends should announce
@@ -71,7 +71,7 @@ pub fn mailer(config: &Config, views: Arc<dyn ViewEngine>) -> Result<Mailer> {
     Ok(mailer_over(config, views, over))
 }
 
-/// The same `mail.from` and `MAIL_ALWAYS_TO` treatment [`mailer`] applies,
+/// The same `mail.from` and `MAIL_ALWAYS_TO` treatment [`mailer()`] applies,
 /// over a transport you chose — for the provider that swaps transports per
 /// mode, because a test wants the memory one and the same everything else.
 pub fn mailer_over(

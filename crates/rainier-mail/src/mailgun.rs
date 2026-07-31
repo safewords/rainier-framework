@@ -1,7 +1,7 @@
 //! The Mailgun API — [`MailgunTransport`], behind the `mailgun` feature.
 //!
 //! Mailgun's `messages.mime` endpoint takes the rendered MIME document
-//! whole, which is the honest fit here: [`render_eml`](crate::render_eml)
+//! whole, which is the honest fit here: [`render_eml`](crate::render_eml())
 //! already produces exactly that, headers, parts and attachments included.
 //! The form carries only the envelope recipients — which is also how `Bcc`
 //! stays blind, since the MIME never contains the header.

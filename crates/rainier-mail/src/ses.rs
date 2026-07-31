@@ -1,7 +1,7 @@
 //! Amazon SES — [`SesTransport`], behind the `ses` feature.
 //!
 //! The raw sending path: the rendered MIME document goes up whole, so what
-//! SES delivers is byte-for-byte what [`render_eml`](crate::render_eml)
+//! SES delivers is byte-for-byte what [`render_eml`](crate::render_eml())
 //! produced and what every other transport here sends. Region and credentials
 //! come from the AWS default chain — environment, profile, IMDS — exactly as
 //! the other AWS drivers in this workspace resolve theirs.
