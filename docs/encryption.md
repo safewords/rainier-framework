@@ -327,17 +327,39 @@ PHP produced, against the same `APP_KEY`:
 base64( json( { "iv": base64(iv), "value": base64(ciphertext), "mac": hex(mac) } ) )
 ```
 
-AES-256-CBC with PKCS#7, and an HMAC-SHA256 over the **base64 forms** of the IV
-and the ciphertext concatenated — not over the raw bytes, which is the detail
-every reimplementation gets wrong and then cannot explain. Both layers are
-pinned in tests against an independent implementation rather than against
-themselves.
+"PHP" names the **envelope**, not a cipher — the cryptography underneath is
+ordinary AES, and the two live in separate modules on purpose:
+`rainier_crypt::php::envelope` is the codec (JSON, base64, hex, and *which
+bytes the MAC covers* — no cryptography), `rainier_crypt::php::primitive` is
+the raw-key AES-256-CBC / AES-256-GCM / HMAC (no encoding), and
+`PhpEncrypter` is the thin composition holding the key ring and the write
+selection. Raw keys are the compat rule: PHP feeds `APP_KEY` straight to
+`openssl_encrypt`, unlike [the native ciphers](#ciphers), which HKDF-derive
+per-algorithm subkeys.
 
-The MAC is checked **before** decrypting, as the PHP implementation does. That
-order is not a preference either: CBC without an authenticated MAC first is a
-padding oracle,
-and a padding oracle recovers plaintext without the key. Every failure returns
-one indistinguishable error for the same reason.
+The default writes AES-256-CBC with an HMAC-SHA256 over the **base64 forms**
+of the IV and the ciphertext concatenated — not the raw bytes, which is the
+detail every reimplementation gets wrong and then cannot explain. The MAC is
+checked **before** decrypting, as the PHP implementation does: CBC without an
+authenticated MAC first is a padding oracle, and a padding oracle recovers
+plaintext without the key. Every failure returns one indistinguishable error
+for the same reason. Both layers are pinned in tests against an independent
+implementation rather than against themselves.
+
+A PHP application configured for **AES-256-GCM** writes the other variant of
+the same envelope — `{iv, value, mac: "", tag}` — and matching it is one
+call:
+
+```rust
+PhpEncrypter::new(keys).writing(PhpCipher::Aes256Gcm)
+```
+
+Pick whatever the PHP application sharing the database is configured for: its
+reader decrypts with its *configured* cipher rather than sniffing the
+payload. Reading here is unaffected by the selection — the payload says which
+variant it is, so a table that changed cipher generations ago opens end to
+end, including rows from reimplementations that omitted the empty `mac` key
+PHP writes beside a `tag`.
 
 ### Use it to migrate, not to stay
 

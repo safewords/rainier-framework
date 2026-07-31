@@ -87,7 +87,7 @@ pub use encrypter::{AeadEncrypter, Encrypter, EncrypterExt};
 #[cfg(feature = "jwt")]
 pub use jwt::{Jwt, JwtAlgorithm, JwtKey, JwtKeyRing};
 pub use key::{Key, KeyRing, KEY_LEN};
-pub use php::{CryptScheme, PhpEncrypter};
+pub use php::{CryptScheme, PhpCipher, PhpEncrypter};
 pub use signer::{HmacSigner, Signer, SignerExt};
 pub use url::UrlSigner;
 

@@ -12,6 +12,26 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **The PHP envelope's GCM variant** (`rainier-crypt`).
+  `PhpEncrypter::new(keys).writing(PhpCipher::Aes256Gcm)` writes the
+  `{iv, value, mac: "", tag}` shape a GCM-configured PHP application
+  produces, byte for byte — including the empty `mac` its payload check
+  insists on. Reading takes **both** variants whatever is selected, and
+  tolerates the missing `mac` key at least one earlier reimplementation
+  omitted; a cross-implementation vector from exactly such a writer is
+  pinned in the tests.
+
+### Changed
+
+- **The PHP compat layer is layered like one** (`rainier-crypt`). "Php" in
+  `PhpEncrypter` names a wire format, not a cipher, and the type no longer
+  fuses the two: `php::envelope` is the codec (JSON/base64/hex and which
+  bytes the MAC covers — no cryptography), `php::primitive` is the raw-key
+  AES-256-CBC / AES-256-GCM / HMAC (no encoding), and `PhpEncrypter` is the
+  thin composition holding the key ring, the write selection and the
+  one-error policy. The public API and the wire format are unchanged; the
+  pinned interop vectors prove it.
+
 - **Mail transports that actually send** (`rainier-mail`). The page that said
   "implement `Transport` yourself" now ships them: `SmtpTransport` (lettre
   over rustls, feature `smtp`), `SesTransport` (the AWS default chain,
