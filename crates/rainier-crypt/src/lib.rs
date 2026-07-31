@@ -75,9 +75,9 @@ pub mod php;
 pub mod signer;
 pub mod url;
 
+pub use hash::{Argon2Hasher, HashDriver, HashManager, Hasher, LegacyVerifier};
 #[cfg(feature = "bcrypt")]
 pub use hash::{BcryptHasher, BcryptVerifier};
-pub use hash::{Argon2Hasher, HashDriver, HashManager, Hasher, LegacyVerifier};
 
 pub use asymmetric::{
     BoxKeyPair, BoxPublicKey, Ed25519Signer, SealedBox, SigningKeyPair, VerifyingPublicKey,

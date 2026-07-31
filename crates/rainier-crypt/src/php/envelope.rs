@@ -66,11 +66,7 @@ pub(super) enum Opened {
     },
     /// The `{iv, value, tag}` half. Any `mac` beside a tag is ignored, as
     /// PHP's own decrypt ignores it for AEAD ciphers.
-    Gcm {
-        iv: Vec<u8>,
-        ciphertext: Vec<u8>,
-        tag: Vec<u8>,
-    },
+    Gcm { iv: Vec<u8>, ciphertext: Vec<u8>, tag: Vec<u8> },
 }
 
 /// One error for every malformation, so nothing distinguishes bad base64
@@ -88,11 +84,7 @@ pub(super) fn decode(payload: &str) -> Result<Opened> {
     let ciphertext = B64.decode(&wire.value).map_err(|_| invalid())?;
 
     if let Some(tag) = wire.tag.as_deref().filter(|tag| !tag.is_empty()) {
-        return Ok(Opened::Gcm {
-            iv,
-            ciphertext,
-            tag: B64.decode(tag).map_err(|_| invalid())?,
-        });
+        return Ok(Opened::Gcm { iv, ciphertext, tag: B64.decode(tag).map_err(|_| invalid())? });
     }
 
     let presented = wire.mac.as_deref().filter(|mac| !mac.is_empty()).ok_or_else(invalid)?;
@@ -130,12 +122,7 @@ impl CbcDraft {
 
     /// Seal with the computed MAC (raw bytes; hex is this module's job).
     pub(super) fn seal(self, mac: &[u8]) -> Result<String> {
-        let wire = Wire {
-            iv: self.iv,
-            value: self.value,
-            mac: Some(hex_encode(mac)),
-            tag: None,
-        };
+        let wire = Wire { iv: self.iv, value: self.value, mac: Some(hex_encode(mac)), tag: None };
 
         Ok(B64.encode(serde_json::to_vec(&wire)?))
     }

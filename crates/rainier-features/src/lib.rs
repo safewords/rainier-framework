@@ -67,10 +67,7 @@ impl Report {
             "cargo build --release --no-default-features".to_string()
         } else {
             let list: Vec<&str> = self.features.iter().map(String::as_str).collect();
-            format!(
-                "cargo build --release --no-default-features --features \"{}\"",
-                list.join(",")
-            )
+            format!("cargo build --release --no-default-features --features \"{}\"", list.join(","))
         }
     }
 
@@ -331,10 +328,8 @@ mod tests {
 
         for driver in QueueDriver::ALL {
             let report = computed(&format!("QUEUE_DRIVER={}", driver.as_str()));
-            let needs_nothing = matches!(
-                driver,
-                QueueDriver::Sync | QueueDriver::Memory | QueueDriver::Database
-            );
+            let needs_nothing =
+                matches!(driver, QueueDriver::Sync | QueueDriver::Memory | QueueDriver::Database);
 
             assert!(
                 needs_nothing || !report.features.is_empty() || !report.unforwarded.is_empty(),

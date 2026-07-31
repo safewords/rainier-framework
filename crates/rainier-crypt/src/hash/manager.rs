@@ -134,9 +134,7 @@ impl Hasher for BcryptHasher {
     fn needs_rehash(&self, hashed: &str) -> bool {
         // `$2y$12$…` — the cost is the second dollar-field. A row this driver
         // cannot read the cost out of is certainly not current.
-        let cost = hashed
-            .get(4..6)
-            .and_then(|digits| digits.parse::<u32>().ok());
+        let cost = hashed.get(4..6).and_then(|digits| digits.parse::<u32>().ok());
 
         cost.is_none_or(|cost| cost < self.cost)
     }
@@ -195,7 +193,10 @@ impl HashManager {
         Self::from_parts(drivers, selected)
     }
 
-    fn from_parts(drivers: Vec<(HashDriver, Arc<dyn Hasher>)>, selected: HashDriver) -> Result<Self> {
+    fn from_parts(
+        drivers: Vec<(HashDriver, Arc<dyn Hasher>)>,
+        selected: HashDriver,
+    ) -> Result<Self> {
         if !drivers.iter().any(|(name, _)| *name == selected) {
             return Err(Error::internal(format!(
                 "HASH_DRIVER={selected} names a driver this build does not carry — it needs \

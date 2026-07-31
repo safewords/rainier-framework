@@ -66,9 +66,8 @@ pub(super) fn gcm_encrypt(key: &[u8], nonce: &[u8], plain: &[u8]) -> Result<(Vec
     let cipher: aes_gcm::Aes256Gcm = aes_gcm::KeyInit::new_from_slice(key)
         .map_err(|_| Error::internal("the key is the wrong length for AES-256-GCM"))?;
 
-    let mut sealed = cipher
-        .encrypt(nonce.into(), plain)
-        .map_err(|_| Error::internal("encryption failed"))?;
+    let mut sealed =
+        cipher.encrypt(nonce.into(), plain).map_err(|_| Error::internal("encryption failed"))?;
 
     let tag = sealed.split_off(sealed.len() - GCM_TAG_LEN);
     Ok((sealed, tag))

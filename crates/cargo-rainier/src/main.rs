@@ -136,11 +136,8 @@ fn build_command(args: &[String]) -> i32 {
 }
 
 fn load(args: &[String]) -> Option<(PathBuf, Report)> {
-    let explicit = args
-        .iter()
-        .position(|a| a == "--env")
-        .and_then(|i| args.get(i + 1))
-        .map(PathBuf::from);
+    let explicit =
+        args.iter().position(|a| a == "--env").and_then(|i| args.get(i + 1)).map(PathBuf::from);
 
     let path = match resolve_env(explicit) {
         Ok(path) => path,

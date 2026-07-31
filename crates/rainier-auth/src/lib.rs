@@ -62,13 +62,13 @@ pub use challenge::Challenges;
 pub use confirm::{confirm_password, ConfirmPassword};
 pub use gate::{Actor, Gate};
 pub use guard::{AuthManager, Guard, GuardExt, SessionGuard, StatefulGuard, TokenGuard};
-#[cfg(feature = "bcrypt")]
-pub use rainier_crypt::hash::{BcryptHasher, BcryptVerifier};
-pub use rainier_crypt::hash::{Argon2Hasher, HashDriver, HashManager, Hasher, LegacyVerifier};
 pub use middleware::{
     AbilitiesRequestExt, Authenticate, AuthenticatedUser, RedirectIfAuthenticated, RequireAbility,
     TokenAbilities,
 };
+pub use rainier_crypt::hash::{Argon2Hasher, HashDriver, HashManager, Hasher, LegacyVerifier};
+#[cfg(feature = "bcrypt")]
+pub use rainier_crypt::hash::{BcryptHasher, BcryptVerifier};
 pub use session::{generate_session_id, MemorySessionStore, Session, SessionStore, AUTH_KEY};
 pub use user::{Authenticatable, Credentials, RepositoryUserProvider, UserProvider};
 

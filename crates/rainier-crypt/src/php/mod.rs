@@ -429,8 +429,7 @@ mod tests {
         let encrypter = encrypter();
 
         let corrupt = B64.encode("{}");
-        let wrong_key =
-            PhpEncrypter::new(KeyRing::new(Key::generate())).encrypt("secret").unwrap();
+        let wrong_key = PhpEncrypter::new(KeyRing::new(Key::generate())).encrypt("secret").unwrap();
         let wrong_key_gcm = gcm_encrypter().encrypt("secret").unwrap();
 
         let messages: std::collections::HashSet<String> = [corrupt, wrong_key, wrong_key_gcm]
@@ -468,8 +467,7 @@ mod tests {
         // "whatever it does today".
         let key = fixed_key();
 
-        let ciphertext =
-            primitive::cbc_encrypt(key.bytes(), &[0u8; 16], b"a card number").unwrap();
+        let ciphertext = primitive::cbc_encrypt(key.bytes(), &[0u8; 16], b"a card number").unwrap();
         assert_eq!(B64.encode(&ciphertext), "nH4xXUTQpgBTKXvgzml9eg==");
 
         // And the MAC over the two base64 strings, which is the part a PHP
