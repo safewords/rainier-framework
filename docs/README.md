@@ -50,6 +50,7 @@ rights in their names or marks.
 | [Requests](requests.md) | Input, headers, cookies, uploads, and why bodies are buffered |
 | [Responses](responses.md) | Builders, `IntoResponse`, streaming, cookies |
 | [Views](views.md) | The template syntax, the engine, and what it deliberately cannot do |
+| [Vite](vite.md) | Frontend assets: `@vite`, the dev server, and the built manifest |
 | [URL Generation](urls.md) | Named routes to URLs, signed links, and the escaping that keeps them safe |
 | [Validation](validation.md) | Rules, the validator, and request contracts |
 | [Error Handling](errors.md) | `Error`, `ErrorKind`, the exception renderer, 4xx versus 5xx |

@@ -50,6 +50,12 @@ pub enum Node {
     },
     /// `@include('partial')`.
     Include(String),
+    /// `@vite('resources/js/app.js')` or `@vite(['a.css', 'b.js'])` —
+    /// script and stylesheet tags for Vite-managed entries. A directive, not
+    /// a function call: the closed set of things a template may ask for
+    /// grows by exactly this, and the entries are literals, so a template
+    /// still cannot compute.
+    Vite(Vec<String>),
     /// `@yield('name')` — where a layout drops a child's section.
     Yield(String),
     /// `@section('name')` … `@endsection`.
@@ -293,6 +299,10 @@ fn parse_nodes(tokens: &[Token], cursor: &mut usize, terminators: &[&str]) -> Re
                         nodes.push(Node::Include(unquote(require_arg(arg, "@include")?)));
                         *cursor += 1;
                     }
+                    "vite" => {
+                        nodes.push(Node::Vite(parse_vite_entries(&require_arg(arg, "@vite")?)?));
+                        *cursor += 1;
+                    }
                     "yield" => {
                         nodes.push(Node::Yield(unquote(require_arg(arg, "@yield")?)));
                         *cursor += 1;
@@ -380,6 +390,39 @@ fn parse_section(tokens: &[Token], cursor: &mut usize, arg: Option<&str>) -> Res
 
 fn require_arg(arg: &Option<String>, directive: &str) -> Result<String> {
     arg.clone().ok_or_else(|| Error::internal(format!("{directive} needs an argument")))
+}
+
+/// Parse `@vite`'s argument: one quoted entry, or a `[…]` list of them.
+///
+/// Entries are string literals only — there is nothing to look up in the view
+/// data, which is the property that keeps this a directive rather than the
+/// language's first function call.
+fn parse_vite_entries(arg: &str) -> Result<Vec<String>> {
+    let trimmed = arg.trim();
+
+    let items: Vec<String> = match trimmed.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+        Some(list) => list
+            .split(',')
+            .map(|item| unquote(item.to_string()))
+            .filter(|item| !item.is_empty())
+            .collect(),
+        None => {
+            let entry = unquote(trimmed.to_string());
+            if entry.is_empty() {
+                Vec::new()
+            } else {
+                vec![entry]
+            }
+        }
+    };
+
+    if items.is_empty() {
+        return Err(Error::internal(
+            "@vite needs at least one entry — `@vite('resources/js/app.js')` or \
+             `@vite(['resources/css/app.css', 'resources/js/app.js'])`",
+        ));
+    }
+    Ok(items)
 }
 
 fn unquote(value: String) -> String {
@@ -614,6 +657,24 @@ mod tests {
     fn include_and_yield_unquote_their_names() {
         assert_eq!(nodes("@include('parts.nav')"), vec![Node::Include("parts.nav".into())]);
         assert_eq!(nodes("@yield(\"content\")"), vec![Node::Yield("content".into())]);
+    }
+
+    #[test]
+    fn vite_takes_one_entry_or_a_list() {
+        assert_eq!(
+            nodes("@vite('resources/js/app.js')"),
+            vec![Node::Vite(vec!["resources/js/app.js".into()])],
+        );
+        assert_eq!(
+            nodes("@vite(['resources/css/app.css', \"resources/js/app.js\"])"),
+            vec![Node::Vite(vec!["resources/css/app.css".into(), "resources/js/app.js".into(),])],
+        );
+    }
+
+    #[test]
+    fn vite_with_nothing_to_load_is_reported() {
+        assert!(parse("@vite([])").is_err());
+        assert!(parse("@vite('')").is_err());
     }
 
     #[test]

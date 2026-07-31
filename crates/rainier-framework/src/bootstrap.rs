@@ -357,7 +357,14 @@ impl Rainier {
         }
 
         let views = self.views.unwrap_or_else(|| {
-            Arc::new(TemplateEngine::new(self.base_path.join("resources").join("views")))
+            // The `@vite` resolver comes attached over `<base>/public` — the
+            // PHP-framework convention (`hot` from the dev server,
+            // `build/manifest.json` from a build). Costs nothing until a
+            // template actually says `@vite`, which is the opt-in.
+            Arc::new(
+                TemplateEngine::new(self.base_path.join("resources").join("views"))
+                    .with_vite(rainier_view::Vite::new(self.base_path.join("public"))),
+            )
         });
 
         let crypt = self.crypt.unwrap_or_else(|| {

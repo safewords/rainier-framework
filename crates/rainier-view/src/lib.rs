@@ -30,8 +30,9 @@
 //!
 //! ## A deliberately small language
 //!
-//! `{{ }}`, `{!! !!}`, `@if`/`@elseif`/`@else`, `@foreach`, `@include`, and
-//! `@extends`/`@section`/`@yield`. There is no arbitrary expression evaluation
+//! `{{ }}`, `{!! !!}`, `@if`/`@elseif`/`@else`, `@foreach`, `@include`,
+//! `@extends`/`@section`/`@yield`, and [`@vite`](vite) — asset tags for
+//! Vite-managed entries. There is no arbitrary expression evaluation
 //! and no way to call a function, because a template that can compute is a
 //! template that ends up holding business logic. Prepare the data in the
 //! controller; let the template lay it out.
@@ -41,6 +42,8 @@
 
 pub mod engine;
 pub mod template;
+pub mod vite;
 
 pub use engine::{escape_html, MemoryEngine, TemplateEngine, View, ViewEngine};
 pub use template::{CompareOp, Condition, Expr, Literal, Node, Template};
+pub use vite::Vite;

@@ -10,6 +10,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::template::{parse, CompareOp, Condition, Expr, Literal, Node, Template};
+use crate::vite::Vite;
 
 /// A view name plus the data to render it with.
 ///
@@ -82,6 +83,9 @@ pub struct TemplateEngine {
     /// Whether to keep parsed templates. Off in development so an edit shows
     /// up without a restart; on in production so a template is parsed once.
     caching: bool,
+    /// The `@vite` resolver, when one is attached. A template using the
+    /// directive without one gets an error saying how to attach it.
+    vite: Option<std::sync::Arc<Vite>>,
 }
 
 impl TemplateEngine {
@@ -92,7 +96,14 @@ impl TemplateEngine {
             extension: "view.html".to_string(),
             cache: RwLock::new(HashMap::new()),
             caching: true,
+            vite: None,
         }
+    }
+
+    /// Attach a [`Vite`] resolver for the `@vite` directive.
+    pub fn with_vite(mut self, vite: impl Into<std::sync::Arc<Vite>>) -> Self {
+        self.vite = Some(vite.into());
+        self
     }
 
     /// Re-read and re-parse templates on every render.
@@ -319,6 +330,19 @@ impl Renderer<'_> {
                     out.push_str(&self.render_named(name, data)?);
                 }
 
+                Node::Vite(entries) => {
+                    let Some(vite) = &self.engine.vite else {
+                        return Err(Error::internal(
+                            "the template uses @vite but the engine has no resolver — attach \
+                             one with `TemplateEngine::new(…).with_vite(Vite::new(\"public\"))` \
+                             (the framework's default bootstrap does)",
+                        ));
+                    };
+                    // Raw on purpose: the resolver emits tags, and it escapes
+                    // the attribute values itself.
+                    out.push_str(&vite.tags(entries)?);
+                }
+
                 Node::Yield(name) => {
                     if let Some(content) = sections.get(name) {
                         out.push_str(content);
@@ -456,12 +480,19 @@ fn compare(left: Option<&Value>, op: CompareOp, right: &Literal) -> bool {
 #[derive(Debug, Default)]
 pub struct MemoryEngine {
     templates: RwLock<HashMap<String, String>>,
+    vite: Option<std::sync::Arc<Vite>>,
 }
 
 impl MemoryEngine {
     /// No templates.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach a [`Vite`] resolver, so a test can render `@vite` too.
+    pub fn with_vite(mut self, vite: impl Into<std::sync::Arc<Vite>>) -> Self {
+        self.vite = Some(vite.into());
+        self
     }
 
     /// Add a template.
@@ -485,7 +516,10 @@ impl ViewEngine for MemoryEngine {
         // Layouts and includes need the engine's loader; an in-memory engine
         // renders one template at a time, which is all a test needs.
         let mut out = String::new();
-        let engine = TemplateEngine::new(".");
+        let mut engine = TemplateEngine::new(".");
+        if let Some(vite) = &self.vite {
+            engine = engine.with_vite(std::sync::Arc::clone(vite));
+        }
         let mut renderer = Renderer { engine: &engine, depth: 0 };
         renderer.render_nodes(&template.nodes, data, &HashMap::new(), &mut out)?;
         Ok(out)
@@ -503,6 +537,30 @@ mod tests {
 
     fn render(source: &str, data: Value) -> String {
         MemoryEngine::new().with("t", source).render("t", &data).expect("should render")
+    }
+
+    #[test]
+    fn vite_renders_through_an_attached_resolver() {
+        let public = std::env::temp_dir().join(format!("rainier-view-vite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&public);
+        std::fs::create_dir_all(&public).unwrap();
+        std::fs::write(public.join("hot"), "http://localhost:5173").unwrap();
+
+        let engine = MemoryEngine::new()
+            .with("t", "@vite('resources/js/app.js')")
+            .with_vite(Vite::new(&public));
+
+        let html = engine.render("t", &Value::Object(Map::new())).unwrap();
+        assert!(html.contains("http://localhost:5173/@vite/client"), "{html}");
+        assert!(html.contains("http://localhost:5173/resources/js/app.js"), "{html}");
+    }
+
+    #[test]
+    fn vite_without_a_resolver_says_how_to_attach_one() {
+        let engine = MemoryEngine::new().with("t", "@vite('resources/js/app.js')");
+
+        let err = engine.render("t", &Value::Object(Map::new())).unwrap_err();
+        assert!(err.message().contains("with_vite"), "{}", err.message());
     }
 
     #[test]

@@ -185,7 +185,8 @@ let data = json!({
 
 The full directive list is `{{ }}`, `{!! !!}`, `@if`/`@elseif`/`@else`/`@endif`,
 `@foreach`/`@endforeach`, `@include`, `@extends`, `@section`/`@endsection`,
-`@yield`. That is the whole language.
+`@yield`, and [`@vite`](vite.md) for Vite-managed asset tags. That is the
+whole language.
 
 There is also no `{{-- comment --}}` directive — use an HTML comment, or leave
 the note in the controller where the data is prepared.
