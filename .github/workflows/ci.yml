@@ -24,7 +24,7 @@ jobs:
 
   fmt:
     name: rustfmt
-    runs-on: ubuntu-latest
+    runs-on: safewords-runners
     permissions:
       contents: write
     steps:
@@ -62,7 +62,7 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: safewords-runners
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -79,7 +79,7 @@ jobs:
 
   test:
     name: test (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    runs-on: safewords-runners
     strategy:
       # Let every combination report, rather than cancelling the rest on the
       # first failure — knowing whether it is one feature or all of them is
@@ -178,7 +178,7 @@ jobs:
 
   msrv:
     name: minimum supported Rust (1.88, default features)
-    runs-on: ubuntu-latest
+    runs-on: safewords-runners
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -202,7 +202,7 @@ jobs:
 
   docs:
     name: rustdoc
-    runs-on: ubuntu-latest
+    runs-on: safewords-runners
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -226,7 +226,7 @@ jobs:
   # so CI counts it and commits the endpoint the badge reads.
   test-count:
     name: test count badge
-    runs-on: ubuntu-latest
+    runs-on: safewords-runners
     # Only on main: a pull request cannot push, and the count from a branch is
     # not the one the README should be claiming.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -262,7 +262,7 @@ jobs:
 
   wasm:
     name: wasm32 target
-    runs-on: ubuntu-latest
+    runs-on: safewords-runners
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
