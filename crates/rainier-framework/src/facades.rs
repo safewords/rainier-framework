@@ -134,6 +134,39 @@ facade!(
     Storage => rainier_filesystem::Storage
 );
 
+impl Storage {
+    /// The disk registered under `name` — `Storage::disk("content")`.
+    ///
+    /// A forwarding method, so the call names the disk rather than the
+    /// container step:
+    ///
+    /// ```ignore
+    /// Storage::disk("content")               // this
+    /// Storage::instance().disk("content")    // the same thing, spelled out
+    /// ```
+    ///
+    /// Both work, and neither is doing anything the other is not. `instance()`
+    /// resolves the service from the container; frameworks that let you write
+    /// the short form resolve it too, behind a magic static call this language
+    /// has no equivalent of. Writing the forwarder by hand is the whole of the
+    /// difference.
+    ///
+    /// Returns `None` for a disk that was never registered, and **never** the
+    /// default disk — see [`rainier_filesystem::Storage::disk`] for why that
+    /// distinction is worth an `Option`.
+    ///
+    /// # Panics
+    ///
+    /// If storage is not bound in the container, as every facade call does. A
+    /// disk lookup on an application with no storage bound at all is a
+    /// configuration bug rather than a runtime condition. Reach for
+    /// [`Facade::try_instance`](rainier_container::Facade::try_instance) where
+    /// degrading is the right behaviour.
+    pub fn disk(name: &str) -> Option<rainier_filesystem::Storage> {
+        <Self as rainier_container::Facade>::instance().disk(name)
+    }
+}
+
 facade!(
     /// The session **store** and its settings.
     ///
