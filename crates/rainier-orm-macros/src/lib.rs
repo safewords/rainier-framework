@@ -90,7 +90,16 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
     let mut pk: Option<(syn::Ident, String)> = None;
     for f in &fields {
         let fident = f.ident.clone().unwrap();
+        // `to_string()` on a raw identifier keeps the `r#`, so a field written
+        // `pub r#type` would become the column `r#type` and every query naming
+        // it would fail with "no such column". A column called `type`, `match`
+        // or `ref` is unremarkable in a database and a keyword in Rust, so the
+        // raw form is the only way to spell it — the derive has to understand
+        // that rather than pass it through.
         let mut column = fident.to_string();
+        if let Some(stripped) = column.strip_prefix("r#") {
+            column = stripped.to_string();
+        }
         let mut is_pk = false;
         let mut auto_increment = false;
         let mut unique = false;
