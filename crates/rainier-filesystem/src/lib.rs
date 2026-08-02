@@ -103,12 +103,52 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct Storage {
     disk: Arc<dyn Filesystem>,
+    /// Disks reachable by name, beyond the default one above.
+    ///
+    /// An application that keeps different kinds of file in different places —
+    /// uploads separate from generated derivatives, public separate from paid —
+    /// needs to say which it means at the call site. Without that, every
+    /// operation goes to whichever disk happened to be configured, and a delete
+    /// aimed at the wrong bucket is indistinguishable from one that worked.
+    named: std::collections::HashMap<String, Arc<dyn Filesystem>>,
 }
 
 impl Storage {
-    /// Wrap a filesystem.
+    /// Wrap a filesystem as the default disk.
     pub fn new(disk: Arc<dyn Filesystem>) -> Self {
-        Self { disk }
+        Self { disk, named: std::collections::HashMap::new() }
+    }
+
+    /// Register a disk under a name.
+    ///
+    /// ```ignore
+    /// let storage = Storage::new(default)
+    ///     .with_disk("content", content)
+    ///     .with_disk("content-paid", paid);
+    /// ```
+    pub fn with_disk(mut self, name: impl Into<String>, disk: Arc<dyn Filesystem>) -> Self {
+        self.named.insert(name.into(), disk);
+        self
+    }
+
+    /// The disk registered under `name`.
+    ///
+    /// `None` rather than a fallback to the default: an operation aimed at a
+    /// disk that was never configured must not quietly land somewhere else. A
+    /// delete is the case that decides this — silently deleting from the wrong
+    /// bucket is unrecoverable, and reads the same as success.
+    pub fn on(&self, name: &str) -> Option<Storage> {
+        self.named.get(name).map(|disk| Storage::new(Arc::clone(disk)))
+    }
+
+    /// Whether a disk is registered under `name`.
+    pub fn has_disk(&self, name: &str) -> bool {
+        self.named.contains_key(name)
+    }
+
+    /// Every registered disk name, for diagnostics.
+    pub fn disk_names(&self) -> impl Iterator<Item = &str> {
+        self.named.keys().map(String::as_str)
     }
 
     /// Files under a local directory.
@@ -149,6 +189,42 @@ impl std::fmt::Debug for Storage {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_named_disk_is_reachable_and_separate_from_the_default() {
+        let storage = Storage::memory().with_disk("content", Arc::new(MemoryFilesystem::new()));
+
+        assert!(storage.has_disk("content"));
+        assert!(storage.on("content").is_some());
+    }
+
+    #[test]
+    fn an_unregistered_disk_is_none_rather_than_the_default() {
+        // The property that matters, and the reason this returns `Option`
+        // instead of falling back: an operation aimed at a disk nobody
+        // configured must not quietly land somewhere else. A delete decides it
+        // — deleting from the wrong bucket is unrecoverable and reads exactly
+        // like success.
+        let storage = Storage::memory().with_disk("content", Arc::new(MemoryFilesystem::new()));
+
+        assert!(storage.on("content-paid").is_none());
+        assert!(!storage.has_disk("content-paid"));
+    }
+
+    #[tokio::test]
+    async fn writing_to_one_disk_does_not_appear_on_another() {
+        let storage = Storage::memory()
+            .with_disk("content", Arc::new(MemoryFilesystem::new()))
+            .with_disk("content-paid", Arc::new(MemoryFilesystem::new()));
+
+        storage.on("content").unwrap().put("a.txt", Bytes::from_static(b"public")).await.unwrap();
+
+        assert!(storage.on("content").unwrap().exists("a.txt").await.unwrap());
+        assert!(
+            !storage.on("content-paid").unwrap().exists("a.txt").await.unwrap(),
+            "the disks must not share storage"
+        );
+    }
     use super::*;
     use bytes::Bytes;
 
