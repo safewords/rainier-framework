@@ -24,6 +24,35 @@
 //!     created: chrono::DateTime<chrono::Utc>,
 //! }
 //! ```
+//!
+//! ## Composite primary keys
+//!
+//! Mark more than one field `#[orm(pk)]` and the key is all of them, in
+//! declaration order — which is the order they appear in `PRIMARY KEY (a, b)`,
+//! so it decides which prefix lookups the index can serve and is worth choosing
+//! deliberately:
+//!
+//! ```ignore
+//! #[derive(Entity)]
+//! #[orm(table = "memberships")]
+//! struct Membership {
+//!     #[orm(pk)]
+//!     team_id: u64,
+//!     #[orm(pk)]
+//!     user_id: u64,
+//!     role: String,
+//! }
+//! ```
+//!
+//! The difference this makes to generated code is confined to the key: no key
+//! column appears in `update_values()`, `WHERE` clauses `AND` every part
+//! together, and the `CREATE TABLE` gets one table-level constraint instead of
+//! an inline `PRIMARY KEY` per column (two of which no engine accepts).
+//!
+//! A single-key struct additionally gets an `impl SingleKey`, which is what lets
+//! it be passed to the APIs taking one key value (`find_by_pk`, `delete_by_pk`,
+//! `cursor`). A composite struct does not, so those calls fail to compile rather
+//! than building a `WHERE` from the first column alone.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -87,7 +116,11 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
     }
 
     let mut metas: Vec<FieldMeta> = Vec::new();
-    let mut pk: Option<(syn::Ident, String)> = None;
+    // Every `#[orm(pk)]` field, in declaration order. Order is load-bearing for
+    // a composite key: it fixes the column order of `PRIMARY KEY (a, b)` (and so
+    // which prefix lookups the index serves) and the positional order key values
+    // are supplied in.
+    let mut pks: Vec<(syn::Ident, String)> = Vec::new();
     for f in &fields {
         let fident = f.ident.clone().unwrap();
         // `to_string()` on a raw identifier keeps the `r#`, so a field written
@@ -136,7 +169,7 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
             }
         }
         if is_pk {
-            pk = Some((fident.clone(), column.clone()));
+            pks.push((fident.clone(), column.clone()));
         }
         metas.push(FieldMeta {
             ident: fident,
@@ -153,8 +186,25 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
         });
     }
 
-    let Some((pk_ident, pk_col)) = pk else {
-        return compile_err("Entity needs exactly one field marked `#[orm(pk)]`");
+    // A struct with no key stays an error. A table the ORM cannot identify a row
+    // in is nearly always a forgotten attribute rather than an intent, and the
+    // consequence of guessing wrong is an `UPDATE` with an empty `WHERE`.
+    if pks.is_empty() {
+        return compile_err("Entity needs at least one field marked `#[orm(pk)]`");
+    }
+    let pk_cols: Vec<&String> = pks.iter().map(|(_, column)| column).collect();
+    let pk_idents: Vec<&syn::Ident> = pks.iter().map(|(ident, _)| ident).collect();
+    // The first key part backs `primary_key()`/`pk_value()`, which name the key
+    // for routing and binding rather than build a predicate from it.
+    let (pk_ident, pk_col) = (pk_idents[0], pk_cols[0]);
+
+    // `SingleKey` is what makes `find_by_pk`/`delete_by_pk`/`cursor` — the APIs
+    // that take one key value — reject a composite entity at compile time, so it
+    // is emitted only when there is genuinely one key column.
+    let single_key_impl = if pks.len() == 1 {
+        quote! { impl ::rainier_orm::SingleKey for #ident {} }
+    } else {
+        quote! {}
     };
 
     let col_specs = metas.iter().map(|m| {
@@ -235,11 +285,18 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
         let col = &m.column;
         quote! { (#col, ::rainier_orm::ToColumn::to_value(&self.#fident)) }
     });
-    // Updates set every non-primary-key column.
+    // Updates set every non-primary-key column — for a composite key that means
+    // every part of it stays out of the `SET`, so a save can never move a row to
+    // a different key.
     let update_vals = metas.iter().filter(|m| !m.pk).map(|m| {
         let fident = &m.ident;
         let col = &m.column;
         quote! { (#col, ::rainier_orm::ToColumn::to_value(&self.#fident)) }
+    });
+
+    // Key values, positionally matching `primary_key_columns()`.
+    let pk_vals = pk_idents.iter().map(|fident| {
+        quote! { ::rainier_orm::ToColumn::to_value(&self.#fident) }
     });
 
     quote! {
@@ -247,6 +304,9 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
             fn table() -> &'static str { #table }
             fn columns() -> &'static [::rainier_orm::ColumnSpec] {
                 &[ #(#col_specs),* ]
+            }
+            fn primary_key_columns() -> &'static [&'static str] {
+                &[ #(#pk_cols),* ]
             }
             fn primary_key() -> &'static str { #pk_col }
             fn indexes() -> &'static [::rainier_orm::IndexSpec] {
@@ -273,10 +333,15 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
             {
                 ::std::vec![ #(#update_vals),* ]
             }
+            fn pk_values(&self) -> ::std::vec::Vec<::rainier_orm::sea_query::Value> {
+                ::std::vec![ #(#pk_vals),* ]
+            }
             fn pk_value(&self) -> ::rainier_orm::sea_query::Value {
                 ::rainier_orm::ToColumn::to_value(&self.#pk_ident)
             }
         }
+
+        #single_key_impl
     }
     .into()
 }

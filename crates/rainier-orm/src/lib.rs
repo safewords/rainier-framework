@@ -97,6 +97,7 @@ mod dialect;
 mod entity;
 mod executor;
 mod json;
+pub mod key;
 pub mod migrate;
 pub mod pool;
 pub mod query;
@@ -124,7 +125,9 @@ pub use shard::{
 pub use dialect::Dialect;
 pub use entity::Entity as EntityTrait; // avoid clashing with the derive name
 pub use entity::Entity;
+pub use entity::SingleKey;
 pub use executor::{ExecOutcome, Executor};
+pub use key::{key_condition, key_route, row_key_condition};
 pub use pool::PoolConfig;
 pub use query::Query;
 pub use row::{FromColumn, Row, ToColumn};

@@ -12,6 +12,35 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Composite primary keys** (`rainier-orm`). `#[derive(Entity)]` takes more
+  than one `#[orm(pk)]` field, so a join table or a per-bucket aggregate keyed
+  `(parent_id, slot)` can be modelled instead of dropped to raw SQL. The key is
+  every marked field **in declaration order** — which is the column order of the
+  emitted `PRIMARY KEY (a, b)`, and so decides which prefix lookups the index
+  serves. `Entity::primary_key_columns()` / `pk_values()` are the general form;
+  `primary_key()` / `pk_value()` still answer for the *first* key column, which
+  is what shard routing and route-model binding want, and are unchanged for the
+  entities that already had one.
+
+  Every key predicate is built in one place (`rainier_orm::key`), because the
+  failure mode is silent: a `WHERE` missing one part of a composite key still
+  parses, still runs, and still reports a plausible row count — it just matches
+  everything sharing the part that survived, so an `UPDATE` overwrites siblings
+  and a `DELETE` removes them. `repo::update` and `Tracked::save` take the whole
+  entity, so they cannot be handed a partial key at all; `repo::find_by_keys` /
+  `delete_by_keys` (and `statement::select_by_keys` / `delete_by_keys`) take a
+  positional list and refuse one of the wrong length rather than narrowing or
+  widening the match.
+
+  The APIs that take a *single* key value — `find_by_pk`, `delete_by_pk`,
+  `cursor`, `Tracked::load`, `Query::first_or_create` — are bounded on the new
+  `SingleKey` marker, which the derive emits only for a one-column key. Pointing
+  one at a composite entity is a compile error rather than a partial-key `WHERE`.
+  `Model` requires `SingleKey` for the same reason: `Repository::find`/`delete`
+  take one `Value` and route binding names one column, so a composite entity is
+  refused where the error names the model. Such tables stay fully usable through
+  Rainier ORM itself and through `Criteria`.
+
 - **`rainier-features` and the `cargo rainier` subcommand.** Cargo cannot
   enable features from code — they resolve before anything compiles, they
   are additive, and a build script cannot add one — and dead-code

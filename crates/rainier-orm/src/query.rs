@@ -416,13 +416,20 @@ impl<E: Entity> Query<E> {
     /// Return the first match, or insert `default` and return it. Not atomic —
     /// two racing callers can both insert; add a `UNIQUE` constraint on the
     /// lookup column(s) if you need the database to arbitrate.
+    ///
+    /// [`SingleKey`] because of the re-read: after inserting, it fetches the row
+    /// back by the key the database generated, and a generated key is one
+    /// column. The rest of this builder is key-agnostic — a composite-key entity
+    /// spells this out as [`first`](Self::first) followed by
+    /// [`repo::insert`](crate::repo::insert()), which is the same two statements
+    /// without a re-read that could not be keyed.
     pub fn first_or_create<'a, X: Executor>(
         self,
         exec: &'a X,
         default: E,
     ) -> impl Future<Output = Result<E>> + 'a
     where
-        E: 'a,
+        E: crate::SingleKey + 'a,
     {
         // `self` is consumed here, outside the block, so the builder never
         // enters the future. See the note above the terminals.

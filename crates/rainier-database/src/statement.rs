@@ -30,7 +30,9 @@ use rainier_orm::sea_query::{
     Alias, Asterisk, ColumnRef, Cond, Expr, Func, IntoColumnRef, JoinType, OnConflict, Order,
     Query as SqQuery, SimpleExpr, Value,
 };
-use rainier_orm::{Dialect, Entity, ShardRoute};
+use rainier_orm::{
+    key_condition, key_route, row_key_condition, Dialect, Entity, Result, ShardRoute, SingleKey,
+};
 
 use crate::criteria::{Criteria, DatePart, JoinKind, Projection};
 
@@ -125,13 +127,30 @@ pub fn select_all<E: Entity>(dialect: Dialect) -> Prepared {
 }
 
 /// `SELECT … WHERE pk = ? LIMIT 1`.
-pub fn select_by_pk<E: Entity>(dialect: Dialect, key: Value) -> Prepared {
+///
+/// Bounded on [`SingleKey`], because one [`Value`] cannot name a row in a table
+/// keyed on two columns; see [`select_by_keys`].
+pub fn select_by_pk<E: Entity + SingleKey>(dialect: Dialect, key: Value) -> Prepared {
     let route = route_for::<E>(E::primary_key(), &key);
     let mut stmt = select_columns::<E>();
     stmt.and_where(Expr::col(alias(E::primary_key())).eq(key)).limit(1);
 
     let (sql, params) = dialect.build_query(&stmt);
     Prepared { sql, params: params.0, route }
+}
+
+/// `SELECT … WHERE a = ? AND b = ? LIMIT 1` — the composite counterpart of
+/// [`select_by_pk`].
+///
+/// `keys` are positional against [`Entity::primary_key_columns`]; a list of the
+/// wrong length is an error rather than a partial match.
+pub fn select_by_keys<E: Entity>(dialect: Dialect, keys: &[Value]) -> Result<Prepared> {
+    let route = key_route::<E>(keys);
+    let mut stmt = select_columns::<E>();
+    stmt.cond_where(key_condition::<E>(keys)?).limit(1);
+
+    let (sql, params) = dialect.build_query(&stmt);
+    Ok(Prepared { sql, params: params.0, route })
 }
 
 /// `SELECT … WHERE column = ?`, optionally limited.
@@ -400,6 +419,11 @@ pub fn insert<E: Entity>(dialect: Dialect, entity: &E, assigned_id: Option<u64>)
 /// Mirrors Rainier ORM: the primary key must itself be a shard key, must not be
 /// auto-increment, and must currently be unset.
 pub fn shard_key_for_insert<E: Entity>(entity: &E) -> Option<u64> {
+    // A minted id is the whole key, so this only applies to a one-column key;
+    // there is nowhere to put an allocated id in a composite one.
+    if E::primary_key_columns().len() != 1 {
+        return None;
+    }
     let pk = E::primary_key();
     if !E::shard_columns().contains(&pk) {
         return None;
@@ -454,16 +478,20 @@ pub fn upsert<E: Entity>(
 }
 
 /// `UPDATE table SET … WHERE pk = ?` — every non-key column.
+///
+/// The key comes off the entity, so a composite one is `AND`-ed together in full
+/// and no caller can supply a partial one — see
+/// [`row_key_condition`](rainier_orm::row_key_condition) for why that makes this
+/// infallible.
 pub fn update<E: Entity>(dialect: Dialect, entity: &E) -> Prepared {
-    let key = entity.pk_value();
-    let route = route_for::<E>(E::primary_key(), &key);
+    let route = key_route::<E>(&entity.pk_values());
 
     let mut stmt = SqQuery::update();
     stmt.table(alias(E::table()));
     for (column, value) in entity.update_values() {
         stmt.value(alias(column), value);
     }
-    stmt.and_where(Expr::col(alias(E::primary_key())).eq(key));
+    stmt.cond_where(row_key_condition(entity));
 
     let (sql, params) = dialect.build_query(&stmt);
     Prepared { sql, params: params.0, route }
@@ -508,7 +536,9 @@ pub fn update_matching<E: Entity>(
 }
 
 /// `DELETE FROM table WHERE pk = ?`.
-pub fn delete_by_pk<E: Entity>(dialect: Dialect, key: Value) -> Prepared {
+///
+/// Bounded on [`SingleKey`]; see [`delete_by_keys`].
+pub fn delete_by_pk<E: Entity + SingleKey>(dialect: Dialect, key: Value) -> Prepared {
     let route = route_for::<E>(E::primary_key(), &key);
 
     let mut stmt = SqQuery::delete();
@@ -517,6 +547,23 @@ pub fn delete_by_pk<E: Entity>(dialect: Dialect, key: Value) -> Prepared {
 
     let (sql, params) = dialect.build_query(&stmt);
     Prepared { sql, params: params.0, route }
+}
+
+/// `DELETE FROM table WHERE a = ? AND b = ?` — the composite counterpart of
+/// [`delete_by_pk`].
+///
+/// `keys` are positional against [`Entity::primary_key_columns`] and all are
+/// required; a short list errors instead of deleting every row sharing the parts
+/// that were given.
+pub fn delete_by_keys<E: Entity>(dialect: Dialect, keys: &[Value]) -> Result<Prepared> {
+    let route = key_route::<E>(keys);
+
+    let mut stmt = SqQuery::delete();
+    stmt.from_table(alias(E::table()));
+    stmt.cond_where(key_condition::<E>(keys)?);
+
+    let (sql, params) = dialect.build_query(&stmt);
+    Ok(Prepared { sql, params: params.0, route })
 }
 
 /// `DELETE FROM table WHERE <criteria>`.
@@ -746,5 +793,113 @@ mod tests {
         let token = Token { id: 0, user_id: 42, hash: "x".into() };
         let prepared = insert::<Token>(Dialect::Sqlite, &token, Some(4242));
         assert_eq!(prepared.route, ShardRoute::Key(4242));
+    }
+
+    // --- composite keys ----------------------------------------------------
+
+    #[derive(rainier_orm::Entity, Clone, Debug)]
+    #[orm(table = "memberships")]
+    struct Membership {
+        #[orm(pk)]
+        team_id: u64,
+        #[orm(pk)]
+        user_id: u64,
+        role: String,
+    }
+
+    /// A composite key routed by its first half — a `(user_id, slot)` table on
+    /// the sharded tier, where only one part of the key names a shard.
+    #[derive(rainier_orm::Entity, Clone, Debug)]
+    #[orm(table = "slots")]
+    struct Slot {
+        #[orm(pk, shard_key)]
+        user_id: u64,
+        #[orm(pk)]
+        slot: i64,
+        payload: String,
+    }
+
+    fn membership() -> Membership {
+        Membership { team_id: 7, user_id: 9, role: "owner".into() }
+    }
+
+    #[test]
+    fn a_composite_update_constrains_every_key_column() {
+        let prepared = update::<Membership>(Dialect::Sqlite, &membership());
+
+        assert!(prepared.sql.contains("\"team_id\""), "{}", prepared.sql);
+        assert!(prepared.sql.contains("\"user_id\""), "{}", prepared.sql);
+        assert!(prepared.sql.contains("AND"), "both parts, not either: {}", prepared.sql);
+        // `role`, then both halves of the key in the WHERE.
+        assert_eq!(prepared.params.len(), 3, "{:?}", prepared.params);
+    }
+
+    #[test]
+    fn a_composite_select_and_delete_constrain_every_key_column() {
+        let keys = [7_u64.into(), 9_u64.into()];
+
+        for (name, sql) in [
+            ("select", select_by_keys::<Membership>(Dialect::Sqlite, &keys).unwrap().sql),
+            ("delete", delete_by_keys::<Membership>(Dialect::Sqlite, &keys).unwrap().sql),
+        ] {
+            assert!(sql.contains("\"team_id\""), "{name}: {sql}");
+            assert!(sql.contains("\"user_id\""), "{name}: {sql}");
+            assert!(sql.contains("AND"), "{name}: both parts, not either: {sql}");
+        }
+    }
+
+    #[test]
+    fn a_partial_key_is_refused_rather_than_prepared() {
+        // The dangerous shape: one value for a two-column key would render
+        // `DELETE FROM memberships WHERE team_id = ?` — the whole team.
+        assert!(delete_by_keys::<Membership>(Dialect::Sqlite, &[7_u64.into()]).is_err());
+        assert!(select_by_keys::<Membership>(Dialect::Sqlite, &[7_u64.into()]).is_err());
+    }
+
+    #[test]
+    fn a_composite_key_renders_on_every_dialect() {
+        for dialect in [Dialect::Sqlite, Dialect::MySql, Dialect::Postgres] {
+            let prepared = update::<Membership>(dialect, &membership());
+            assert!(prepared.sql.contains("memberships"), "{dialect:?}: {}", prepared.sql);
+            assert!(prepared.sql.contains("AND"), "{dialect:?}: {}", prepared.sql);
+            assert_eq!(prepared.params.len(), 3, "{dialect:?}: {:?}", prepared.params);
+        }
+    }
+
+    #[test]
+    fn a_composite_key_routes_by_whichever_part_is_shard_encoded() {
+        // `slot` is not a shard column, so the scan has to run past the first
+        // key part rather than assuming it decides.
+        let slot = Slot { user_id: 42, slot: 3, payload: "x".into() };
+        assert_eq!(update::<Slot>(Dialect::Sqlite, &slot).route, ShardRoute::Key(42));
+
+        let keys = [42_u64.into(), 3_i64.into()];
+        assert_eq!(
+            delete_by_keys::<Slot>(Dialect::Sqlite, &keys).unwrap().route,
+            ShardRoute::Key(42)
+        );
+
+        // A composite key with no shard column at all stays global.
+        assert_eq!(update::<Membership>(Dialect::Sqlite, &membership()).route, ShardRoute::Global);
+    }
+
+    #[test]
+    fn a_composite_key_never_asks_the_connector_to_mint_an_id() {
+        // There is nowhere to put an allocated id in a two-column key, and
+        // writing it into the first half would leave the second unset.
+        let slot = Slot { user_id: 0, slot: 3, payload: "x".into() };
+        assert_eq!(shard_key_for_insert::<Slot>(&slot), None);
+    }
+
+    #[test]
+    fn a_single_key_update_is_unchanged() {
+        // The control: one equality, no conjunction, the same parameter count
+        // this module has always produced.
+        let prepared = update::<Post>(Dialect::Sqlite, &Post { id: 3, ..post() });
+        assert_eq!(
+            prepared.sql,
+            r#"UPDATE "posts" SET "title" = ?, "published" = ? WHERE "id" = ?"#
+        );
+        assert_eq!(prepared.params.len(), 3);
     }
 }

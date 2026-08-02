@@ -64,7 +64,7 @@
 
 use std::any::type_name;
 
-use rainier_orm::Entity;
+use rainier_orm::{Entity, SingleKey};
 use rainier_support::str::class_basename;
 
 /// An entity the framework manages.
@@ -72,7 +72,27 @@ use rainier_support::str::class_basename;
 /// `Clone` is required because lifecycle hooks receive the model by value:
 /// a repository hands a copy to the event bus and keeps the original for the
 /// write. The clone is skipped entirely when nothing is listening.
-pub trait Model: Entity + Clone + Send + Sync + 'static {
+///
+/// [`SingleKey`] is required because this layer is single-key *throughout*, in
+/// its types rather than by convention: [`Repository::find`] and
+/// [`Repository::delete`] take one [`Value`], [`Deleting`]/[`Deleted`] carry one
+/// key, and [`route_key_name`](Self::route_key_name) names the one column a URL
+/// segment binds to. A composite-key entity has no honest answer for any of
+/// them, so it is refused here — where the error names the model — rather than
+/// at each of those call sites, or worse, in a `WHERE` built from the first key
+/// column alone.
+///
+/// Composite-key tables are still fully usable through Rainier ORM itself:
+/// [`repo::find_by_keys`](rainier_orm::repo::find_by_keys),
+/// [`repo::update`](rainier_orm::repo::update),
+/// [`repo::delete_by_keys`](rainier_orm::repo::delete_by_keys) and
+/// [`repo::query`](rainier_orm::repo::query), plus this crate's
+/// [`Criteria`](crate::Criteria)-driven statements.
+///
+/// [`Value`]: rainier_orm::sea_query::Value
+/// [`Repository::find`]: crate::Repository::find
+/// [`Repository::delete`]: crate::Repository::delete
+pub trait Model: Entity + SingleKey + Clone + Send + Sync + 'static {
     /// The model's name, for error messages — `"Post"`.
     fn model_name() -> &'static str {
         class_basename(type_name::<Self>())

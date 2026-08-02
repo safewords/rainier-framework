@@ -30,7 +30,7 @@
 
 use core::ops::{Deref, DerefMut};
 
-use crate::{repo, Entity, Executor, Result};
+use crate::{repo, Entity, Executor, Result, SingleKey};
 use sea_query::Value;
 
 /// A loaded [`Entity`] that remembers its original column values so
@@ -49,8 +49,13 @@ impl<E: Entity> Tracked<E> {
     }
 
     /// Load `pk`'s row and wrap it for tracking. `None` when no row matches.
+    ///
+    /// One key value, so [`SingleKey`]. A composite-key row is loaded with
+    /// [`repo::find_by_keys`] and wrapped with [`new`](Self::new) — tracking
+    /// itself works for either, only this shorthand is single-key.
     pub async fn load<X, V>(exec: &X, pk: V) -> Result<Option<Self>>
     where
+        E: SingleKey,
         X: Executor,
         V: Into<Value>,
     {
@@ -84,10 +89,25 @@ impl<E: Entity> Tracked<E> {
         if changes.is_empty() {
             return Ok(0);
         }
-        let affected = repo::query::<E>()
-            .where_eq(E::primary_key(), self.current.pk_value())
-            .update(exec, changes)
-            .await?;
+        // Every key column is constrained, not just the first. On a composite
+        // key, filtering by one part would make this partial `UPDATE` land on
+        // each sibling row sharing it — silently, since the affected count would
+        // look plausible.
+        //
+        // The builder is created *and consumed* inside this block, so only the
+        // already-rendered future survives to the await. A `Query<E>` holds
+        // `Rc`, and one still in scope across the await would be captured by the
+        // generated future and make `save` unusable from a spawned handler —
+        // which `tests/send_futures.rs` catches at compile time.
+        let update = {
+            let mut query = repo::query::<E>();
+            for (column, value) in E::primary_key_columns().iter().zip(self.current.pk_values()) {
+                query = query.where_eq(column, value);
+            }
+            query.update(exec, changes)
+        };
+
+        let affected = update.await?;
         self.baseline = self.current.update_values();
         Ok(affected)
     }

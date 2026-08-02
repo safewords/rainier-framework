@@ -18,8 +18,8 @@
 
 use crate::{ColumnType, Dialect, Entity, RefAction};
 use sea_query::{
-    Alias, ColumnDef, ForeignKey, ForeignKeyAction, ForeignKeyCreateStatement, Index, Table,
-    TableCreateStatement,
+    Alias, ColumnDef, ForeignKey, ForeignKeyAction, ForeignKeyCreateStatement, Index, IntoIden,
+    Table, TableCreateStatement,
 };
 
 /// The type a column is actually declared as.
@@ -57,6 +57,12 @@ pub fn create_table_stmt<E: Entity>() -> TableCreateStatement {
     let mut stmt = Table::create();
     stmt.table(Alias::new(E::table())).if_not_exists();
 
+    // An inline `PRIMARY KEY` per column is two primary keys once a key has two
+    // parts, which no engine accepts — the table simply fails to create. A
+    // composite key is therefore declared once, at table level, after the
+    // columns. Single keys keep the inline form so their DDL is unchanged.
+    let composite_key = E::primary_key_columns().len() > 1;
+
     for col in E::columns() {
         // "Keyed" = the column participates in any index/constraint: the primary
         // key, a single-column unique, or any (single or composite) secondary
@@ -68,7 +74,9 @@ pub fn create_table_stmt<E: Entity>() -> TableCreateStatement {
         apply_type(&mut def, effective_type(col), keyed);
 
         if col.pk {
-            def.primary_key();
+            if !composite_key {
+                def.primary_key();
+            }
             if col.auto_increment {
                 def.auto_increment();
             }
@@ -82,6 +90,17 @@ pub fn create_table_stmt<E: Entity>() -> TableCreateStatement {
             def.unique_key();
         }
         stmt.col(&mut def);
+    }
+
+    if composite_key {
+        // Declared in `primary_key_columns()` order, which is the entity's field
+        // order: it decides which prefix lookups the index can serve, so it is
+        // carried through rather than sorted or taken from `columns()`.
+        let mut key = Index::create();
+        for column in E::primary_key_columns() {
+            key.col(Alias::new(*column).into_iden());
+        }
+        stmt.primary_key(&mut key);
     }
 
     for fk in E::foreign_keys() {

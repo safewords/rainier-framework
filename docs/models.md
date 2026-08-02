@@ -47,7 +47,7 @@ implementation.
 | Attribute | Effect |
 |---|---|
 | `#[orm(table = "posts")]` | the table name (defaults to the pluralised struct name) |
-| `#[orm(pk)]` | the primary key |
+| `#[orm(pk)]` | the primary key (mark more than one field for a composite key) |
 | `#[orm(pk, auto_increment)]` | database-assigned key |
 | `#[orm(unique)]` | a unique index |
 | `#[orm(index)]` | an index on this column |
@@ -61,6 +61,52 @@ schema cannot drift from the struct that defines it**.
 `Clone` is required by `Model` because lifecycle hooks receive the model by
 value — a repository hands a copy to the event bus and keeps the original for
 the write. The clone is skipped entirely when nothing is listening.
+
+## Composite primary keys
+
+Mark more than one field `#[orm(pk)]` and the key is all of them, in
+**declaration order** — the order they appear in `PRIMARY KEY (a, b)`, so it
+decides which prefix lookups the index can serve:
+
+```rust
+#[derive(Entity, Clone)]
+#[orm(table = "memberships")]
+struct Membership {
+    #[orm(pk)]
+    team_id: u64,
+    #[orm(pk)]
+    user_id: u64,
+    role: String,
+}
+```
+
+Reads and writes keyed on the pair take the values positionally, and **all** of
+them:
+
+```rust
+let membership: Option<Membership> =
+    repo::find_by_keys(&db, vec![team_id.into(), user_id.into()]).await?;
+
+repo::update(&db, &membership).await?;                    // key read off the row
+repo::delete_by_keys::<Membership, _>(&db, vec![team_id.into(), user_id.into()]).await?;
+```
+
+A list of the wrong length is an error rather than a narrower or wider query.
+That is the whole point: a `WHERE` missing one part of the key still parses,
+still runs, and still reports a plausible row count — it just matches every row
+sharing the part that survived. An `UPDATE` written that way overwrites the
+siblings and a `DELETE` removes them, with nothing in the result to say so.
+
+The single-value APIs (`find_by_pk`, `delete_by_pk`, `cursor`, `Tracked::load`,
+`first_or_create`) are bounded on `SingleKey`, which the derive emits only for a
+one-column key, so aiming one at a composite entity is a **compile error** rather
+than a partial-key match.
+
+`Model` requires `SingleKey` too, so a composite-key table is not an
+`EntityRepository`: `Repository::find`/`delete` take one `Value` and route
+binding names one column, neither of which a two-column key can answer. Such
+tables are used through the ORM directly — the calls above, plus `repo::query`
+and `Criteria`-driven statements.
 
 ## Relationships are loaded, not navigated
 

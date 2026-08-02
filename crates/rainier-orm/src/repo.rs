@@ -35,8 +35,9 @@
 //! API, so a regression fails the build rather than surfacing as a confusing
 //! error in a downstream crate.
 
+use crate::key::{key_condition, key_route, row_key_condition};
 use crate::route::route_for;
-use crate::{Entity, Executor, Result, ShardRoute};
+use crate::{Entity, Executor, Result, ShardRoute, SingleKey};
 use sea_query::{Alias, Expr, OnConflict, Order, Query, SimpleExpr, Value};
 
 fn col(name: &str) -> Alias {
@@ -66,6 +67,12 @@ fn route_from_pairs<E: Entity>(pairs: &[(&'static str, Value)]) -> ShardRoute {
 /// pair). `None` for global entities, auto-increment keys, an already-set key,
 /// or an executor that doesn't allocate (single-DB).
 fn assign_shard_pk<E: Entity, X: Executor>(exec: &X, pairs: &[(&str, Value)]) -> Option<u64> {
+    // A minted id *is* the whole key, so this only applies to a single-column
+    // one. On a composite key there is no single column to write the allocated
+    // id into, and picking the first would leave the rest unset.
+    if E::primary_key_columns().len() != 1 {
+        return None;
+    }
     let pk = E::primary_key();
     if !E::shard_columns().contains(&pk) {
         return None;
@@ -179,9 +186,12 @@ where
 
 /// Find the row whose primary key equals `pk`, decoded into `E`. `None` if no
 /// row matches.
+///
+/// Bounded on [`SingleKey`] because one value cannot identify a row in a table
+/// keyed on two columns — see [`find_by_keys`] for those.
 pub async fn find_by_pk<E, X, V>(exec: &X, pk: V) -> Result<Option<E>>
 where
-    E: Entity,
+    E: Entity + SingleKey,
     X: Executor,
     V: Into<Value>,
 {
@@ -192,6 +202,43 @@ where
         stmt.from(col(E::table()))
             .columns(E::columns().iter().map(|c| col(c.name)))
             .and_where(Expr::col(col(E::primary_key())).eq(pk_val))
+            .limit(1);
+
+        let (sql, params) = exec.dialect().build_query(&stmt);
+        (route, sql, into_vec(params))
+    };
+
+    let rows = exec.fetch_all_routed(route, &sql, params).await?;
+    match rows.first() {
+        Some(row) => Ok(Some(E::from_row(row.as_ref())?)),
+        None => Ok(None),
+    }
+}
+
+/// Find the row whose primary key equals `keys`, decoded into `E`. `None` if no
+/// row matches.
+///
+/// The composite counterpart of [`find_by_pk`]: `keys` are positional against
+/// [`Entity::primary_key_columns`], and all of them are required. Supplying the
+/// wrong number is an error rather than a narrower or wider query — a short list
+/// would silently return whichever row of the bucket came first.
+///
+/// ```ignore
+/// let membership: Option<Membership> =
+///     repo::find_by_keys(&db, vec![team_id.into(), user_id.into()]).await?;
+/// ```
+pub async fn find_by_keys<E, X>(exec: &X, keys: Vec<Value>) -> Result<Option<E>>
+where
+    E: Entity,
+    X: Executor,
+{
+    let (route, sql, params) = {
+        let route = key_route::<E>(&keys);
+        let condition = key_condition::<E>(&keys)?;
+        let mut stmt = Query::select();
+        stmt.from(col(E::table()))
+            .columns(E::columns().iter().map(|c| col(c.name)))
+            .cond_where(condition)
             .limit(1);
 
         let (sql, params) = exec.dialect().build_query(&stmt);
@@ -285,20 +332,25 @@ where
 
 /// Update every non-primary-key column of `entity`, matched by its primary
 /// key. Returns the number of rows affected (0 or 1 for a unique key).
+///
+/// Takes the whole entity, so the key is read off the row itself and every part
+/// of a composite one reaches the `WHERE` — no bound is needed and none of the
+/// caller's arithmetic can go wrong. Matching on only part of a key here would
+/// be the worst bug in this module: the statement would still succeed while
+/// overwriting every sibling row that shares the first column.
 pub async fn update<E, X>(exec: &X, entity: &E) -> Result<u64>
 where
     E: Entity,
     X: Executor,
 {
     let (route, sql, params) = {
-        let pk_val = entity.pk_value();
-        let route = route_for::<E>(E::primary_key(), &pk_val);
+        let route = key_route::<E>(&entity.pk_values());
         let mut stmt = Query::update();
         stmt.table(col(E::table()));
         for (c, v) in entity.update_values() {
             stmt.value(col(c), v);
         }
-        stmt.and_where(Expr::col(col(E::primary_key())).eq(pk_val));
+        stmt.cond_where(row_key_condition(entity));
 
         let (sql, params) = exec.dialect().build_query(&stmt);
         (route, sql, into_vec(params))
@@ -309,9 +361,11 @@ where
 }
 
 /// Delete the row whose primary key equals `pk`. Returns rows affected.
+///
+/// Bounded on [`SingleKey`]; see [`delete_by_keys`] for a composite key.
 pub async fn delete_by_pk<E, X, V>(exec: &X, pk: V) -> Result<u64>
 where
-    E: Entity,
+    E: Entity + SingleKey,
     X: Executor,
     V: Into<Value>,
 {
@@ -329,11 +383,41 @@ where
     Ok(outcome.rows_affected)
 }
 
-/// Open a [`Cursor`] over `E`'s whole table, walking it in primary-key order
-/// in pages of `page_size`.
-pub fn cursor<E, X>(exec: &X, page_size: u64) -> Cursor<'_, E, X>
+/// Delete the row whose primary key equals `keys`. Returns rows affected.
+///
+/// The composite counterpart of [`delete_by_pk`]. `keys` are positional against
+/// [`Entity::primary_key_columns`] and all are required — a short list errors
+/// rather than deleting the whole bucket that shares the columns it did supply.
+pub async fn delete_by_keys<E, X>(exec: &X, keys: Vec<Value>) -> Result<u64>
 where
     E: Entity,
+    X: Executor,
+{
+    let (route, sql, params) = {
+        let route = key_route::<E>(&keys);
+        let condition = key_condition::<E>(&keys)?;
+        let mut stmt = Query::delete();
+        stmt.from_table(col(E::table())).cond_where(condition);
+
+        let (sql, params) = exec.dialect().build_query(&stmt);
+        (route, sql, into_vec(params))
+    };
+
+    let outcome = exec.execute_routed(route, &sql, params).await?;
+    Ok(outcome.rows_affected)
+}
+
+/// Open a [`Cursor`] over `E`'s whole table, walking it in primary-key order
+/// in pages of `page_size`.
+///
+/// Bounded on [`SingleKey`]: the keyset is one `Value`, and `WHERE key > ?` over
+/// the first column of a composite key is not a keyset at all — it would skip
+/// every remaining row sharing the page boundary's first column. A composite
+/// walk needs lexicographic tuple comparison, which is a different query than
+/// this one builds.
+pub fn cursor<E, X>(exec: &X, page_size: u64) -> Cursor<'_, E, X>
+where
+    E: Entity + SingleKey,
     X: Executor,
 {
     Cursor::new(exec, page_size)
@@ -365,7 +449,7 @@ pub struct Cursor<'a, E, X> {
 
 impl<'a, E, X> Cursor<'a, E, X>
 where
-    E: Entity,
+    E: Entity + SingleKey,
     X: Executor,
 {
     fn new(exec: &'a X, page_size: u64) -> Self {
@@ -443,8 +527,9 @@ where
 }
 
 /// Read just the primary-key column out of a row, by its declared
-/// [`ColumnType`](crate::ColumnType), to advance the keyset.
-fn pk_from_row<E: Entity>(row: &dyn crate::Row) -> Result<Value> {
+/// [`ColumnType`](crate::ColumnType), to advance the keyset. `SingleKey` because
+/// a keyset position is one value; see [`cursor`].
+fn pk_from_row<E: Entity + SingleKey>(row: &dyn crate::Row) -> Result<Value> {
     use crate::ColumnType;
     let pk = E::primary_key();
     let spec = E::columns()
