@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use rainier_events::Dispatcher;
 use rainier_orm::sea_query::Value;
+use rainier_orm::Entity;
 use rainier_support::{Error, Result};
 
 use crate::connection::Database;
@@ -221,7 +222,20 @@ impl<M> Clone for EntityRepository<M> {
     }
 }
 
-impl<M: Model> EntityRepository<M> {
+/// What a repository can do knowing only that its type is an [`Entity`].
+///
+/// Bounded on `Entity` rather than [`Model`] — which is `Entity + SingleKey` —
+/// so that an entity keyed on more than one column can still be read from.
+/// [`Repository`]'s own methods stay `Model`-bound because most of them name a
+/// row by its key, and "the key" is one value there.
+///
+/// [`aggregate`](Self::aggregate) is the method that does not: it projects
+/// columns and returns rows, and never identifies a row by anything. Leaving it
+/// on the `Model`-bound trait made it unreachable for composite-key entities,
+/// whose only remaining route to a `SUM` was raw SQL — or loading every row and
+/// adding them up in process, which is the same query with the table scan moved
+/// somewhere it cannot be indexed.
+impl<E: Entity> EntityRepository<E> {
     /// A repository over `db`, with no lifecycle hooks.
     pub fn new(db: Database) -> Self {
         Self { db, events: None, _model: PhantomData }
@@ -239,6 +253,26 @@ impl<M: Model> EntityRepository<M> {
         &self.db
     }
 
+    /// Run an aggregate query and return the projected rows.
+    ///
+    /// The same query [`Repository::aggregate`] runs — that one delegates here,
+    /// so a model and a composite-key entity cannot drift apart.
+    pub async fn aggregate_rows(&self, criteria: Criteria) -> Result<Vec<OwnedRow>> {
+        let requests: Vec<ColumnRequest> = criteria
+            .projections()
+            .iter()
+            .map(|(projection, name)| {
+                ColumnRequest::new(name.clone(), column_type_of::<E>(projection))
+            })
+            .collect();
+
+        self.db
+            .fetch(statement::select_aggregate::<E>(self.db.dialect(), &criteria), requests)
+            .await
+    }
+}
+
+impl<M: Model> EntityRepository<M> {
     /// Dispatch a lifecycle hook.
     ///
     /// The event is only *built* when something is listening, so the model
@@ -280,17 +314,9 @@ impl<M: Model> Repository<M> for EntityRepository<M> {
     }
 
     async fn aggregate(&self, criteria: Criteria) -> Result<Vec<OwnedRow>> {
-        let requests: Vec<ColumnRequest> = criteria
-            .projections()
-            .iter()
-            .map(|(projection, name)| {
-                ColumnRequest::new(name.clone(), column_type_of::<M>(projection))
-            })
-            .collect();
-
-        self.db
-            .fetch(statement::select_aggregate::<M>(self.db.dialect(), &criteria), requests)
-            .await
+        // Delegated rather than duplicated: the same query has to mean the same
+        // thing whether the type behind it has one key column or several.
+        self.aggregate_rows(criteria).await
     }
 
     async fn first_matching(&self, criteria: Criteria) -> Result<Option<M>> {

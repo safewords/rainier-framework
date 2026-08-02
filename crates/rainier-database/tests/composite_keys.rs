@@ -178,3 +178,37 @@ async fn a_partial_key_errors_without_touching_the_table() {
 
     assert_eq!(all(&exec).await.len(), 4, "the table is untouched");
 }
+
+#[tokio::test]
+async fn a_composite_key_entity_can_be_aggregated() {
+    // The capability this test exists for is a *bound*, so most of the proof is
+    // that this file compiles: `aggregate_rows` is reachable from an entity with
+    // two key columns. It used to live only on the `Model`-bound repository
+    // trait, and `Model` requires a single key, so the sole route to a `SUM`
+    // over a table like this one was raw SQL — or loading every row and adding
+    // them up in process, which is the same table scan moved somewhere it
+    // cannot be indexed.
+    //
+    // The assertions then check it is the right rows: a `COUNT` scoped to one
+    // team must not see the other team's, which is what a predicate built from
+    // half a key would get wrong.
+    use rainier_database::{Criteria, EntityRepository, Projection};
+    use rainier_orm::Row as _;
+
+    let database = rainier_database::Database::new(world().await);
+    let memberships = EntityRepository::<Membership>::new(database);
+
+    let rows = memberships
+        .aggregate_rows(
+            Criteria::new().select(Projection::CountAll, "n").where_eq("team_id", 1_u64),
+        )
+        .await
+        .expect("an aggregate over a composite-key entity");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get_i64("n").ok().flatten(),
+        Some(2),
+        "team 1 has two memberships; seeing four means the predicate was dropped"
+    );
+}
