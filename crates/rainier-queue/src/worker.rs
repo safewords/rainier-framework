@@ -75,6 +75,25 @@ pub struct WorkerOptions {
     pub stop_when_empty: bool,
     /// Give up on a job that runs longer than this.
     pub timeout: Option<Duration>,
+    /// Stop once the worker has been running this long.
+    ///
+    /// A long-lived process accumulates whatever it leaks — memory,
+    /// connections, file descriptors. Recycling on a clock is the blunt but
+    /// reliable answer, and it pairs with `max_jobs`: whichever limit is
+    /// reached first ends the run, and the supervisor starts a fresh worker.
+    ///
+    /// `None` runs until stopped.
+    pub max_time: Option<Duration>,
+    /// A floor on how many attempts a job gets.
+    ///
+    /// Individual jobs carry their own `max_attempts`, chosen when they are
+    /// dispatched. This raises that for jobs that did not ask for more, so a
+    /// worker can be told "retry anything up to three times" without every
+    /// dispatch site having to say so.
+    ///
+    /// It only ever raises. A job that explicitly asked for more attempts than
+    /// this keeps them — the worker is expressing a default, not a ceiling.
+    pub tries: Option<u32>,
 }
 
 impl Default for WorkerOptions {
@@ -85,6 +104,8 @@ impl Default for WorkerOptions {
             max_jobs: None,
             stop_when_empty: false,
             timeout: Some(Duration::from_secs(60)),
+            max_time: None,
+            tries: None,
         }
     }
 }
@@ -118,6 +139,26 @@ impl WorkerOptions {
     pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// Stop once the worker has run this long, so a supervisor can replace it.
+    pub fn max_time(mut self, max_time: Duration) -> Self {
+        self.max_time = Some(max_time);
+        self
+    }
+
+    /// Give every job at least this many attempts.
+    ///
+    /// Raises a job's own `max_attempts` if it asked for fewer; never lowers
+    /// one that asked for more.
+    pub fn tries(mut self, tries: u32) -> Self {
+        self.tries = Some(tries);
+        self
+    }
+
+    /// How many attempts this job actually gets under these options.
+    pub fn attempts_for(&self, job_max_attempts: u32) -> u32 {
+        job_max_attempts.max(self.tries.unwrap_or(0)).max(1)
     }
 }
 
@@ -225,12 +266,20 @@ impl Worker {
     /// about.
     pub async fn run(&self) -> Result<WorkerStats> {
         let mut stats = WorkerStats::default();
+        let started = std::time::Instant::now();
 
         loop {
             if self.is_stopping() {
                 break;
             }
             if self.options.max_jobs.is_some_and(|max| stats.total() >= max) {
+                break;
+            }
+            // Checked between jobs, never mid-job: a worker that abandoned
+            // work halfway through to meet a deadline would be a worse problem
+            // than the leak the deadline exists to bound.
+            if self.options.max_time.is_some_and(|max| started.elapsed() >= max) {
+                tracing::info!(max_time = ?self.options.max_time, "worker reached its time limit");
                 break;
             }
 
@@ -321,7 +370,7 @@ impl Worker {
     async fn handle_failure(&self, job: QueuedJob, error: Error) -> Result<Outcome> {
         let message = error.to_string();
 
-        if job.is_exhausted() {
+        if job.attempts >= self.options.attempts_for(job.max_attempts) {
             self.queue.fail(&job, &message).await?;
 
             // Released on final failure too. Holding the lock until
@@ -389,6 +438,32 @@ mod tests {
     use super::*;
     use crate::job::{Job, QueuedJob};
     use crate::queue::MemoryQueue;
+
+    #[test]
+    fn tries_raises_a_jobs_attempts_but_never_lowers_them() {
+        // A worker expresses a default, not a ceiling. A job dispatched asking
+        // for five attempts has a reason to want five, and a worker started
+        // with `--tries=3` must not quietly halve it.
+        let options = WorkerOptions::default().tries(3);
+
+        assert_eq!(options.attempts_for(1), 3, "a job that asked for one gets the floor");
+        assert_eq!(options.attempts_for(5), 5, "a job that asked for more keeps them");
+    }
+
+    #[test]
+    fn without_tries_a_jobs_own_attempts_stand() {
+        let options = WorkerOptions::default();
+
+        assert_eq!(options.attempts_for(1), 1);
+        assert_eq!(options.attempts_for(7), 7);
+    }
+
+    #[test]
+    fn attempts_are_never_zero() {
+        // Zero would mean a job that can be reserved and never run: exhausted
+        // before its first try.
+        assert_eq!(WorkerOptions::default().attempts_for(0), 1);
+    }
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::AtomicU32;
     use std::sync::Mutex;

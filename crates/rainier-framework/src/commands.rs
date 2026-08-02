@@ -327,6 +327,26 @@ impl Command for QueueWorkCommand {
             options = options.max_jobs(max);
         }
 
+        // A job that runs forever holds its worker forever, so a timeout is on
+        // by default; `--timeout=0` is how a caller says "no limit" rather
+        // than having to mean it by omission.
+        if let Some(seconds) = args.option("timeout").and_then(|value| value.parse::<u64>().ok()) {
+            options = options.timeout(match seconds {
+                0 => None,
+                seconds => Some(Duration::from_secs(seconds)),
+            });
+        }
+
+        // Recycling on a clock bounds whatever a long-lived process leaks.
+        if let Some(seconds) = args.option("max-time").and_then(|value| value.parse::<u64>().ok()) {
+            options = options.max_time(Duration::from_secs(seconds));
+        }
+
+        // A floor, not a ceiling: a job that asked for more attempts keeps them.
+        if let Some(tries) = args.option("tries").and_then(|value| value.parse::<u32>().ok()) {
+            options = options.tries(tries);
+        }
+
         let mut worker = Worker::new(
             Arc::clone(manager.queue()),
             Arc::clone(manager.registry()),
