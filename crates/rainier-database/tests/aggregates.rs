@@ -141,3 +141,27 @@ fn an_empty_or_group_is_ignored_rather_than_rendering_an_empty_paren() {
     let rendered = sql(Dialect::MySql, &criteria);
     assert!(!rendered.contains("()"), "{rendered}");
 }
+
+#[test]
+fn case_insensitive_equality_lowers_both_sides() {
+    // MySQL's usual collations compare text case-insensitively; SQLite and
+    // Postgres do not. A plain equality on a username therefore behaves
+    // differently depending on the database behind it — an application ported
+    // from MySQL keeps working in production and stops finding rows in its own
+    // test suite. Lowering both sides is identical on all three.
+    let criteria = Criteria::new().where_eq_ci("case_id", "AdA").select(Projection::CountAll, "n");
+
+    for dialect in [Dialect::MySql, Dialect::Sqlite, Dialect::Postgres] {
+        let rendered = sql(dialect, &criteria).to_uppercase();
+        assert_eq!(rendered.matches("LOWER").count(), 2, "{dialect:?}: {rendered}");
+    }
+}
+
+#[test]
+fn distinct_is_rendered_when_asked_for() {
+    let plain = Criteria::new().select(Projection::Column("case_id".into()), "case_id");
+    assert!(!sql(Dialect::MySql, &plain).to_uppercase().contains("DISTINCT"));
+
+    let deduped = plain.distinct();
+    assert!(sql(Dialect::MySql, &deduped).to_uppercase().contains("DISTINCT"));
+}

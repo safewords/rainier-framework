@@ -307,6 +307,10 @@ fn apply_criteria<E: Entity>(
     criteria: &Criteria,
     with_paging: bool,
 ) -> ShardRoute {
+    if criteria.is_distinct() {
+        stmt.distinct();
+    }
+
     for (table, local, foreign) in criteria.joins() {
         let on =
             Expr::col((alias(E::table()), alias(local))).equals((alias(table), alias(foreign)));

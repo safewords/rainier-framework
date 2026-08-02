@@ -19,11 +19,13 @@
 //! assert_eq!(front_page.limit_value(), Some(10));
 //! ```
 
-use rainier_orm::sea_query::{ColumnRef, Expr, SimpleExpr, Value};
+use rainier_orm::sea_query::{ColumnRef, Expr, Func, SimpleExpr, Value};
 
 /// One recorded predicate.
 #[derive(Debug, Clone)]
 pub enum Constraint {
+    /// `LOWER(column) = LOWER(value)`.
+    EqCi(String, Value),
     /// `column = value`.
     Eq(String, Value),
     /// `column <> value`.
@@ -54,7 +56,8 @@ impl Constraint {
     /// The column this constraint applies to.
     pub fn column(&self) -> &str {
         match self {
-            Constraint::Eq(column, _)
+            Constraint::EqCi(column, _)
+            | Constraint::Eq(column, _)
             | Constraint::Ne(column, _)
             | Constraint::Gt(column, _)
             | Constraint::Gte(column, _)
@@ -94,6 +97,10 @@ impl Constraint {
             Constraint::NotLike(_, pattern) => expr.not_like(pattern.as_str()),
             Constraint::In(_, values) => expr.is_in(values.clone()),
             Constraint::NotIn(_, values) => expr.is_not_in(values.clone()),
+            // `LOWER(col) = LOWER(?)`, which is the same in every dialect —
+            // unlike a date part, this needs no per-dialect branch.
+            Constraint::EqCi(_, value) => SimpleExpr::FunctionCall(Func::lower(expr))
+                .eq(SimpleExpr::FunctionCall(Func::lower(Expr::val(value.clone())))),
             Constraint::Null(_) => expr.is_null(),
             Constraint::NotNull(_) => expr.is_not_null(),
         }
@@ -201,6 +208,8 @@ pub struct Criteria {
     groups: Vec<Projection>,
     /// Predicate groups combined with `OR` internally, `AND`-ed with the rest.
     or_groups: Vec<Vec<Constraint>>,
+    /// `SELECT DISTINCT`.
+    distinct: bool,
     /// `(alias, descending)` — ordering by a selected projection's alias.
     alias_orders: Vec<(String, bool)>,
     /// `(column, descending)`.
@@ -213,6 +222,30 @@ impl Criteria {
     /// No constraints — every row.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// `LOWER(column) = LOWER(value)` — equality ignoring case.
+    ///
+    /// Not a nicety. MySQL's usual collations compare text case-insensitively,
+    /// while SQLite and Postgres do not, so a plain `where_eq` on a username
+    /// behaves differently depending on which database is behind it. An
+    /// application ported from MySQL keeps working in production and starts
+    /// failing to find rows in its own test suite — the same shape of bug as a
+    /// dialect-specific function, arrived at through a default nobody set.
+    pub fn where_eq_ci(mut self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.constraints.push(Constraint::EqCi(column.into(), value.into()));
+        self
+    }
+
+    /// `SELECT DISTINCT …`.
+    pub fn distinct(mut self) -> Self {
+        self.distinct = true;
+        self
+    }
+
+    /// Whether the query is `DISTINCT`.
+    pub fn is_distinct(&self) -> bool {
+        self.distinct
     }
 
     /// `column = value`.
