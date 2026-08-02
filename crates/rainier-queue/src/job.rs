@@ -132,6 +132,25 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// The queue this job goes on by default.
     const QUEUE: &'static str = "default";
 
+    /// The queue this job goes on, resolved when it is dispatched.
+    ///
+    /// Defaults to [`QUEUE`](Self::QUEUE), so a job that names a constant queue
+    /// says nothing more and behaves exactly as before.
+    ///
+    /// It exists because a `const` cannot express a queue name the application
+    /// computes — one carrying an environment prefix, a driver-dependent shape,
+    /// or anything else known only at run time. Without this, such an
+    /// application has to name the queue at every call site, and the constant
+    /// on the job becomes a decoy: it reads like the job's queue, it is not
+    /// what the job is dispatched to, and the first plain `dispatch` written
+    /// against it sends the job to a queue that may have no worker.
+    ///
+    /// That failure is silent. A job on a queue nobody drains is not an error
+    /// anywhere — it is accepted, stored, and never run.
+    fn queue(&self) -> String {
+        Self::QUEUE.to_string()
+    }
+
     /// How long to wait before retrying after `attempt` failures.
     ///
     /// Exponential by default — 1s, 2s, 4s, … — because the usual reason a job
@@ -232,7 +251,9 @@ impl QueuedJob {
             id: generate_id(),
             name: J::NAME.to_string(),
             payload: serde_json::to_value(job)?,
-            queue: J::QUEUE.to_string(),
+            // `job.queue()`, not `J::QUEUE` — so an application that computes
+            // its queue names is dispatched to the queue it actually drains.
+            queue: job.queue(),
             attempts: 0,
             max_attempts: J::TRIES,
             unique_key: None,
@@ -440,6 +461,47 @@ mod tests {
         let queued = QueuedJob::from_job(&AlwaysFails).unwrap();
         assert_eq!(queued.queue, "slow");
         assert_eq!(queued.max_attempts, 2);
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Prefixed;
+
+    #[async_trait::async_trait]
+    impl Job for Prefixed {
+        const NAME: &'static str = "test.prefixed";
+        const QUEUE: &'static str = "reports";
+
+        // The case the constant cannot express: a name assembled at run time.
+        fn queue(&self) -> String {
+            format!("app-production-{}", Self::QUEUE)
+        }
+
+        async fn handle(&self, _: &JobContext) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_computed_queue_name_is_what_the_job_is_dispatched_to() {
+        // Not `"reports"`. A job whose application prefixes its queue names is
+        // dispatched to the prefixed one, so it lands where the worker draining
+        // that name will find it. Taking the constant here instead would put it
+        // on a queue nobody reads — accepted, stored, and never run, with
+        // nothing reported anywhere.
+        let queued = QueuedJob::from_job(&Prefixed).unwrap();
+        assert_eq!(queued.queue, "app-production-reports");
+    }
+
+    #[test]
+    fn a_job_that_does_not_override_still_uses_its_constant() {
+        // The default has to stay exactly as it was: every existing job relies
+        // on the constant alone, and this trait method is additive only if
+        // saying nothing keeps meaning what it meant.
+        assert_eq!(QueuedJob::from_job(&AlwaysFails).unwrap().queue, AlwaysFails::QUEUE);
+        assert_eq!(
+            QueuedJob::from_job(&SendEmail { to: "a@b.c".into() }).unwrap().queue,
+            "default"
+        );
     }
 
     #[test]
