@@ -49,6 +49,95 @@ let pool = if url.starts_with("sqlite::memory:") {
 };
 ```
 
+`Databases` below picks that pool for you — see
+[what the section does not carry](#what-the-section-does-not-carry).
+
+## More than one database
+
+One `DATABASE_URL` is one database, which is right for nearly every
+application. A read replica, a reporting warehouse or a second database another
+system also writes to cannot be written down that way at all, so those are
+declared as a **section**: a `default` naming one entry, and each entry naming
+its own driver and settings.
+
+```rust
+use rainier_database::{Databases, ServerDatabase, SqliteDatabase};
+
+let databases = Databases::new("primary")
+    .with("primary", ServerDatabase::mysql("app").host("db.internal").credentials("app", secret))
+    .with("replica", ServerDatabase::mysql("app").host("replica.internal").credentials("reader", secret))
+    .with("reporting", SqliteDatabase::new("storage/reporting.sqlite"));
+
+let manager = databases.build().await?;      // every connection opened once
+
+manager.default_connection();                // the `primary` handle
+manager.connection("replica");               // Some(&Database)
+manager.connection("replicaa");              // None — never the default
+```
+
+The same thing from the configuration tree, which is the shape a `database`
+section already has:
+
+```json
+{
+  "default": "primary",
+  "connections": {
+    "primary":   { "driver": "mysql", "host": "db.internal", "database": "app",
+                   "username": "app", "password": "…" },
+    "replica":   { "driver": "postgres", "url": "postgres://reader:…@replica.internal/app" },
+    "reporting": { "driver": "sqlite", "database": "storage/reporting.sqlite" }
+  }
+}
+```
+
+`DATABASE_URL` is the same section with one entry in it, and stays the way to
+say so:
+
+```rust
+let manager = Databases::from_url(&url)?.build().await?;
+```
+
+The driver comes from the DSN's scheme (`mysql`, `mariadb`, `postgres`,
+`postgresql`, `sqlite`), and a scheme no driver speaks is a boot failure rather
+than a guess.
+
+### A name nobody declared is not the default
+
+`manager.connection("replicaa")` is `None`, and `manager.resolve(Some(name))`
+is an error listing what *is* declared. Neither falls back, because a query
+against the wrong database does not raise — it **answers**. The rows come back,
+the types match, the report renders, and nothing anywhere fails, because from
+the database's point of view nothing went wrong.
+
+### Two ways to write one connection, never both
+
+A platform that injects one secret injects a **DSN**; a file written by hand
+names **discrete fields**, because a host you can read is a host you can
+review. Both are supported. Declaring both on one connection is refused rather
+than resolved by precedence: the setting that loses is still sitting in the file
+being read by whoever changes it next, so repointing a connection by editing its
+visible `host` would review cleanly, deploy cleanly and change nothing.
+
+The other refusals are on the same principle — a `host` on a `sqlite`
+connection, a server connection with no `host` or no `database`, a `password`
+with no `username`, a `default` naming an entry nobody declared. Each is a case
+where the connection would work and read the wrong rows.
+
+### What the section does not carry
+
+**Pool settings.** The one case where getting it wrong is silent — an in-memory
+SQLite database with more than one connection is more than one *database* — has
+exactly one right answer, and `Databases` uses it. Sizing a pool is a tuning
+decision with no wrong-data failure mode.
+
+**The `d1` and `libsql` drivers.** Their executors take a caller-supplied
+transport (a `fetch` binding in a Worker, an HTTP client on a server), which is
+not a value a configuration tree can hold. Build one in code and register it:
+
+```rust
+manager.with_connection("edge", Database::new(D1Executor::new(transport)))
+```
+
 ## Dialects
 
 ```rust

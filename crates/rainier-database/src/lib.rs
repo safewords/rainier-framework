@@ -5,11 +5,12 @@
 //! Postgres, and where the stack of hand-written per-engine repositories
 //! collapses to zero.
 //!
-//! This crate adds the four things a framework needs on top of that:
+//! This crate adds the five things a framework needs on top of that:
 //!
 //! | | |
 //! |---|---|
 //! | [`Connection`] / [`Database`] | a `dyn`-safe port over Rainier ORM's `Executor`, so a backend can live in the IoC container |
+//! | [`Databases`] / [`DatabaseManager`] | the `database` section as a type: a default connection and the named ones beside it |
 //! | [`Model`] | an entity the framework manages, with lifecycle **hooks** |
 //! | [`Repository`] / [`EntityRepository`] | a contract to depend on, implemented once for every model |
 //! | [`Criteria`] / [`Paginated`] | composable scopes and paging |
@@ -65,7 +66,9 @@
 
 pub mod connection;
 pub mod criteria;
+pub mod databases;
 pub mod factory;
+pub mod manager;
 pub mod migrator;
 pub mod model;
 pub mod pagination;
@@ -78,7 +81,12 @@ pub mod testing;
 
 pub use connection::{Connection, Database};
 pub use criteria::{Constraint, Criteria, DatePart, JoinKind, Projection};
+pub use databases::{
+    DatabaseConfig, DatabaseCredentials, DatabaseDriver, Databases, DsnDatabase, ServerDatabase,
+    SqliteDatabase,
+};
 pub use factory::{Factory, HasFactory};
+pub use manager::DatabaseManager;
 pub use migrator::{Down, Migration, Migrator, Step};
 pub use model::{Created, Creating, Deleted, Deleting, Model, Updated, Updating};
 pub use pagination::Paginated;
