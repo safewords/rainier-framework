@@ -1,12 +1,13 @@
 //! Dispatching — the [`QueueManager`] facade accessor and the [`SyncQueue`]
 //! driver.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rainier_cache::{LockGuard, LockManager};
 use rainier_container::Container;
-use rainier_support::{BoxFuture, Result};
+use rainier_support::{BoxFuture, Error, Result};
 
 use crate::job::{Job, JobContext, JobRegistry, QueuedJob};
 use crate::queue::Queue;
@@ -87,6 +88,13 @@ impl Queue for SyncQueue {
 pub struct PendingDispatch<'a> {
     manager: &'a QueueManager,
     job: QueuedJob,
+    /// Which declared connection to push to, or `None` for the default.
+    ///
+    /// A name rather than a resolved queue, because resolution belongs at the
+    /// moment of sending: a builder that names a connection that is not
+    /// declared must fail the *dispatch*, loudly, rather than be constructible
+    /// and then quietly land somewhere.
+    connection: Option<String>,
     /// The uniqueness key and its TTL, from [`Job::unique_id`].
     ///
     /// Captured here rather than claimed in `pending`, because the claim
@@ -99,6 +107,26 @@ impl<'a> PendingDispatch<'a> {
     /// Put the job on a named queue instead of its default.
     pub fn on_queue(mut self, queue: impl Into<String>) -> Self {
         self.job = self.job.on_queue(queue);
+        self
+    }
+
+    /// Push the job to a named connection instead of the default one.
+    ///
+    /// Orthogonal to [`on_queue`](Self::on_queue), and the two answer different
+    /// questions: a connection is **which backend** the job is stored in — a
+    /// database, an SQS queue, a Kafka cluster — and a queue is **which named
+    /// lane within it**. `on_connection("bulk").on_queue("mail")` is the `mail`
+    /// queue of the `bulk` backend, and neither setting implies the other.
+    ///
+    /// The name must be declared on the manager (see
+    /// [`Connections`](crate::Connections) or
+    /// [`with_connection`](QueueManager::with_connection)). One that is not
+    /// fails at [`send`](Self::send) rather than falling back to the default,
+    /// because a fallback here is invisible: the push succeeds, an id comes
+    /// back, and the job waits in a backend whose worker is not the one anybody
+    /// is watching.
+    pub fn on_connection(mut self, connection: impl Into<String>) -> Self {
+        self.connection = Some(connection.into());
         self
     }
 
@@ -119,8 +147,20 @@ impl<'a> PendingDispatch<'a> {
     /// `Ok(Some(id))` when it was queued. `Ok(None)` when the job declares a
     /// [`unique_id`](Job::unique_id) and an identical one is already pending —
     /// dropping it is the point, so it is not an error.
+    ///
+    /// # Errors
+    ///
+    /// When [`on_connection`](Self::on_connection) named a connection that is
+    /// not declared, or when the backend refuses the push.
     pub async fn send(self) -> Result<Option<String>> {
         let mut job = self.job;
+
+        // Resolved before the uniqueness claim rather than after, because the
+        // claim deliberately outlives this call: taking one and *then* failing
+        // to resolve would leave a lock nothing will ever release, and every
+        // later dispatch of that job would be dropped as a duplicate until its
+        // TTL lapsed.
+        let destination = self.manager.resolve(self.connection.as_deref())?;
 
         let claim = match &self.unique {
             Some((key, ttl)) => {
@@ -140,7 +180,7 @@ impl<'a> PendingDispatch<'a> {
             None => Claim::NotEnforced,
         };
 
-        let id = self.manager.push(job).await?;
+        let id = self.manager.push_to(destination, job).await?;
 
         // The claim outlives this call on purpose. Releasing it here would
         // deduplicate nothing: the point is that it stands while the job is
@@ -167,8 +207,21 @@ enum Claim {
 /// Dispatches jobs onto the configured queue.
 ///
 /// The accessor behind the `Queue` facade.
+///
+/// One default connection, plus any number of named ones — the queue equivalent
+/// of a filesystem `Storage` holding a default disk and a map of named ones, and
+/// assembled the same way, from a [`Connections`](crate::Connections)
+/// declaration.
 pub struct QueueManager {
     queue: Arc<dyn Queue>,
+    /// The connections a dispatch may name, by the name it names them with.
+    ///
+    /// A `BTreeMap` so an error that lists the declared connections reads the
+    /// same each run. The default connection is in here too when it was
+    /// declared — see [`Connections::build`](crate::Connections::build) — and
+    /// is the *same* `Arc`, not a second backend built from the same
+    /// declaration.
+    connections: BTreeMap<String, Arc<dyn Queue>>,
     registry: Arc<JobRegistry>,
     /// `Some` while faking: jobs are recorded and never enqueued.
     recorded: Option<Mutex<Vec<QueuedJob>>>,
@@ -182,8 +235,77 @@ pub struct QueueManager {
 
 impl QueueManager {
     /// Dispatch onto `queue`.
+    ///
+    /// No connection is named: `queue` is the default, and a dispatch that does
+    /// not ask for one goes there. Names come from
+    /// [`with_connection`](Self::with_connection).
     pub fn new(queue: Arc<dyn Queue>, registry: Arc<JobRegistry>) -> Self {
-        Self { queue, registry, recorded: None, locks: None }
+        Self { queue, connections: BTreeMap::new(), registry, recorded: None, locks: None }
+    }
+
+    /// Declare a connection reachable as `name`.
+    ///
+    /// The default connection is registered here too when it is declared, under
+    /// its own name and as the **same** backend — one built twice would give
+    /// `connection("primary")` a different store from the default even though
+    /// both name one declaration.
+    pub fn with_connection(mut self, name: impl Into<String>, queue: Arc<dyn Queue>) -> Self {
+        self.connections.insert(name.into(), queue);
+        self
+    }
+
+    /// The connection declared as `name`, or `None`.
+    ///
+    /// `None` rather than the default, which is the whole point: Laravel's
+    /// `Queue::connection('sqs')` on a name nobody declared is a job accepted
+    /// into a backend no worker drains, and that raises nothing, retries
+    /// nothing and leaves no failed row. An `Option` makes the caller say what
+    /// happens instead.
+    pub fn connection(&self, name: &str) -> Option<&Arc<dyn Queue>> {
+        self.connections.get(name)
+    }
+
+    /// Whether `name` is declared.
+    pub fn has_connection(&self, name: &str) -> bool {
+        self.connections.contains_key(name)
+    }
+
+    /// Every declared connection name, in a stable order.
+    pub fn connection_names(&self) -> impl Iterator<Item = &str> {
+        self.connections.keys().map(String::as_str)
+    }
+
+    /// The backend a dispatch naming `connection` goes to.
+    ///
+    /// `None` means the default. A name that is not declared is an error and
+    /// never the default — see [`connection`](Self::connection).
+    fn resolve(&self, connection: Option<&str>) -> Result<&Arc<dyn Queue>> {
+        let Some(name) = connection else {
+            return Ok(&self.queue);
+        };
+
+        self.connection(name).ok_or_else(|| {
+            Error::internal(format!(
+                "no queue connection named `{name}` is declared; declared connections are {}. \
+                 Dispatching to the default instead would store the job in a backend nobody \
+                 drains, which is accepted, never run, and reported nowhere",
+                self.declared_connections()
+            ))
+        })
+    }
+
+    /// The declared names, backtick-quoted, for an error message.
+    fn declared_connections(&self) -> String {
+        if self.connections.is_empty() {
+            let hint = if self.is_faking() {
+                "none — this manager is faking, and a fake declares no connections until one is \
+                 added with `QueueManager::fake().with_connection(…)`"
+            } else {
+                "none"
+            };
+            return hint.to_string();
+        }
+        self.connection_names().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ")
     }
 
     /// Enforce [`Job::unique_id`] with locks taken from `locks`.
@@ -211,6 +333,7 @@ impl QueueManager {
                 Arc::new(JobRegistry::new()),
                 Arc::new(Container::new()),
             )),
+            connections: BTreeMap::new(),
             registry: Arc::new(JobRegistry::new()),
             recorded: Some(Mutex::new(Vec::new())),
             locks: None,
@@ -287,7 +410,12 @@ impl QueueManager {
     /// ```
     pub fn pending<J: Job>(&self, job: J) -> Result<PendingDispatch<'_>> {
         let unique = Self::unique_key(&job);
-        Ok(PendingDispatch { manager: self, job: QueuedJob::from_job(&job)?, unique })
+        Ok(PendingDispatch {
+            manager: self,
+            job: QueuedJob::from_job(&job)?,
+            connection: None,
+            unique,
+        })
     }
 
     /// Queue `job` on a named queue.
@@ -315,13 +443,20 @@ impl QueueManager {
         self.registry.run(&queued, context).await
     }
 
-    async fn push(&self, job: QueuedJob) -> Result<String> {
+    /// Push `job` to an already-resolved backend.
+    ///
+    /// Resolution happens in [`resolve`](Self::resolve), *before* this, and
+    /// applies while faking too: a fake that accepted a connection name the
+    /// real manager would reject is a test that passes and a production
+    /// dispatch that lands nowhere, which is the failure the name check exists
+    /// for.
+    async fn push_to(&self, queue: &Arc<dyn Queue>, job: QueuedJob) -> Result<String> {
         if let Some(recorded) = &self.recorded {
             let id = job.id.clone();
             recorded.lock().expect("recorder lock poisoned").push(job);
             return Ok(id);
         }
-        self.queue.push(job).await
+        queue.push(job).await
     }
 
     // --- assertions (faking) -----------------------------------------------
@@ -422,6 +557,7 @@ impl std::fmt::Debug for QueueManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueueManager")
             .field("driver", &self.queue.name())
+            .field("connections", &self.connection_names().collect::<Vec<_>>())
             .field("jobs", &self.registry.names())
             .field("faking", &self.is_faking())
             .finish()
@@ -599,6 +735,53 @@ mod unique_tests {
     }
 
     #[tokio::test]
+    async fn a_dispatch_to_an_undeclared_connection_leaves_no_lock() {
+        // The claim outlives a successful dispatch on purpose, so one taken
+        // before a *failed* resolution would never be released — and every
+        // later dispatch of that job would be dropped as a duplicate until the
+        // TTL lapsed. Resolution therefore comes first.
+        let (manager, queue) = manager();
+
+        assert!(manager
+            .pending(RebuildIndex)
+            .unwrap()
+            .on_connection("nowhere")
+            .send()
+            .await
+            .is_err());
+
+        assert!(
+            manager.dispatch(RebuildIndex).await.unwrap().is_some(),
+            "the failed dispatch must not have claimed the uniqueness key"
+        );
+        assert_eq!(queue.size("default").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_unique_job_is_deduplicated_across_connections() {
+        // The key is the job's name and id, not the backend — two copies of one
+        // rebuild are two rebuilds however they were routed.
+        let queue = Arc::new(MemoryQueue::new());
+        let bulk = Arc::new(MemoryQueue::new());
+        let manager = QueueManager::new(Arc::clone(&queue) as Arc<_>, Arc::new(JobRegistry::new()))
+            .with_connection("bulk", Arc::clone(&bulk) as Arc<_>)
+            .with_locks(rainier_cache::LockManager::new(Arc::new(MemoryCache::new())));
+
+        assert!(manager.dispatch(RebuildIndex).await.unwrap().is_some());
+        assert!(manager
+            .pending(RebuildIndex)
+            .unwrap()
+            .on_connection("bulk")
+            .send()
+            .await
+            .unwrap()
+            .is_none());
+
+        assert_eq!(queue.size("default").await.unwrap(), 1);
+        assert_eq!(bulk.size("default").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn a_pending_dispatch_that_is_dropped_leaves_no_lock() {
         // The claim is at `send`, not at `pending`, so a builder that is
         // configured and then abandoned must not block the next dispatch.
@@ -760,6 +943,115 @@ mod tests {
         manager.assert_pushed_on::<Ping>("mail");
         manager.assert_not_pushed::<Boom>();
         assert_eq!(manager.all_pushed().len(), 2);
+    }
+
+    // --- connections --------------------------------------------------------
+
+    /// A manager with a default and two named connections, all three distinct
+    /// stores.
+    fn multi_connection() -> (QueueManager, Arc<MemoryQueue>, Arc<MemoryQueue>, Arc<MemoryQueue>) {
+        let default = Arc::new(MemoryQueue::new());
+        let primary = Arc::new(MemoryQueue::new());
+        let bulk = Arc::new(MemoryQueue::new());
+
+        let manager = QueueManager::new(Arc::clone(&default) as Arc<_>, registry())
+            .with_connection("primary", Arc::clone(&primary) as Arc<_>)
+            .with_connection("bulk", Arc::clone(&bulk) as Arc<_>);
+
+        (manager, default, primary, bulk)
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_lands_on_the_connection_it_named_and_on_no_other() {
+        let (manager, default, primary, bulk) = multi_connection();
+
+        manager.pending(Ping).unwrap().on_connection("bulk").send().await.unwrap();
+
+        assert_eq!(bulk.size("default").await.unwrap(), 1);
+        assert_eq!(primary.size("default").await.unwrap(), 0, "not the other named one");
+        assert_eq!(default.size("default").await.unwrap(), 0, "and not the default");
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_connection_never_becomes_the_default() {
+        // The silent failure this exists to prevent: a fallback here is a job
+        // accepted into a backend nobody drains, which raises nothing.
+        let (manager, default, primary, bulk) = multi_connection();
+
+        let err = manager
+            .pending(Ping)
+            .unwrap()
+            .on_connection("blk")
+            .send()
+            .await
+            .err()
+            .expect("`blk` is not declared");
+
+        assert!(err.message().contains("`blk`"), "{}", err.message());
+        assert!(err.message().contains("`bulk`"), "the declared ones: {}", err.message());
+        assert!(err.message().contains("`primary`"), "the declared ones: {}", err.message());
+
+        assert_eq!(default.size("default").await.unwrap(), 0, "nothing fell back");
+        assert_eq!(primary.size("default").await.unwrap(), 0);
+        assert_eq!(bulk.size("default").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_connection_and_a_queue_are_two_different_choices() {
+        // Which backend, and which lane within it. Neither implies the other.
+        let (manager, _default, _primary, bulk) = multi_connection();
+
+        manager.pending(Ping).unwrap().on_connection("bulk").on_queue("mail").send().await.unwrap();
+
+        assert_eq!(bulk.size("mail").await.unwrap(), 1);
+        assert_eq!(bulk.size("default").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_that_names_no_connection_still_goes_to_the_default() {
+        // Every existing call site, unchanged: declaring connections must not
+        // move work that never asked to be moved.
+        let (manager, default, primary, bulk) = multi_connection();
+
+        manager.dispatch(Ping).await.unwrap();
+        manager.dispatch_on("mail", Ping).await.unwrap();
+        manager.pending(Ping).unwrap().tries(5).send().await.unwrap();
+
+        assert_eq!(default.size("default").await.unwrap(), 2);
+        assert_eq!(default.size("mail").await.unwrap(), 1);
+        assert_eq!(primary.size("default").await.unwrap(), 0);
+        assert_eq!(bulk.size("default").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_name_resolves_to_none_rather_than_the_default() {
+        let (manager, _default, _primary, _bulk) = multi_connection();
+
+        assert!(manager.connection("bulk").is_some());
+        assert!(manager.connection("blk").is_none());
+        assert!(!manager.has_connection("blk"));
+        assert_eq!(manager.connection_names().collect::<Vec<_>>(), vec!["bulk", "primary"]);
+    }
+
+    #[tokio::test]
+    async fn a_fake_checks_the_connection_name_as_the_real_manager_would() {
+        // A fake that accepted a name the real manager rejects is a green test
+        // and a production dispatch that lands nowhere.
+        let manager = QueueManager::fake();
+
+        let err = manager
+            .pending(Ping)
+            .unwrap()
+            .on_connection("bulk")
+            .send()
+            .await
+            .err()
+            .expect("a fake declares no connections");
+        assert!(err.message().contains("faking"), "{}", err.message());
+
+        let declared = QueueManager::fake().with_connection("bulk", Arc::new(MemoryQueue::new()));
+        declared.pending(Ping).unwrap().on_connection("bulk").send().await.unwrap();
+        declared.assert_pushed::<Ping>();
     }
 
     #[tokio::test]

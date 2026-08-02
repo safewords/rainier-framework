@@ -49,6 +49,21 @@
 //! | [`DatabaseQueue`] | yes | production, on the database you already have |
 //! | `SqsQueue` | yes | production, managed — needs the `sqs` feature |
 //!
+//! ## Connections
+//!
+//! An application with more than one backend declares them as
+//! [`Connections`] — a `default` and a named map, each entry naming its own
+//! driver — and dispatches to one by name:
+//!
+//! ```ignore
+//! queue.pending(RebuildIndex)?.on_connection("bulk").send().await?;
+//! ```
+//!
+//! A name that is not declared is an **error**, never the default. That is the
+//! one silent failure this whole area has: a job pushed to the wrong backend is
+//! accepted, gets an id, and then waits in a store no worker drains — no error,
+//! no retry, no failed-job row.
+//!
 //! ## Testing
 //!
 //! [`QueueManager::fake`] records dispatches instead of performing them:
@@ -71,6 +86,7 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod connections;
 pub mod database;
 pub mod driver;
 pub mod job;
@@ -84,6 +100,10 @@ pub mod redis;
 pub mod sqs;
 pub mod worker;
 
+pub use connections::{
+    ConnectionConfig, Connections, DatabaseConnection, KafkaConnection, QueueResources,
+    RedisConnection, SqsConnection, SqsCredentials,
+};
 pub use database::{DatabaseQueue, FailedJobRow, JobRow};
 pub use driver::QueueDriver;
 pub use job::{Job, JobContext, JobRegistry, QueuedJob};
