@@ -132,6 +132,36 @@ impl Filesystem for MemoryFilesystem {
             Ok(out)
         })
     }
+
+    fn directories<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            let prefix = normalise_prefix(prefix)?;
+            let files = self.lock();
+
+            let mut out: Vec<String> = files
+                .keys()
+                .filter_map(|path| {
+                    // A directory here is not stored; it is *implied* by a key
+                    // with something after the next separator. `a/b.txt` implies
+                    // nothing under `a`, `a/sub/b.txt` implies `a/sub`.
+                    let rest = strip_prefix(path, &prefix)?;
+                    let (segment, _) = rest.split_once('/')?;
+
+                    Some(if prefix.is_empty() {
+                        segment.to_string()
+                    } else {
+                        format!("{prefix}/{segment}")
+                    })
+                })
+                .collect();
+
+            // Many keys imply one directory, so the duplicates are the normal
+            // case rather than a surprise.
+            out.sort();
+            out.dedup();
+            Ok(out)
+        })
+    }
 }
 
 impl std::fmt::Debug for MemoryFilesystem {
@@ -234,6 +264,63 @@ mod tests {
         fs.rename("a.txt", "c.txt").await.unwrap();
         assert!(!fs.exists("a.txt").await.unwrap());
         assert_eq!(fs.get_string("c.txt").await.unwrap().as_deref(), Some("content"));
+    }
+
+    #[tokio::test]
+    async fn directories_are_found_one_level_at_a_time() {
+        let fs = MemoryFilesystem::new();
+        fs.put_string("a.txt", "x").await.unwrap();
+        fs.put_string("uploads/one.png", "x").await.unwrap();
+        fs.put_string("uploads/variants/small.png", "x").await.unwrap();
+        fs.put_string("uploads/variants/large.png", "x").await.unwrap();
+        fs.put_string("archive/old.zip", "x").await.unwrap();
+
+        assert_eq!(fs.directories("").await.unwrap(), vec!["archive", "uploads"], "not recursive");
+        assert_eq!(fs.directories("uploads").await.unwrap(), vec!["uploads/variants"]);
+
+        // What comes back is a prefix `list` accepts, so descending is passing
+        // the answer straight back in.
+        let inside: Vec<String> =
+            fs.list("uploads/variants").await.unwrap().into_iter().map(|meta| meta.path).collect();
+        assert_eq!(inside, vec!["uploads/variants/large.png", "uploads/variants/small.png"]);
+    }
+
+    #[tokio::test]
+    async fn many_files_imply_one_directory() {
+        // The keys are what is stored, so the same directory is derived once per
+        // key underneath it and must be reported once.
+        let fs = MemoryFilesystem::new();
+        for name in ["a", "b", "c"] {
+            fs.put_string(&format!("uploads/variants/{name}.png"), "x").await.unwrap();
+        }
+
+        assert_eq!(fs.directories("uploads").await.unwrap(), vec!["uploads/variants"]);
+    }
+
+    #[tokio::test]
+    async fn a_prefix_with_no_directories_under_it_is_empty_not_an_error() {
+        let fs = MemoryFilesystem::new();
+        fs.put_string("uploads/one.png", "x").await.unwrap();
+
+        assert!(fs.directories("uploads").await.unwrap().is_empty(), "files are not directories");
+        assert!(fs.directories("never/written").await.unwrap().is_empty(), "nor is nothing");
+    }
+
+    #[tokio::test]
+    async fn enumerating_directories_matches_on_a_separator_not_a_substring() {
+        let fs = MemoryFilesystem::new();
+        fs.put_string("sub/inner/a.txt", "x").await.unwrap();
+        fs.put_string("subdirectory/inner/b.txt", "x").await.unwrap();
+
+        assert_eq!(fs.directories("sub").await.unwrap(), vec!["sub/inner"]);
+    }
+
+    #[tokio::test]
+    async fn enumerating_directories_refuses_a_traversal() {
+        let fs = MemoryFilesystem::new();
+
+        assert!(fs.directories("../etc").await.is_err());
+        assert!(fs.directories("a/../../b").await.is_err());
     }
 
     #[tokio::test]

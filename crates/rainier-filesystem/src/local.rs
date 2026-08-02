@@ -31,6 +31,15 @@ impl LocalFilesystem {
     /// Only meaningful if something — nginx, a CDN, a route you wrote — actually
     /// serves the directory. Without it [`url`](Filesystem::url) is `None`,
     /// because a link that 404s is worse than no link.
+    ///
+    /// Setting it does **not** make this driver able to sign. Whatever serves
+    /// the directory was configured somewhere else and has never heard of this
+    /// process, so a signature minted here would be checked by nobody: the URL
+    /// would be exactly as public and as permanent as [`url`](Filesystem::url),
+    /// while carrying a query string that says otherwise. That is worse than
+    /// refusing, because it is the failure that looks fixed.
+    /// [`temporary_url`](Filesystem::temporary_url) therefore keeps the port's
+    /// refusing default.
     pub fn with_url_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.url_prefix = Some(prefix.into().trim_end_matches('/').to_string());
         self
@@ -221,6 +230,48 @@ impl Filesystem for LocalFilesystem {
         })
     }
 
+    fn directories<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            let normalised = normalise_prefix(prefix)?;
+            let directory =
+                if normalised.is_empty() { self.root.clone() } else { self.root.join(&normalised) };
+
+            let mut entries = match tokio::fs::read_dir(&directory).await {
+                Ok(entries) => entries,
+                // Nothing there lists as empty, matching `list`.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(io_error("list the directories under", prefix, e)),
+            };
+
+            let mut out = Vec::new();
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|e| io_error("list the directories under", prefix, e))?
+            {
+                // The exact inverse of `list`'s `is_file`, so between the two
+                // every entry is accounted for once and neither reports the
+                // other's.
+                match entry.metadata().await {
+                    Ok(meta) if meta.is_dir() => {}
+                    _ => continue,
+                }
+
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    // Not UTF-8, so it has no storage path and nothing could be
+                    // done with it if it were reported.
+                    continue;
+                };
+
+                out.push(if normalised.is_empty() { name } else { format!("{normalised}/{name}") });
+            }
+
+            // Sorted, so a listing is reproducible; the OS gives no order.
+            out.sort();
+            Ok(out)
+        })
+    }
+
     fn rename<'a>(&'a self, from: &'a str, to: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let source = self.resolve(from)?;
@@ -393,6 +444,59 @@ mod tests {
     async fn listing_a_prefix_with_nothing_under_it_is_empty_not_an_error() {
         let temp = Temp::new("list-empty");
         assert!(temp.filesystem().list("never/created").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn directories_are_found_one_level_at_a_time() {
+        let temp = Temp::new("directories");
+        let fs = temp.filesystem();
+
+        fs.put_string("a.txt", "x").await.unwrap();
+        fs.put_string("uploads/one.png", "x").await.unwrap();
+        fs.put_string("uploads/variants/small.png", "x").await.unwrap();
+        fs.put_string("archive/old.zip", "x").await.unwrap();
+
+        assert_eq!(fs.directories("").await.unwrap(), vec!["archive", "uploads"], "not recursive");
+        assert_eq!(fs.directories("uploads").await.unwrap(), vec!["uploads/variants"]);
+
+        // A returned directory is a prefix `list` accepts.
+        let inside: Vec<String> =
+            fs.list("uploads/variants").await.unwrap().into_iter().map(|meta| meta.path).collect();
+        assert_eq!(inside, vec!["uploads/variants/small.png"]);
+    }
+
+    #[tokio::test]
+    async fn a_file_is_not_a_directory() {
+        // The exact inverse of `a_directory_is_not_a_file`, and between them
+        // every entry is reported by one of the two and never by both.
+        let temp = Temp::new("files-are-not-directories");
+        let fs = temp.filesystem();
+        fs.put_string("uploads/one.png", "x").await.unwrap();
+
+        assert!(fs.directories("uploads").await.unwrap().is_empty());
+        assert_eq!(fs.list("uploads").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_prefix_with_no_directories_under_it_is_empty_not_an_error() {
+        let temp = Temp::new("directories-empty");
+        assert!(temp.filesystem().directories("never/created").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn enumerating_directories_refuses_a_traversal() {
+        let temp = Temp::new("directories-traversal");
+        let fs = temp.filesystem();
+
+        // A canary outside the root, which must not be enumerated.
+        let outside = temp.0.parent().unwrap().join("outside-directory");
+        let _ = std::fs::create_dir_all(&outside);
+
+        for hostile in ["../", "a/../../", "..\\"] {
+            assert!(fs.directories(hostile).await.is_err(), "{hostile}");
+        }
+
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[tokio::test]

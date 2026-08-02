@@ -1,8 +1,10 @@
 //! The [`Filesystem`] port and the conveniences every driver gets.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use rainier_support::{BoxFuture, Error, Result};
+use rainier_support::{BoxFuture, Error, ErrorKind, Result};
 
 /// What a driver knows about one stored file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +34,7 @@ pub trait Filesystem: Send + Sync + 'static {
     /// expose.
     ///
     /// The port is deliberately the small set every backend can do, so a
-    /// presigned URL, a multipart upload or object tagging is reachable only
+    /// multipart upload, object tagging or a presigned `PUT` is reachable only
     /// through [`S3Filesystem::client`](crate::S3Filesystem::client) — which
     /// used to mean *keep the concrete value you constructed*. Once disks are
     /// [declared in configuration](crate::Disks) nobody constructs them, so
@@ -76,6 +78,31 @@ pub trait Filesystem: Send + Sync + 'static {
     /// `""` lists the root.
     fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<Metadata>>>;
 
+    /// Every **directory** directly under `prefix`, not recursing.
+    ///
+    /// [`list`](Self::list) answers with files and says nothing about what is
+    /// below them, so "how many variants are stored beside this one" — a count
+    /// of sibling directories — has no answer through this port without it. The
+    /// alternative is listing every key in the subtree and cutting each at the
+    /// first separator, which downloads a whole subtree to learn its shape.
+    ///
+    /// What comes back is a **prefix `list` accepts**, not a bare segment:
+    /// `directories("a")` answers `["a/sub"]`, so descending is passing the
+    /// answer back in rather than rebuilding a path at every call site.
+    ///
+    /// `""` enumerates the root. A prefix with no directories under it — or no
+    /// prefix at all — is an empty `Vec`, not an error: "what is in here" has a
+    /// sensible answer for somewhere nothing has been written yet, matching
+    /// [`list`](Self::list).
+    ///
+    /// Required rather than defaulted, for the reason
+    /// [`as_any`](Self::as_any) is: the only defensible default is an empty
+    /// `Vec`, and an empty `Vec` is already the answer for "there are none".
+    /// A driver that had not implemented this would be indistinguishable from
+    /// one whose prefix is genuinely flat, and the caller counting siblings
+    /// would count zero and believe it.
+    fn directories<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<String>>>;
+
     /// Copy a file.
     ///
     /// Provided as read-then-write, which every driver can do. Override it where
@@ -105,9 +132,80 @@ pub trait Filesystem: Send + Sync + 'static {
     /// `None` for a driver with no public face — a local disk behind an
     /// application is not reachable by URL, and pretending otherwise produces a
     /// link that 404s.
+    ///
+    /// **Public and permanent.** For anything not everyone may read, see
+    /// [`temporary_url`](Self::temporary_url), and see there for why one is
+    /// never a substitute for the other.
     fn url(&self, path: &str) -> Option<String> {
         let _ = path;
         None
+    }
+
+    /// A URL that grants access to one object and stops working after
+    /// `expires_in`.
+    ///
+    /// What paid or otherwise restricted content needs: the object is not
+    /// publicly readable, so the link has to carry its own proof of
+    /// authorisation, and that proof has to run out.
+    ///
+    /// # A public URL is never a substitute for a signed one
+    ///
+    /// This is the whole reason the method exists, and the one rule that must
+    /// not bend. [`url`](Self::url) answers with a link that anyone who sees it
+    /// can keep and pass on, **for ever** — there is nothing in it to expire. If
+    /// a driver that cannot sign quietly answered with that instead, every
+    /// paywalled object would ship with a permanent redistributable link, and
+    /// nothing about the call site would look wrong: it asked for a temporary
+    /// URL and got a URL. So a driver that cannot sign **fails**.
+    ///
+    /// That is also why this answers `Result<String>` and not
+    /// `Result<Option<String>>`. `Option` is the right shape for
+    /// [`url`](Self::url), where "there is no public face" is an ordinary state
+    /// a caller handles by serving the bytes itself. Here it would be an
+    /// invitation: `unwrap_or_else(|| public_url)` is a natural line to write,
+    /// reads as a graceful fallback, and is the paywall bypass above. `Result`
+    /// makes the same mistake require deliberately discarding an error, and
+    /// makes the correct handling a `?`.
+    ///
+    /// # The default refuses
+    ///
+    /// A driver signs or it does not, and the one that has not implemented this
+    /// says so — naming itself, so the answer to "why is this a 501" is the disk
+    /// that is configured rather than a hunt through the drivers. It renders as
+    /// **501**, because from outside it is exactly that: the deployment put
+    /// restricted content somewhere with no way to sign for it, and no request
+    /// the client could have made differently would work.
+    ///
+    /// ```
+    /// # use std::time::Duration;
+    /// # use rainier_filesystem::{Filesystem, MemoryFilesystem};
+    /// # #[tokio::main] async fn main() {
+    /// let disk = MemoryFilesystem::new();
+    /// let error = disk.temporary_url("paid/film.mp4", Duration::from_secs(300)).await.unwrap_err();
+    ///
+    /// assert_eq!(error.status(), 501);
+    /// # }
+    /// ```
+    fn temporary_url<'a>(
+        &'a self,
+        path: &'a str,
+        expires_in: Duration,
+    ) -> BoxFuture<'a, Result<String>> {
+        let _ = expires_in;
+        Box::pin(async move {
+            // The path is deliberately absent from the message: this is a
+            // deployment fault, not a fact about the object, and the path is
+            // frequently the one thing worth not logging.
+            let _ = path;
+            Err(Error::new(
+                ErrorKind::Status(501),
+                format!(
+                    "the `{}` disk cannot sign a temporary URL; storage that must expire needs a \
+                     driver that signs",
+                    self.name()
+                ),
+            ))
+        })
     }
 }
 
@@ -261,5 +359,103 @@ mod tests {
     #[test]
     fn unicode_and_spaces_survive() {
         assert_eq!(normalise_path("uploads/my file 🎉.png").unwrap(), "uploads/my file 🎉.png");
+    }
+
+    /// A driver that **has** a public URL and has **not** implemented signing.
+    ///
+    /// Deliberately that combination: it is the only shape in which a fallback
+    /// from `temporary_url` to `url` would compile, run, and look like it
+    /// worked. A driver with no public URL could not fall back even if someone
+    /// wrote the code.
+    struct PubliclyServed;
+
+    impl Filesystem for PubliclyServed {
+        fn name(&self) -> &str {
+            "publicly-served"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn get<'a>(&'a self, _path: &'a str) -> BoxFuture<'a, Result<Option<Bytes>>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn put<'a>(&'a self, _path: &'a str, _contents: Bytes) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn delete<'a>(&'a self, _path: &'a str) -> BoxFuture<'a, Result<bool>> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn exists<'a>(&'a self, _path: &'a str) -> BoxFuture<'a, Result<bool>> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn metadata<'a>(&'a self, _path: &'a str) -> BoxFuture<'a, Result<Option<Metadata>>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn list<'a>(&'a self, _prefix: &'a str) -> BoxFuture<'a, Result<Vec<Metadata>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn directories<'a>(&'a self, _prefix: &'a str) -> BoxFuture<'a, Result<Vec<String>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn url(&self, path: &str) -> Option<String> {
+            Some(format!("https://cdn.example.com/{path}"))
+        }
+    }
+
+    /// **The test that must not be made to pass by relaxing it.**
+    ///
+    /// If someone gives [`Filesystem::temporary_url`] a default that falls back
+    /// to [`Filesystem::url`], every other test in this crate still passes and
+    /// every paywalled object silently starts shipping a permanent,
+    /// redistributable link. This is the only thing standing in the way, so it
+    /// asserts on the failure rather than on the error.
+    #[tokio::test]
+    async fn a_driver_that_cannot_sign_refuses_rather_than_falling_back_to_a_public_url() {
+        let disk = PubliclyServed;
+        let public = disk.url("paid/film.mp4").expect("this driver does have a public URL");
+
+        match disk.temporary_url("paid/film.mp4", Duration::from_secs(300)).await {
+            Ok(answered) if answered == public => panic!(
+                "`temporary_url` answered with the *public* URL `{answered}`. That link never \
+                 expires and anyone who receives it can redistribute it for ever, which is the \
+                 paywall this method exists to keep shut. A driver that cannot sign must return \
+                 an error."
+            ),
+            Ok(answered) => panic!(
+                "`temporary_url` answered `{answered}` from a driver that has not implemented \
+                 signing. Whatever it is, it was not signed."
+            ),
+            Err(error) => {
+                assert_eq!(error.status(), 501, "a disk that cannot sign is not a client error");
+
+                // Naming the driver is what makes the 501 actionable: the answer
+                // to "why" is which disk is configured, not which route was hit.
+                assert!(error.message().contains("publicly-served"), "{}", error.message());
+
+                // A refusal is a fact about the deployment, not about the
+                // object, and the path is often the thing worth not logging.
+                assert!(!error.message().contains("paid/film.mp4"), "{}", error.message());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_refusal_does_not_depend_on_the_expiry_asked_for() {
+        // Otherwise a caller could discover that some duration "works" and get a
+        // public URL out of it.
+        let disk = PubliclyServed;
+
+        for expiry in [Duration::ZERO, Duration::from_secs(1), Duration::from_secs(86_400 * 365)] {
+            assert!(disk.temporary_url("a.txt", expiry).await.is_err(), "{expiry:?}");
+        }
     }
 }

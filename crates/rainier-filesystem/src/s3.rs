@@ -56,6 +56,13 @@ impl S3Filesystem {
     /// A CloudFront distribution, an R2 custom domain, or a bucket with public
     /// read. Without it [`url`](Filesystem::url) is `None`: a private bucket's
     /// object URL answers `403`, and a link that fails is worse than no link.
+    ///
+    /// This affects [`url`](Filesystem::url) only.
+    /// [`temporary_url`](Filesystem::temporary_url) ignores it and signs against
+    /// the bucket's own endpoint, because the signature is checked by **S3**:
+    /// pointing a SigV4 query string at a CDN host that was never told to
+    /// validate one produces a link the CDN either serves to everyone or
+    /// refuses to everyone, neither of which is what was asked for.
     pub fn with_url_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.url_prefix = Some(prefix.into().trim_end_matches('/').to_string());
         self
@@ -66,8 +73,8 @@ impl S3Filesystem {
         self.client.bucket()
     }
 
-    /// The client, for an operation this port does not expose — a presigned URL,
-    /// a multipart upload, object tagging.
+    /// The client, for an operation this port does not expose — a multipart
+    /// upload, object tagging, a presigned `PUT`.
     pub fn client(&self) -> &S3Client {
         &self.client
     }
@@ -153,6 +160,19 @@ impl Filesystem for S3Filesystem {
         })
     }
 
+    fn directories<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            let prefix = normalise_prefix(prefix)?;
+            let search = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
+
+            let mut out = self.client.list_prefixes(&search).await?;
+
+            // Sorted, so a listing is reproducible — matching the local driver.
+            out.sort();
+            Ok(out)
+        })
+    }
+
     fn copy<'a>(&'a self, from: &'a str, to: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let source = normalise_path(from)?;
@@ -170,6 +190,17 @@ impl Filesystem for S3Filesystem {
         let prefix = self.url_prefix.as_ref()?;
         let key = normalise_path(path).ok()?;
         Some(format!("{prefix}/{}", encode_path(&key)))
+    }
+
+    fn temporary_url<'a>(
+        &'a self,
+        path: &'a str,
+        expires_in: std::time::Duration,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let key = normalise_path(path)?;
+            self.client.presigned_get_url(&key, expires_in).await
+        })
     }
 }
 
@@ -220,6 +251,8 @@ fn guess_content_type(key: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     async fn s3() -> S3Filesystem {
@@ -259,6 +292,128 @@ mod tests {
     async fn a_url_is_not_produced_for_a_path_that_would_be_refused() {
         let served = s3().await.with_url_prefix("https://cdn.example.com");
         assert_eq!(served.url("../secrets"), None);
+    }
+
+    // --- signing ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_temporary_url_carries_an_expiry_and_a_signature() {
+        // Presigning is local arithmetic over the credential, so this needs no
+        // bucket and no network — which is the reason it can be asserted on.
+        let url =
+            s3().await.temporary_url("paid/film.mp4", Duration::from_secs(900)).await.unwrap();
+
+        assert!(url.contains("X-Amz-Expires=900"), "the expiry the caller asked for: {url}");
+        assert!(url.contains("X-Amz-Signature="), "{url}");
+        assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"), "{url}");
+        assert!(url.contains("paid/film.mp4"), "{url}");
+    }
+
+    #[tokio::test]
+    async fn a_temporary_url_is_produced_without_a_public_prefix() {
+        // The point of the whole thing: an object nobody may fetch publicly is
+        // exactly the object that needs a signed link, so this must not require
+        // the configuration that makes objects public.
+        let s3 = s3().await;
+        assert_eq!(s3.url("paid/film.mp4"), None, "no public URL");
+
+        assert!(s3.temporary_url("paid/film.mp4", Duration::from_secs(60)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_signed_url_ignores_the_public_prefix_and_points_at_the_bucket() {
+        // A SigV4 query string is checked by S3. Aimed at a CDN host that was
+        // never told to validate one it is not a paywall, it is either open to
+        // everyone or closed to everyone.
+        let served = s3().await.with_url_prefix("https://cdn.example.com");
+        let url = served.temporary_url("paid/film.mp4", Duration::from_secs(60)).await.unwrap();
+
+        assert!(!url.contains("cdn.example.com"), "{url}");
+        assert!(url.contains("my-bucket"), "{url}");
+    }
+
+    #[tokio::test]
+    async fn two_paths_sign_differently() {
+        // The signature covers the path, so a link to one object cannot be
+        // edited into a link to another.
+        let s3 = s3().await;
+        let expiry = Duration::from_secs(600);
+
+        let first = s3.temporary_url("paid/one.mp4", expiry).await.unwrap();
+        let second = s3.temporary_url("paid/two.mp4", expiry).await.unwrap();
+
+        assert_ne!(signature_of(&first), signature_of(&second), "{first}\n{second}");
+    }
+
+    #[tokio::test]
+    async fn an_already_expired_link_is_still_produced_with_the_expiry_asked_for() {
+        // Whether a link is still valid is decided by S3 when it is presented,
+        // not here. Refusing to sign a short one would just mean a caller that
+        // wants a 1-second link cannot have one.
+        let url = s3().await.temporary_url("paid/film.mp4", Duration::ZERO).await.unwrap();
+
+        assert!(url.contains("X-Amz-Expires=0"), "encoded as asked: {url}");
+        assert!(url.contains("X-Amz-Signature="), "and still signed: {url}");
+    }
+
+    #[tokio::test]
+    async fn a_temporary_url_is_refused_for_a_path_that_would_be_refused() {
+        // Signed before normalising would mint a working link to a key outside
+        // the intended prefix.
+        let s3 = s3().await;
+
+        assert!(s3.temporary_url("../other-bucket/secret", Duration::from_secs(60)).await.is_err());
+        assert!(s3.temporary_url("a/../../b", Duration::from_secs(60)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_temporary_url_beyond_seven_days_is_refused_rather_than_clamped() {
+        let error = s3()
+            .await
+            .temporary_url("paid/film.mp4", Duration::from_secs(8 * 24 * 60 * 60))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status(), 400);
+        assert!(error.message().contains("7 days"), "{}", error.message());
+    }
+
+    #[tokio::test]
+    async fn debug_rendering_discloses_neither_a_credential_nor_a_signature() {
+        // A signature is a bearer token for one object: anything that logs one
+        // has published that object for as long as it lasts.
+        let s3 = S3Filesystem::new(
+            &AwsConnector::with_credentials("AKIA-visible", "super-secret", "us-east-1").await,
+            "my-bucket",
+        );
+        let signed = s3.temporary_url("paid/film.mp4", Duration::from_secs(60)).await.unwrap();
+        let rendered = format!("{s3:?}");
+
+        assert!(!rendered.contains("super-secret"), "{rendered}");
+        assert!(!rendered.contains("AKIA-visible"), "{rendered}");
+        assert!(!rendered.contains(signature_of(&signed)), "{rendered}");
+        assert!(rendered.contains("my-bucket"), "{rendered}");
+    }
+
+    /// The `X-Amz-Signature` value out of a presigned URL, for a test that needs
+    /// to compare two of them.
+    fn signature_of(url: &str) -> &str {
+        url.split("X-Amz-Signature=")
+            .nth(1)
+            .expect("a presigned URL carries a signature")
+            .split('&')
+            .next()
+            .unwrap()
+    }
+
+    // --- directories --------------------------------------------------------
+
+    #[tokio::test]
+    async fn enumerating_directories_refuses_a_traversal_before_any_request() {
+        let s3 = s3().await;
+
+        assert!(s3.directories("../..").await.is_err());
+        assert!(s3.directories("a/../../b").await.is_err());
     }
 
     #[test]

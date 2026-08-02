@@ -5,7 +5,10 @@
 //! semantics — this module has never heard of a path, a traversal, or a URL
 //! prefix.
 
+use std::time::Duration;
+
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::Client;
 use rainier_support::{Error, Result};
 
@@ -58,8 +61,8 @@ impl S3Client {
         &self.bucket
     }
 
-    /// The SDK client, for an operation this does not expose — a presigned URL,
-    /// a multipart upload, object tagging.
+    /// The SDK client, for an operation this does not expose — a multipart
+    /// upload, object tagging, a presigned `PUT`.
     pub fn inner(&self) -> &Client {
         &self.client
     }
@@ -166,6 +169,84 @@ impl S3Client {
         Ok(out)
     }
 
+    /// The **common prefixes** directly under `prefix` — S3's answer to "what
+    /// directories are in here".
+    ///
+    /// A bucket has no directories; it has keys with slashes in them. Asking for
+    /// them is `delimiter("/")` again, but reading a different half of the
+    /// response: [`list`](Self::list) takes `contents` and this takes
+    /// `common_prefixes`, which is the set of distinct next segments S3 rolled
+    /// the deeper keys up into. Deriving the same set by listing every key
+    /// underneath and cutting at the first slash would work and would download
+    /// the whole subtree to do it.
+    ///
+    /// The trailing delimiter is stripped, so what comes back is a prefix that
+    /// can be handed straight back to [`list`](Self::list) rather than one that
+    /// has to be trimmed at every call site.
+    ///
+    /// Paginated to the end, for the same reason `list` is: a prefix with more
+    /// children than fit in a page would otherwise silently answer with the
+    /// first page and look complete.
+    pub async fn list_prefixes(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut pages = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .delimiter("/")
+            .into_paginator()
+            .send();
+
+        let mut out = Vec::new();
+        while let Some(page) = pages.next().await {
+            let page = page.map_err(|e| sdk_error(&format!("S3 list_objects `{prefix}`"), e))?;
+
+            for common in page.common_prefixes() {
+                let Some(found) = common.prefix() else { continue };
+                out.push(found.strip_suffix('/').unwrap_or(found).to_string());
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// A **presigned** `GET` URL for one object, good for `expires_in`.
+    ///
+    /// The SDK's presigner, not a signature assembled here. That matters beyond
+    /// not rewriting SigV4: the signing credential comes from the same provider
+    /// every other call uses, so a temporary one — an instance role, a task
+    /// role, IRSA — is picked up *and* carries its `X-Amz-Security-Token`. A
+    /// hand-rolled signer that omits that token produces a URL which validates
+    /// as a signature and is then rejected as an unknown key, which reads as
+    /// "presigning is broken" rather than "the token is missing".
+    ///
+    /// Nothing is sent: the URL is computed locally from the credential, so this
+    /// costs no request and works while the object does not yet exist.
+    ///
+    /// SigV4 caps a query-string signature at **seven days**, and the SDK
+    /// refuses to build a longer one. Refused rather than silently clamped: a
+    /// link that expires six days before the caller asked is worse than being
+    /// told the ask was impossible.
+    pub async fn presigned_get_url(&self, key: &str, expires_in: Duration) -> Result<String> {
+        let config = PresigningConfig::expires_in(expires_in).map_err(|_| {
+            Error::bad_request(format!(
+                "a presigned URL cannot last {} seconds; SigV4 caps a signed URL at 7 days",
+                expires_in.as_secs()
+            ))
+        })?;
+
+        let request = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .presigned(config)
+            .await
+            .map_err(|e| sdk_error(&format!("S3 presign get_object `{key}`"), e))?;
+
+        Ok(request.uri().to_string())
+    }
+
     /// Copy an object **server-side**.
     ///
     /// `false` if the source did not exist. Server-side matters: the alternative
@@ -237,6 +318,33 @@ mod tests {
 
         assert_eq!(S3Client::new(&r2, "bucket").bucket(), "bucket");
         assert!(r2.is_path_style(), "an endpoint override implies path style");
+    }
+
+    #[tokio::test]
+    async fn a_presigned_url_is_built_locally_and_carries_its_own_expiry() {
+        // No network: the signature is computed from the credential, which is
+        // why this can be asserted on at all.
+        let url =
+            client().await.presigned_get_url("a/b.txt", Duration::from_secs(900)).await.unwrap();
+
+        assert!(url.starts_with("https://my-bucket.s3.us-east-1.amazonaws.com/a/b.txt"), "{url}");
+        assert!(url.contains("X-Amz-Expires=900"), "{url}");
+        assert!(url.contains("X-Amz-Signature="), "{url}");
+        assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"), "{url}");
+    }
+
+    #[tokio::test]
+    async fn a_presigned_url_beyond_seven_days_is_refused_rather_than_clamped() {
+        // A link that expires six days before the caller asked is worse than
+        // being told the ask was impossible.
+        let error = client()
+            .await
+            .presigned_get_url("a/b.txt", Duration::from_secs(8 * 24 * 60 * 60))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status(), 400);
+        assert!(error.message().contains("7 days"), "{}", error.message());
     }
 
     #[test]

@@ -18,11 +18,11 @@
 //!
 //! ## Drivers
 //!
-//! | Driver | Feature | Notes |
-//! |---|---|---|
-//! | [`LocalFilesystem`] | — | one directory on this machine |
-//! | [`MemoryFilesystem`] | — | tests |
-//! | `S3Filesystem` | `s3` | S3, **Cloudflare R2**, MinIO, B2, Wasabi |
+//! | Driver | Feature | Signs URLs | Notes |
+//! |---|---|---|---|
+//! | [`LocalFilesystem`] | — | no | one directory on this machine |
+//! | [`MemoryFilesystem`] | — | no | tests |
+//! | `S3Filesystem` | `s3` | **yes** | S3, **Cloudflare R2**, MinIO, B2, Wasabi |
 //!
 //! S3-compatible is not a special case. R2 and MinIO speak SigV4 against a
 //! different endpoint, so the difference is entirely in
@@ -73,6 +73,61 @@
 //! The local driver adds a second guard — the resolved parent must canonicalise
 //! to somewhere inside the root — because a symlink inside the root can point
 //! out of it and `..` alone does not catch that.
+//!
+//! ## A signed URL is not a public URL, and never degrades into one
+//!
+//! [`url`](Filesystem::url) is a permanent public link.
+//! [`temporary_url`](Filesystem::temporary_url) is a link that carries its own
+//! authorisation and expires, which is what an object nobody may fetch freely
+//! needs.
+//!
+//! A driver that cannot sign **fails** rather than answering with the public
+//! one:
+//!
+//! ```
+//! # use std::time::Duration;
+//! # use rainier_filesystem::{Filesystem, Storage};
+//! # #[tokio::main] async fn main() {
+//! let storage = Storage::memory();
+//! let error = storage.temporary_url("paid/film.mp4", Duration::from_secs(300)).await.unwrap_err();
+//!
+//! assert_eq!(error.status(), 501);
+//! # }
+//! ```
+//!
+//! Degrading to [`url`](Filesystem::url) would be the worst available bug: the
+//! call site asked for a temporary URL and got a URL, so nothing reads as
+//! broken, while every restricted object ships a permanent link anyone who
+//! receives it can redistribute for ever. That is also why the method answers
+//! `Result<String>` rather than `Result<Option<String>>` — an `Option` invites
+//! `unwrap_or_else(|| public_url)`, which is that bug written as a one-liner
+//! that looks like good manners.
+//!
+//! ## Enumerating directories, not only files
+//!
+//! [`list`](Filesystem::list) answers with the files directly under a prefix and
+//! says nothing about what is below them, so
+//! [`directories`](Filesystem::directories) is the other half — what a caller
+//! counting sibling variants under a prefix needs:
+//!
+//! ```
+//! # use rainier_filesystem::{Filesystem, FilesystemExt, MemoryFilesystem};
+//! # #[tokio::main] async fn main() -> rainier_support::Result<()> {
+//! let disk = MemoryFilesystem::new();
+//! disk.put_string("uploads/variants/small.png", "x").await?;
+//! disk.put_string("uploads/one.png", "x").await?;
+//!
+//! assert_eq!(disk.directories("uploads").await?, vec!["uploads/variants"]);
+//! # Ok(()) }
+//! ```
+//!
+//! One level, never recursive, and what comes back is a prefix
+//! [`list`](Filesystem::list) accepts — so descending is passing the answer back
+//! in rather than reassembling a path. On S3 it is a delimiter listing's common
+//! prefixes; on a disk it is the subdirectories; in memory it is the distinct
+//! next segments of the stored keys. The memory driver is asserted to agree with
+//! the local one for the same set of files, which is what lets a test suite use
+//! it in place of a real disk.
 //!
 //! ## Declaring disks rather than wiring them
 //!
@@ -226,9 +281,10 @@ impl Storage {
 
     /// This disk as a concrete driver, or `None` if it is a different one.
     ///
-    /// The port covers what every backend can do; a presigned URL, a multipart
-    /// upload and object tagging are not on it, and reaching them means getting
-    /// back to [`S3Filesystem`] itself. That used to mean keeping the value you
+    /// The port covers what every backend can do; a multipart upload, object
+    /// tagging and a presigned `PUT` are not on it, and reaching them means
+    /// getting back to [`S3Filesystem`] itself. That used to mean keeping the
+    /// value you
     /// constructed — which stops being possible the moment disks are
     /// [declared in configuration](Disks) and nobody constructs one.
     ///
@@ -360,6 +416,102 @@ mod tests {
             // A 404 from the failing variants.
             assert_eq!(disk.get_or_fail("absent.txt").await.unwrap_err().status(), 404, "{name}");
             assert_eq!(disk.copy("absent.txt", "x.txt").await.unwrap_err().status(), 404, "{name}");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The memory driver derives directories from its keys; the local driver
+    /// reads them off a disk. Those are different enough implementations that
+    /// "they agree" has to be asserted rather than assumed — and agreeing is
+    /// the entire reason a test suite is allowed to use the memory driver to
+    /// stand in for a real one.
+    #[tokio::test]
+    async fn every_local_driver_enumerates_the_same_directories() {
+        let root = std::env::temp_dir()
+            .join("rainier-fs-directory-parity")
+            .join(format!("{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let memory: Arc<dyn Filesystem> = Arc::new(MemoryFilesystem::new());
+        let local: Arc<dyn Filesystem> = Arc::new(LocalFilesystem::new(&root));
+
+        // Written through the port, so neither driver is given a shape the
+        // other could not have been given.
+        for key in [
+            "root.txt",
+            "uploads/one.png",
+            "uploads/variants/small.png",
+            "uploads/variants/large.png",
+            "uploads/variants/thumbnails/tiny.png",
+            "archive/old.zip",
+        ] {
+            for disk in [&memory, &local] {
+                disk.put_string(key, "x").await.unwrap();
+            }
+        }
+
+        for prefix in ["", "uploads", "uploads/variants", "uploads/variants/thumbnails", "archive"]
+        {
+            let from_memory = memory.directories(prefix).await.unwrap();
+            let from_local = local.directories(prefix).await.unwrap();
+
+            assert_eq!(from_memory, from_local, "the drivers disagree about `{prefix}`");
+        }
+
+        // And the answers are the ones expected, so agreeing on the wrong thing
+        // is not enough to pass.
+        assert_eq!(memory.directories("").await.unwrap(), vec!["archive", "uploads"]);
+        assert_eq!(memory.directories("uploads").await.unwrap(), vec!["uploads/variants"]);
+        assert_eq!(
+            memory.directories("uploads/variants").await.unwrap(),
+            vec!["uploads/variants/thumbnails"]
+        );
+        assert!(memory.directories("archive").await.unwrap().is_empty());
+
+        // Refusals agree too — a traversal that one driver caught and the other
+        // did not would make the double the more permissive of the pair.
+        for hostile in ["../etc", "a/../../b"] {
+            assert!(memory.directories(hostile).await.is_err(), "{hostile}");
+            assert!(local.directories(hostile).await.is_err(), "{hostile}");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Neither driver can sign, so neither may answer with a URL.
+    #[tokio::test]
+    async fn no_local_driver_answers_a_temporary_url_with_a_public_one() {
+        let root = std::env::temp_dir()
+            .join("rainier-fs-signing-parity")
+            .join(format!("{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // The local disk is given a public URL prefix on purpose: that is what
+        // a fallback would have to return, so this is the configuration in
+        // which the mistake is reachable.
+        let disks: Vec<(&str, Arc<dyn Filesystem>)> = vec![
+            ("memory", Arc::new(MemoryFilesystem::new())),
+            (
+                "local",
+                Arc::new(
+                    LocalFilesystem::new(&root).with_url_prefix("https://cdn.example.com/files"),
+                ),
+            ),
+        ];
+
+        for (name, disk) in disks {
+            disk.put_string("paid/film.mp4", "x").await.unwrap();
+
+            let error = disk
+                .temporary_url("paid/film.mp4", std::time::Duration::from_secs(300))
+                .await
+                .expect_err("a driver that cannot sign must not answer with a URL");
+
+            assert_eq!(error.status(), 501, "{name}");
+            assert!(error.message().contains(name), "{name}: {}", error.message());
         }
 
         let _ = std::fs::remove_dir_all(&root);
