@@ -68,7 +68,8 @@
 //!
 //! Beyond CRUD: a fluent query builder ([`repo::query`] — predicates, joins,
 //! `first_or_create`, partial [`update`](query::Query::update) / atomic
-//! [`increment`](query::Query::increment)), [`repo::upsert`], a keyset
+//! [`increment`](query::Query::increment)), insert-or-update
+//! ([`repo::upsert_with`] with an [`Upsert`] plan), a keyset
 //! [`Cursor`](repo::Cursor), derived constraints + DDL ([`schema`]), and column
 //! types past the primitives: [`Json<T>`](Json) (serde-as-text),
 //! [`Base64Bytes`] (uniform binary), and string-backed enums via
@@ -108,6 +109,7 @@ pub mod schema;
 pub mod shard;
 pub mod sharding;
 pub mod string_column;
+pub mod upsert;
 
 pub use active::Tracked;
 pub use blueprint::{Action, Blueprint, Column, ColumnKind, IndexDef, TableChanges};
@@ -133,6 +135,7 @@ pub use query::Query;
 pub use row::{FromColumn, Row, ToColumn};
 pub use sharding::{IdAllocator, ShardingSettings};
 pub use string_column::StringColumn;
+pub use upsert::{Upsert, UpsertAction};
 
 /// The crate error type. `anyhow` keeps the surface small and wasm-safe; a
 /// typed error is a later tightening.

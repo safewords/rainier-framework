@@ -27,6 +27,18 @@ struct Widget {
     active: bool,
 }
 
+/// A counter keyed on a pair — the shape an insert-or-increment upsert exists
+/// for, and a composite key so the plan carries more than one conflict column.
+#[derive(Entity, Clone)]
+#[orm(table = "tallies")]
+struct Tally {
+    #[orm(pk)]
+    day: i64,
+    #[orm(pk)]
+    bucket: i64,
+    total: i64,
+}
+
 /// A `Send + Sync` executor whose own futures are `Send`, so anything `!Send`
 /// in an assertion below comes from the layer being tested rather than here.
 struct SendExecutor;
@@ -65,6 +77,14 @@ fn repo_crud_futures_are_send() {
 
     assert_send(repo::insert(&exec, &widget));
     assert_send(repo::upsert(&exec, &widget, &["name"], &["active"]));
+    // The plan-based form holds an `OnConflict` — another `Rc<dyn Iden>` — while
+    // it renders, so it has the same hazard as every statement above.
+    assert_send(repo::upsert_with(&exec, &widget, &rainier_orm::Upsert::on(["name"])));
+    assert_send(repo::upsert_with(
+        &exec,
+        &Tally { day: 1, bucket: 2, total: 0 },
+        &rainier_orm::Upsert::on(["day", "bucket"]).increment(["total"]),
+    ));
     assert_send(repo::find_by_pk::<Widget, _, _>(&exec, 1_i64));
     assert_send(repo::find_by::<Widget, _, _>(&exec, "name", "a"));
     assert_send(repo::find_one_by::<Widget, _, _>(&exec, "name", "a"));

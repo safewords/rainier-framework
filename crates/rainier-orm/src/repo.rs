@@ -38,6 +38,7 @@
 use crate::key::{key_condition, key_route, row_key_condition};
 use crate::route::route_for;
 use crate::{Entity, Executor, Result, ShardRoute, SingleKey};
+use core::future::Future;
 use sea_query::{Alias, Expr, OnConflict, Order, Query, SimpleExpr, Value};
 
 fn col(name: &str) -> Alias {
@@ -145,6 +146,11 @@ where
 /// / MySQL `ON DUPLICATE KEY UPDATE`, rendered per dialect by sea-query). An
 /// empty `update_columns` makes it insert-or-ignore (a no-op self-update,
 /// portable across dialects). Returns rows affected.
+///
+/// Every updated column is overwritten with the value being inserted. For a
+/// column that must **accumulate** instead — a counter, where an overwrite
+/// silently discards whatever concurrent callers already added — use
+/// [`upsert_with`] with an [`Upsert`](crate::Upsert) plan.
 pub async fn upsert<E, X>(
     exec: &X,
     entity: &E,
@@ -182,6 +188,65 @@ where
     };
 
     Ok(exec.execute_routed(route, &sql, params).await?.rows_affected)
+}
+
+/// Insert `entity`, resolving a collision with an [`Upsert`] plan.
+///
+/// The general form of [`upsert`], and the one that can express an
+/// **accumulating counter**: `Upsert::on(…).increment(["n"])` renders
+/// `n = n + <incoming>` rather than `n = <incoming>`, so two callers racing on
+/// the same key add up instead of one overwriting the other. Read-then-write
+/// cannot do that — it loses increments silently, reporting a total that is
+/// merely too low. See the [`upsert`](crate::upsert) module for the argument in
+/// full and for why the conflict columns are mandatory.
+///
+/// Returns rows affected.
+///
+/// ```ignore
+/// use rainier_orm::{repo, Upsert};
+///
+/// repo::upsert_with(&db, &tally, &Upsert::on(["a", "b"]).increment(["n"])).await?;
+/// ```
+///
+/// # Errors
+///
+/// If the plan cannot be rendered — see [`Upsert::to_on_conflict`]. The check
+/// happens before anything is sent, so a rejected plan leaves the table
+/// untouched.
+pub fn upsert_with<'a, E, X>(
+    exec: &'a X,
+    entity: &E,
+    plan: &crate::Upsert,
+) -> impl Future<Output = Result<u64>> + 'a
+where
+    E: Entity,
+    X: Executor,
+{
+    // Rendered outside the `async move` block, so nothing `sea_query` holds is
+    // captured by the returned future. An `async fn` would capture `plan` and
+    // `entity` whether or not the body still needed them — see the module docs
+    // and `tests/send_futures.rs`.
+    let rendered = {
+        let pairs = entity.insert_values();
+        let route = route_from_pairs::<E>(&pairs);
+        let columns: Vec<&str> = pairs.iter().map(|(c, _)| *c).collect();
+
+        plan.to_on_conflict(exec.dialect(), E::table(), &columns).map(|on_conflict| {
+            let mut stmt = Query::insert();
+            stmt.into_table(col(E::table()));
+            stmt.columns(pairs.iter().map(|(c, _)| col(c)));
+            stmt.values_panic(pairs.iter().map(|(_, v)| SimpleExpr::from(Expr::val(v.clone()))));
+            stmt.on_conflict(on_conflict);
+
+            let (sql, params) = exec.dialect().build_query(&stmt);
+            (route, sql, into_vec(params))
+        })
+    };
+
+    async move {
+        let (route, sql, params) = rendered?;
+        Ok(exec.execute_routed(route, &sql, params).await?.rows_affected)
+    }
 }
 
 /// Find the row whose primary key equals `pk`, decoded into `E`. `None` if no

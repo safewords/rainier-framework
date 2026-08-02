@@ -96,7 +96,7 @@ pub use statement::Prepared;
 pub use rainier_orm;
 pub use rainier_orm::{
     ddl, migrate, repo, schema, Action, Blueprint, ColumnKind, Dialect, Entity, Executor, IndexDef,
-    Query, TableChanges,
+    Query, TableChanges, Upsert, UpsertAction,
 };
 
 /// What [`bind_executor!`] expands to. Not a stable API.

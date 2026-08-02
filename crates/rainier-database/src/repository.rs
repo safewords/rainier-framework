@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use rainier_events::Dispatcher;
 use rainier_orm::sea_query::Value;
-use rainier_orm::Entity;
+use rainier_orm::{Entity, Upsert};
 use rainier_support::{Error, Result};
 
 use crate::connection::Database;
@@ -96,12 +96,24 @@ pub trait Repository<M: Model>: Send + Sync + 'static {
 
     /// Insert, or update on a conflict with `conflict_columns`. An empty
     /// `update_columns` makes it insert-or-ignore.
+    ///
+    /// Every updated column is *overwritten* with the value being inserted. Use
+    /// [`upsert_with`](Self::upsert_with) for a column that must accumulate.
     async fn upsert(
         &self,
         model: &M,
         conflict_columns: &[&str],
         update_columns: &[&str],
     ) -> Result<u64>;
+
+    /// Insert, resolving a collision with an [`Upsert`] plan.
+    ///
+    /// The form that can express an accumulating counter —
+    /// `Upsert::on(…).increment(["n"])` renders `n = n + <incoming>`, so racing
+    /// callers add up instead of overwriting one another. The read-then-write
+    /// alternative loses increments silently: the stored total is simply lower
+    /// than the truth and no result says so.
+    async fn upsert_with(&self, model: &M, plan: &Upsert) -> Result<u64>;
 
     /// Delete the row with this primary key.
     async fn delete(&self, key: Value) -> Result<u64>;
@@ -458,6 +470,11 @@ impl<M: Model> Repository<M> for EntityRepository<M> {
     ) -> Result<u64> {
         let prepared =
             statement::upsert::<M>(self.db.dialect(), model, conflict_columns, update_columns);
+        Ok(self.db.execute(prepared).await?.rows_affected)
+    }
+
+    async fn upsert_with(&self, model: &M, plan: &Upsert) -> Result<u64> {
+        let prepared = statement::upsert_with::<M>(self.db.dialect(), model, plan)?;
         Ok(self.db.execute(prepared).await?.rows_affected)
     }
 

@@ -32,6 +32,7 @@ use rainier_orm::sea_query::{
 };
 use rainier_orm::{
     key_condition, key_route, row_key_condition, Dialect, Entity, Result, ShardRoute, SingleKey,
+    Upsert,
 };
 
 use crate::criteria::{Criteria, DatePart, JoinKind, Projection};
@@ -477,6 +478,38 @@ pub fn upsert<E: Entity>(
     Prepared { sql, params: params.0, route }
 }
 
+/// `INSERT … ON CONFLICT (…) DO UPDATE` from an [`Upsert`] plan.
+///
+/// The general form of [`upsert`]: the plan can say a column *accumulates*
+/// (`n = n + <incoming>`) rather than being overwritten, which is the only
+/// single-statement way to keep a counter. Read-then-write loses increments
+/// under concurrency and reports nothing — the total is merely too low.
+///
+/// Rendering is Rainier ORM's, so this routes and renders identically to
+/// [`rainier_orm::repo::upsert_with`]; see [`Upsert`] for the dialect
+/// differences and for why the conflict columns are required.
+///
+/// # Errors
+///
+/// If the plan cannot be rendered — see [`Upsert::to_on_conflict`].
+pub fn upsert_with<E: Entity>(dialect: Dialect, entity: &E, plan: &Upsert) -> Result<Prepared> {
+    let pairs = entity.insert_values();
+    let route = route_from_pairs::<E>(&pairs);
+    let columns: Vec<&str> = pairs.iter().map(|(column, _)| *column).collect();
+
+    // Before anything is built, so a rejected plan cannot half-render.
+    let on_conflict = plan.to_on_conflict(dialect, E::table(), &columns)?;
+
+    let mut stmt = SqQuery::insert();
+    stmt.into_table(alias(E::table()));
+    stmt.columns(pairs.iter().map(|(column, _)| alias(column)));
+    stmt.values_panic(pairs.iter().map(|(_, value)| SimpleExpr::from(Expr::val(value.clone()))));
+    stmt.on_conflict(on_conflict);
+
+    let (sql, params) = dialect.build_query(&stmt);
+    Ok(Prepared { sql, params: params.0, route })
+}
+
 /// `UPDATE table SET … WHERE pk = ?` — every non-key column.
 ///
 /// The key comes off the entity, so a composite one is `AND`-ed together in full
@@ -714,6 +747,61 @@ mod tests {
     }
 
     #[test]
+    fn an_upsert_plan_renders_an_increment_per_dialect() {
+        let plan = Upsert::on(["title"]).increment(["published"]);
+
+        // MySQL infers the conflicting key and reads the incoming row through
+        // `VALUES()`; the other two name the target and read `excluded`.
+        assert!(upsert_with::<Post>(Dialect::MySql, &post(), &plan)
+            .unwrap()
+            .sql
+            .ends_with("ON DUPLICATE KEY UPDATE `published` = `published` + VALUES(`published`)"));
+
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            let sql = upsert_with::<Post>(dialect, &post(), &plan).unwrap().sql;
+            assert!(
+                sql.ends_with(
+                    r#"ON CONFLICT ("title") DO UPDATE SET "published" = "posts"."published" + "excluded"."published""#
+                ),
+                "{dialect:?}: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_upsert_plan_binds_its_values_rather_than_inlining_them() {
+        // The injection this layer exists to make unwritable: a value pasted
+        // into the statement instead of bound.
+        let post = Post { id: 0, title: "'); DROP TABLE posts; --".into(), published: true };
+        let prepared =
+            upsert_with::<Post>(Dialect::Sqlite, &post, &Upsert::on(["title"]).increment(["id"]))
+                .unwrap_err();
+        // `id` is auto-increment, so it is not in the insert and the plan is
+        // refused before anything renders — which is the other half of the same
+        // guarantee.
+        assert!(prepared.to_string().contains("id"), "{prepared}");
+
+        let prepared = upsert_with::<Post>(
+            Dialect::Sqlite,
+            &post,
+            &Upsert::on(["title"]).replace(["published"]),
+        )
+        .unwrap();
+        assert!(!prepared.sql.contains("DROP TABLE"), "{}", prepared.sql);
+        assert_eq!(prepared.params.len(), 2, "title and published, both bound");
+    }
+
+    #[test]
+    fn an_upsert_plan_with_no_conflict_columns_is_refused() {
+        // Renders on MySQL, syntax error on SQLite and Postgres — so it must
+        // not render at all.
+        let plan = Upsert::on(Vec::<String>::new()).replace(["published"]);
+        for dialect in [Dialect::Sqlite, Dialect::MySql, Dialect::Postgres] {
+            assert!(upsert_with::<Post>(dialect, &post(), &plan).is_err(), "{dialect:?}");
+        }
+    }
+
+    #[test]
     fn delete_targets_the_key() {
         let prepared = delete_by_pk::<Post>(Dialect::Sqlite, 3_i64.into());
         assert!(prepared.sql.starts_with("DELETE FROM"), "{}", prepared.sql);
@@ -881,6 +969,41 @@ mod tests {
 
         // A composite key with no shard column at all stays global.
         assert_eq!(update::<Membership>(Dialect::Sqlite, &membership()).route, ShardRoute::Global);
+    }
+
+    #[test]
+    fn a_composite_conflict_target_carries_every_column() {
+        // A counter keyed on a pair is the main reason to want an upsert with
+        // an increment, so the target has to survive as a pair. Half of it
+        // names a constraint that does not exist, which SQLite and Postgres
+        // reject — but only at runtime, on whichever row first collides.
+        let plan = Upsert::on(["team_id", "user_id"]).increment(["role"]);
+
+        for dialect in [Dialect::Sqlite, Dialect::Postgres] {
+            let sql = upsert_with::<Membership>(dialect, &membership(), &plan).unwrap().sql;
+            assert!(sql.contains(r#"ON CONFLICT ("team_id", "user_id")"#), "{dialect:?}: {sql}");
+        }
+
+        // MySQL infers the key, so the pair is carried by the constraint rather
+        // than by the statement — and emitting a target there would be a syntax
+        // error, so its absence is the correct rendering, not a dropped column.
+        let mysql = upsert_with::<Membership>(Dialect::MySql, &membership(), &plan).unwrap().sql;
+        assert!(!mysql.contains("ON CONFLICT"), "{mysql}");
+        assert!(mysql.contains("ON DUPLICATE KEY UPDATE"), "{mysql}");
+    }
+
+    #[test]
+    fn a_composite_key_upsert_routes_like_the_rest_of_the_layer() {
+        // The plan must not lose the shard route the row's own values imply, or
+        // an upsert would land on a different shard than the `SELECT` that
+        // reads it back.
+        let slot = Slot { user_id: 42, slot: 3, payload: "x".into() };
+        let plan = Upsert::on(["user_id", "slot"]).replace(["payload"]);
+
+        assert_eq!(
+            upsert_with::<Slot>(Dialect::Sqlite, &slot, &plan).unwrap().route,
+            ShardRoute::Key(42)
+        );
     }
 
     #[test]
