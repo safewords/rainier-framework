@@ -100,6 +100,80 @@ impl Constraint {
     }
 }
 
+/// A part of a date, extracted in whatever way the dialect spells it.
+///
+/// The spelling is the whole reason this exists as a value rather than a
+/// string: MySQL writes `MONTH(x)`, SQLite `CAST(strftime('%m', x) AS INTEGER)`
+/// and Postgres `EXTRACT(MONTH FROM x)`. An application that writes one of
+/// those by hand works on one dialect and fails on the others — including on
+/// the SQLite its own test suite runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatePart {
+    /// The calendar year.
+    Year,
+    /// The month, 1–12.
+    Month,
+    /// The day of the month.
+    Day,
+}
+
+/// Something a query can select or group by that is not simply a column.
+///
+/// Enough to express the aggregate reporting queries that would otherwise be
+/// written as raw SQL — which is the point: raw SQL in a handler is a query
+/// nothing can check, and it silently picks a dialect.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Projection {
+    /// A plain column.
+    Column(String),
+    /// Part of a date column, extracted per dialect.
+    DatePart(DatePart, String),
+    /// `COUNT(*)`.
+    CountAll,
+    /// `COUNT(column)` — nulls excluded, as SQL defines it.
+    Count(String),
+    /// `SUM(column)`.
+    Sum(String),
+    /// `MIN(column)` / `MAX(column)` / `AVG(column)`.
+    Min(String),
+    /// See [`Projection::Min`].
+    Max(String),
+    /// See [`Projection::Min`].
+    Avg(String),
+    /// `SUM(CASE WHEN column IN (values) THEN 1 ELSE 0 END)` — counting the
+    /// rows in a group that match, which is the shape every "how many of these
+    /// were resolved" report needs.
+    CountWhenIn(String, Vec<Value>),
+}
+
+impl Projection {
+    /// The column this reads, for qualification against the model's table.
+    pub fn column(&self) -> Option<&str> {
+        match self {
+            Projection::CountAll => None,
+            Projection::Column(c)
+            | Projection::DatePart(_, c)
+            | Projection::Count(c)
+            | Projection::Sum(c)
+            | Projection::Min(c)
+            | Projection::Max(c)
+            | Projection::Avg(c)
+            | Projection::CountWhenIn(c, _) => Some(c),
+        }
+    }
+}
+
+/// How two tables are joined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// Rows must match on both sides.
+    Inner,
+    /// Keep the left row when the right side has none — which is what makes a
+    /// count of "reports, and how many have a closed case" answerable in one
+    /// query rather than two.
+    Left,
+}
+
 /// A recorded, replayable set of query constraints.
 ///
 /// Predicates are AND-combined. A column is `"name"` (qualified to the model's
@@ -109,6 +183,16 @@ pub struct Criteria {
     constraints: Vec<Constraint>,
     /// `(table, local_column, foreign_column)`.
     joins: Vec<(String, String, String)>,
+    /// `(table, local, foreign, kind)` — the join list that can express an
+    /// outer join. Kept beside `joins` rather than replacing it so existing
+    /// callers and `joins()` keep working unchanged.
+    typed_joins: Vec<(String, String, String, JoinKind)>,
+    /// `(projection, alias)` — an empty list means "every column of the model".
+    projections: Vec<(Projection, String)>,
+    /// What to group by.
+    groups: Vec<Projection>,
+    /// `(alias, descending)` — ordering by a selected projection's alias.
+    alias_orders: Vec<(String, bool)>,
     /// `(column, descending)`.
     orders: Vec<(String, bool)>,
     limit: Option<u64>,
@@ -216,6 +300,59 @@ impl Criteria {
     ) -> Self {
         self.joins.push((table.into(), local.into(), foreign.into()));
         self
+    }
+
+    /// `LEFT JOIN table ON model.local = table.foreign`.
+    pub fn left_join(
+        mut self,
+        table: impl Into<String>,
+        local: impl Into<String>,
+        foreign: impl Into<String>,
+    ) -> Self {
+        self.typed_joins.push((table.into(), local.into(), foreign.into(), JoinKind::Left));
+        self
+    }
+
+    /// Select a projection under an alias.
+    ///
+    /// Selecting anything at all switches the query from "the model's columns"
+    /// to exactly what was asked for, so a result is read by alias rather than
+    /// decoded into the entity.
+    pub fn select(mut self, projection: Projection, alias: impl Into<String>) -> Self {
+        self.projections.push((projection, alias.into()));
+        self
+    }
+
+    /// `GROUP BY projection`.
+    pub fn group_by(mut self, projection: Projection) -> Self {
+        self.groups.push(projection);
+        self
+    }
+
+    /// `ORDER BY alias` — ordering by something [`select`](Self::select) named.
+    pub fn order_by_alias(mut self, alias: impl Into<String>, descending: bool) -> Self {
+        self.alias_orders.push((alias.into(), descending));
+        self
+    }
+
+    /// The selected projections, if any.
+    pub fn projections(&self) -> &[(Projection, String)] {
+        &self.projections
+    }
+
+    /// What the query groups by.
+    pub fn groups(&self) -> &[Projection] {
+        &self.groups
+    }
+
+    /// Ordering expressed against selected aliases.
+    pub fn alias_orders(&self) -> &[(String, bool)] {
+        &self.alias_orders
+    }
+
+    /// Joins that carry a kind, including outer ones.
+    pub fn typed_joins(&self) -> impl Iterator<Item = (&str, &str, &str, JoinKind)> {
+        self.typed_joins.iter().map(|(t, l, f, k)| (t.as_str(), l.as_str(), f.as_str(), *k))
     }
 
     /// `ORDER BY column ASC`.

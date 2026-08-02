@@ -32,7 +32,7 @@ use rainier_orm::sea_query::{
 };
 use rainier_orm::{Dialect, Entity, ShardRoute};
 
-use crate::criteria::Criteria;
+use crate::criteria::{Criteria, DatePart, JoinKind, Projection};
 
 /// A rendered statement: SQL, its ordered bind values, and where to run it.
 ///
@@ -152,7 +152,90 @@ pub fn select_by_column<E: Entity>(
     Prepared { sql, params: params.0, route }
 }
 
-/// `SELECT …` under a [`Criteria`]'s filters, joins, ordering and paging.
+/// Render a [`Projection`] for this dialect.
+///
+/// The date parts are the reason this is a function and not a string in the
+/// caller: MySQL writes `MONTH(x)`, SQLite has no such function and needs
+/// `CAST(strftime('%m', x) AS INTEGER)`, and Postgres spells it
+/// `date_part('month', x)`. Application code that picks one works on one
+/// deployment and 500s on the others — including the SQLite its own tests run.
+fn projection_expr<E: Entity>(dialect: Dialect, projection: &Projection) -> SimpleExpr {
+    let col = |name: &str| Expr::col(column_ref::<E>(name));
+
+    match projection {
+        Projection::Column(c) => col(c).into(),
+        Projection::CountAll => Func::count(Expr::col(Asterisk)).into(),
+        Projection::Count(c) => Func::count(col(c)).into(),
+        Projection::Sum(c) => Func::sum(col(c)).into(),
+        Projection::Min(c) => Func::min(col(c)).into(),
+        Projection::Max(c) => Func::max(col(c)).into(),
+        Projection::Avg(c) => Func::avg(col(c)).into(),
+
+        // `SUM(CASE WHEN col IN (…) THEN 1 ELSE 0 END)`, which counts the
+        // matching rows of each group in the same pass as the total.
+        Projection::CountWhenIn(c, values) => {
+            let case = Expr::case(col(c).is_in(values.clone()), Expr::val(1)).finally(Expr::val(0));
+            Func::sum(SimpleExpr::Case(Box::new(case))).into()
+        }
+
+        Projection::DatePart(part, c) => {
+            let (mysql, sqlite, postgres) = match part {
+                DatePart::Year => ("YEAR", "%Y", "year"),
+                DatePart::Month => ("MONTH", "%m", "month"),
+                DatePart::Day => ("DAY", "%d", "day"),
+            };
+
+            match dialect {
+                // SQLite has no date functions of its own; `strftime` returns
+                // text, so the cast is what makes `month` comparable and
+                // sortable as a number rather than as "01" < "02" < "10".
+                Dialect::Sqlite => Func::cast_as(
+                    Func::cust(Alias::new("strftime"))
+                        .args([SimpleExpr::from(Expr::val(sqlite)), col(c).into()]),
+                    Alias::new("INTEGER"),
+                )
+                .into(),
+                // `date_part('month', x)` rather than `EXTRACT(MONTH FROM x)`:
+                // identical in Postgres, and an ordinary function call, so it
+                // goes through the same builder path as the other two instead
+                // of needing raw SQL for its unusual argument syntax.
+                Dialect::Postgres => Func::cust(Alias::new("date_part"))
+                    .args([SimpleExpr::from(Expr::val(postgres)), col(c).into()])
+                    .into(),
+                _ => Func::cust(Alias::new(mysql)).arg(col(c)).into(),
+            }
+        }
+    }
+}
+
+/// `SELECT <projections> … GROUP BY …` under a [`Criteria`].
+///
+/// The escape hatch that means an application never has to write raw SQL for
+/// an aggregate report — see [`Projection`].
+pub fn select_aggregate<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Prepared {
+    let mut stmt = SqQuery::select();
+    stmt.from(alias(E::table()));
+
+    for (projection, name) in criteria.projections() {
+        stmt.expr_as(projection_expr::<E>(dialect, projection), alias(name));
+    }
+
+    let route = apply_criteria::<E>(&mut stmt, criteria, true);
+
+    for projection in criteria.groups() {
+        stmt.add_group_by([projection_expr::<E>(dialect, projection)]);
+    }
+
+    for (name, descending) in criteria.alias_orders() {
+        let order = if *descending { Order::Desc } else { Order::Asc };
+        stmt.order_by(alias(name), order);
+    }
+
+    let (sql, params) = dialect.build_query(&stmt);
+    Prepared { sql, params: params.0, route }
+}
+
+/// `SELECT <model columns>` under a [`Criteria`]'s filters, joins and paging.
 pub fn select_matching<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Prepared {
     let mut stmt = select_columns::<E>();
     let route = apply_criteria::<E>(&mut stmt, criteria, true);
@@ -219,6 +302,16 @@ fn apply_criteria<E: Entity>(
         let on =
             Expr::col((alias(E::table()), alias(local))).equals((alias(table), alias(foreign)));
         stmt.join(JoinType::InnerJoin, alias(table), on);
+    }
+
+    for (table, local, foreign, kind) in criteria.typed_joins() {
+        let on =
+            Expr::col((alias(E::table()), alias(local))).equals((alias(table), alias(foreign)));
+        let join = match kind {
+            JoinKind::Inner => JoinType::InnerJoin,
+            JoinKind::Left => JoinType::LeftJoin,
+        };
+        stmt.join(join, alias(table), on);
     }
 
     let mut condition = Cond::all();

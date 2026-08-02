@@ -230,8 +230,8 @@ pub mod prelude {
     pub use rainier_validation::{field, FormRequest, Rule, RuleSet, Validated, Validator};
 
     pub use rainier_database::{
-        BelongsTo, BelongsToMany, Criteria, Database, EntityRepository, HasMany, HasOne, Model,
-        Paginated, Related, RelatedCounts, Relation, Repository,
+        BelongsTo, BelongsToMany, Criteria, Database, DatePart, EntityRepository, HasMany, HasOne,
+        JoinKind, Model, Paginated, Projection, Related, RelatedCounts, Relation, Repository,
     };
     pub use rainier_orm::Entity;
 

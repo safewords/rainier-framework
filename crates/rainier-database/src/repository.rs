@@ -27,11 +27,12 @@ use rainier_orm::sea_query::Value;
 use rainier_support::{Error, Result};
 
 use crate::connection::Database;
-use crate::criteria::Criteria;
+use crate::criteria::{Criteria, Projection};
 use crate::model::{Created, Creating, Deleted, Deleting, Model, Updated, Updating};
 use crate::pagination::Paginated;
 use crate::relation::{PivotQuery, RelationKey};
 use crate::row::Cell;
+use crate::row::{ColumnRequest, OwnedRow};
 use crate::statement;
 
 /// Read and write access to one model's rows.
@@ -63,6 +64,20 @@ pub trait Repository<M: Model>: Send + Sync + 'static {
 
     /// How many rows match `criteria`, ignoring its paging.
     async fn count_matching(&self, criteria: Criteria) -> Result<u64>;
+
+    /// Run an aggregate query and return its rows as selected.
+    ///
+    /// For a `criteria` carrying [`select`](Criteria::select) projections and
+    /// usually [`group_by`](Criteria::group_by). The result is **not** decoded
+    /// into the entity — the columns are whatever was projected, read by the
+    /// alias each was given.
+    ///
+    /// This exists so an application never has to drop to raw SQL for a report.
+    /// Raw SQL in a handler is a query nothing type-checks, and it silently
+    /// commits to one dialect: `MONTH(x)` is MySQL's spelling and simply does
+    /// not exist in SQLite, so a query written that way works in production and
+    /// fails in the test suite.
+    async fn aggregate(&self, criteria: Criteria) -> Result<Vec<OwnedRow>>;
 
     /// One page of rows matching `criteria`.
     async fn paginate_matching(
@@ -264,6 +279,18 @@ impl<M: Model> Repository<M> for EntityRepository<M> {
         self.db.fetch_all(statement::select_matching::<M>(self.db.dialect(), &criteria)).await
     }
 
+    async fn aggregate(&self, criteria: Criteria) -> Result<Vec<OwnedRow>> {
+        let requests: Vec<ColumnRequest> = criteria
+            .projections()
+            .iter()
+            .map(|(projection, name)| ColumnRequest::new(name.clone(), column_type_of(projection)))
+            .collect();
+
+        self.db
+            .fetch(statement::select_aggregate::<M>(self.db.dialect(), &criteria), requests)
+            .await
+    }
+
     async fn first_matching(&self, criteria: Criteria) -> Result<Option<M>> {
         let criteria = criteria.limit(1);
         self.db.fetch_one(statement::select_matching::<M>(self.db.dialect(), &criteria)).await
@@ -446,6 +473,23 @@ impl<M> std::fmt::Debug for EntityRepository<M> {
             .field("model", &std::any::type_name::<M>())
             .field("hooks", &self.events.is_some())
             .finish()
+    }
+}
+
+/// What a projection's column comes back as.
+///
+/// Counts and sums are integral; a date part is an integer by construction (the
+/// SQLite branch casts for exactly that reason); an average is not. A plain
+/// column keeps its own type, which the driver reports.
+fn column_type_of(projection: &Projection) -> rainier_orm::ColumnType {
+    use rainier_orm::ColumnType;
+
+    match projection {
+        Projection::CountAll | Projection::Count(_) => ColumnType::BigInt,
+        Projection::Sum(_) | Projection::CountWhenIn(..) => ColumnType::BigInt,
+        Projection::DatePart(..) => ColumnType::Int,
+        Projection::Avg(_) => ColumnType::Double,
+        Projection::Column(_) | Projection::Min(_) | Projection::Max(_) => ColumnType::Text,
     }
 }
 

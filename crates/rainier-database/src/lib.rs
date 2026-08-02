@@ -77,7 +77,7 @@ pub mod statement;
 pub mod testing;
 
 pub use connection::{Connection, Database};
-pub use criteria::{Constraint, Criteria};
+pub use criteria::{Constraint, Criteria, DatePart, JoinKind, Projection};
 pub use factory::{Factory, HasFactory};
 pub use migrator::{Down, Migration, Migrator, Step};
 pub use model::{Created, Creating, Deleted, Deleting, Model, Updated, Updating};
