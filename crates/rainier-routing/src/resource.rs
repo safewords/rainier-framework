@@ -106,14 +106,77 @@ impl ResourceAction {
     }
 }
 
-/// Middleware a controller applies to its own actions.
+/// The name of an action a [`ControllerMiddleware`] rule can be scoped to.
 ///
-/// Declared with the actions as an enum and the middleware as a value.
+/// A name rather than a [`ResourceAction`], because not every controller is a
+/// RESTful resource. A controller with actions like `search` or `export` has
+/// nothing to say in a seven-variant enum, and scoping rules on that enum
+/// leaves those actions unable to carry a rule at all.
+///
+/// [`ResourceAction`] converts into one, so a resource controller keeps
+/// naming its actions with the enum and gets the compiler's spell-checking.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ActionName(String);
+
+impl ActionName {
+    /// The name as written.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<ResourceAction> for ActionName {
+    fn from(action: ResourceAction) -> Self {
+        ActionName(action.as_str().to_string())
+    }
+}
+
+impl From<&str> for ActionName {
+    fn from(name: &str) -> Self {
+        ActionName(name.to_string())
+    }
+}
+
+impl From<String> for ActionName {
+    fn from(name: String) -> Self {
+        ActionName(name)
+    }
+}
+
+/// Which actions one rule covers.
+///
+/// Held as the rule that was written rather than as the set of actions it
+/// resolved to, which is what lets [`ControllerMiddleware::except`] work on a
+/// controller whose full action list the framework never sees: "everything but
+/// these" is answerable for an action nobody enumerated, where "all seven minus
+/// these" is not.
+#[derive(Clone, Debug)]
+enum Scope {
+    Always,
+    Only(Vec<ActionName>),
+    Except(Vec<ActionName>),
+}
+
+impl Scope {
+    fn covers(&self, action: &ActionName) -> bool {
+        match self {
+            Scope::Always => true,
+            Scope::Only(actions) => actions.contains(action),
+            Scope::Except(actions) => !actions.contains(action),
+        }
+    }
+}
+
+/// Middleware a controller applies to its own actions.
 ///
 /// Declaring it on the controller rather than at the route puts the rule next
 /// to the code it protects: someone adding a `destroy` action reads the guard
 /// in the same file, instead of having to remember that a route file three
 /// directories away is what stops it being public.
+///
+/// Actions are named by [`ResourceAction`] on a resource controller, or by
+/// plain name on one that is not a resource — the two mix freely, because both
+/// convert into [`ActionName`].
 ///
 /// ```
 /// use rainier_routing::{ControllerMiddleware, ResourceAction};
@@ -131,9 +194,23 @@ impl ResourceAction {
 /// assert_eq!(middleware.for_action(ResourceAction::Index).len(), 1);
 /// assert_eq!(middleware.for_action(ResourceAction::Store).len(), 2);
 /// ```
+///
+/// A controller whose actions are not the RESTful seven scopes by name, which
+/// is the same rule written the same way:
+///
+/// ```
+/// use rainier_routing::ControllerMiddleware;
+/// # use rainier_middleware::ThrottleRequests;
+///
+/// let middleware = ControllerMiddleware::new()
+///     .except(["show", "search"], ThrottleRequests::per_minute(20));
+///
+/// assert!(middleware.for_action("search").is_empty());
+/// assert_eq!(middleware.for_action("export").len(), 1);
+/// ```
 #[derive(Default, Clone, Debug)]
 pub struct ControllerMiddleware {
-    entries: Vec<(Vec<ResourceAction>, MiddlewareStack)>,
+    entries: Vec<(Scope, MiddlewareStack)>,
 }
 
 impl ControllerMiddleware {
@@ -144,17 +221,18 @@ impl ControllerMiddleware {
 
     /// Apply to every action.
     pub fn always(mut self, middleware: impl IntoMiddlewareStack) -> Self {
-        self.entries.push((ResourceAction::ALL.to_vec(), middleware.into_middleware_stack()));
+        self.entries.push((Scope::Always, middleware.into_middleware_stack()));
         self
     }
 
     /// Apply to the listed actions only.
     pub fn only(
         mut self,
-        actions: impl IntoIterator<Item = ResourceAction>,
+        actions: impl IntoIterator<Item = impl Into<ActionName>>,
         middleware: impl IntoMiddlewareStack,
     ) -> Self {
-        self.entries.push((actions.into_iter().collect(), middleware.into_middleware_stack()));
+        let actions = actions.into_iter().map(Into::into).collect();
+        self.entries.push((Scope::Only(actions), middleware.into_middleware_stack()));
         self
     }
 
@@ -163,23 +241,28 @@ impl ControllerMiddleware {
     /// The safer default of the two: a new action added later is guarded unless
     /// it is named here, rather than unguarded unless it is named in an
     /// [`only`](Self::only).
+    ///
+    /// That guarantee is the reason this stores the exclusion rather than the
+    /// inclusion it would expand to. An action added next year is covered
+    /// because it is not in the list, without anyone having to re-register
+    /// anything — which is precisely the case the safer default exists for.
     pub fn except(
         mut self,
-        actions: impl IntoIterator<Item = ResourceAction>,
+        actions: impl IntoIterator<Item = impl Into<ActionName>>,
         middleware: impl IntoMiddlewareStack,
     ) -> Self {
-        let excluded: Vec<ResourceAction> = actions.into_iter().collect();
-        let included = ResourceAction::ALL.into_iter().filter(|a| !excluded.contains(a)).collect();
-
-        self.entries.push((included, middleware.into_middleware_stack()));
+        let actions = actions.into_iter().map(Into::into).collect();
+        self.entries.push((Scope::Except(actions), middleware.into_middleware_stack()));
         self
     }
 
     /// The stack for one action, in declaration order.
-    pub fn for_action(&self, action: ResourceAction) -> MiddlewareStack {
+    pub fn for_action(&self, action: impl Into<ActionName>) -> MiddlewareStack {
+        let action = action.into();
+
         self.entries
             .iter()
-            .filter(|(actions, _)| actions.contains(&action))
+            .filter(|(scope, _)| scope.covers(&action))
             .fold(MiddlewareStack::new(), |stack, (_, middleware)| {
                 stack.with_stack(middleware.clone())
             })
@@ -458,6 +541,45 @@ mod tests {
 
         let write = compiled.dispatch(request(Method::POST, "/posts")).await;
         assert_eq!(tags(&write), vec!["writes", "every"]);
+    }
+
+    #[test]
+    fn a_rule_can_be_scoped_to_an_action_that_is_not_one_of_the_seven() {
+        // A controller that is not a RESTful resource still has actions, and
+        // they still need guarding. Naming them as strings is the whole reason
+        // scoping is not expressed as the enum.
+        let middleware = ControllerMiddleware::new()
+            .only(["search", "export"], Tag("throttle"))
+            .always(Tag("headers"));
+
+        assert_eq!(middleware.for_action("search").len(), 2);
+        assert_eq!(middleware.for_action("export").len(), 2);
+        assert_eq!(middleware.for_action("show").len(), 1);
+    }
+
+    #[test]
+    fn except_on_a_named_action_covers_one_the_framework_never_saw() {
+        // The case that decided how `Scope` is stored. `except` used to expand
+        // to "all seven minus these", which answers nothing for an action that
+        // is not one of the seven — a controller action named here would have
+        // come back unguarded, which is the exact failure `except` exists to
+        // prevent.
+        let middleware = ControllerMiddleware::new().except(["public_read"], Tag("guard"));
+
+        assert!(middleware.for_action("public_read").is_empty());
+        assert_eq!(middleware.for_action("destroy_everything").len(), 1);
+    }
+
+    #[test]
+    fn the_two_ways_of_naming_an_action_agree() {
+        // `ResourceAction::Index` and `"index"` are the same action, so a rule
+        // written with one must bind a lookup written with the other.
+        let middleware = ControllerMiddleware::new().only([ResourceAction::Index], Tag("guard"));
+
+        assert_eq!(middleware.for_action("index").len(), 1);
+
+        let by_name = ControllerMiddleware::new().only(["index"], Tag("guard"));
+        assert_eq!(by_name.for_action(ResourceAction::Index).len(), 1);
     }
 
     #[test]

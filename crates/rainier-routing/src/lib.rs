@@ -59,7 +59,7 @@ pub mod router;
 pub mod url;
 
 pub use handler::{Handler, IntoRouteHandler, Req, RouteHandler};
-pub use resource::{ControllerMiddleware, ResourceAction, ResourceController};
+pub use resource::{ActionName, ControllerMiddleware, ResourceAction, ResourceController};
 pub use route::{ParamConstraint, Route, Segment};
 pub use router::{not_found, CompiledRouter, GroupAttributes, MatchedRoute, RouteSummary, Router};
 pub use url::UrlGenerator;

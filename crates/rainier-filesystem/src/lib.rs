@@ -131,13 +131,23 @@ impl Storage {
         self
     }
 
-    /// The disk registered under `name`.
+    /// The disk registered under `name` — `Storage::disk("content")`.
+    ///
+    /// Named for the framework this borrows from, where the equivalent reads
+    /// `Storage::disk('content')->get($path)`. An earlier spelling of this was
+    /// `on`, purely because `disk` was taken by the default-disk accessor
+    /// (now [`default_disk`](Self::default_disk)); that traded a familiar name
+    /// for an unfamiliar one to avoid a rename, which is the wrong way round.
     ///
     /// `None` rather than a fallback to the default: an operation aimed at a
     /// disk that was never configured must not quietly land somewhere else. A
     /// delete is the case that decides this — silently deleting from the wrong
     /// bucket is unrecoverable, and reads the same as success.
-    pub fn on(&self, name: &str) -> Option<Storage> {
+    ///
+    /// The `Option` is this language's spelling of the exception the original
+    /// throws for an unconfigured disk, not a softening of it: both refuse to
+    /// guess, and this one is refused at compile time rather than at runtime.
+    pub fn disk(&self, name: &str) -> Option<Storage> {
         self.named.get(name).map(|disk| Storage::new(Arc::clone(disk)))
     }
 
@@ -161,8 +171,12 @@ impl Storage {
         Self::new(Arc::new(MemoryFilesystem::new()))
     }
 
-    /// The filesystem underneath.
-    pub fn disk(&self) -> &Arc<dyn Filesystem> {
+    /// The filesystem underneath — the *default* disk, not a named one.
+    ///
+    /// Spelled out rather than left as a bare `disk()`, so that the name a
+    /// caller reaches for by habit ([`disk`](Self::disk), taking a name) is the
+    /// one that asks which disk it means.
+    pub fn default_disk(&self) -> &Arc<dyn Filesystem> {
         &self.disk
     }
 
@@ -195,7 +209,7 @@ mod tests {
         let storage = Storage::memory().with_disk("content", Arc::new(MemoryFilesystem::new()));
 
         assert!(storage.has_disk("content"));
-        assert!(storage.on("content").is_some());
+        assert!(storage.disk("content").is_some());
     }
 
     #[test]
@@ -207,7 +221,7 @@ mod tests {
         // like success.
         let storage = Storage::memory().with_disk("content", Arc::new(MemoryFilesystem::new()));
 
-        assert!(storage.on("content-paid").is_none());
+        assert!(storage.disk("content-paid").is_none());
         assert!(!storage.has_disk("content-paid"));
     }
 
@@ -217,11 +231,11 @@ mod tests {
             .with_disk("content", Arc::new(MemoryFilesystem::new()))
             .with_disk("content-paid", Arc::new(MemoryFilesystem::new()));
 
-        storage.on("content").unwrap().put("a.txt", Bytes::from_static(b"public")).await.unwrap();
+        storage.disk("content").unwrap().put("a.txt", Bytes::from_static(b"public")).await.unwrap();
 
-        assert!(storage.on("content").unwrap().exists("a.txt").await.unwrap());
+        assert!(storage.disk("content").unwrap().exists("a.txt").await.unwrap());
         assert!(
-            !storage.on("content-paid").unwrap().exists("a.txt").await.unwrap(),
+            !storage.disk("content-paid").unwrap().exists("a.txt").await.unwrap(),
             "the disks must not share storage"
         );
     }
