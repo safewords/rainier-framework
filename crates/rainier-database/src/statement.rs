@@ -514,7 +514,7 @@ pub fn upsert_with<E: Entity>(dialect: Dialect, entity: &E, plan: &Upsert) -> Re
 ///
 /// The key comes off the entity, so a composite one is `AND`-ed together in full
 /// and no caller can supply a partial one — see
-/// [`row_key_condition`](rainier_orm::row_key_condition) for why that makes this
+/// [`rainier_orm::row_key_condition`] for why that makes this
 /// infallible.
 pub fn update<E: Entity>(dialect: Dialect, entity: &E) -> Prepared {
     let route = key_route::<E>(&entity.pk_values());

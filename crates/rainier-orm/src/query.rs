@@ -417,7 +417,7 @@ impl<E: Entity> Query<E> {
     /// two racing callers can both insert; add a `UNIQUE` constraint on the
     /// lookup column(s) if you need the database to arbitrate.
     ///
-    /// [`SingleKey`] because of the re-read: after inserting, it fetches the row
+    /// [`SingleKey`](crate::SingleKey) because of the re-read: after inserting, it fetches the row
     /// back by the key the database generated, and a generated key is one
     /// column. The rest of this builder is key-agnostic — a composite-key entity
     /// spells this out as [`first`](Self::first) followed by

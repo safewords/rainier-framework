@@ -190,7 +190,7 @@ where
     Ok(exec.execute_routed(route, &sql, params).await?.rows_affected)
 }
 
-/// Insert `entity`, resolving a collision with an [`Upsert`] plan.
+/// Insert `entity`, resolving a collision with an [`Upsert`](crate::Upsert) plan.
 ///
 /// The general form of [`upsert`], and the one that can express an
 /// **accumulating counter**: `Upsert::on(…).increment(["n"])` renders
@@ -210,7 +210,7 @@ where
 ///
 /// # Errors
 ///
-/// If the plan cannot be rendered — see [`Upsert::to_on_conflict`]. The check
+/// If the plan cannot be rendered — see [`Upsert::to_on_conflict`](crate::Upsert::to_on_conflict). The check
 /// happens before anything is sent, so a rejected plan leaves the table
 /// untouched.
 pub fn upsert_with<'a, E, X>(

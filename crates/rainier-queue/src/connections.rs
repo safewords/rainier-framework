@@ -859,7 +859,10 @@ impl SqsConnection {
     ///
     /// # Errors
     ///
-    /// When the declaration does not [validate](Self::validate).
+    /// When the declaration does not validate — a missing queue URL, or half a
+    /// credential pair. Plain text rather than a link: the check is private, and
+    /// a doc link to a private item fails the documentation build rather than
+    /// rendering as nothing.
     pub async fn build(&self) -> Result<crate::sqs::SqsQueue> {
         let queue = crate::sqs::SqsQueue::new(&self.connector().await?, &self.queue_url);
 
