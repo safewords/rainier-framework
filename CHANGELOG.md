@@ -12,6 +12,47 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Disks declared in configuration** (`rainier-filesystem`). A `filesystems`
+  section — a `default` naming one of a `disks` map, each entry naming **its
+  own** driver and settings — deserialises into `Disks` and builds a `Storage`
+  in one call: `Disks::new("uploads").with("uploads", DiskConfig::local(…))
+  .with("archive", S3Disk::new(…).endpoint(…))`, or `Rainier::with_disks(…)`,
+  or the section itself. `keys::FILESYSTEMS` reads it; `default_config` seeds
+  one `local` disk under `<base>/storage/app`, so the default boot is what it
+  was.
+
+  Each disk is built from its own declaration, which is the point. The previous
+  arrangement had a consuming application loop over a hardcoded list building
+  every named disk from **one** connector, and that cannot express two disks on
+  two services: the second gets the right bucket name pointed at the wrong host.
+  It does not raise — it reads an empty prefix, which is indistinguishable from
+  a bucket that is genuinely empty. `Disks::build` has no shared connector to
+  inherit from, and the test that pins it asserts on the region each built
+  client will sign for, with the by-hand shared-connector build beside it as a
+  negative control.
+
+  An s3 disk's credentials default to the **ambient chain** — the SDK's
+  discovered, refreshed provider chain — and take an explicit `key`/`secret`
+  pair for a service that has no chain (R2, MinIO, B2). That default is the safe
+  direction: a disk that should have named a pair fails to authenticate, where
+  the reverse authenticates successfully against somebody else's bucket. Half a
+  pair is refused rather than silently falling back to the chain, an explicit
+  pair without a `region` is refused rather than signing for a guessed one, and
+  no `Debug` anywhere renders a credential.
+
+  A declaration is checked when it is read, not when a write lands somewhere
+  unexpected: `driver` is required, a setting the chosen driver does not use
+  (`bucket` on a `local` disk) is an error rather than a dropped key, an unknown
+  setting is a typo rather than a comment, and a `default` naming an undeclared
+  disk stops the boot instead of falling back. `Storage::disk(name)` still
+  answers `None` for an unregistered disk and still never falls back.
+
+  `Filesystem::as_any` is new and required — one line, `self`, in each driver —
+  with `Storage::as_driver::<T>()` over it. Once disks come from configuration
+  nobody holds the concrete value, so there was no route back to
+  `S3Filesystem::client()` for the operations the port does not carry: a
+  presigned URL, a multipart upload, object tagging.
+
 - **Composite primary keys** (`rainier-orm`). `#[derive(Entity)]` takes more
   than one `#[orm(pk)]` field, so a join table or a per-bucket aggregate keyed
   `(parent_id, slot)` can be modelled instead of dropped to raw SQL. The key is

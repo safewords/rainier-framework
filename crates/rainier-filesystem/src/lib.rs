@@ -73,10 +73,40 @@
 //! The local driver adds a second guard — the resolved parent must canonicalise
 //! to somewhere inside the root — because a symlink inside the root can point
 //! out of it and `..` alone does not catch that.
+//!
+//! ## Declaring disks rather than wiring them
+//!
+//! [`Storage`] holds a default disk and a map of named ones. Populating that map
+//! by hand works until two disks live on **different backends**, at which point
+//! the loop that builds them all from one connector hands the second disk the
+//! right bucket name pointed at the wrong service — and that reads an empty
+//! prefix rather than raising, so it looks like an empty bucket.
+//!
+//! [`Disks`] is the declarative form, where every disk carries its own driver
+//! and its own settings and is built from those alone:
+//!
+//! ```
+//! use rainier_filesystem::{DiskConfig, Disks};
+//!
+//! # #[tokio::main] async fn main() -> rainier_support::Result<()> {
+//! let storage = Disks::new("uploads")
+//!     .with("uploads", DiskConfig::local("storage/app"))
+//!     .with("scratch", DiskConfig::memory())
+//!     .build()
+//!     .await?;
+//!
+//! assert_eq!(storage.driver(), "local");
+//! # Ok(()) }
+//! ```
+//!
+//! It deserialises from a configuration tree, so the same set can come from a
+//! `filesystems` section instead. See [the module](disks) for the wire shape and
+//! for what a declaration refuses.
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod disks;
 pub mod driver;
 pub mod filesystem;
 pub mod local;
@@ -85,6 +115,7 @@ pub mod memory;
 #[cfg(feature = "s3")]
 pub mod s3;
 
+pub use disks::{DiskConfig, Disks, LocalDisk, S3Credentials, S3Disk};
 pub use driver::FilesystemDriver;
 pub use filesystem::{normalise_path, normalise_prefix, Filesystem, FilesystemExt, Metadata};
 pub use local::LocalFilesystem;
@@ -121,11 +152,19 @@ impl Storage {
 
     /// Register a disk under a name.
     ///
-    /// ```ignore
-    /// let storage = Storage::new(default)
-    ///     .with_disk("content", content)
-    ///     .with_disk("content-paid", paid);
     /// ```
+    /// # use std::sync::Arc;
+    /// # use rainier_filesystem::{MemoryFilesystem, Storage};
+    /// let storage = Storage::memory()
+    ///     .with_disk("uploads", Arc::new(MemoryFilesystem::new()))
+    ///     .with_disk("archive", Arc::new(MemoryFilesystem::new()));
+    /// ```
+    ///
+    /// The imperative form. It takes an already-built disk, so a caller
+    /// registering several is the one deciding what each is built from — and a
+    /// loop that builds them all from one connector is how a disk ends up with
+    /// the right bucket name pointed at the wrong service. [`Disks`] is the
+    /// declarative form that cannot express that.
     pub fn with_disk(mut self, name: impl Into<String>, disk: Arc<dyn Filesystem>) -> Self {
         self.named.insert(name.into(), disk);
         self
@@ -183,6 +222,29 @@ impl Storage {
     /// The driver's name — `"local"`, `"s3"`, `"memory"`.
     pub fn driver(&self) -> &str {
         self.disk.name()
+    }
+
+    /// This disk as a concrete driver, or `None` if it is a different one.
+    ///
+    /// The port covers what every backend can do; a presigned URL, a multipart
+    /// upload and object tagging are not on it, and reaching them means getting
+    /// back to [`S3Filesystem`] itself. That used to mean keeping the value you
+    /// constructed — which stops being possible the moment disks are
+    /// [declared in configuration](Disks) and nobody constructs one.
+    ///
+    /// ```
+    /// # use rainier_filesystem::{MemoryFilesystem, LocalFilesystem, Storage};
+    /// let storage = Storage::memory();
+    ///
+    /// assert!(storage.as_driver::<MemoryFilesystem>().is_some());
+    /// assert!(storage.as_driver::<LocalFilesystem>().is_none());
+    /// ```
+    ///
+    /// `None` rather than a panic, for the same reason [`disk`](Self::disk)
+    /// answers `None`: which driver a disk is configured with is a deployment's
+    /// decision, and code that asks has to be able to cope with the answer.
+    pub fn as_driver<T: Filesystem>(&self) -> Option<&T> {
+        self.disk.as_any().downcast_ref::<T>()
     }
 }
 

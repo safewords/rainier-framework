@@ -3345,6 +3345,8 @@ dependencies = [
  "chrono",
  "rainier-drivers",
  "rainier-support",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

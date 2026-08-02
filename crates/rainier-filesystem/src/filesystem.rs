@@ -28,6 +28,29 @@ pub trait Filesystem: Send + Sync + 'static {
     /// A label for diagnostics — `"local"`, `"s3"`, `"memory"`.
     fn name(&self) -> &str;
 
+    /// This driver as its concrete type, for the operations the port does not
+    /// expose.
+    ///
+    /// The port is deliberately the small set every backend can do, so a
+    /// presigned URL, a multipart upload or object tagging is reachable only
+    /// through [`S3Filesystem::client`](crate::S3Filesystem::client) — which
+    /// used to mean *keep the concrete value you constructed*. Once disks are
+    /// [declared in configuration](crate::Disks) nobody constructs them, so
+    /// without this there is no route back and the only workaround is to build
+    /// a second client beside the one the disk already holds.
+    ///
+    /// Required rather than defaulted: a default would have to answer with
+    /// something that downcasts to nothing, and a driver that silently refuses
+    /// to be recognised is worse than one that does not compile. It is one
+    /// line — `self` — in every implementation.
+    ///
+    /// ```
+    /// # use rainier_filesystem::{Filesystem, MemoryFilesystem, Storage};
+    /// let storage = Storage::memory();
+    /// assert!(storage.as_driver::<MemoryFilesystem>().is_some());
+    /// ```
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Read a file. `None` if it is not there.
     ///
     /// A missing file is **not an error**: "read it if it exists" is the common

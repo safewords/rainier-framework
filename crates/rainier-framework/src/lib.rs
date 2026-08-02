@@ -214,8 +214,8 @@ pub mod prelude {
     pub use rainier_cache::{Cache as CacheContract, CacheDriver, CacheExt as _, CacheManager};
     pub use rainier_crypt::{EncrypterExt as _, Encryption, SignerExt as _};
     pub use rainier_filesystem::{
-        Filesystem, FilesystemDriver, FilesystemExt as _, LocalFilesystem,
-        Storage as StorageManager,
+        DiskConfig, Disks, Filesystem, FilesystemDriver, FilesystemExt as _, LocalDisk,
+        LocalFilesystem, S3Disk, Storage as StorageManager,
     };
     pub use rainier_http_client::{Backoff, Http};
     pub use rainier_middleware::{

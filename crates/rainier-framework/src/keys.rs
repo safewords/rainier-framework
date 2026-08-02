@@ -76,6 +76,7 @@
 use rainier_cache::CacheDriver;
 use rainier_config::{config_keys, AppEnv};
 use rainier_crypt::{CryptScheme, HashDriver};
+use rainier_filesystem::Disks;
 use rainier_mail::{MailDriver, MailEncryption};
 use rainier_queue::QueueDriver;
 use rainier_session::SessionDriver;
@@ -223,6 +224,44 @@ config_keys! {
 
     /// The database DSN — `sqlite::memory:`, `mysql://…`, `postgres://…`.
     pub DATABASE_URL: String = "database.url";
+
+    // --- filesystems -------------------------------------------------------
+
+    /// Every disk the application declares, and which of them is the default.
+    ///
+    /// A whole section rather than a scalar, because a disk is not one setting:
+    /// it names its own driver and its own bucket, endpoint, region and
+    /// credentials, and two disks on two services have nothing to share. The
+    /// version of this that was a single driver plus one set of connection
+    /// settings could not express the second disk at all, and building it from
+    /// the first one's connector gave it the right bucket name pointed at the
+    /// wrong host.
+    ///
+    /// ```
+    /// use rainier_framework::config::Config;
+    /// use rainier_framework::filesystem::{DiskConfig, Disks};
+    /// use rainier_framework::keys;
+    ///
+    /// let config = Config::new();
+    /// config.set(keys::FILESYSTEMS, Disks::new("uploads")
+    ///     .with("uploads", DiskConfig::local("storage/app"))).unwrap();
+    ///
+    /// assert_eq!(config.string(keys::FILESYSTEM_DEFAULT).as_deref(), Some("uploads"));
+    /// ```
+    ///
+    /// The framework seeds one `local` disk under `storage/app`, so a fresh
+    /// clone has working storage; an application adds its own with
+    /// [`Config::merge`](rainier_config::Config::merge) or replaces the section
+    /// outright.
+    pub FILESYSTEMS: Disks = "filesystems";
+
+    /// Which declared disk [`Storage`](rainier_filesystem::Storage) uses when a
+    /// call does not name one.
+    ///
+    /// A disk that is not declared is a **boot failure**, not a fallback to the
+    /// framework's default: a write aimed at a disk nobody configured must not
+    /// quietly land in a directory that goes away with the container.
+    pub FILESYSTEM_DEFAULT: String = "filesystems.default";
 
     // --- cache -------------------------------------------------------------
 
@@ -394,6 +433,7 @@ mod tests {
             ("SERVER", SERVER_REQUEST_TIMEOUT_SECS.path()),
             ("SERVER", SERVER_COMPRESSION.path()),
             ("DATABASE", DATABASE_URL.path()),
+            ("FILESYSTEMS", FILESYSTEM_DEFAULT.path()),
             ("HASHING", HASH_DRIVER.path()),
             ("CACHE", CACHE_DRIVER.path()),
             ("CACHE", CACHE_REDIS_URL.path()),
@@ -449,6 +489,8 @@ mod tests {
             SERVER_REQUEST_TIMEOUT_SECS.path(),
             SERVER_COMPRESSION.path(),
             DATABASE_URL.path(),
+            FILESYSTEMS.path(),
+            FILESYSTEM_DEFAULT.path(),
             HASH_DRIVER.path(),
             CACHE_DRIVER.path(),
             CACHE_REDIS_URL.path(),

@@ -293,8 +293,44 @@ impl Rainier {
     ///
     /// Defaults to `<base>/storage/app`, so `Storage::instance()` works on a
     /// fresh clone without configuration.
+    ///
+    /// Takes a built [`Storage`], so it is the escape hatch — a test's memory
+    /// disk, or a disk on a driver the framework does not ship. Declaring disks
+    /// is [`with_disks`](Self::with_disks) or the `filesystems` section, both of
+    /// which build each disk from its own settings.
     pub fn with_storage(mut self, storage: Storage) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Declare the disks, and let the framework build them.
+    ///
+    /// ```no_run
+    /// # use rainier_framework::Rainier;
+    /// use rainier_framework::filesystem::{DiskConfig, Disks, S3Disk};
+    ///
+    /// # #[tokio::main] async fn main() -> rainier_support::Result<()> {
+    /// let app = Rainier::new(".")
+    ///     .with_disks(
+    ///         Disks::new("uploads")
+    ///             .with("uploads", DiskConfig::local("storage/app"))
+    ///             .with("archive", S3Disk::new("archive-bucket").region("us-east-1")),
+    ///     )
+    ///     .boot()
+    ///     .await?;
+    /// # let _ = app; Ok(()) }
+    /// ```
+    ///
+    /// Written into the configuration tree rather than held aside, so
+    /// `config.get(keys::FILESYSTEMS)` answers with what the application
+    /// actually declared and a later
+    /// [`configure`](Self::configure) can still add to it. A declaration that
+    /// cannot be built — a default naming a disk nobody declared, half a key
+    /// pair — fails at [`boot`](Self::boot).
+    pub fn with_disks(mut self, disks: rainier_filesystem::Disks) -> Self {
+        if let Err(e) = self.config.set(keys::FILESYSTEMS, disks) {
+            self.deferred = self.deferred.or(Some(e));
+        }
         self
     }
 
@@ -468,10 +504,13 @@ impl Rainier {
                 rainier_notify::Notifier::new().with(rainier_notify::LogChannel)
             }),
         );
-        app.instance(
-            self.storage
-                .unwrap_or_else(|| Storage::local(self.base_path.join("storage").join("app"))),
-        );
+        // An explicit `with_storage` wins; otherwise the declared disks are
+        // built, each from its own settings.
+        let storage = match self.storage {
+            Some(storage) => storage,
+            None => build_storage(app.resolve::<Config>()?.as_ref(), &self.base_path).await?,
+        };
+        app.instance(storage);
 
         if let Some(database) = self.database {
             app.instance(database);
@@ -596,6 +635,22 @@ fn default_config(env: &Env, base_path: &std::path::Path) -> Result<Config> {
 
     config.set(keys::DATABASE_URL, env.string("DATABASE_URL", "sqlite::memory:"))?;
 
+    // One local disk, under the base path, so a fresh clone has working storage
+    // without a `filesystems` section. An application declares the rest —
+    // `Rainier::with_disks`, or `config.merge("filesystems", …)` — and each of
+    // those disks carries its own driver, bucket, endpoint and credentials.
+    //
+    // The default *name* comes from the environment because which disk a
+    // deployment writes to is a deployment's decision; naming one it never
+    // declared fails at boot rather than falling back to this one.
+    config.set(
+        keys::FILESYSTEMS,
+        rainier_filesystem::Disks::new(env.string("FILESYSTEM_DISK", "local")).with(
+            "local",
+            rainier_filesystem::DiskConfig::local(base_path.join("storage").join("app")),
+        ),
+    )?;
+
     config.set(keys::CACHE_DRIVER, env.setting("CACHE_DRIVER")?)?;
     config.set(keys::CACHE_REDIS_URL, env.string("REDIS_URL", "redis://127.0.0.1:6379/"))?;
     config.set(keys::CACHE_MEMCACHED_URL, env.string("MEMCACHED_URL", "127.0.0.1:11211"))?;
@@ -636,6 +691,30 @@ fn default_config(env: &Env, base_path: &std::path::Path) -> Result<Config> {
     config.set(keys::MAIL_RESEND_KEY, env.string("MAIL_RESEND_KEY", ""))?;
 
     Ok(config)
+}
+
+/// Build the [`Storage`] the application's `filesystems` section declares.
+///
+/// Every disk is built from **its own** declaration, which is the whole reason
+/// this reads a section rather than a driver name and one set of connection
+/// settings: two disks on two services share no endpoint and no credentials,
+/// and building the second from the first's connector gives it the right bucket
+/// name pointed at the wrong host. That does not raise — it reads an empty
+/// prefix, which is indistinguishable from an empty bucket.
+///
+/// A tree with no section at all still gets a working local disk, so a `Config`
+/// assembled by hand — a test, an embedded use — does not have to know this
+/// section exists. A section that *is* there and does not make sense is an
+/// error: `default` naming a disk nobody declared has no safe interpretation.
+async fn build_storage(config: &Config, base_path: &std::path::Path) -> Result<Storage> {
+    if !config.has(keys::FILESYSTEMS) {
+        return Ok(Storage::local(base_path.join("storage").join("app")));
+    }
+
+    // `require` rather than `get`: `get` answers `None` for both "nothing
+    // declared" and "declared, and wrong", and the second must not read as the
+    // first and quietly leave every upload in a container's directory.
+    config.require(keys::FILESYSTEMS)?.build().await
 }
 
 /// The keys encryption and signing use.
@@ -1133,5 +1212,93 @@ mod storage_tests {
     async fn a_traversal_through_the_container_is_still_refused() {
         let storage = app().await.resolve::<Storage>().unwrap();
         assert!(storage.get("../../etc/passwd").await.is_err());
+    }
+
+    // --- disks from configuration -------------------------------------------
+
+    #[tokio::test]
+    async fn the_seeded_section_declares_the_disk_the_default_used_to_be() {
+        // The default boot goes through the declarative path now, and has to
+        // come out the other side with exactly what it came out with before.
+        let app = Rainier::new(".").without_facades().without_tracing().boot().await.unwrap();
+        let config = app.resolve::<Config>().unwrap();
+
+        assert_eq!(config.string(keys::FILESYSTEM_DEFAULT).as_deref(), Some("local"));
+        assert_eq!(app.resolve::<Storage>().unwrap().driver(), "local");
+    }
+
+    #[tokio::test]
+    async fn declared_disks_are_reachable_by_name_after_boot() {
+        let app = Rainier::new(".")
+            .without_facades()
+            .without_tracing()
+            .with_disks(
+                rainier_filesystem::Disks::new("uploads")
+                    .with("uploads", rainier_filesystem::DiskConfig::memory())
+                    .with("archive", rainier_filesystem::DiskConfig::memory()),
+            )
+            .boot()
+            .await
+            .unwrap();
+
+        let storage = app.resolve::<Storage>().unwrap();
+
+        assert_eq!(storage.driver(), "memory");
+        assert!(storage.disk("uploads").is_some());
+        assert!(storage.disk("archive").is_some());
+        // Still no falling back for one nobody declared.
+        assert!(storage.disk("scratch").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_default_naming_an_undeclared_disk_stops_the_boot() {
+        // The alternative is an application whose uploads all went to a
+        // directory that goes away with the container, discovered later.
+        let error = Rainier::new(".")
+            .without_facades()
+            .without_tracing()
+            .with_disks(
+                rainier_filesystem::Disks::new("uploads")
+                    .with("archive", rainier_filesystem::DiskConfig::memory()),
+            )
+            .boot()
+            .await
+            .err()
+            .expect("the default is not declared");
+
+        assert!(error.message().contains("`uploads`"), "{}", error.message());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_section_stops_the_boot_rather_than_reading_as_no_disks() {
+        let error = Rainier::new(".")
+            .without_facades()
+            .without_tracing()
+            .configure(|config| {
+                config.set("filesystems.disks.uploads.driver", "s4").unwrap();
+            })
+            .boot()
+            .await
+            .err()
+            .expect("`s4` is not a driver");
+
+        assert!(error.message().contains("filesystems"), "{}", error.message());
+    }
+
+    #[tokio::test]
+    async fn an_explicit_storage_still_wins_over_the_declared_disks() {
+        let app = Rainier::new(".")
+            .without_facades()
+            .without_tracing()
+            .with_disks(
+                rainier_filesystem::Disks::new("uploads")
+                    .with("uploads", rainier_filesystem::DiskConfig::local("storage/app")),
+            )
+            .with_storage(Storage::new(Arc::new(MemoryFilesystem::new())))
+            .boot()
+            .await
+            .unwrap();
+
+        assert_eq!(app.resolve::<Storage>().unwrap().driver(), "memory");
     }
 }

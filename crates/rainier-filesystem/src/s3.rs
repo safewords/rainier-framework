@@ -78,6 +78,10 @@ impl Filesystem for S3Filesystem {
         "s3"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn get<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<Option<Bytes>>> {
         Box::pin(async move {
             let key = normalise_path(path)?;

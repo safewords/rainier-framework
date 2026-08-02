@@ -439,6 +439,49 @@ mod tests {
     }
 
     #[test]
+    fn deserialises_a_section_whose_keys_are_not_known_in_advance() {
+        // A section shaped like `filesystems` or `database.connections` — a
+        // named map, where the names belong to the application and the
+        // framework only knows the shape of each entry. Nothing in the tree
+        // needs to change to hold one: it is a `serde_json::Value` throughout,
+        // so an arbitrary map is a map.
+        #[derive(serde::Deserialize, PartialEq, Debug)]
+        struct Entry {
+            driver: String,
+        }
+
+        let config = Config::from_value(json!({
+            "section": {
+                "default": "one",
+                "entries": {
+                    "one": { "driver": "a" },
+                    "two": { "driver": "b" },
+                },
+            }
+        }));
+
+        let entries: std::collections::BTreeMap<String, Entry> =
+            config.require("section.entries").unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries["two"], Entry { driver: "b".into() });
+    }
+
+    #[test]
+    fn merge_adds_a_named_entry_without_disturbing_the_ones_already_there() {
+        // How an application adds to a section the framework seeded, rather
+        // than restating the whole thing to keep what was in it.
+        let config = Config::from_value(json!({
+            "section": { "entries": { "one": { "driver": "a" } } }
+        }));
+
+        config.merge("section", json!({ "entries": { "two": { "driver": "b" } } })).unwrap();
+
+        assert_eq!(config.string("section.entries.one.driver").as_deref(), Some("a"));
+        assert_eq!(config.string("section.entries.two.driver").as_deref(), Some("b"));
+    }
+
+    #[test]
     fn a_non_object_root_becomes_empty() {
         let config = Config::from_value(json!("scalar"));
         assert_eq!(config.all(), json!({}));
