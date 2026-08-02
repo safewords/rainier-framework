@@ -13,17 +13,19 @@
 //! ```
 //! use rainier_filesystem::{DiskConfig, Disks, S3Disk};
 //!
-//! # #[tokio::main] async fn main() -> rainier_support::Result<()> {
 //! let disks = Disks::new("uploads")
 //!     .with("uploads", DiskConfig::local("storage/app"))
 //!     .with("archive", S3Disk::new("archive-bucket").region("us-east-1"));
 //!
-//! let storage = disks.build().await?;
-//!
-//! assert_eq!(storage.driver(), "local");
-//! assert!(storage.disk("archive").is_some());
-//! # Ok(()) }
+//! assert_eq!(disks.default_name(), "uploads");
+//! assert!(disks.get("archive").is_some());
 //! ```
+//!
+//! Declaring is separate from building, which is what lets the example above
+//! run anywhere: [`build`](Disks::build) on an `s3` disk needs the `s3` feature
+//! and **fails without it** rather than quietly substituting a local directory.
+//! That is the right behaviour and it makes `build` the wrong thing to put in a
+//! doc example — this one demonstrates the shape, and the tests below build.
 //!
 //! ## The same thing, from the configuration tree
 //!
