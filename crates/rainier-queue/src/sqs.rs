@@ -98,6 +98,21 @@ impl Queue for SqsQueue {
         "sqs"
     }
 
+    /// Send a payload with no job envelope — see [`Queue::push_raw`].
+    ///
+    /// `queue` is ignored: this driver is bound to the one `queue_url` it was
+    /// constructed with, so the destination is already decided. An application
+    /// pushing to a *different* queue builds a second `SqsQueue` for it, which
+    /// is the honest way to say "somewhere else" rather than passing a name
+    /// that would be silently disregarded.
+    fn push_raw<'a>(&'a self, queue: &'a str, payload: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let _ = queue;
+            self.client.send(payload, Duration::ZERO).await?;
+            Ok(())
+        })
+    }
+
     fn push<'a>(&'a self, job: QueuedJob) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let delay = job

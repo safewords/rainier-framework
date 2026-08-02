@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::Utc;
-use rainier_support::{BoxFuture, Result};
+use rainier_support::{BoxFuture, Error, Result};
 
 use crate::job::QueuedJob;
 
@@ -21,6 +21,33 @@ pub trait Queue: Send + Sync + 'static {
 
     /// Enqueue a job.
     fn push<'a>(&'a self, job: QueuedJob) -> BoxFuture<'a, Result<String>>;
+
+    /// Put a payload on a queue **without** a job envelope.
+    ///
+    /// For a queue whose consumer is not this framework. A worker written
+    /// against some other contract — another service, another language —
+    /// expects the message body it was designed for, not a `QueuedJob` wrapper
+    /// it has never heard of, and wrapping one is indistinguishable from
+    /// corrupting it.
+    ///
+    /// The counterpart of Laravel's `Queue::pushRaw`, and needed for the same
+    /// reason: an application that has to hand work to a foreign consumer
+    /// otherwise reaches past the queue abstraction into a driver-specific
+    /// client, which is exactly the coupling the abstraction exists to prevent.
+    ///
+    /// Defaults to an error naming the driver rather than silently pushing an
+    /// enveloped job: a raw push that arrives wrapped would be accepted by the
+    /// queue and rejected by the consumer, which is the least debuggable of the
+    /// available failures.
+    fn push_raw<'a>(&'a self, queue: &'a str, payload: &'a str) -> BoxFuture<'a, Result<()>> {
+        let name = self.name().to_string();
+        let _ = (queue, payload);
+        Box::pin(async move {
+            Err(Error::internal(format!(
+                "the `{name}` queue driver cannot push a raw payload; a consumer outside this                  framework needs one that can"
+            )))
+        })
+    }
 
     /// Reserve the next available job on `queue`, or `None` if there is none.
     fn reserve<'a>(&'a self, queue: &'a str) -> BoxFuture<'a, Result<Option<QueuedJob>>>;
@@ -206,6 +233,20 @@ impl std::fmt::Debug for MemoryQueue {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn a_driver_that_cannot_push_raw_says_so_instead_of_wrapping() {
+        // The failure that matters is the silent one: a raw payload delivered
+        // inside a job envelope is accepted by the queue and rejected by the
+        // foreign consumer that was supposed to read it, which is the least
+        // debuggable outcome available. Refusing names the driver instead.
+        let queue = MemoryQueue::new();
+
+        let error = queue.push_raw("transcode-requests", "{\"job_id\":\"1\"}").await.unwrap_err();
+
+        assert!(error.message().contains("raw payload"), "{}", error.message());
+        assert_eq!(queue.size("transcode-requests").await.unwrap(), 0, "nothing was enqueued");
+    }
     use super::*;
     use crate::job::{Job, JobContext};
     use serde::{Deserialize, Serialize};
