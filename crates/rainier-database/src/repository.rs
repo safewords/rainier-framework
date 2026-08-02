@@ -283,7 +283,9 @@ impl<M: Model> Repository<M> for EntityRepository<M> {
         let requests: Vec<ColumnRequest> = criteria
             .projections()
             .iter()
-            .map(|(projection, name)| ColumnRequest::new(name.clone(), column_type_of(projection)))
+            .map(|(projection, name)| {
+                ColumnRequest::new(name.clone(), column_type_of::<M>(projection))
+            })
             .collect();
 
         self.db
@@ -478,18 +480,50 @@ impl<M> std::fmt::Debug for EntityRepository<M> {
 
 /// What a projection's column comes back as.
 ///
-/// Counts and sums are integral; a date part is an integer by construction (the
-/// SQLite branch casts for exactly that reason); an average is not. A plain
-/// column keeps its own type, which the driver reports.
-fn column_type_of(projection: &Projection) -> rainier_orm::ColumnType {
+/// # Why this consults the entity instead of guessing
+///
+/// `SUM` and `MIN`/`MAX` return the *summed column's own type*, so a fixed
+/// answer is wrong for half of them. Reading `BigInt` off a `SUM` over a
+/// `double` column — a money total, say — decodes a float as an integer and
+/// silently mangles the value, which is worse than failing.
+///
+/// So the column's declared type comes from the entity, which already knows it.
+/// Only the projections whose type is genuinely fixed regardless of input are
+/// hardcoded: a count is integral, and a date part is an integer by
+/// construction (the SQLite branch casts for exactly that reason).
+fn column_type_of<E: rainier_orm::Entity>(projection: &Projection) -> rainier_orm::ColumnType {
     use rainier_orm::ColumnType;
 
+    /// The declared type of one of the entity's own columns.
+    fn declared<E: rainier_orm::Entity>(name: &str) -> Option<ColumnType> {
+        // A qualified `table.column` refers to a joined table this entity knows
+        // nothing about, so there is nothing to look up.
+        if name.contains('.') {
+            return None;
+        }
+        E::columns().iter().find(|c| c.name == name).map(|c| c.ty)
+    }
+
     match projection {
-        Projection::CountAll | Projection::Count(_) => ColumnType::BigInt,
-        Projection::Sum(_) | Projection::CountWhenIn(..) => ColumnType::BigInt,
+        // Fixed regardless of what they read.
+        Projection::CountAll | Projection::Count(_) | Projection::CountWhenIn(..) => {
+            ColumnType::BigInt
+        }
         Projection::DatePart(..) => ColumnType::Int,
+        // A calendar date, which every dialect renders as text here.
+        Projection::DateOf(_) => ColumnType::Text,
+
+        // `AVG` is fractional even over integers.
         Projection::Avg(_) => ColumnType::Double,
-        Projection::Column(_) | Projection::Min(_) | Projection::Max(_) => ColumnType::Text,
+
+        // These carry the column's own type through. Unknown — a joined table,
+        // or a column this entity does not declare — falls back to `Text`,
+        // which every driver can produce and the caller can parse, rather than
+        // to a numeric type that would misread a string.
+        Projection::Sum(c) => declared::<E>(c).unwrap_or(ColumnType::BigInt),
+        Projection::Column(c) | Projection::Min(c) | Projection::Max(c) => {
+            declared::<E>(c).unwrap_or(ColumnType::Text)
+        }
     }
 }
 

@@ -128,6 +128,13 @@ pub enum Projection {
     Column(String),
     /// Part of a date column, extracted per dialect.
     DatePart(DatePart, String),
+    /// A timestamp truncated to its calendar date, per dialect.
+    ///
+    /// Distinct from [`Projection::DatePart`] with [`DatePart::Day`], and the
+    /// difference matters: a day-of-month is 1–31, so grouping by it collapses
+    /// the same day of different months into one bucket. A daily revenue chart
+    /// grouped that way silently adds January to February.
+    DateOf(String),
     /// `COUNT(*)`.
     CountAll,
     /// `COUNT(column)` — nulls excluded, as SQL defines it.
@@ -158,6 +165,7 @@ impl Projection {
             | Projection::Min(c)
             | Projection::Max(c)
             | Projection::Avg(c)
+            | Projection::DateOf(c)
             | Projection::CountWhenIn(c, _) => Some(c),
         }
     }
@@ -191,6 +199,8 @@ pub struct Criteria {
     projections: Vec<(Projection, String)>,
     /// What to group by.
     groups: Vec<Projection>,
+    /// Predicate groups combined with `OR` internally, `AND`-ed with the rest.
+    or_groups: Vec<Vec<Constraint>>,
     /// `(alias, descending)` — ordering by a selected projection's alias.
     alias_orders: Vec<(String, bool)>,
     /// `(column, descending)`.
@@ -321,6 +331,36 @@ impl Criteria {
     pub fn select(mut self, projection: Projection, alias: impl Into<String>) -> Self {
         self.projections.push((projection, alias.into()));
         self
+    }
+
+    /// Add a group of predicates combined with `OR`, `AND`-ed with the rest.
+    ///
+    /// `Criteria`'s own predicates are `AND`-combined, which covers most
+    /// filtering and cannot express "matches either of these" — a search over
+    /// two columns, most obviously. Rather than make every predicate carry a
+    /// combinator, an `OR` is a nested group: the shape it actually has in SQL,
+    /// and impossible to write ambiguously.
+    ///
+    /// ```ignore
+    /// Criteria::new()
+    ///     .where_eq("state", "active")
+    ///     .or_where(|any| {
+    ///         any.where_like("username", "%ada%").where_like("display_name", "%ada%")
+    ///     })
+    /// ```
+    ///
+    /// renders `state = ? AND (username LIKE ? OR display_name LIKE ?)`.
+    pub fn or_where(mut self, group: impl FnOnce(Criteria) -> Criteria) -> Self {
+        let built = group(Criteria::new());
+        if !built.constraints.is_empty() {
+            self.or_groups.push(built.constraints);
+        }
+        self
+    }
+
+    /// The `OR` groups, each `AND`-ed with the top-level predicates.
+    pub fn or_groups(&self) -> &[Vec<Constraint>] {
+        &self.or_groups
     }
 
     /// `GROUP BY projection`.

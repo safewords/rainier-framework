@@ -101,3 +101,43 @@ fn without_projections_nothing_changes_for_existing_callers() {
     assert!(rendered.to_uppercase().contains("SELECT"), "{rendered}");
     assert!(!rendered.to_uppercase().contains("GROUP BY"), "{rendered}");
 }
+
+#[test]
+fn a_calendar_date_is_not_a_day_of_month() {
+    // `DateOf` truncates to YYYY-MM-DD; `DatePart(Day)` extracts 1–31. Grouping
+    // a daily chart by the latter silently adds January's 3rd to February's.
+    let by_date = Criteria::new()
+        .select(Projection::DateOf("created_at".into()), "day")
+        .group_by(Projection::DateOf("created_at".into()));
+
+    let mysql = sql(Dialect::MySql, &by_date).to_uppercase();
+    assert!(mysql.contains("CAST") && mysql.contains("DATE"), "{mysql}");
+
+    let sqlite = sql(Dialect::Sqlite, &by_date);
+    assert!(sqlite.contains("date("), "{sqlite}");
+}
+
+#[test]
+fn an_or_group_is_parenthesised_and_anded_with_the_rest() {
+    // The precedence is the whole point: `a AND (b OR c)` keeps `a` required,
+    // where `a AND b OR c` would return rows matching only `c`.
+    let criteria = Criteria::new()
+        .where_eq("id", 1)
+        .or_where(|any| any.where_like("case_id", "%x%").where_like("id", "%y%"));
+
+    let rendered = sql(Dialect::MySql, &criteria.select(Projection::CountAll, "n"));
+    let upper = rendered.to_uppercase();
+
+    assert!(upper.contains(" OR "), "{rendered}");
+    assert!(upper.contains(" AND "), "{rendered}");
+    assert!(rendered.contains('('), "the OR must be grouped: {rendered}");
+}
+
+#[test]
+fn an_empty_or_group_is_ignored_rather_than_rendering_an_empty_paren() {
+    let criteria =
+        Criteria::new().where_eq("id", 1).or_where(|any| any).select(Projection::CountAll, "n");
+
+    let rendered = sql(Dialect::MySql, &criteria);
+    assert!(!rendered.contains("()"), "{rendered}");
+}

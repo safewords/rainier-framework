@@ -178,6 +178,15 @@ fn projection_expr<E: Entity>(dialect: Dialect, projection: &Projection) -> Simp
             Func::sum(SimpleExpr::Case(Box::new(case))).into()
         }
 
+        // The whole calendar date, not one component of it.
+        Projection::DateOf(c) => match dialect {
+            // `date(x)` yields `YYYY-MM-DD`; SQLite has no DATE type to cast to.
+            Dialect::Sqlite => Func::cust(Alias::new("date")).arg(col(c)).into(),
+            // MySQL and Postgres both accept the standard cast, and it keeps
+            // the value ordering correctly as a date rather than as text.
+            _ => Func::cast_as(col(c), Alias::new("DATE")).into(),
+        },
+
         Projection::DatePart(part, c) => {
             let (mysql, sqlite, postgres) = match part {
                 DatePart::Year => ("YEAR", "%Y", "year"),
@@ -327,6 +336,16 @@ fn apply_criteria<E: Entity>(
         }
         condition = condition.add(constraint.to_expr(column_ref::<E>(constraint.column())));
     }
+    // Each `or_where` group is one parenthesised `OR`, `AND`-ed with the rest —
+    // the shape it has in SQL, so there is no precedence to get wrong.
+    for group in criteria.or_groups() {
+        let mut any = Cond::any();
+        for constraint in group {
+            any = any.add(constraint.to_expr(column_ref::<E>(constraint.column())));
+        }
+        condition = condition.add(any);
+    }
+
     stmt.cond_where(condition);
 
     for (column, descending) in criteria.orders() {
@@ -468,6 +487,16 @@ pub fn update_matching<E: Entity>(
         }
         condition = condition.add(constraint.to_expr(column_ref::<E>(constraint.column())));
     }
+    // Each `or_where` group is one parenthesised `OR`, `AND`-ed with the rest —
+    // the shape it has in SQL, so there is no precedence to get wrong.
+    for group in criteria.or_groups() {
+        let mut any = Cond::any();
+        for constraint in group {
+            any = any.add(constraint.to_expr(column_ref::<E>(constraint.column())));
+        }
+        condition = condition.add(any);
+    }
+
     stmt.cond_where(condition);
 
     let (sql, params) = dialect.build_query(&stmt);
@@ -501,6 +530,16 @@ pub fn delete_matching<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Prep
         }
         condition = condition.add(constraint.to_expr(column_ref::<E>(constraint.column())));
     }
+    // Each `or_where` group is one parenthesised `OR`, `AND`-ed with the rest —
+    // the shape it has in SQL, so there is no precedence to get wrong.
+    for group in criteria.or_groups() {
+        let mut any = Cond::any();
+        for constraint in group {
+            any = any.add(constraint.to_expr(column_ref::<E>(constraint.column())));
+        }
+        condition = condition.add(any);
+    }
+
     stmt.cond_where(condition);
 
     let (sql, params) = dialect.build_query(&stmt);
