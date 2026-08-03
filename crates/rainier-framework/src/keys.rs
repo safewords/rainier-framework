@@ -73,7 +73,7 @@
 //! }
 //! ```
 
-use rainier_cache::CacheDriver;
+use rainier_cache::{CacheDriver, Stores as CacheStores};
 use rainier_config::{config_keys, AppEnv};
 use rainier_crypt::{CryptScheme, HashDriver};
 use rainier_database::Databases;
@@ -332,6 +332,37 @@ config_keys! {
     /// Prepended to every cache key, so two applications can share a server.
     pub CACHE_PREFIX: String = "cache.prefix";
 
+    /// Every cache store the application declares, and which of them is the
+    /// default.
+    ///
+    /// A whole section rather than a driver name and one set of settings, for
+    /// the reason [`FILESYSTEMS`] and [`QUEUES`] are: two stores on two servers
+    /// share no connector and no timeouts, and building the second from the
+    /// first's connector gives it the right *name* pointed at the wrong server.
+    ///
+    /// The failure that produces is quiet in the way a cache's failures always
+    /// are. Everything downstream of a cache is built to treat absence as
+    /// normal — a miss is not an error — so a store on the wrong server is not
+    /// an outage, it is a permanent miss that reads as a slow application. And
+    /// when what was cached was a rate-limit counter or a lock, it is not slow,
+    /// it is wrong.
+    ///
+    /// ```
+    /// use rainier_framework::cache::{StoreConfig, Stores};
+    /// use rainier_framework::config::Config;
+    /// use rainier_framework::keys;
+    ///
+    /// let config = Config::new();
+    /// config.set(keys::CACHE_STORES, Stores::new("scratch")
+    ///     .with("scratch", StoreConfig::memory())).unwrap();
+    ///
+    /// assert!(config.get(keys::CACHE_STORES).is_some());
+    /// ```
+    ///
+    /// Declaring this **and** [`CACHE_DRIVER`] is a boot failure rather than a
+    /// precedence rule, for the same reason [`QUEUES`] and [`QUEUE_DRIVER`] are.
+    pub CACHE_STORES: CacheStores = "cache.stores";
+
     // --- session -----------------------------------------------------------
 
     /// Where session state lives.
@@ -552,6 +583,7 @@ mod tests {
             ("CACHE", CACHE_REDIS_URL.path()),
             ("CACHE", CACHE_MEMCACHED_URL.path()),
             ("CACHE", CACHE_PREFIX.path()),
+            ("CACHE", CACHE_STORES.path()),
             ("SESSION", SESSION_DRIVER.path()),
             ("SESSION", SESSION_LIFETIME.path()),
             ("SESSION", SESSION_COOKIE.path()),
@@ -612,6 +644,7 @@ mod tests {
             CACHE_REDIS_URL.path(),
             CACHE_MEMCACHED_URL.path(),
             CACHE_PREFIX.path(),
+            CACHE_STORES.path(),
             SESSION_DRIVER.path(),
             SESSION_LIFETIME.path(),
             SESSION_COOKIE.path(),

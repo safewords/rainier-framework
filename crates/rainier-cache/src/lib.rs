@@ -44,6 +44,43 @@
 //! ).await?;
 //! ```
 //!
+//! ## Declaring stores
+//!
+//! [`Stores`] is the `cache` section as a type: a default store and named ones,
+//! each carrying its own settings, built in one call.
+//!
+//! ```
+//! # use rainier_cache::{StoreConfig, Stores};
+//! let stores = Stores::new("shared")
+//!     .with("shared", StoreConfig::redis("redis://127.0.0.1:6379/1"))
+//!     .with("scratch", StoreConfig::memory());
+//! # assert_eq!(stores.default_name(), "shared");
+//! ```
+//!
+//! ## Timeouts, and why there is no pool to size
+//!
+//! The Redis connection **multiplexes**: one socket carries every concurrent
+//! command, so a pool on top would add sockets without adding throughput. A
+//! `max_connections` on a `redis` store is therefore refused by name rather
+//! than accepted and ignored — and a `memcached` store *does* take a
+//! `pool_size`, because its protocol has no request ids and one connection
+//! really does serve one command at a time. The difference is in the protocols,
+//! not in how finished the two are.
+//!
+//! What a multiplexed connection can honour is a connect timeout, a response
+//! timeout and reconnection, declared per store. All three matter more here
+//! than anywhere else, because the cache is on the hot path of nearly every
+//! request:
+//!
+//! - without a **response timeout**, a server that accepted a command and never
+//!   answered stalls every request that touches a session, a cached value or a
+//!   rate limit, all at once;
+//! - without **reconnection**, one dropped socket — a proxy reaping an idle
+//!   connection is the usual way — breaks this cache for the life of the
+//!   process, since a multiplexed connection does not re-open itself.
+//!
+//! [`stores`] has the whole account.
+//!
 //! ## A miss is not a failure
 //!
 //! [`get`](Cache::get) returns `Ok(None)` for an absent key and `Err` only when
@@ -91,6 +128,7 @@ pub mod lock;
 pub mod memory;
 pub mod prefixed;
 pub mod rate_limit;
+pub mod stores;
 
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
@@ -107,6 +145,10 @@ pub use lock::{Lock, LockGuard, LockManager};
 pub use memory::MemoryCache;
 pub use prefixed::PrefixedCache;
 pub use rate_limit::CacheRateLimiter;
+pub use stores::{
+    CacheResources, ConnectionSettings, DynamoDbStore, KvStore, MemcachedStore, MemoryStore,
+    RedisClusterStore, RedisStore, StoreConfig, StoreCredentials, Stores,
+};
 
 #[cfg(feature = "dynamodb")]
 pub use dynamodb::DynamoDbCache;
@@ -125,17 +167,55 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct CacheManager {
     store: Arc<dyn Cache>,
+
+    /// Stores reachable by name, beyond the default one above.
+    ///
+    /// An application that keeps different kinds of value in different places —
+    /// a shared store for anything cached for correctness, an in-process one for
+    /// a memoised computation — needs more than one, and [`Stores`] is where
+    /// they are declared.
+    ///
+    /// A `BTreeMap` so a dump reads the same each run.
+    stores: std::collections::BTreeMap<String, Arc<dyn Cache>>,
 }
 
 impl CacheManager {
     /// Wrap a cache.
     pub fn new(store: Arc<dyn Cache>) -> Self {
-        Self { store }
+        Self { store, stores: std::collections::BTreeMap::new() }
     }
 
     /// An in-process cache — the default, and right for development.
     pub fn memory() -> Self {
         Self::new(Arc::new(MemoryCache::new()))
+    }
+
+    /// Register `store` under `name`, beside the default.
+    ///
+    /// The default is **not** registered under a name by this — [`Stores::build`]
+    /// does both, from one declaration, so the two are the same backend rather
+    /// than two built from the same settings.
+    pub fn with_store(mut self, name: impl Into<String>, store: Arc<dyn Cache>) -> Self {
+        self.stores.insert(name.into(), store);
+        self
+    }
+
+    /// The store registered under `name`, if there is one.
+    ///
+    /// Named `store_named` rather than overloading [`store`](Self::store),
+    /// which is the default one and has callers.
+    pub fn store_named(&self, name: &str) -> Option<&Arc<dyn Cache>> {
+        self.stores.get(name)
+    }
+
+    /// Whether a store is registered under `name`.
+    pub fn has_store(&self, name: &str) -> bool {
+        self.stores.contains_key(name)
+    }
+
+    /// Every registered name, in a stable order.
+    pub fn store_names(&self) -> impl Iterator<Item = &str> {
+        self.stores.keys().map(String::as_str)
     }
 
     /// The cache underneath.
@@ -161,7 +241,10 @@ impl std::ops::Deref for CacheManager {
 
 impl std::fmt::Debug for CacheManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CacheManager").field("driver", &self.driver()).finish()
+        f.debug_struct("CacheManager")
+            .field("driver", &self.driver())
+            .field("stores", &self.store_names().collect::<Vec<_>>())
+            .finish()
     }
 }
 

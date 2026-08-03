@@ -10,6 +10,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rainier_cache::CacheManager;
+use rainier_cache::{
+    CacheDriver, CacheResources, DynamoDbStore, MemcachedStore, RedisClusterStore, RedisStore,
+    StoreConfig, Stores as CacheStores,
+};
 use rainier_config::{Config, Env};
 use rainier_container::{Application, ServiceProvider};
 use rainier_crypt::{Encryption, Key, KeyRing};
@@ -566,26 +570,21 @@ impl Rainier {
         app.instance(crypt);
         app.instance(url_signer);
         app.instance(sessions);
-        // Nobody handed one over, so this is the in-process default. If the
-        // configuration asked for Redis, that is a gap between what the
-        // deployment believes and what it has — and the symptom otherwise is a
-        // rate limiter that counts to `N ×` its limit with nothing logged.
+        // Built from what the configuration declares, and falling back to the
+        // in-process one only when it declares nothing. The version of this
+        // that warned and used memory anyway *was* the failure it warned
+        // about: `CACHE_DRIVER=redis` produced an unshared cache, so locks were
+        // not locks and a rate limit counted to `N ×` its limit across `N`
+        // replicas — with one line in a log nobody reads at boot.
         let cache = match self.cache {
             Some(cache) => cache,
-            None => {
-                if let Ok(driver) = app.resolve::<Config>()?.setting(keys::CACHE_DRIVER) {
-                    if driver.is_shared() {
-                        tracing::warn!(
-                            configured = %driver,
-                            "CACHE_DRIVER asks for a shared cache but none was built, so \
-                             this process is using the in-process one — locks, rate limits \
-                             and anything else cached for correctness are per-instance. \
-                             Build the store and pass it to `Rainier::with_cache`."
-                        );
-                    }
-                }
-                CacheManager::memory()
-            }
+            None => build_cache(
+                app.resolve::<Env>()?.as_ref(),
+                app.resolve::<Config>()?.as_ref(),
+                &CacheResources::new(),
+            )
+            .await?
+            .unwrap_or_else(CacheManager::memory),
         };
 
         // The locks behind `without_overlapping` and `on_one_server` — and
@@ -934,6 +933,145 @@ async fn build_databases(env: &Env, config: &Config) -> Result<Option<DatabaseMa
         }
 
         (false, None) => Ok(None),
+    }
+}
+
+/// Build the cache stores the application declared, if it declared any.
+///
+/// The same rule as [`build_queues`], and the gap it closes was the widest of
+/// the three. A cache is the one dependency an application is meant to be able
+/// to lose, so everything downstream of it treats absence as normal — which is
+/// exactly what makes a cache that is not the one you configured invisible. It
+/// does not fail. It misses, forever, and reads as a slow application.
+///
+/// And when what was cached was a lock or a rate-limit counter, it is not slow.
+/// A `LockManager` over a per-process store is a real lock within one process
+/// and nothing at all between two.
+///
+/// `None` means the application declared no cache anywhere, and the caller
+/// falls back to the in-process store — right for a test and for single-process
+/// development, and what it has always done.
+async fn build_cache(
+    env: &Env,
+    config: &Config,
+    resources: &CacheResources,
+) -> Result<Option<CacheManager>> {
+    let declared = config.has(keys::CACHE_STORES);
+    let driver = env.get("CACHE_DRIVER").filter(|driver| !driver.trim().is_empty());
+
+    match (declared, driver) {
+        (true, Some(_)) => Err(Error::internal(
+            "`CACHE_DRIVER` is set and a `cache.stores` section is declared, and both name the \
+             default cache store. Rainier will not choose between them: whichever one loses is \
+             not an error anybody sees, because a read from the wrong store is a miss and a \
+             miss is not a failure — so the application is merely slow, and its locks are not \
+             locks. Keep one — drop the section and let `CACHE_DRIVER` declare the single \
+             store, or unset `CACHE_DRIVER` and declare every store in the section",
+        )),
+
+        (true, None) => Ok(Some(config.require(keys::CACHE_STORES)?.build(resources).await?)),
+
+        (false, Some(_)) => {
+            let stores = stores_from_env(env)?;
+
+            // Written into the tree, so `config.get(keys::CACHE_STORES)`
+            // describes what was actually built rather than answering `None`
+            // for a store the application demonstrably has.
+            config.set(keys::CACHE_STORES, stores.clone())?;
+            Ok(Some(stores.build(resources).await?))
+        }
+
+        (false, None) => Ok(None),
+    }
+}
+
+/// The one store `CACHE_DRIVER` declares, named after its driver.
+///
+/// Named after the driver rather than something like `default` for the reason
+/// [`queues_from_env`] gives: it is the one name that cannot be a lie about
+/// what the store is.
+///
+/// Each driver reads the settings it needs from the environment beside it. No
+/// **connection** settings are read from anywhere — no timeouts, no
+/// reconnection — because this is the shorthand for a deployment that has one
+/// store and says so, and a framework that invented a timeout on its behalf
+/// would be choosing when its application fails. A deployment that wants them
+/// declares the section, where they belong to a store rather than to a process.
+fn stores_from_env(env: &Env) -> Result<CacheStores> {
+    let driver: CacheDriver = env.setting("CACHE_DRIVER")?;
+
+    let store: StoreConfig =
+        match driver {
+            CacheDriver::Memory => StoreConfig::memory(),
+
+            // The same variable and the same fallback the queue reads, because "we
+            // have a Redis at this URL" is one fact about a deployment. Give the
+            // queue a different database index in its own URL: flushing this cache
+            // empties the whole index, and every job waiting in it goes too.
+            CacheDriver::Redis => {
+                RedisStore::new(env.string("REDIS_URL", "redis://127.0.0.1:6379/")).into()
+            }
+
+            // Comma-separated, because a cluster is a seed list and one variable
+            // holding all of them is how a deployment writes that down. Empties
+            // dropped, so a stray trailing comma is not a seed whose host is the
+            // empty string.
+            CacheDriver::RedisCluster => RedisClusterStore::new(
+                env.string("REDIS_URL", "redis://127.0.0.1:6379/")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|seed| !seed.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+            .into(),
+
+            CacheDriver::Memcached => {
+                MemcachedStore::new(env.string("MEMCACHED_URL", "127.0.0.1:11211")).into()
+            }
+
+            // No fallback: a table name cannot be guessed into anything but
+            // somebody else's table, or one that is not there.
+            CacheDriver::DynamoDb => {
+                let mut store = DynamoDbStore::new(env.require("DYNAMODB_CACHE_TABLE")?);
+                if let Some(region) = env.get("AWS_REGION").filter(|r| !r.trim().is_empty()) {
+                    store = store.region(region);
+                }
+                store.into()
+            }
+
+            // Its transport is a binding inside a Worker and an API client outside
+            // one, and neither is a value a variable can hold. This is the one
+            // store an application has to build and hand over.
+            CacheDriver::Kv => return Err(Error::internal(
+                "`CACHE_DRIVER=kv` cannot be built from the environment: Workers KV is reached \
+                 through a binding inside a Worker and an API client outside one, and neither \
+                 is a value a variable can hold. Build the store and pass it to \
+                 `Rainier::with_cache`",
+            )),
+        };
+
+    let name = driver.as_str();
+    let store = match env.get("CACHE_PREFIX").filter(|prefix| !prefix.trim().is_empty()) {
+        Some(prefix) => prefixed(store, prefix),
+        None => store,
+    };
+
+    Ok(CacheStores::new(name).with(name, store))
+}
+
+/// Namespace a store, whichever driver it is.
+///
+/// Two applications caching `user:1` on one server read each other's values,
+/// and the symptom is a user seeing another application's data.
+fn prefixed(store: StoreConfig, prefix: String) -> StoreConfig {
+    match store {
+        StoreConfig::Memory(store) => store.prefix(prefix).into(),
+        StoreConfig::Redis(store) => store.prefix(prefix).into(),
+        StoreConfig::RedisCluster(store) => store.prefix(prefix).into(),
+        StoreConfig::Memcached(store) => store.prefix(prefix).into(),
+        StoreConfig::DynamoDb(store) => store.prefix(prefix).into(),
+        StoreConfig::Kv(store) => store.prefix(prefix).into(),
     }
 }
 
@@ -1862,6 +2000,176 @@ mod database_and_queue_tests {
 
         assert!(err.message().contains("DATABASE_URL"), "{}", err.message());
         assert!(err.message().contains("databases"), "{}", err.message());
+    }
+
+    // --- the cache ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn declaring_no_cache_anywhere_builds_none_and_the_caller_falls_back() {
+        // The one path that has to stay exactly as it was: a test, or
+        // single-process development, gets the in-process store and no attempt
+        // to reach anything.
+        let built = build_cache(&env(&[]), &Config::new(), &CacheResources::new()).await.unwrap();
+
+        assert!(built.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_cache_driver_builds_the_store_it_names_rather_than_warning_about_it() {
+        // The defect this closes. `CACHE_DRIVER=redis` used to produce an
+        // in-process cache and a log line: locks that were not locks, and a
+        // rate limit that counted to `N ×` its limit across `N` replicas.
+        let config = Config::new();
+
+        let cache =
+            build_cache(&env(&[("CACHE_DRIVER", "memory")]), &config, &CacheResources::new())
+                .await
+                .unwrap()
+                .expect("`CACHE_DRIVER` names a store");
+
+        assert_eq!(cache.driver(), "memory");
+        assert!(cache.has_store("memory"), "and it is reachable by name");
+    }
+
+    #[tokio::test]
+    async fn what_was_built_is_written_back_into_the_tree() {
+        // Otherwise `config.get(keys::CACHE_STORES)` answers `None` for a store
+        // the application demonstrably has.
+        let config = Config::new();
+        build_cache(&env(&[("CACHE_DRIVER", "memory")]), &config, &CacheResources::new())
+            .await
+            .unwrap();
+
+        let stores = config.require(keys::CACHE_STORES).unwrap();
+        assert_eq!(stores.names().collect::<Vec<_>>(), vec!["memory"]);
+    }
+
+    #[tokio::test]
+    async fn a_declared_section_is_built_as_declared() {
+        let config = Config::new();
+        config
+            .set(
+                keys::CACHE_STORES,
+                CacheStores::new("scratch")
+                    .with("scratch", StoreConfig::memory())
+                    .with("other", StoreConfig::memory()),
+            )
+            .unwrap();
+
+        let cache = build_cache(&env(&[]), &config, &CacheResources::new())
+            .await
+            .unwrap()
+            .expect("declared");
+
+        assert!(cache.has_store("scratch"));
+        assert!(cache.has_store("other"));
+    }
+
+    #[tokio::test]
+    async fn a_cache_driver_beside_a_declared_section_is_refused_rather_than_resolved() {
+        let config = Config::new();
+        config
+            .set(
+                keys::CACHE_STORES,
+                CacheStores::new("scratch").with("scratch", StoreConfig::memory()),
+            )
+            .unwrap();
+
+        let err = build_cache(&env(&[("CACHE_DRIVER", "memory")]), &config, &CacheResources::new())
+            .await
+            .err()
+            .expect("two declarations of the default store");
+
+        assert!(err.message().contains("CACHE_DRIVER"), "{}", err.message());
+        assert!(err.message().contains("cache.stores"), "{}", err.message());
+    }
+
+    #[test]
+    fn each_driver_reads_the_settings_beside_it() {
+        for (driver, pairs) in [
+            ("memory", vec![]),
+            ("redis", vec![("REDIS_URL", "redis://127.0.0.1:6379/2")]),
+            ("redis-cluster", vec![("REDIS_URL", "redis://10.0.0.1:6379,redis://10.0.0.2:6379")]),
+            ("memcached", vec![("MEMCACHED_URL", "127.0.0.1:11211")]),
+            ("dynamodb", vec![("DYNAMODB_CACHE_TABLE", "cache")]),
+        ] {
+            let mut pairs = pairs;
+            pairs.push(("CACHE_DRIVER", driver));
+
+            let stores = stores_from_env(&env(&pairs)).expect(driver);
+            assert_eq!(stores.default_name(), driver);
+            assert_eq!(stores.get(driver).unwrap().driver().as_str(), driver);
+        }
+    }
+
+    #[test]
+    fn a_cluster_seed_list_is_one_variable_and_a_stray_comma_is_not_a_seed() {
+        let stores = stores_from_env(&env(&[
+            ("CACHE_DRIVER", "redis-cluster"),
+            ("REDIS_URL", "redis://10.0.0.1:6379, , redis://10.0.0.2:6379,"),
+        ]))
+        .unwrap();
+
+        let StoreConfig::RedisCluster(cluster) = stores.get("redis-cluster").unwrap() else {
+            panic!("declared as a cluster")
+        };
+        assert_eq!(cluster.seed_count(), 2);
+    }
+
+    #[test]
+    fn a_table_name_is_required_rather_than_guessed() {
+        // A guess is somebody else's table, or one that is not there.
+        let err = stores_from_env(&env(&[("CACHE_DRIVER", "dynamodb")])).unwrap_err();
+
+        assert!(err.message().contains("DYNAMODB_CACHE_TABLE"), "{}", err.message());
+    }
+
+    #[test]
+    fn the_kv_driver_says_it_cannot_come_from_the_environment() {
+        // Its transport is a binding or an API client, and neither is a value a
+        // variable can hold. Better than a store that builds and cannot reach
+        // anything.
+        let err = stores_from_env(&env(&[("CACHE_DRIVER", "kv")])).unwrap_err();
+
+        assert!(err.message().contains("with_cache"), "{}", err.message());
+    }
+
+    #[test]
+    fn a_prefix_reaches_whichever_driver_was_named() {
+        // Two applications caching `user:1` on one server read each other's
+        // values, and the prefix is what stops it — so it cannot be a setting
+        // that only some drivers honour.
+        for driver in ["memory", "redis", "memcached"] {
+            let stores = stores_from_env(&env(&[
+                ("CACHE_DRIVER", driver),
+                ("CACHE_PREFIX", "billing"),
+                ("REDIS_URL", "redis://127.0.0.1:6379/2"),
+                ("MEMCACHED_URL", "127.0.0.1:11211"),
+            ]))
+            .expect(driver);
+
+            assert_eq!(stores.get(driver).unwrap().prefix(), Some("billing"), "{driver}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_rendering_of_a_built_section_discloses_a_password() {
+        // A configuration dump at boot must not put the Redis password in the
+        // log of every process that started.
+        let config = Config::new();
+        build_cache(
+            &env(&[
+                ("CACHE_DRIVER", "memory"),
+                ("REDIS_URL", "redis://default:hunter2@cache.internal:6379/1"),
+            ]),
+            &config,
+            &CacheResources::new(),
+        )
+        .await
+        .unwrap();
+
+        let stores: CacheStores = config.require(keys::CACHE_STORES).unwrap();
+        assert!(!format!("{stores:?}").contains("hunter2"), "{stores:?}");
     }
 
     #[tokio::test]

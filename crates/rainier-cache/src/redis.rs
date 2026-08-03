@@ -1,4 +1,44 @@
 //! [`RedisCache`] — the [`Cache`] port over a [`RedisClient`].
+//!
+//! # Where the connection settings go
+//!
+//! On the **connector**, not here: this store is handed one, and every timeout
+//! and reconnection setting rides along with it. See
+//! [`RedisSettings`](rainier_drivers::RedisSettings) for what can be set and
+//! why there is no pool to size — the short version is that the connection
+//! multiplexes, so one socket carries every concurrent command and a pool would
+//! add sockets without adding throughput.
+//!
+//! Two of those settings matter more for a cache than for anything else,
+//! because the cache is on the hot path of nearly every request:
+//!
+//! - **A response timeout.** Without one, a Redis that accepted a command and
+//!   never answered stalls every request that touches a session, a cached
+//!   value or a rate limit — all of them, at once. The symptom is "the whole
+//!   site is slow", which names nothing.
+//! - **Reconnection.** Without it a dropped socket is permanent for the life of
+//!   the process, and the usual cause is not an outage but a proxy reaping a
+//!   connection that had been idle. [`RedisCache::reconnects`] is the check
+//!   worth making at boot, next to
+//!   [`LockManager::is_shared`](crate::LockManager::is_shared).
+//!
+//! ```no_run
+//! use std::time::Duration;
+//! use rainier_cache::RedisCache;
+//! use rainier_drivers::{Reconnect, RedisConnector, RedisSettings};
+//!
+//! # async fn run() -> rainier_support::Result<()> {
+//! let cache = RedisCache::connect(&RedisConnector::open_with(
+//!     "redis://127.0.0.1/",
+//!     RedisSettings::new()
+//!         .response_timeout(Duration::from_millis(250))
+//!         .reconnect(Reconnect::new()),
+//! )?)
+//! .await?;
+//!
+//! assert!(cache.reconnects());
+//! # Ok(()) }
+//! ```
 
 use std::time::Duration;
 
@@ -53,6 +93,24 @@ impl RedisCache {
     /// Whether this cache is on a cluster.
     pub fn is_cluster(&self) -> bool {
         self.client.is_cluster()
+    }
+
+    /// Whether this cache's connection re-opens itself after losing its socket.
+    ///
+    /// **Worth asserting at boot.** `false` means the store this application
+    /// caches in, rate-limits with and takes locks over stops working the first
+    /// time its socket goes — which is usually not an outage but a proxy
+    /// reaping an idle connection — and stays broken until the process is
+    /// restarted. Ask for it with
+    /// [`RedisSettings::reconnect`](rainier_drivers::RedisSettings::reconnect)
+    /// on the connector.
+    ///
+    /// The same shape of check as
+    /// [`LockManager::is_shared`](crate::LockManager::is_shared), and for the
+    /// same reason: what a deployment believes it configured is worth
+    /// confirming against what it actually built.
+    pub fn reconnects(&self) -> bool {
+        self.client.reconnects()
     }
 
     /// Store only if the key is absent, atomically.
@@ -142,6 +200,63 @@ mod tests {
     fn the_label_names_the_backend() {
         // Constructible without a server, so this needs no live Redis.
         assert!(!RedisConnector::open("redis://127.0.0.1:6379/").unwrap().is_cluster());
+    }
+
+    #[test]
+    fn a_cache_built_from_a_bare_connector_declares_no_settings() {
+        // The cache is on the hot path of nearly every request, so "we changed
+        // nothing" has to mean nothing changed.
+        let connector = RedisConnector::open("redis://127.0.0.1:6379/").unwrap();
+
+        assert!(connector.settings().is_unset());
+    }
+
+    #[test]
+    fn the_settings_a_cache_is_built_with_reach_the_connector() {
+        use rainier_drivers::{Reconnect, RedisSettings};
+
+        let connector = RedisConnector::open_with(
+            "redis://127.0.0.1:6379/",
+            RedisSettings::new()
+                .response_timeout(Duration::from_millis(250))
+                .reconnect(Reconnect::new().max_backoff(Duration::from_secs(2))),
+        )
+        .unwrap();
+
+        assert_eq!(
+            connector.settings().response_timeout_period(),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            connector.settings().reconnection().and_then(|r| r.backoff_ceiling()),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn a_setting_the_cache_could_not_honour_is_refused_at_declaration() {
+        use rainier_drivers::RedisSettings;
+
+        // Accepted, it would fail every read on the hot path — which for a
+        // cache means the whole application, since a miss and a failure are
+        // deliberately different things here.
+        let err = RedisConnector::open_with(
+            "redis://127.0.0.1:6379/",
+            RedisSettings::new().response_timeout(Duration::ZERO),
+        )
+        .unwrap_err();
+
+        assert!(err.message().contains("`response_timeout` of zero"), "{}", err.message());
+    }
+
+    #[test]
+    fn no_rendering_of_a_cache_connector_discloses_its_password() {
+        // A Redis DSN carries it inline, so this is the assertion that has to
+        // hold whatever else changes about the settings above.
+        let connector =
+            RedisConnector::open("redis://default:hunter2@cache.internal:6379/1").unwrap();
+
+        assert!(!format!("{connector:?}").contains("hunter2"), "{connector:?}");
     }
 
     #[tokio::test]

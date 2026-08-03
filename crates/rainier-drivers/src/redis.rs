@@ -1,5 +1,38 @@
 //! Redis transport — a connector that speaks to a single server or a sharded
 //! cluster behind one type.
+//!
+//! # There is no pool here, and that is not a gap
+//!
+//! Both backends **multiplex**: one socket carries every concurrent command,
+//! and the client matches each reply to the request that asked for it. A
+//! [`RedisConnection`] is a handle to that socket, so cloning it costs nothing
+//! and opens nothing — and a pool on top would add sockets without adding
+//! throughput.
+//!
+//! Worth saying plainly, because the database layer next door *does* pool and
+//! the difference is not an oversight. A SQL connection is **exclusive** for the
+//! length of a statement, so concurrency there means more connections. A Redis
+//! connection is not, so concurrency here means more requests in flight on the
+//! one connection.
+//!
+//! Two things follow, and they are what [`RedisSettings`] is for.
+//!
+//! **There is nothing to size.** A process holds one connection per client —
+//! one per node, on a cluster — so a server's `maxclients` divided by the number
+//! of processes is the whole calculation, and no setting here moves it. Nothing
+//! to exhaust means no `acquire` to queue on either: the hot-path failure a
+//! pool's acquire timeout converts into a legible error arrives here in a
+//! different shape, as a command that never returns, and
+//! [`response_timeout`](RedisSettings::response_timeout) is what converts *that*
+//! one.
+//!
+//! **There is nothing to recycle.** A pool guards against the socket a proxy
+//! silently dropped by retiring connections after a while and opening fresh
+//! ones. With one socket there is no fresh one to hand out, and a
+//! `MultiplexedConnection` does not re-establish itself: once the socket is
+//! gone, every command on every clone fails **for the life of the process**.
+//! [`reconnect`](RedisSettings::reconnect) is the guard that applies to this
+//! shape, and the one worth setting.
 
 use std::time::Duration;
 
@@ -15,15 +48,305 @@ enum Backend {
     Cluster(redis::cluster::ClusterClient),
 }
 
+/// What a connection may wait for, and what it does when its socket goes away.
+///
+/// **Not a pool**, because there is nothing here to pool — see the [module
+/// docs](self) for why one socket is the right answer for Redis and what
+/// changes as a result. These are the settings that shape of connection can
+/// actually honour.
+///
+/// Every field is optional and **nothing is set by default**, so a connector
+/// built without settings behaves exactly as it did before this type existed:
+/// no timeouts, and no recovery from a dropped socket. Each one changes *when*
+/// an application is told about a failure rather than whether it has one, which
+/// is a deployment's decision rather than a default worth imposing on
+/// everybody's tests.
+///
+/// ```
+/// use std::time::Duration;
+/// use rainier_drivers::{Reconnect, RedisSettings};
+///
+/// let settings = RedisSettings::new()
+///     .connect_timeout(Duration::from_secs(2))
+///     .response_timeout(Duration::from_millis(500))
+///     .reconnect(Reconnect::new().max_backoff(Duration::from_secs(2)));
+/// # let _ = settings;
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RedisSettings {
+    connect_timeout: Option<Duration>,
+    response_timeout: Option<Duration>,
+    reconnect: Option<Reconnect>,
+}
+
+impl RedisSettings {
+    /// Nothing set — the connector's behaviour with no settings at all.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How long opening a connection may take before it fails.
+    ///
+    /// Covers the socket *and* the handshake, which matters: a server that
+    /// accepts the connection and then does not answer is indistinguishable
+    /// from one that is merely slow, and without this the wait is however long
+    /// the operating system's own connect takes — which for a silently dropped
+    /// route is minutes.
+    ///
+    /// Applies to reconnection attempts too, so a connection being
+    /// re-established cannot stall longer than this per attempt.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// How long a command may wait for its reply before it fails.
+    ///
+    /// **The one to set on a hot path.** Sessions, cache reads, rate limits,
+    /// queue pushes and broadcast publishes all go through Redis, so a server
+    /// that accepted a command and never answered stalls every one of them at
+    /// once — and the symptom is "the whole site is slow", which names nothing
+    /// and points at nothing. A response timeout turns that into a
+    /// [`ServiceUnavailable`](rainier_support::ErrorKind::ServiceUnavailable)
+    /// that says Redis, which is the difference between an outage somebody can
+    /// act on and an afternoon spent reading dashboards.
+    ///
+    /// Size it against what the call can afford, not against what Redis
+    /// normally takes: a request that waits five seconds for a cache read has
+    /// already failed the person waiting for it.
+    pub fn response_timeout(mut self, timeout: Duration) -> Self {
+        self.response_timeout = Some(timeout);
+        self
+    }
+
+    /// Re-establish the connection when its socket is lost.
+    ///
+    /// **The guard that replaces a pool's recycling-by-age.** Without it a
+    /// dropped socket is permanent: the connection does not re-open itself, and
+    /// every clone of it — the cache's, the queue's, the broadcaster's — fails
+    /// every command until the process restarts. The usual cause is not a Redis
+    /// outage at all but a proxy or a NAT table dropping a connection that had
+    /// been idle, which is why the failure arrives at three in the morning and
+    /// looks like nothing.
+    ///
+    /// The cost is spelled out in [`Reconnect`]: at least one command fails per
+    /// loss, always. What this buys is that the *next* one does not.
+    pub fn reconnect(mut self, reconnect: Reconnect) -> Self {
+        self.reconnect = Some(reconnect);
+        self
+    }
+
+    /// The connect timeout, if one was declared.
+    pub fn connect_timeout_period(&self) -> Option<Duration> {
+        self.connect_timeout
+    }
+
+    /// The response timeout, if one was declared.
+    pub fn response_timeout_period(&self) -> Option<Duration> {
+        self.response_timeout
+    }
+
+    /// The reconnection policy, if one was declared.
+    pub fn reconnection(&self) -> Option<Reconnect> {
+        self.reconnect
+    }
+
+    /// Whether nothing at all is declared.
+    ///
+    /// The connector takes a different path for these, so that an application
+    /// which declares no settings runs the same code it ran before settings
+    /// existed rather than a configured path that happens to be configured with
+    /// nothing.
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Whether these settings can be honoured, and a message when they cannot.
+    ///
+    /// Checked where a connector is built, so a bad declaration fails at boot
+    /// rather than becoming a connection that quietly ignores what it was told.
+    ///
+    /// # Errors
+    ///
+    /// When a timeout is zero, or a reconnection policy would never reconnect.
+    pub fn validate(&self) -> Result<()> {
+        if self.connect_timeout == Some(Duration::ZERO) {
+            return Err(Error::internal(
+                "a `connect_timeout` of zero expires before the socket is open, so every \
+                 connection fails; leave it unset to wait as long as the operating system does",
+            ));
+        }
+
+        if self.response_timeout == Some(Duration::ZERO) {
+            return Err(Error::internal(
+                "a `response_timeout` of zero expires before the reply can arrive, so every \
+                 command fails; leave it unset to wait indefinitely",
+            ));
+        }
+
+        if let Some(reconnect) = self.reconnect {
+            reconnect.validate()?;
+        }
+        Ok(())
+    }
+
+    /// These settings as the client's own connection options.
+    fn async_config(&self) -> redis::AsyncConnectionConfig {
+        let mut config = redis::AsyncConnectionConfig::new();
+        if let Some(timeout) = self.connect_timeout {
+            config = config.set_connection_timeout(timeout);
+        }
+        if let Some(timeout) = self.response_timeout {
+            config = config.set_response_timeout(timeout);
+        }
+        config
+    }
+
+    /// These settings as the client's own reconnection options.
+    ///
+    /// Only the fields that were declared are set, so the rest stay at the
+    /// client's defaults rather than at a second set of numbers kept here.
+    fn manager_config(&self, reconnect: Reconnect) -> redis::aio::ConnectionManagerConfig {
+        let mut config = redis::aio::ConnectionManagerConfig::new()
+            .set_number_of_retries(reconnect.attempts as usize);
+
+        if let Some(ceiling) = reconnect.max_backoff {
+            // Milliseconds, which is the unit this option is in.
+            config = config.set_max_delay(ceiling.as_millis().min(u64::MAX as u128) as u64);
+        }
+        if let Some(timeout) = self.connect_timeout {
+            config = config.set_connection_timeout(timeout);
+        }
+        if let Some(timeout) = self.response_timeout {
+            config = config.set_response_timeout(timeout);
+        }
+        config
+    }
+}
+
+/// How hard to try to get the connection back.
+///
+/// **One command still fails per loss**, always: the failure is how the
+/// connection finds out it is gone. Everything here is about the commands after
+/// that one — whether they fail too, and for how long.
+///
+/// The defaults are the client's own: six attempts with an exponentially
+/// growing wait between them, about six seconds in total. That is a deliberate
+/// choice not to invent numbers, so a connector that declares
+/// [`Reconnect::new`] and one that reaches the client directly agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reconnect {
+    attempts: u32,
+    max_backoff: Option<Duration>,
+}
+
+impl Default for Reconnect {
+    fn default() -> Self {
+        Self { attempts: DEFAULT_RECONNECT_ATTEMPTS, max_backoff: None }
+    }
+}
+
+/// What the client retries a lost connection by default.
+///
+/// Mirrored rather than invented — the client's own
+/// `DEFAULT_NUMBER_OF_CONNECTION_RETRIES` — so that declaring the default
+/// explicitly and leaving it out mean the same thing.
+const DEFAULT_RECONNECT_ATTEMPTS: u32 = 6;
+
+impl Reconnect {
+    /// The client's own retry policy.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many times to retry re-establishing the connection.
+    ///
+    /// Once these are spent the connection stays down and commands go on
+    /// failing, so this is not "give up and lose Redis" — a later attempt can
+    /// still succeed — but the wait between attempts grows exponentially, and a
+    /// large number is mostly a long tail of waiting.
+    pub fn attempts(mut self, attempts: u32) -> Self {
+        self.attempts = attempts;
+        self
+    }
+
+    /// A ceiling on the wait between attempts.
+    ///
+    /// Worth setting. The wait doubles each time, so on a server that stays
+    /// down the later attempts are minutes apart — and when it comes back, the
+    /// application does not: it is asleep until whatever wait it last started.
+    /// A ceiling bounds how stale that can get.
+    pub fn max_backoff(mut self, ceiling: Duration) -> Self {
+        self.max_backoff = Some(ceiling);
+        self
+    }
+
+    /// How many retries this policy allows.
+    pub fn attempt_limit(&self) -> u32 {
+        self.attempts
+    }
+
+    /// The ceiling on the wait between attempts, if one was declared.
+    pub fn backoff_ceiling(&self) -> Option<Duration> {
+        self.max_backoff
+    }
+
+    /// Whether this policy can reconnect at all.
+    ///
+    /// # Errors
+    ///
+    /// When it allows no attempts, which reads as reconnection being on and
+    /// behaves as it being off.
+    fn validate(&self) -> Result<()> {
+        if self.attempts == 0 {
+            return Err(Error::internal(
+                "a reconnection policy of zero attempts never reconnects, which is what leaving \
+                 `reconnect` out already means; give it attempts or leave it out",
+            ));
+        }
+
+        if self.max_backoff == Some(Duration::ZERO) {
+            return Err(Error::internal(
+                "a `max_backoff` of zero retries with no wait at all, which spends every attempt \
+                 in the instant the connection dropped and reconnects to nothing",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A live connection, single-node or cluster.
 ///
 /// Both variants multiplex, so this is cheap to clone and does not need a pool:
 /// concurrent commands share one socket per node and are matched up by the
 /// client. A pool on top would add sockets without adding throughput.
+///
+/// # Not `rainier_queue::RedisConnection`
+///
+/// That one is a **declaration** — a URL and some settings, in the queue's
+/// `connections` section, sibling to its `SqsConnection` and `KafkaConnection`.
+/// This one is an open socket. Both names are right for their own family
+/// ([`MemcachedConnector`](crate::MemcachedConnector) and
+/// [`MemcachedConnection`](crate::MemcachedConnection) are the same pair here),
+/// so neither is renamed to avoid the other — but nothing imports both today,
+/// and anything that starts to should alias one at the `use`.
 #[derive(Clone)]
 pub enum RedisConnection {
     /// A multiplexed connection to one server.
+    ///
+    /// **Does not re-establish itself.** When the socket goes, every clone of
+    /// this fails every command until the process restarts — see
+    /// [`Reconnecting`](Self::Reconnecting), which is the same connection with
+    /// that one difference.
     Single(MultiplexedConnection),
+
+    /// The same multiplexed connection, re-opened when it is lost.
+    ///
+    /// What [`RedisSettings::reconnect`] asks for. One command still fails per
+    /// loss — that failure is how the connection learns it is gone — and the
+    /// ones after it do not.
+    Reconnecting(redis::aio::ConnectionManager),
+
     /// A connection to a cluster, routing each command to the owning shard.
     #[cfg(feature = "redis-cluster")]
     Cluster(redis::cluster_async::ClusterConnection),
@@ -38,6 +361,7 @@ impl RedisConnection {
     pub async fn query<T: FromRedisValue>(&mut self, command: &Cmd) -> Result<T> {
         let outcome = match self {
             RedisConnection::Single(connection) => command.query_async(connection).await,
+            RedisConnection::Reconnecting(connection) => command.query_async(connection).await,
             #[cfg(feature = "redis-cluster")]
             RedisConnection::Cluster(connection) => command.query_async(connection).await,
         };
@@ -53,7 +377,21 @@ impl RedisConnection {
     /// Whether this connection is talking to a cluster.
     pub fn is_cluster(&self) -> bool {
         match self {
+            RedisConnection::Single(_) | RedisConnection::Reconnecting(_) => false,
+            #[cfg(feature = "redis-cluster")]
+            RedisConnection::Cluster(_) => true,
+        }
+    }
+
+    /// Whether this connection re-opens itself after losing its socket.
+    ///
+    /// A cluster connection does, of its own accord. A single-server one does
+    /// only where [`RedisSettings::reconnect`] asked for it, and this is the
+    /// way to check at boot that it was asked for.
+    pub fn reconnects(&self) -> bool {
+        match self {
             RedisConnection::Single(_) => false,
+            RedisConnection::Reconnecting(_) => true,
             #[cfg(feature = "redis-cluster")]
             RedisConnection::Cluster(_) => true,
         }
@@ -62,10 +400,11 @@ impl RedisConnection {
 
 impl std::fmt::Debug for RedisConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.is_cluster() {
-            "RedisConnection::Cluster"
-        } else {
-            "RedisConnection::Single"
+        f.write_str(match self {
+            RedisConnection::Single(_) => "RedisConnection::Single",
+            RedisConnection::Reconnecting(_) => "RedisConnection::Reconnecting",
+            #[cfg(feature = "redis-cluster")]
+            RedisConnection::Cluster(_) => "RedisConnection::Cluster",
         })
     }
 }
@@ -95,19 +434,50 @@ impl std::fmt::Debug for RedisConnection {
 pub struct RedisConnector {
     backend: Backend,
     description: String,
+    settings: RedisSettings,
 }
 
 impl RedisConnector {
     /// Open a connector to a single server.
     ///
     /// `redis://host:port/db`, or `rediss://` for TLS.
+    ///
+    /// No timeouts and no recovery from a dropped socket — see
+    /// [`open_with`](Self::open_with), which is this with settings.
     pub fn open(url: &str) -> Result<Self> {
+        Self::open_with(url, RedisSettings::new())
+    }
+
+    /// Open a connector to a single server, with settings.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use rainier_drivers::{Reconnect, RedisConnector, RedisSettings};
+    ///
+    /// # fn run() -> rainier_support::Result<()> {
+    /// let redis = RedisConnector::open_with(
+    ///     "redis://127.0.0.1/",
+    ///     RedisSettings::new()
+    ///         .response_timeout(Duration::from_millis(500))
+    ///         .reconnect(Reconnect::new()),
+    /// )?;
+    /// # let _ = redis; Ok(()) }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// When the URL cannot be parsed, or the settings cannot be honoured. Both
+    /// fail here rather than at the first command, so a mistake is a boot
+    /// failure rather than a connection that quietly ignores what it was told.
+    pub fn open_with(url: &str, settings: RedisSettings) -> Result<Self> {
+        settings.validate()?;
+
         let client = redis::Client::open(url).map_err(|e| {
             // The URL frequently contains a password, so it is not echoed.
             Error::internal(format!("could not open a Redis client: {e}"))
         })?;
 
-        Ok(Self { backend: Backend::Single(client), description: "redis".to_string() })
+        Ok(Self { backend: Backend::Single(client), description: "redis".to_string(), settings })
     }
 
     /// Open a connector to a sharded cluster.
@@ -129,24 +499,71 @@ impl RedisConnector {
     /// ```
     #[cfg(feature = "redis-cluster")]
     pub fn open_cluster(urls: impl IntoIterator<Item = impl Into<String>>) -> Result<Self> {
+        Self::open_cluster_with(urls, RedisSettings::new())
+    }
+
+    /// Open a connector to a sharded cluster, with settings.
+    ///
+    /// A cluster connection already re-establishes itself and already retries,
+    /// so [`reconnect`](RedisSettings::reconnect) here **tightens** a policy
+    /// rather than turning one on. That is worth knowing before leaving it out:
+    /// the client's own default is sixteen retries with a wait that grows to
+    /// roughly eleven minutes, which is a long time for a command on a hot path
+    /// to be neither answered nor failed.
+    ///
+    /// # Errors
+    ///
+    /// When there are no seeds, when a URL cannot be parsed, or when the
+    /// settings cannot be honoured.
+    #[cfg(feature = "redis-cluster")]
+    pub fn open_cluster_with(
+        urls: impl IntoIterator<Item = impl Into<String>>,
+        settings: RedisSettings,
+    ) -> Result<Self> {
+        settings.validate()?;
+
         let seeds: Vec<String> = urls.into_iter().map(Into::into).collect();
         if seeds.is_empty() {
             return Err(Error::internal("a Redis cluster needs at least one seed node"));
         }
         let count = seeds.len();
 
-        let client = redis::cluster::ClusterClient::new(seeds)
+        // The builder even when nothing is declared: `ClusterClient::new` is
+        // this with no options set, so an application that declares nothing
+        // gets the client it got before.
+        let mut builder = redis::cluster::ClusterClient::builder(seeds);
+        if let Some(timeout) = settings.connect_timeout_period() {
+            builder = builder.connection_timeout(timeout);
+        }
+        if let Some(timeout) = settings.response_timeout_period() {
+            builder = builder.response_timeout(timeout);
+        }
+        if let Some(reconnect) = settings.reconnection() {
+            builder = builder.retries(reconnect.attempt_limit());
+            if let Some(ceiling) = reconnect.backoff_ceiling() {
+                builder = builder.max_retry_wait(ceiling.as_millis().min(u64::MAX as u128) as u64);
+            }
+        }
+
+        let client = builder
+            .build()
             .map_err(|e| Error::internal(format!("could not open a Redis cluster client: {e}")))?;
 
         Ok(Self {
             backend: Backend::Cluster(client),
             description: format!("redis-cluster({count} seeds)"),
+            settings,
         })
     }
 
     /// A label for diagnostics.
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// The settings every connection from this connector is opened with.
+    pub fn settings(&self) -> &RedisSettings {
+        &self.settings
     }
 
     /// Whether this connector talks to a cluster.
@@ -165,11 +582,30 @@ impl RedisConnector {
     /// server's connection limit under load.
     pub async fn connect(&self) -> Result<RedisConnection> {
         match &self.backend {
-            Backend::Single(client) => client
+            // Three paths, and the first is the one that matters: with nothing
+            // declared this is the call it has always been, not a configured
+            // call that happens to be configured with nothing.
+            Backend::Single(client) if self.settings.is_unset() => client
                 .get_multiplexed_async_connection()
                 .await
                 .map(RedisConnection::Single)
                 .map_err(redis_error),
+
+            Backend::Single(client) => match self.settings.reconnection() {
+                Some(reconnect) => client
+                    .get_connection_manager_with_config(self.settings.manager_config(reconnect))
+                    .await
+                    .map(RedisConnection::Reconnecting)
+                    .map_err(redis_error),
+                None => client
+                    .get_multiplexed_async_connection_with_config(&self.settings.async_config())
+                    .await
+                    .map(RedisConnection::Single)
+                    .map_err(redis_error),
+            },
+
+            // The cluster's settings were baked into the client when it was
+            // opened, because that is where its builder takes them.
             #[cfg(feature = "redis-cluster")]
             Backend::Cluster(client) => client
                 .get_async_connection()
@@ -187,9 +623,19 @@ impl RedisConnector {
     }
 }
 
+/// Names the backend and the settings, and never the URL.
+///
+/// Hand-written rather than derived, and it stays that way: a Redis URL carries
+/// its password inline — `redis://default:hunter2@host:6379` — so a derived
+/// `Debug` would put it in the log of every process that dumped its
+/// configuration at boot. [`RedisSettings`] holds no credential, so it is
+/// rendered whole.
 impl std::fmt::Debug for RedisConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RedisConnector").field("backend", &self.description).finish()
+        f.debug_struct("RedisConnector")
+            .field("backend", &self.description)
+            .field("settings", &self.settings)
+            .finish()
     }
 }
 
@@ -278,6 +724,323 @@ mod tests {
 
         assert_eq!(err.status(), 503, "{}", err.message());
     }
+
+    // --- settings -----------------------------------------------------------
+
+    #[test]
+    fn a_connector_with_no_settings_declares_none() {
+        // The condition the connect path branches on: this is what keeps an
+        // application that configured nothing on the code it ran before.
+        assert!(RedisConnector::open("redis://127.0.0.1:6379/").unwrap().settings().is_unset());
+    }
+
+    #[test]
+    fn the_settings_reach_the_connector_that_will_open_with_them() {
+        let settings = RedisSettings::new()
+            .connect_timeout(Duration::from_secs(2))
+            .response_timeout(Duration::from_millis(250))
+            .reconnect(Reconnect::new().attempts(3).max_backoff(Duration::from_secs(5)));
+
+        let connector = RedisConnector::open_with("redis://127.0.0.1:6379/", settings).unwrap();
+
+        assert!(!connector.settings().is_unset());
+        assert_eq!(connector.settings().connect_timeout_period(), Some(Duration::from_secs(2)));
+        assert_eq!(
+            connector.settings().response_timeout_period(),
+            Some(Duration::from_millis(250))
+        );
+        let reconnect = connector.settings().reconnection().expect("declared");
+        assert_eq!(reconnect.attempt_limit(), 3);
+        assert_eq!(reconnect.backoff_ceiling(), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_reconnection_policy_reaches_the_clients_own_options() {
+        // One step further than the accessors: this is the value handed to the
+        // client, so a setting that stopped being applied fails here.
+        let settings = RedisSettings::new()
+            .connect_timeout(Duration::from_secs(2))
+            .response_timeout(Duration::from_millis(250));
+        let reconnect = Reconnect::new().attempts(3).max_backoff(Duration::from_millis(1500));
+
+        let rendered = format!("{:?}", settings.manager_config(reconnect));
+
+        assert!(rendered.contains("number_of_retries: 3"), "{rendered}");
+        assert!(rendered.contains("max_delay: Some(1500)"), "{rendered}");
+        assert!(rendered.contains("connection_timeout: Some(2s)"), "{rendered}");
+        assert!(rendered.contains("response_timeout: Some(250ms)"), "{rendered}");
+    }
+
+    #[test]
+    fn an_undeclared_setting_is_left_at_the_clients_default_rather_than_ours() {
+        // A second set of numbers kept here is a second set to drift.
+        let rendered = format!("{:?}", RedisSettings::new().manager_config(Reconnect::new()));
+
+        assert!(rendered.contains("max_delay: None"), "{rendered}");
+        assert!(rendered.contains("connection_timeout: None"), "{rendered}");
+        assert!(rendered.contains("response_timeout: None"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("number_of_retries: {DEFAULT_RECONNECT_ATTEMPTS}")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_zero_timeout_is_refused_rather_than_accepted_and_disabling_everything() {
+        // Both read as "no waiting" and mean "nothing works", which is the
+        // worst kind of setting to accept.
+        let connect = RedisConnector::open_with(
+            "redis://127.0.0.1:6379/",
+            RedisSettings::new().connect_timeout(Duration::ZERO),
+        )
+        .unwrap_err();
+        assert!(connect.message().contains("`connect_timeout` of zero"), "{}", connect.message());
+
+        let response = RedisConnector::open_with(
+            "redis://127.0.0.1:6379/",
+            RedisSettings::new().response_timeout(Duration::ZERO),
+        )
+        .unwrap_err();
+        assert!(
+            response.message().contains("`response_timeout` of zero"),
+            "{}",
+            response.message()
+        );
+    }
+
+    #[test]
+    fn a_reconnection_that_would_never_reconnect_is_refused() {
+        // It reads as reconnection being on and behaves as it being off, which
+        // is exactly the belief that survives to production.
+        let err = RedisConnector::open_with(
+            "redis://127.0.0.1:6379/",
+            RedisSettings::new().reconnect(Reconnect::new().attempts(0)),
+        )
+        .unwrap_err();
+
+        assert!(err.message().contains("never reconnects"), "{}", err.message());
+    }
+
+    #[test]
+    fn settings_are_refused_before_the_url_is_even_parsed() {
+        // So a bad declaration cannot be masked by a URL that also happens to
+        // be wrong, and so the message names the setting.
+        let err = RedisConnector::open_with(
+            "postgres://user:hunter2@host/db",
+            RedisSettings::new().response_timeout(Duration::ZERO),
+        )
+        .unwrap_err();
+
+        assert!(err.message().contains("`response_timeout`"), "{}", err.message());
+        assert!(!err.message().contains("hunter2"), "{}", err.message());
+    }
+
+    #[test]
+    fn no_debug_rendering_of_a_connector_discloses_the_url() {
+        // A Redis DSN carries its password inline, so a configuration dump at
+        // boot must not put it in the log of every process that started.
+        let connector = RedisConnector::open_with(
+            "redis://default:hunter2@cache.internal:6379/0",
+            RedisSettings::new().response_timeout(Duration::from_millis(250)),
+        )
+        .unwrap();
+
+        let rendered = format!("{connector:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(!rendered.contains("cache.internal"), "{rendered}");
+        assert!(rendered.contains("250ms"), "{rendered}");
+    }
+
+    /// A server that accepts the connection and then says nothing.
+    ///
+    /// Which is the case a connect timeout is for, and the reason this is not
+    /// tested against a closed port: a closed port refuses immediately, so it
+    /// cannot tell a timeout that fired from a timeout that was never set.
+    async fn a_silent_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let held = tokio::spawn(async move {
+            // Accepted and held open. The client's handshake waits for a reply
+            // that never comes.
+            let mut sockets = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                sockets.push(socket);
+            }
+        });
+
+        (format!("redis://127.0.0.1:{port}/"), held)
+    }
+
+    #[tokio::test]
+    async fn a_connect_timeout_reaches_the_socket_it_configures() {
+        let (url, held) = a_silent_server().await;
+
+        let connector = RedisConnector::open_with(
+            &url,
+            RedisSettings::new().connect_timeout(Duration::from_millis(100)),
+        )
+        .unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(5), connector.connect())
+            .await
+            .expect("the declared timeout should have fired long before this one")
+            .expect_err("a server that never answers cannot be connected to");
+        assert_eq!(err.status(), 503, "{}", err.message());
+
+        held.abort();
+    }
+
+    // --- losing the socket --------------------------------------------------
+
+    /// A server that speaks just enough RESP to answer, and hangs up once.
+    ///
+    /// Which is what a proxy reaping a connection that had been idle looks like
+    /// from this side: the socket closes with nothing said about it. Returns the
+    /// URL and a count of how many times it has been connected to, so a test can
+    /// tell "recovered" from "never noticed".
+    async fn a_server_that_hangs_up_once(
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinHandle<()>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connections);
+
+        let serving = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+                tokio::spawn(serve_until_bored(socket, first));
+            }
+        });
+
+        (format!("redis://127.0.0.1:{port}/"), connections, serving)
+    }
+
+    /// Answer `+PONG` to every command; on the first connection, hang up after
+    /// the handshake and one command.
+    async fn serve_until_bored(socket: tokio::net::TcpStream, hang_up: bool) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (reading, mut writing) = socket.into_split();
+        let mut reader = BufReader::new(reading);
+        let mut line = String::new();
+        let mut answered = 0;
+
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return;
+            }
+
+            // `*n` opens a command of `n` arguments, each a `$len` line and a
+            // payload line. Anything else is not a command and is skipped.
+            let Some(arguments) =
+                line.trim().strip_prefix('*').and_then(|count| count.parse::<usize>().ok())
+            else {
+                continue;
+            };
+
+            for _ in 0..arguments * 2 {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+            }
+
+            if writing.write_all(b"+PONG\r\n").await.is_err() {
+                return;
+            }
+
+            // Two handshake commands, then the caller's first. Enough to prove
+            // the connection worked before it did not.
+            answered += 1;
+            if hang_up && answered >= 3 {
+                return;
+            }
+        }
+    }
+
+    /// Ping until it answers, or give up. The reconnection happens in the
+    /// background, so the recovery is not the very next command.
+    async fn ping_until_it_answers(client: &RedisClient) -> bool {
+        for _ in 0..40 {
+            if client.ping().await.is_ok() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_dropped_socket_is_permanent_without_reconnection() {
+        // The finding this whole type exists for, asserted rather than
+        // asserted-about: there is no pool to recycle from, and a multiplexed
+        // connection does not re-open itself, so one dropped socket ends the
+        // process's Redis — silently, and usually because something idle was
+        // reaped rather than because Redis went anywhere.
+        use std::sync::atomic::Ordering;
+
+        let (url, connections, serving) = a_server_that_hangs_up_once().await;
+        let client = RedisClient::connect(&RedisConnector::open(&url).unwrap()).await.unwrap();
+
+        assert!(client.ping().await.is_ok(), "the connection works before the socket goes");
+        assert!(!client.reconnects());
+
+        assert!(
+            !ping_until_it_answers(&client).await,
+            "a connection with no reconnection should stay down"
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "and should never reconnect");
+
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn declaring_reconnection_is_what_gets_it_back() {
+        use std::sync::atomic::Ordering;
+
+        let (url, connections, serving) = a_server_that_hangs_up_once().await;
+        let client = RedisClient::connect(
+            &RedisConnector::open_with(
+                &url,
+                RedisSettings::new()
+                    .reconnect(Reconnect::new().max_backoff(Duration::from_millis(50))),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(client.ping().await.is_ok(), "the connection works before the socket goes");
+        assert!(client.reconnects());
+
+        assert!(ping_until_it_answers(&client).await, "reconnection should get the client back");
+        assert!(
+            connections.load(Ordering::SeqCst) > 1,
+            "which means a second connection, not a first that never noticed"
+        );
+
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn without_one_the_same_connect_waits_as_it_always_did() {
+        // The other half, and the one that matters for "absent settings are
+        // today's behaviour": the connect that used to hang still hangs.
+        let (url, held) = a_silent_server().await;
+
+        let connector = RedisConnector::open(&url).unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_millis(300), connector.connect()).await;
+        assert!(outcome.is_err(), "an unset connect timeout should still wait indefinitely");
+
+        held.abort();
+    }
 }
 
 /// Redis key/value operations.
@@ -310,6 +1073,17 @@ impl RedisClient {
     /// Whether this client is talking to a cluster.
     pub fn is_cluster(&self) -> bool {
         self.connection.is_cluster()
+    }
+
+    /// Whether this client's connection re-opens itself after losing its
+    /// socket.
+    ///
+    /// Worth asserting at boot on anything long-lived. `false` means a dropped
+    /// socket — a proxy reaping an idle connection is the usual way — takes the
+    /// cache, the queue and the broadcaster with it until the process is
+    /// restarted.
+    pub fn reconnects(&self) -> bool {
+        self.connection.reconnects()
     }
 
     /// A label for diagnostics.
