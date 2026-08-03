@@ -99,6 +99,21 @@ pub trait Setting: Copy + Eq + Sized + 'static {
     ///
     /// So: exact first, tolerance second. Both spellings still work and no
     /// value can be shadowed by the normalisation of another.
+    ///
+    /// # If you are adding a variant whose value decides something safe
+    ///
+    /// Underscored values are the ones this got wrong, and some of them carry
+    /// more than a preference. A TLS mode spelled `verify_ca` or
+    /// `verify_identity` is exactly that shape — and a verification mode that
+    /// fails to parse does not fail loudly, it falls back to whatever the
+    /// caller treats as the default, which is the weaker setting. That is a
+    /// security failure wearing a configuration failure's clothes.
+    ///
+    /// The round-trip property below holds for every variant of every enum, so
+    /// nothing is unprotected. But when the value chooses how much to trust
+    /// something, assert its exact spelling in that enum's own tests too — a
+    /// general property nobody reads is weaker evidence than a named case
+    /// somebody wrote down on purpose.
     fn parse(raw: &str) -> Result<Self> {
         let trimmed = raw.trim();
 
