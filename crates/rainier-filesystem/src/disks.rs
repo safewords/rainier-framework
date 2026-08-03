@@ -1,4 +1,5 @@
-//! Disks as configuration — [`Disks`], [`DiskConfig`], [`S3Disk`].
+//! Disks as configuration — [`Disks`], [`DiskConfig`], [`S3Disk`],
+//! [`CustomDisk`].
 //!
 //! A [`Storage`] holds a default disk and a map of named ones, and something
 //! has to put them there. Doing it imperatively works until two disks live on
@@ -70,15 +71,41 @@
 //! | `key` without `secret` | falls back to the ambient chain, and reads a **different account's** bucket of the same name |
 //! | `key` and `secret` with no `region` | a signed request has to name one, and a guess is a wrong one |
 //! | `default` naming an undeclared disk | the fallback would be silent, and the wrong disk |
+//! | a `driver` no built-in and no registration answers to | the fallback would be a disk on whichever backend the default happens to be |
+//!
+//! ## A driver the framework does not ship
+//!
+//! The `driver` field is not limited to the drivers in this crate. An
+//! application registers its own with
+//! [`FilesystemDriver::extend`](crate::FilesystemDriver::extend) and then
+//! declares it by name like any other, carrying whatever settings that driver
+//! needs:
+//!
+//! ```json
+//! { "driver": "my-store", "endpoint": "https://example.invalid", "namespace": "uploads" }
+//! ```
+//!
+//! Those settings arrive at the factory as a [`CustomDisk`]. They are *not*
+//! checked against the built-in field list — the framework has no idea what a
+//! driver it does not ship needs — so a custom driver validates its own, which
+//! [`CustomDisk::settings_as`] makes one `?`.
+//!
+//! The name still has to resolve. An unregistered one is refused when the
+//! declaration is read, and a declaration assembled in code is refused when it
+//! is [built](DiskConfig::build); neither ever falls back to a driver that
+//! works. See [`driver`](crate::driver) for the two messages and why they
+//! differ.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use rainier_support::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{Map, Value};
 
-use crate::driver::FilesystemDriver;
+use crate::driver::{DiskDriver, FilesystemDriver};
 use crate::filesystem::Filesystem;
 use crate::{LocalFilesystem, MemoryFilesystem, Storage};
 
@@ -221,8 +248,7 @@ impl std::fmt::Debug for Disks {
 /// have cannot be written down: there is no `bucket` on a local disk to fill in
 /// and wonder why it is ignored. The wire form is still flat — `driver` beside
 /// the rest — because that is what a configuration file wants to be.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(try_from = "RawDisk", into = "RawDisk")]
+#[derive(Clone)]
 pub enum DiskConfig {
     /// One directory on this machine.
     Local(LocalDisk),
@@ -232,6 +258,16 @@ pub enum DiskConfig {
 
     /// A bucket on S3 or anything that speaks its API.
     S3(S3Disk),
+
+    /// A driver the framework does not ship, registered by the application.
+    ///
+    /// Its settings are not this crate's business, so they are carried as
+    /// written and handed to whatever
+    /// [`FilesystemDriver::extend`](crate::FilesystemDriver::extend)
+    /// registered. Everything the variants above enforce — a driver that must
+    /// be named, a name that must resolve, a build that fails rather than
+    /// substitutes — still applies.
+    Custom(CustomDisk),
 }
 
 impl DiskConfig {
@@ -248,12 +284,24 @@ impl DiskConfig {
         Self::Memory
     }
 
+    /// A disk on a driver the application registered.
+    pub fn custom(driver: impl Into<String>) -> Self {
+        Self::Custom(CustomDisk::new(driver))
+    }
+
     /// Which driver this declares.
-    pub fn driver(&self) -> FilesystemDriver {
+    ///
+    /// A [`DiskDriver`] rather than a [`FilesystemDriver`], because a
+    /// declaration may name one the framework does not ship. Comparing against
+    /// a built-in still reads as it did — `disk.driver() ==
+    /// FilesystemDriver::S3` — and [`built_in`](DiskDriver::built_in) is the way
+    /// back to the closed set for code that matches on it.
+    pub fn driver(&self) -> DiskDriver {
         match self {
-            Self::Local(_) => FilesystemDriver::Local,
-            Self::Memory => FilesystemDriver::Memory,
-            Self::S3(_) => FilesystemDriver::S3,
+            Self::Local(_) => FilesystemDriver::Local.into(),
+            Self::Memory => FilesystemDriver::Memory.into(),
+            Self::S3(_) => FilesystemDriver::S3.into(),
+            Self::Custom(disk) => DiskDriver::Custom(disk.driver().to_string()),
         }
     }
 
@@ -266,6 +314,7 @@ impl DiskConfig {
         match self {
             Self::Local(disk) => Ok(Arc::new(disk.build())),
             Self::Memory => Ok(Arc::new(MemoryFilesystem::new())),
+            Self::Custom(disk) => disk.build().await,
 
             #[cfg(feature = "s3")]
             Self::S3(disk) => Ok(Arc::new(disk.build().await?)),
@@ -273,12 +322,68 @@ impl DiskConfig {
             // Loud, and naming the fix. Falling back to a local directory would
             // "work": uploads would land on a container's disk, be served back
             // for the life of that container, and vanish on the next deploy.
+            //
+            // Note that a driver whose feature is off is refused *here* rather
+            // than being handed to the registry: `s3` is the framework's name
+            // whether or not the feature is compiled in, so a build without it
+            // is a build error and never a lookup that some registration could
+            // answer.
             #[cfg(not(feature = "s3"))]
             Self::S3(disk) => Err(Error::internal(format!(
                 "this disk uses the `s3` driver for bucket `{}`, but rainier-filesystem was \
                  built without the `s3` feature",
                 disk.bucket()
             ))),
+        }
+    }
+
+    /// This declaration as the flat form it is written in.
+    fn wire_form(&self) -> Value {
+        match self {
+            Self::Local(disk) => RawDisk::for_local(disk).to_value(),
+            Self::Memory => RawDisk::blank(FilesystemDriver::Memory).to_value(),
+            Self::S3(disk) => RawDisk::for_s3(disk).to_value(),
+            Self::Custom(disk) => disk.wire_form(),
+        }
+    }
+
+    /// Read a declaration out of the flat form, driver first.
+    ///
+    /// The driver decides everything else, so it is resolved before any other
+    /// field is looked at: a built-in goes through [`RawDisk`], which knows
+    /// exactly which settings it has and refuses the rest, and an application's
+    /// driver keeps its settings as written because nothing here knows what they
+    /// should be.
+    fn from_wire_form(value: Value) -> Result<Self> {
+        let Value::Object(mut fields) = value else {
+            return Err(Error::internal(
+                "a disk is declared as a table of settings, one of which is `driver`",
+            ));
+        };
+
+        let named = fields.remove("driver").ok_or_else(|| {
+            Error::internal(
+                "a disk declaration needs a `driver`; an assumed driver is a disk pointed at \
+                 whichever backend the default happens to be",
+            )
+        })?;
+
+        let named = named.as_str().ok_or_else(|| {
+            Error::internal("a disk's `driver` names a driver, so it has to be a string")
+        })?;
+
+        match DiskDriver::resolve(named)? {
+            DiskDriver::BuiltIn(built_in) => {
+                // Put back the *canonical* spelling rather than what was
+                // written, so the checked form cannot disagree with what was
+                // just resolved.
+                fields.insert("driver".to_string(), Value::String(built_in.to_string()));
+
+                let raw: RawDisk = serde_json::from_value(Value::Object(fields))
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                Self::try_from(raw)
+            }
+            DiskDriver::Custom(driver) => Ok(Self::Custom(CustomDisk { driver, settings: fields })),
         }
     }
 }
@@ -295,12 +400,47 @@ impl From<LocalDisk> for DiskConfig {
     }
 }
 
+impl From<CustomDisk> for DiskConfig {
+    fn from(disk: CustomDisk) -> Self {
+        Self::Custom(disk)
+    }
+}
+
+/// Written and read as the flat table a configuration file wants.
+///
+/// Hand-written rather than derived through the built-in wire form, which names
+/// every field the drivers in this crate have — exactly what makes it able to
+/// refuse a setting one of them would ignore. An application's driver has fields
+/// nobody here can enumerate, so it is carried as written.
+impl Serialize for DiskConfig {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.wire_form().serialize(serializer)
+    }
+}
+
+/// Read through the tree the configuration already is.
+///
+/// A declaration has to be looked at *twice* — once for its `driver`, and again
+/// for the settings that driver turns out to have — so it is buffered into the
+/// same `serde_json::Value` the configuration repository holds rather than a
+/// second representation of it. That does mean a self-describing format is
+/// required, which every configuration format is.
+impl<'de> Deserialize<'de> for DiskConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        let value = Value::deserialize(deserializer)?;
+        Self::from_wire_form(value).map_err(|e| D::Error::custom(e.message()))
+    }
+}
+
 impl std::fmt::Debug for DiskConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Local(disk) => std::fmt::Debug::fmt(disk, f),
             Self::Memory => f.write_str("Memory"),
             Self::S3(disk) => std::fmt::Debug::fmt(disk, f),
+            Self::Custom(disk) => std::fmt::Debug::fmt(disk, f),
         }
     }
 }
@@ -587,14 +727,177 @@ impl std::fmt::Debug for S3Credentials {
     }
 }
 
+/// A disk on a driver the framework does not ship.
+///
+/// The declaration, exactly as it was written, minus the `driver` key that
+/// selected it. What is left is that driver's own settings, and nothing in this
+/// crate pretends to know what they should be — the driver validates them, and
+/// [`settings_as`](Self::settings_as) is the one-line way to do it against a
+/// struct with `#[serde(deny_unknown_fields)]`, which gets a custom driver the
+/// same refusal of a misfiled setting the built-ins have.
+///
+/// ```
+/// use rainier_filesystem::CustomDisk;
+///
+/// let disk = CustomDisk::new("my-store")
+///     .with("endpoint", "https://example.invalid")
+///     .with("namespace", "uploads");
+///
+/// assert_eq!(disk.driver(), "my-store");
+/// assert_eq!(disk.string("endpoint"), Some("https://example.invalid"));
+/// assert_eq!(disk.string("missing"), None);
+/// ```
+///
+/// Constructing one does **not** check that anything is registered under the
+/// name — it is a declaration, and a declaration is checked when it is
+/// [built](Self::build). That is the path where "register it before boot" is the
+/// diagnosis rather than "you spelled it wrong".
+#[derive(Clone)]
+pub struct CustomDisk {
+    driver: String,
+    settings: Map<String, Value>,
+}
+
+impl CustomDisk {
+    /// A disk on the driver registered under `driver`, with no settings yet.
+    pub fn new(driver: impl Into<String>) -> Self {
+        Self { driver: driver.into(), settings: Map::new() }
+    }
+
+    /// Declare a setting.
+    pub fn with(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.settings.insert(key.into(), value.into());
+        self
+    }
+
+    /// The driver name this disk was declared with.
+    pub fn driver(&self) -> &str {
+        &self.driver
+    }
+
+    /// Every setting, as written.
+    pub fn settings(&self) -> &Map<String, Value> {
+        &self.settings
+    }
+
+    /// One setting, as written.
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.settings.get(key)
+    }
+
+    /// One setting, if it is a string.
+    ///
+    /// `None` both for a setting that is absent and for one that is not a
+    /// string, because a driver reading `endpoint` wants the same answer either
+    /// way: it was not declared usably. Where the difference matters,
+    /// [`get`](Self::get) has it.
+    pub fn string(&self, key: &str) -> Option<&str> {
+        self.get(key)?.as_str()
+    }
+
+    /// The settings, deserialised into this driver's own type.
+    ///
+    /// The recommended way to read them. A struct with
+    /// `#[serde(deny_unknown_fields)]` gets a custom driver the property the
+    /// built-ins have — a misfiled setting is refused rather than dropped —
+    /// which is worth more here than anywhere, since nothing else in this crate
+    /// can check them.
+    ///
+    /// ```
+    /// # use rainier_filesystem::CustomDisk;
+    /// #[derive(serde::Deserialize)]
+    /// #[serde(deny_unknown_fields)]
+    /// struct MyStore {
+    ///     endpoint: String,
+    /// }
+    ///
+    /// let disk = CustomDisk::new("my-store").with("endpoint", "https://example.invalid");
+    /// assert_eq!(disk.settings_as::<MyStore>().unwrap().endpoint, "https://example.invalid");
+    ///
+    /// let typo = CustomDisk::new("my-store").with("endpiont", "https://example.invalid");
+    /// assert!(typo.settings_as::<MyStore>().is_err());
+    /// ```
+    pub fn settings_as<T: DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_value(Value::Object(self.settings.clone())).map_err(|e| {
+            Error::internal(format!("the `{}` disk's settings do not fit: {e}", self.driver))
+        })
+    }
+
+    /// Build this disk through whatever was registered under its driver name.
+    ///
+    /// # It fails rather than substituting
+    ///
+    /// A name nothing is registered under is an error naming the driver, listing
+    /// what *is* registered, and saying that registration has to come first.
+    /// There is deliberately no fallback: a disk that quietly became `local`
+    /// would accept every write, serve them back for the life of the container,
+    /// and lose them on the next deploy — which is indistinguishable from
+    /// working until it is not.
+    pub async fn build(&self) -> Result<Arc<dyn Filesystem>> {
+        // A built-in name in this slot means the declaration was assembled by
+        // hand with a name the framework already owns. Handing it to the
+        // registry would report it unregistered, which sends the reader looking
+        // for a registration that must never exist.
+        if let Some(built_in) = crate::driver::built_in_matching(&self.driver) {
+            return Err(Error::internal(format!(
+                "this disk names `{}` as an application driver, but `{built_in}` is one the \
+                 framework ships; declare it as `{built_in}` so the framework's own driver builds \
+                 it",
+                self.driver
+            )));
+        }
+
+        let factory = crate::driver::factory_for(&self.driver).ok_or_else(|| {
+            Error::internal(format!(
+                "no filesystem driver is registered under `{}`; register it with \
+                 `FilesystemDriver::extend` before the disk that names it is built. {}",
+                self.driver,
+                crate::driver::registered_summary()
+            ))
+        })?;
+
+        factory(self.clone()).await
+    }
+
+    /// This declaration as the flat table it was written as.
+    fn wire_form(&self) -> Value {
+        let mut fields = self.settings.clone();
+        fields.insert("driver".to_string(), Value::String(self.driver.clone()));
+        Value::Object(fields)
+    }
+}
+
+/// Names the driver and the settings it was given, and never their values.
+///
+/// Hand-written for the reason [`S3Credentials`]' is: a driver the framework
+/// does not ship is exactly the kind to be handed a bearer token or a signing
+/// key, and this crate has no idea which of its settings those are. Printing the
+/// keys says enough to diagnose a declaration; printing the values puts whatever
+/// is in them in the log of every process that dumped its configuration at boot.
+impl std::fmt::Debug for CustomDisk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomDisk")
+            .field("driver", &self.driver)
+            .field("settings", &self.settings.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 // --- the wire form -----------------------------------------------------------
 
-/// A disk as it is written down, before it is known to make sense.
+/// A **built-in** disk as it is written down, before it is known to make sense.
 ///
 /// The flat shape a configuration file wants, which [`DiskConfig`] is the
 /// checked form of. Everything but `driver` is optional here so the *driver*
 /// gets to say which settings apply, and so a misfiled one can be named in the
 /// error rather than silently dropped.
+///
+/// It covers the drivers this crate ships and no others: naming every field they
+/// have is what lets `deny_unknown_fields` and
+/// [`reject_settings_it_ignores`](RawDisk::reject_settings_it_ignores) refuse
+/// anything else. A [`CustomDisk`] cannot go through it — its fields are the
+/// application's, and enumerating them here would mean the framework deciding
+/// what a driver it does not ship is allowed to be configured with.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDisk {
@@ -726,9 +1029,10 @@ impl TryFrom<RawDisk> for DiskConfig {
     }
 }
 
-impl From<DiskConfig> for RawDisk {
-    fn from(disk: DiskConfig) -> Self {
-        let blank = |driver| Self {
+impl RawDisk {
+    /// A declaration naming only its driver.
+    fn blank(driver: FilesystemDriver) -> Self {
+        Self {
             driver,
             root: None,
             bucket: None,
@@ -738,43 +1042,131 @@ impl From<DiskConfig> for RawDisk {
             path_style: None,
             key: None,
             secret: None,
+        }
+    }
+
+    /// The written form of a local disk.
+    fn for_local(disk: &LocalDisk) -> Self {
+        Self {
+            root: Some(disk.root.clone()),
+            url: disk.url.clone(),
+            ..Self::blank(FilesystemDriver::Local)
+        }
+    }
+
+    /// The written form of an object-storage disk.
+    fn for_s3(disk: &S3Disk) -> Self {
+        let (key, secret) = match &disk.credentials {
+            S3Credentials::Chain => (None, None),
+            S3Credentials::Static { access_key_id, secret_access_key } => {
+                (Some(access_key_id.clone()), Some(secret_access_key.clone()))
+            }
         };
 
-        match disk {
-            DiskConfig::Local(disk) => {
-                Self { root: Some(disk.root), url: disk.url, ..blank(FilesystemDriver::Local) }
-            }
-            DiskConfig::Memory => blank(FilesystemDriver::Memory),
-            DiskConfig::S3(disk) => {
-                let (key, secret) = match disk.credentials {
-                    S3Credentials::Chain => (None, None),
-                    S3Credentials::Static { access_key_id, secret_access_key } => {
-                        (Some(access_key_id), Some(secret_access_key))
-                    }
-                };
-                Self {
-                    bucket: Some(disk.bucket),
-                    region: disk.region,
-                    endpoint: disk.endpoint,
-                    url: disk.url,
-                    // Written back only when it was the disk's own doing: an
-                    // endpoint implies it, and re-emitting the implication as a
-                    // literal would make a round trip say more than the
-                    // original did.
-                    path_style: disk.path_style.then_some(true),
-                    key,
-                    secret,
-                    ..blank(FilesystemDriver::S3)
-                }
-            }
+        Self {
+            bucket: Some(disk.bucket.clone()),
+            region: disk.region.clone(),
+            endpoint: disk.endpoint.clone(),
+            url: disk.url.clone(),
+            // Written back only when it was the disk's own doing: an endpoint
+            // implies it, and re-emitting the implication as a literal would
+            // make a round trip say more than the original did.
+            path_style: disk.path_style.then_some(true),
+            key,
+            secret,
+            ..Self::blank(FilesystemDriver::S3)
         }
+    }
+
+    /// This declaration as the flat table it is serialised as.
+    fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("a RawDisk is a flat table of strings and booleans")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use rainier_support::BoxFuture;
     use serde_json::json;
+
+    use crate::{FilesystemExt, Metadata};
+
+    // --- a driver the framework does not ship -------------------------------
+
+    /// A driver registered by an "application", for the tests that need one to
+    /// be **distinguishable** from a built-in.
+    ///
+    /// It reports its own name and keeps the settings it was declared with,
+    /// which is the whole point: a factory answering with a bare
+    /// [`MemoryFilesystem`] would be indistinguishable from a silent fallback to
+    /// the `memory` driver, and every assertion below would pass for the bug.
+    struct BespokeFilesystem {
+        name: String,
+        settings: Map<String, Value>,
+        inner: MemoryFilesystem,
+    }
+
+    impl BespokeFilesystem {
+        fn new(disk: &CustomDisk) -> Self {
+            Self {
+                name: disk.driver().to_string(),
+                settings: disk.settings().clone(),
+                inner: MemoryFilesystem::new(),
+            }
+        }
+    }
+
+    impl Filesystem for BespokeFilesystem {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn get<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<Option<Bytes>>> {
+            self.inner.get(path)
+        }
+
+        fn put<'a>(&'a self, path: &'a str, contents: Bytes) -> BoxFuture<'a, Result<()>> {
+            self.inner.put(path, contents)
+        }
+
+        fn delete<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<bool>> {
+            self.inner.delete(path)
+        }
+
+        fn exists<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<bool>> {
+            self.inner.exists(path)
+        }
+
+        fn metadata<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<Option<Metadata>>> {
+            self.inner.metadata(path)
+        }
+
+        fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<Metadata>>> {
+            self.inner.list(prefix)
+        }
+
+        fn directories<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<String>>> {
+            self.inner.directories(prefix)
+        }
+    }
+
+    /// Register [`BespokeFilesystem`] under `name`.
+    ///
+    /// Each test uses a name of its own: the registry is process-wide, tests run
+    /// in parallel, and a name shared between two of them would make whichever
+    /// registered second fail.
+    fn register(name: &'static str) {
+        FilesystemDriver::extend(name, |disk: CustomDisk| async move {
+            Ok(Arc::new(BespokeFilesystem::new(&disk)) as Arc<dyn Filesystem>)
+        })
+        .expect("this test's driver name is its own");
+    }
 
     // --- reading a declaration ---------------------------------------------
 
@@ -1128,6 +1520,311 @@ mod tests {
 
         assert!(disk.is_path_style());
         assert!(disk.connector().await.unwrap().is_path_style());
+    }
+
+    // --- a driver the application registered ---------------------------------
+
+    #[tokio::test]
+    async fn a_registered_driver_is_declared_and_reached_like_any_other() {
+        register("reachable-store");
+
+        let disks: Disks = serde_json::from_value(json!({
+            "default": "uploads",
+            "disks": {
+                "uploads": { "driver": "local", "root": "storage/app" },
+                "bespoke": {
+                    "driver": "reachable-store",
+                    "endpoint": "https://example.invalid",
+                    "namespace": "uploads",
+                },
+            },
+        }))
+        .unwrap();
+
+        // Declared beside the built-ins, and named as itself.
+        assert_eq!(disks.get("uploads").unwrap().driver(), FilesystemDriver::Local);
+        assert_eq!(
+            disks.get("bespoke").unwrap().driver(),
+            DiskDriver::Custom("reachable-store".to_string())
+        );
+
+        let storage = disks.build().await.unwrap();
+        let bespoke = storage.disk("bespoke").expect("declared under this name");
+
+        // The disk that came back is the registered driver's, not a stand-in:
+        // it names itself, which no built-in would.
+        assert_eq!(bespoke.driver(), "reachable-store");
+
+        // And it was handed its own declaration's settings.
+        let built = bespoke.as_driver::<BespokeFilesystem>().expect("built by the registration");
+        assert_eq!(
+            built.settings.get("endpoint").and_then(Value::as_str),
+            Some("https://example.invalid")
+        );
+        assert_eq!(built.settings.get("namespace").and_then(Value::as_str), Some("uploads"));
+        // The key that selected the driver is not one of its settings.
+        assert!(!built.settings.contains_key("driver"));
+
+        // It is a working disk, not merely a resolved name.
+        bespoke.put_string("a.txt", "hello").await.unwrap();
+        assert_eq!(bespoke.get_string("a.txt").await.unwrap().as_deref(), Some("hello"));
+
+        // And it is separate from the disk beside it, like any other pair.
+        assert!(!storage.disk("uploads").unwrap().exists("a.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_registered_driver_can_be_the_default_disk() {
+        register("default-store");
+
+        let storage = Disks::new("bespoke")
+            .with("bespoke", CustomDisk::new("default-store").with("endpoint", "https://x.invalid"))
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(storage.driver(), "default-store");
+        assert!(storage.as_driver::<BespokeFilesystem>().is_some());
+    }
+
+    #[test]
+    fn a_custom_declaration_round_trips_through_its_wire_form() {
+        register("round-trip-store");
+
+        // Settings this crate has no field for, and of types it never uses —
+        // they belong to the driver, so they survive as written.
+        let original = json!({
+            "driver": "round-trip-store",
+            "endpoint": "https://example.invalid",
+            "retries": 3,
+            "verify": true,
+            "headers": { "x-tenant": "one" },
+        });
+
+        let disk: DiskConfig = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&disk).unwrap(), original);
+
+        // The shorthand constructor names the same driver as the declaration.
+        assert_eq!(disk.driver(), DiskConfig::custom("round-trip-store").driver());
+    }
+
+    #[test]
+    fn a_custom_driver_settles_its_own_settings_rather_than_this_crate_s() {
+        // A `bucket` on a `local` disk is refused because this crate knows
+        // `local` has no bucket. It knows nothing about an application's driver,
+        // so the driver is the one that gets to refuse — and `settings_as` makes
+        // that the same refusal.
+        register("validating-store");
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Settings {
+            endpoint: String,
+        }
+
+        let disk: DiskConfig = serde_json::from_value(json!({
+            "driver": "validating-store",
+            "endpoint": "https://example.invalid",
+        }))
+        .unwrap();
+        let DiskConfig::Custom(custom) = disk else { panic!("declared as a custom driver") };
+        assert_eq!(custom.settings_as::<Settings>().unwrap().endpoint, "https://example.invalid");
+
+        let typo: DiskConfig = serde_json::from_value(json!({
+            "driver": "validating-store",
+            "endpiont": "https://example.invalid",
+        }))
+        .unwrap();
+        let DiskConfig::Custom(typo) = typo else { panic!("declared as a custom driver") };
+        let err = typo.settings_as::<Settings>().err().expect("`endpiont` is not a setting");
+        assert!(err.message().contains("endpiont"), "{}", err.message());
+    }
+
+    #[test]
+    fn no_debug_rendering_discloses_a_custom_driver_s_settings() {
+        // The same rule the S3 key pair has, applied where this crate cannot
+        // tell which setting is the secret: a driver it does not ship is exactly
+        // the kind to be handed a bearer token, so the keys are printed and the
+        // values never are.
+        register("secretive-store");
+
+        let disks = Disks::new("bespoke").with(
+            "bespoke",
+            CustomDisk::new("secretive-store")
+                .with("token", "super-secret")
+                .with("endpoint", "https://example.invalid"),
+        );
+
+        let rendered = format!("{disks:?}");
+        assert!(!rendered.contains("super-secret"), "{rendered}");
+        assert!(rendered.contains("secretive-store"), "{rendered}");
+        assert!(rendered.contains("token"), "{rendered}");
+    }
+
+    // --- a driver nobody registered ------------------------------------------
+
+    #[test]
+    fn an_unregistered_driver_is_refused_when_the_declaration_is_read() {
+        register("store-that-is-registered");
+
+        let err = serde_json::from_value::<Disks>(json!({
+            "disks": { "uploads": { "driver": "store-that-is-not" } },
+        }))
+        .unwrap_err()
+        .to_string();
+
+        // Names the driver, lists the built-ins, and lists what is registered.
+        assert!(err.contains("`store-that-is-not`"), "{err}");
+        assert!(err.contains("`local`, `memory`, `s3`"), "{err}");
+        assert!(err.contains("`store-that-is-registered`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_declaration_built_before_its_driver_is_registered_says_so() {
+        // The one somebody will hit. A declaration assembled in code is not read
+        // through serde, so nothing checks the name until the disk is built —
+        // and "register it first" is a different fix from "you spelled it
+        // wrong", so it is a different message.
+        let disks = Disks::new("bespoke").with("bespoke", CustomDisk::new("store-registered-late"));
+
+        let err = disks.build().await.err().expect("nothing is registered under that name");
+
+        assert!(err.message().starts_with("disk `bespoke`:"), "{}", err.message());
+        assert!(err.message().contains("`store-registered-late`"), "{}", err.message());
+        assert!(err.message().contains("no filesystem driver is registered"), "{}", err.message());
+        assert!(
+            err.message().contains("before the disk that names it is built"),
+            "{}",
+            err.message()
+        );
+        // And what it could have been, so the answer is in the message.
+        assert!(err.message().contains("`local`, `memory`, `s3`"), "{}", err.message());
+
+        // Registering it is the fix, and it is the *only* fix — the same
+        // declaration builds once the driver exists.
+        register("store-registered-late");
+        assert_eq!(disks.build().await.unwrap().driver(), "store-registered-late");
+    }
+
+    #[tokio::test]
+    async fn a_built_in_name_declared_as_a_custom_disk_is_sent_back_to_the_built_in() {
+        // Reachable only by assembling a declaration in code. Reporting `s3`
+        // unregistered would send the reader looking for a registration that
+        // must never exist — `extend` refuses to make one.
+        let err = CustomDisk::new("s3")
+            .build()
+            .await
+            .err()
+            .expect("`s3` is the framework's, not an application's");
+
+        assert!(err.message().contains("the framework ships"), "{}", err.message());
+        assert!(err.message().contains("`s3`"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn a_built_in_whose_feature_is_off_is_an_error_and_not_a_substitution() {
+        // Two halves of one property. `s3` is the framework's name whether or
+        // not the feature is compiled in, so: no registration can claim it…
+        let taken = FilesystemDriver::extend("s3", |_disk: CustomDisk| async move {
+            Ok(Arc::new(MemoryFilesystem::new()) as Arc<dyn Filesystem>)
+        })
+        .err()
+        .expect("`s3` is a built-in name");
+        assert!(taken.message().contains("built-in"), "{}", taken.message());
+
+        // …and a declaration naming it is the built-in driver either way, so
+        // there is no lookup for a registration to answer.
+        let disks: Disks = serde_json::from_value(json!({
+            "default": "archive",
+            "disks": { "archive": { "driver": "s3", "bucket": "b", "region": "us-east-1" } },
+        }))
+        .unwrap();
+        assert_eq!(disks.get("archive").unwrap().driver(), FilesystemDriver::S3);
+
+        if cfg!(feature = "s3") {
+            assert_eq!(disks.build().await.unwrap().disk("archive").unwrap().driver(), "s3");
+        } else {
+            let err = disks.build().await.err().expect("no s3 driver to build with");
+            assert!(err.message().contains("without the `s3` feature"), "{}", err.message());
+        }
+    }
+
+    /// **The test that must not be made to pass by relaxing it.**
+    ///
+    /// Every route a driver name can travel, swept with names nothing answers
+    /// to. If anyone later adds a convenience fallback — a declaration that
+    /// resolves to the default driver, a build that shrugs and returns a local
+    /// directory — every other test in this crate still passes, and a disk
+    /// declared for object storage silently starts writing to a container's
+    /// filesystem: accepted, served back for the life of that container, gone on
+    /// the next deploy.
+    ///
+    /// So this asserts on the *absence of a working disk*, not on the wording of
+    /// an error.
+    #[tokio::test]
+    async fn no_route_from_an_unrecognised_driver_reaches_a_working_disk() {
+        // A positive control first, so the sweep below is known to be able to
+        // pass rather than merely never reaching its assertions.
+        register("sweep-control-store");
+        assert!(Disks::new("d")
+            .with("d", CustomDisk::new("sweep-control-store"))
+            .build()
+            .await
+            .is_ok());
+
+        for name in [
+            "ceph",          // a real backend nobody registered
+            "s4",            // a typo for a built-in
+            "loca",          // a truncation of one
+            "local-disk",    // a built-in with something appended
+            "s3-compatible", // the kind of name that sounds official
+            "default",       // a word somebody might expect to mean "the usual one"
+            "none",          // and one that might be expected to mean "no driver"
+            "",              // written as empty
+            "   ",           // and as blank
+        ] {
+            // 1. read as a `filesystems` section.
+            let section = serde_json::from_value::<Disks>(json!({
+                "default": "uploads",
+                "disks": { "uploads": { "driver": name } },
+            }));
+            assert!(section.is_err(), "the section declaring `{name}` was accepted");
+
+            // 2. read as one declaration, in case the section is what refused.
+            let declaration = serde_json::from_value::<DiskConfig>(json!({ "driver": name }));
+            assert!(declaration.is_err(), "the declaration naming `{name}` was accepted");
+
+            // 3. assembled in code, where nothing is read through serde at all
+            //    and the only check left is the one `build` does.
+            let built = Disks::new("uploads").with("uploads", CustomDisk::new(name)).build().await;
+
+            if let Ok(storage) = built {
+                panic!(
+                    "a disk declared with the driver `{name}` — which is not built in and is \
+                     registered nowhere — was built anyway, on the `{}` driver. That is the \
+                     silent substitution this crate is shaped around: every write to that disk \
+                     appears to succeed and goes somewhere other than where it was declared, and \
+                     nothing about the call site reads as broken. An unrecognised driver has to \
+                     be a failure, never a default.",
+                    storage.driver()
+                );
+            }
+
+            // The failure names the driver, so the fix is in the message rather
+            // than in a search. (Not asserted for the blank spellings, where
+            // `contains` would hold for anything.)
+            if !name.trim().is_empty() {
+                let message = Disks::new("uploads")
+                    .with("uploads", CustomDisk::new(name))
+                    .build()
+                    .await
+                    .err()
+                    .expect("just asserted")
+                    .message()
+                    .to_string();
+                assert!(message.contains(name), "`{name}` is missing from: {message}");
+            }
+        }
     }
 
     #[cfg(feature = "s3")]

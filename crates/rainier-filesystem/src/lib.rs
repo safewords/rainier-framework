@@ -24,6 +24,12 @@
 //! | [`MemoryFilesystem`] | — | no | tests |
 //! | `S3Filesystem` | `s3` | **yes** | S3, **Cloudflare R2**, MinIO, B2, Wasabi |
 //!
+//! The set is not closed. An application registers a driver the framework does
+//! not ship with [`FilesystemDriver::extend`], and declares it by name like any
+//! other — see [the module](driver) for how registration and resolution work,
+//! and for why an unregistered name is a boot failure rather than a disk that
+//! quietly becomes `local`.
+//!
 //! S3-compatible is not a special case. R2 and MinIO speak SigV4 against a
 //! different endpoint, so the difference is entirely in
 //! `AwsConfig`, from `rainier-drivers`:
@@ -170,8 +176,8 @@ pub mod memory;
 #[cfg(feature = "s3")]
 pub mod s3;
 
-pub use disks::{DiskConfig, Disks, LocalDisk, S3Credentials, S3Disk};
-pub use driver::FilesystemDriver;
+pub use disks::{CustomDisk, DiskConfig, Disks, LocalDisk, S3Credentials, S3Disk};
+pub use driver::{DiskDriver, FilesystemDriver};
 pub use filesystem::{normalise_path, normalise_prefix, Filesystem, FilesystemExt, Metadata};
 pub use local::LocalFilesystem;
 pub use memory::MemoryFilesystem;
