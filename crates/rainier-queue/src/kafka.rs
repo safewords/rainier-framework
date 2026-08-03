@@ -68,7 +68,17 @@ const POSITION: &str = "__kafka_position";
 pub const FAILED_SUFFIX: &str = ".failed";
 
 /// How long a partition lease lasts before another worker may take it.
-const DEFAULT_LEASE: Duration = Duration::from_secs(60);
+///
+/// Public, and read by [`ConnectionConfig`](crate::ConnectionConfig) rather than
+/// copied into it: the check that a lease outlives the worker's timeout is
+/// worthless if it compares against a stale duplicate of this number.
+///
+/// Note that this is **shorter** than the worker's own default timeout, so a
+/// Kafka connection that declares no `lease` and a worker that takes its default
+/// `timeout` are already the misconfiguration
+/// [`Connections::check_reservations`](crate::Connections::check_reservations)
+/// exists to name.
+pub const DEFAULT_LEASE: Duration = Duration::from_secs(60);
 
 /// How long the partition list is trusted before being asked for again.
 const METADATA_TTL: Duration = Duration::from_secs(30);

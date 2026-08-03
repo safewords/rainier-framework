@@ -29,8 +29,20 @@
 //!   tell you which you have.
 //! - **You cannot enqueue in your database transaction.** Insert an order and
 //!   dispatch its confirmation email and either can succeed alone.
-//!   [`DatabaseQueue`](crate::DatabaseQueue) makes them one transaction, which
-//!   is why it is the usual recommendation.
+//!
+//!   [`DatabaseQueue`](crate::DatabaseQueue) does **not** currently fix this,
+//!   and this bullet used to say it did. This framework has no transaction API
+//!   at all, so that driver's push is a bare insert like any other write and
+//!   the two can still diverge. What it does give you is one store rather than
+//!   two: the job is written to the same database as the row it refers to, so
+//!   it is as durable as that row and survives a restart that loses everything
+//!   queued here. That is the honest reason it is the usual recommendation —
+//!   durability, not atomicity.
+//!
+//!   Until there is a transaction to enlist in, a dispatch that must not be
+//!   orphaned is the application's to reconcile: write the intent in the same
+//!   statement as the data and dispatch from that, or make the job tolerate a
+//!   row that is not there yet and retry. Both are work. Neither is a setting.
 //!
 //! So: right for work you can afford to lose — warming a cache, recomputing a
 //! projection, analytics — and wrong for work you cannot, like taking a payment
@@ -133,6 +145,14 @@ impl RedisQueue {
         Ok(Self::new(RedisClient::connect(connector).await?))
     }
 
+    /// How long a reservation lasts when a connection does not say.
+    ///
+    /// Public, and read by [`ConnectionConfig`](crate::ConnectionConfig) rather
+    /// than copied into it: the check that a reservation outlives the worker's
+    /// timeout is worthless if it compares against a stale duplicate of this
+    /// number.
+    pub const DEFAULT_RESERVATION: Duration = Duration::from_secs(90);
+
     /// Use a client you already have — the point of sharing one connector
     /// between the cache, the broadcaster and this.
     pub fn new(client: RedisClient) -> Self {
@@ -140,7 +160,7 @@ impl RedisQueue {
             client,
             keys: Keys::new("rainier:queue:"),
             consumer: consumer_name(),
-            reservation: Duration::from_secs(90),
+            reservation: Self::DEFAULT_RESERVATION,
         }
     }
 

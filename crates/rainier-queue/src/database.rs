@@ -138,13 +138,21 @@ pub struct DatabaseQueue {
 }
 
 impl DatabaseQueue {
+    /// How long a claim lasts when a connection does not say.
+    ///
+    /// Public, and read by [`ConnectionConfig`](crate::ConnectionConfig) rather
+    /// than copied into it: the check that a reservation outlives the worker's
+    /// timeout is worthless if it compares against a stale duplicate of this
+    /// number.
+    pub const DEFAULT_RESERVATION: Duration = Duration::from_secs(90);
+
     /// A database queue over `db`.
     pub fn new(db: Database) -> Self {
         Self {
             jobs: Arc::new(EntityRepository::<JobRow>::new(db.clone())),
             failed: Arc::new(EntityRepository::<FailedJobRow>::new(db.clone())),
             db,
-            reservation: Duration::from_secs(90),
+            reservation: Self::DEFAULT_RESERVATION,
             max_claim_attempts: 5,
         }
     }

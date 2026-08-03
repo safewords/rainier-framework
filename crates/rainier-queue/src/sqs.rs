@@ -57,9 +57,17 @@ impl SqsQueue {
         Self::with_client(SqsClient::new(connector, queue_url))
     }
 
+    /// How long a message stays invisible when a connection does not say.
+    ///
+    /// Public, and read by [`ConnectionConfig`](crate::ConnectionConfig) rather
+    /// than copied into it: the check that a visibility timeout outlives the
+    /// worker's timeout is worthless if it compares against a stale duplicate
+    /// of this number.
+    pub const DEFAULT_VISIBILITY: Duration = Duration::from_secs(90);
+
     /// Use a client you already have.
     pub fn with_client(client: SqsClient) -> Self {
-        Self { client, visibility: Duration::from_secs(90), wait_time: Duration::ZERO }
+        Self { client, visibility: Self::DEFAULT_VISIBILITY, wait_time: Duration::ZERO }
     }
 
     /// How long a received message stays invisible.
