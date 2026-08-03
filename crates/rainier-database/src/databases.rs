@@ -100,8 +100,60 @@
 //! | a `sqlite` connection with no `database` | there is no file to open, and an assumed one is an empty database that migrates cleanly |
 //! | a DSN whose scheme no driver speaks | choosing one on the deployment's behalf is choosing the wrong database in silence |
 //! | `default` naming an undeclared connection | the fallback would be silent, and the wrong database |
+//! | `charset`, `collation` or `strict` on a driver with no such setting | the driver drops it, and the connection negotiates whatever it would have anyway |
+//! | `collation` with no `charset` | a collation orders **one** character set; alone it is matched against whichever one the driver assumes |
+//! | `unix_socket` beside `host` or `port` | a socket connection never dials a host, so the host in the file is read by everyone and used by nothing |
+//! | `prefix` or `prefix_indexes` | not supported at all — see below, and a half-applied prefix reads as missing data |
+//! | `engine` | nothing renders it, and a setting the database never sees is worse than one that was refused |
+//!
+//! ## Two of these settings are about data, not connectivity
+//!
+//! Everything above is about reaching the *right* database. `charset` and
+//! `strict` are about what happens to a value once it gets there, and both fail
+//! by **storing something other than what was sent**:
+//!
+//! **`charset`.** MySQL's `utf8` is three bytes wide. A connection negotiating
+//! it does not reject an emoji, or a good deal of CJK text, or a mathematical
+//! symbol — it truncates the value at the first four-byte character, or
+//! replaces it, and stores the row. Nothing raises, the write succeeds, and the
+//! text is short. `utf8mb4` is the one that holds all of Unicode. The framework
+//! still declares no default: an assumed character set is an assumption about
+//! every existing row in a database this connection did not create, so an
+//! undeclared `charset` leaves the driver and the server to settle it exactly
+//! as they did before.
+//!
+//! **`strict`.** MySQL's strict mode decides whether a value too long or out of
+//! range for its column is an **error** or a **truncation**. Non-strict is the
+//! dangerous direction, and it is dangerous in the same way: the `INSERT`
+//! returns success and the stored value is not the one that was sent. Left
+//! undeclared, the server's own `sql_mode` decides — which is not a safe
+//! default so much as an unknown one, because a managed database's parameter
+//! group is a place strict mode routinely gets turned off. Declaring `strict`
+//! settles it for every connection in the pool rather than for whichever
+//! connection happened to be checked out.
 //!
 //! ## What this section deliberately does not carry
+//!
+//! **A table prefix.** Not supported, and refused rather than accepted,
+//! because it cannot be applied *everywhere* a table name is rendered.
+//! `Entity::table()` is a `&'static str` with no connection in scope; a
+//! foreign key names its parent table as a string; a migration step and
+//! [`Database::statement`](crate::Database::statement) take SQL already
+//! written. A prefix reaching the first of those and not the rest is the worst
+//! outcome available: some statements hit prefixed tables and some hit
+//! unprefixed ones, and a query against a table that exists but is not the one
+//! holding the rows comes back **empty** rather than failing. That reads as
+//! missing data, and it is the same silent-wrong-database failure the rest of
+//! this module exists to refuse. If it is wanted, it belongs in the statement
+//! layer where every table name is rendered, not here.
+//!
+//! **`engine`.** MySQL's table engine is a `CREATE TABLE` clause, and nothing
+//! between a declaration and the schema builder carries it: a migration renders
+//! from a [`Dialect`] and never sees the connection's configuration. Accepting
+//! it would put a value in the file that the database never hears, which is
+//! strictly worse than refusing it — the configuration would say `InnoDB` while
+//! the server used whatever its default is, and the only way to find out would
+//! be to look at the table.
 //!
 //! **Pool settings.** [`PoolConfig`](rainier_orm::PoolConfig) is chosen from
 //! the connection rather than declared, because the one case where getting it
@@ -499,7 +551,27 @@ impl DatabaseConfig {
         match self {
             Self::Server(server) => server.dsn(),
             Self::Sqlite(sqlite) => Ok(sqlite.dsn()),
-            Self::Dsn(dsn) => Ok(dsn.dsn().to_string()),
+            Self::Dsn(dsn) => {
+                dsn.validate()?;
+                Ok(dsn.dsn().to_string())
+            }
+        }
+    }
+
+    /// SQL this connection runs on **every** connection its pool opens.
+    ///
+    /// Empty for all but a MySQL connection that declared `strict`, which is
+    /// the one setting here that no connection string can carry. Reachable
+    /// because a caller opening the same database by hand — through
+    /// [`SeaOrmExecutor::connect_with_session`](rainier_drivers::sql::SeaOrmExecutor::connect_with_session)
+    /// — needs the same statements this does, and a connection configured half
+    /// like this one is a connection that stores different rows for the same
+    /// write.
+    pub fn session_statements(&self) -> Vec<String> {
+        match self {
+            Self::Server(server) => server.session_statements(),
+            Self::Sqlite(_) => Vec::new(),
+            Self::Dsn(dsn) => dsn.session_statements(),
         }
     }
 
@@ -534,8 +606,15 @@ impl DatabaseConfig {
 
         #[cfg(feature = "sea-orm-executor")]
         {
-            let executor =
-                rainier_drivers::sql::SeaOrmExecutor::connect(&dsn, &self.pool()).await?;
+            // The session statements go to the pool, not to a connection: they
+            // have to reach every connection it opens, including the ones it
+            // opens later to replace a socket the server timed out.
+            let executor = rainier_drivers::sql::SeaOrmExecutor::connect_with_session(
+                &dsn,
+                &self.pool(),
+                &self.session_statements(),
+            )
+            .await?;
             Ok(Database::new(executor))
         }
 
@@ -595,8 +674,19 @@ pub struct ServerDatabase {
     host: String,
     /// `None` takes the engine's standard port.
     port: Option<u16>,
+    /// A local socket path, reached *instead* of `host` and `port`.
+    socket: Option<String>,
     database: String,
     credentials: DatabaseCredentials,
+    /// `None` leaves the character set to the driver and the server, which is
+    /// where it was before this was declarable — see this module's header.
+    charset: Option<String>,
+    /// `None` takes the character set's own default collation.
+    collation: Option<String>,
+    /// `None` leaves MySQL's `sql_mode` alone.
+    strict: Option<bool>,
+    /// A CA certificate to verify the server against.
+    ssl_ca: Option<String>,
 }
 
 impl ServerDatabase {
@@ -619,8 +709,13 @@ impl ServerDatabase {
             driver,
             host: String::new(),
             port: None,
+            socket: None,
             database: database.into(),
             credentials: DatabaseCredentials::None,
+            charset: None,
+            collation: None,
+            strict: None,
+            ssl_ca: None,
         }
     }
 
@@ -633,6 +728,17 @@ impl ServerDatabase {
     /// The port to connect to. Defaults to the engine's standard one.
     pub fn port(mut self, port: u16) -> Self {
         self.port = Some(port);
+        self
+    }
+
+    /// Reach the server over a local socket at `path`, rather than over TCP.
+    ///
+    /// Replaces the host and the port rather than joining them: a connection
+    /// over a socket never dials anything, so declaring both leaves a host in
+    /// the file that everybody reads and nothing uses. Setting one after the
+    /// other is refused when the declaration is checked, not silently resolved.
+    pub fn unix_socket(mut self, path: impl Into<String>) -> Self {
+        self.socket = Some(path.into());
         self
     }
 
@@ -649,12 +755,58 @@ impl ServerDatabase {
         self
     }
 
+    /// The character set this connection negotiates. MySQL only.
+    ///
+    /// `utf8mb4` is the one that holds all of Unicode; MySQL's `utf8` is three
+    /// bytes wide and truncates or replaces a four-byte character **without
+    /// failing the write**. Undeclared leaves it to the driver and the server,
+    /// because an assumed character set is an assumption about rows this
+    /// connection did not write.
+    pub fn charset(mut self, charset: impl Into<String>) -> Self {
+        self.charset = Some(charset.into());
+        self
+    }
+
+    /// The collation this connection sorts and compares with. MySQL only.
+    ///
+    /// A collation belongs to a character set, so this needs
+    /// [`charset`](Self::charset) beside it — a collation alone is matched
+    /// against whichever character set the driver assumes, which is a different
+    /// answer to the same question. The reverse is fine: a character set with
+    /// no collation takes that character set's own default, which is the
+    /// engine's convention rather than a guess about the deployment.
+    pub fn collation(mut self, collation: impl Into<String>) -> Self {
+        self.collation = Some(collation.into());
+        self
+    }
+
+    /// Whether an over-long or out-of-range value is an error. MySQL only.
+    ///
+    /// `false` is not "off" so much as "truncate": the write succeeds and the
+    /// stored value is not the one that was sent. Undeclared leaves the
+    /// server's own `sql_mode` in charge — see this module's header for why
+    /// that is an unknown rather than a default.
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = Some(strict);
+        self
+    }
+
+    /// Verify the server's certificate against the CA at `path`.
+    ///
+    /// What a managed database hands out with its endpoint. The path is read by
+    /// the driver at connect time, so a wrong one is a boot failure rather than
+    /// an unverified connection.
+    pub fn tls_ca(mut self, path: impl Into<String>) -> Self {
+        self.ssl_ca = Some(path.into());
+        self
+    }
+
     /// Which engine this speaks.
     pub fn driver(&self) -> DatabaseDriver {
         self.driver
     }
 
-    /// The host this connects to.
+    /// The host this connects to. Empty when it connects over a socket.
     pub fn host_name(&self) -> &str {
         &self.host
     }
@@ -662,6 +814,11 @@ impl ServerDatabase {
     /// The port, when one was declared.
     pub fn port_number(&self) -> Option<u16> {
         self.port
+    }
+
+    /// The local socket this connects over, when it does.
+    pub fn socket_path(&self) -> Option<&str> {
+        self.socket.as_deref()
     }
 
     /// The name of the database this opens.
@@ -674,6 +831,26 @@ impl ServerDatabase {
         &self.credentials
     }
 
+    /// The character set this negotiates, when one was declared.
+    pub fn charset_name(&self) -> Option<&str> {
+        self.charset.as_deref()
+    }
+
+    /// The collation this compares with, when one was declared.
+    pub fn collation_name(&self) -> Option<&str> {
+        self.collation.as_deref()
+    }
+
+    /// Whether this connection was declared strict, when it says either way.
+    pub fn strict_mode(&self) -> Option<bool> {
+        self.strict
+    }
+
+    /// The CA this verifies the server against, when one was declared.
+    pub fn tls_ca_path(&self) -> Option<&str> {
+        self.ssl_ca.as_deref()
+    }
+
     /// The server this connects to, with any credentials removed.
     ///
     /// Enough to tell two connections apart in a log, and not enough to
@@ -682,12 +859,73 @@ impl ServerDatabase {
         format!("{}://{}/{}", self.driver.scheme(), self.authority(), self.database)
     }
 
-    /// `host:port`, with the engine's standard port when none was declared.
+    /// `host:port`, with the engine's standard port when none was declared —
+    /// or the socket path, percent-encoded, when the connection is local.
+    ///
+    /// The socket goes in the authority for both engines because that is the
+    /// one place both drivers read it from: PostgreSQL takes a host beginning
+    /// with `/` as a socket path, and MySQL needs the `socket` parameter
+    /// [`query`](Self::query) adds — but a URL with an empty authority does not
+    /// parse at all, so there has to be something there, and the socket path is
+    /// the only honest candidate. `localhost` would put a host in the boot log
+    /// for a connection that never opens one.
     fn authority(&self) -> String {
+        if let Some(socket) = &self.socket {
+            return encode(socket);
+        }
         match self.port.or_else(|| self.driver.default_port()) {
             Some(port) => format!("{}:{port}", self.host),
             None => self.host.clone(),
         }
+    }
+
+    /// The settings the driver reads off the connection string's query.
+    ///
+    /// Each of these is a parameter the underlying driver parses itself, which
+    /// is what makes them settings rather than decoration: `charset` and
+    /// `collation` become the `SET NAMES … COLLATE …` the driver issues on
+    /// every connection it opens, and `ssl-ca` becomes the certificate it
+    /// verifies the server against. A setting the driver would *not* read is
+    /// refused when the declaration is checked rather than rendered here and
+    /// dropped on arrival.
+    fn query(&self) -> String {
+        let mut params: Vec<String> = Vec::new();
+
+        if let Some(charset) = &self.charset {
+            params.push(format!("charset={}", encode(charset)));
+        }
+        if let Some(collation) = &self.collation {
+            params.push(format!("collation={}", encode(collation)));
+        }
+        if let Some(socket) = &self.socket {
+            // PostgreSQL reads the socket off the authority, which already
+            // carries it. MySQL only reads this parameter.
+            if self.driver == DatabaseDriver::MySql {
+                params.push(format!("socket={}", encode(socket)));
+            }
+        }
+        if let Some(ca) = &self.ssl_ca {
+            // One spelling for both: `ssl-ca` is MySQL's name for it and one of
+            // PostgreSQL's accepted aliases for `sslrootcert`.
+            params.push(format!("ssl-ca={}", encode(ca)));
+        }
+
+        if params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", params.join("&"))
+        }
+    }
+
+    /// SQL run on **every** connection this declaration's pool opens.
+    ///
+    /// Empty unless `strict` was declared, because `sql_mode` is the one
+    /// setting here that no MySQL connection string can carry. It is a
+    /// statement rather than a parameter for that reason alone — see
+    /// [`SeaOrmExecutor::connect_with_session`](rainier_drivers::sql::SeaOrmExecutor::connect_with_session)
+    /// for why it has to reach every connection and not just the first.
+    fn session_statements(&self) -> Vec<String> {
+        self.strict.map(|strict| vec![strict_sql_mode(strict)]).unwrap_or_default()
     }
 
     /// Whether this declaration can be opened.
@@ -697,10 +935,26 @@ impl ServerDatabase {
     /// connection is opened so one assembled in code fails the same way with
     /// the same message.
     fn validate(&self) -> Result<()> {
-        if self.host.trim().is_empty() {
+        if self.socket.is_some() && !self.host.trim().is_empty() {
             return Err(Error::internal(format!(
-                "the `{}` connection to `{}` declares no `host`; a guessed one is a different \
-                 database, and the obvious guess is one that very often exists and answers",
+                "the `{}` connection to `{}` declares both a `unix_socket` and a `host`; a socket \
+                 connection never dials anything, so the host would be read by everyone who opens \
+                 the file and used by nothing",
+                self.driver, self.database
+            )));
+        }
+        if self.socket.is_none() && self.host.trim().is_empty() {
+            return Err(Error::internal(format!(
+                "the `{}` connection to `{}` declares no `host` or `unix_socket`; a guessed host \
+                 is a different database, and the obvious guess is one that very often exists and \
+                 answers",
+                self.driver, self.database
+            )));
+        }
+        if self.socket.as_ref().is_some_and(|socket| socket.trim().is_empty()) {
+            return Err(Error::internal(format!(
+                "the `{}` connection to `{}` declares an empty `unix_socket`; there is no path to \
+                 open",
                 self.driver, self.database
             )));
         }
@@ -712,6 +966,36 @@ impl ServerDatabase {
                 self.driver, self.host
             )));
         }
+        if self.collation.is_some() && self.charset.is_none() {
+            return Err(Error::internal(format!(
+                "the `{}` connection to `{}` declares a `collation` and no `charset`; a collation \
+                 orders one character set, so alone it is matched against whichever one the driver \
+                 assumes — which is a second answer to the question `charset` exists to settle",
+                self.driver, self.database
+            )));
+        }
+
+        let mysql_only: [(&str, bool); 3] = [
+            ("charset", self.charset.is_some()),
+            ("collation", self.collation.is_some()),
+            ("strict", self.strict.is_some()),
+        ];
+        let misplaced: Vec<String> = mysql_only
+            .iter()
+            .filter(|(_, present)| *present && self.driver != DatabaseDriver::MySql)
+            .map(|(name, _)| format!("`{name}`"))
+            .collect();
+        if !misplaced.is_empty() {
+            return Err(Error::internal(format!(
+                "the `{}` driver has no {}; PostgreSQL stores and compares text by the encoding \
+                 and collation the *database* was created with, and refuses an over-long value \
+                 either way. Accepting the setting here would put a value in the file that the \
+                 server never hears",
+                self.driver,
+                misplaced.join(" or ")
+            )));
+        }
+
         Ok(())
     }
 
@@ -731,12 +1015,44 @@ impl ServerDatabase {
         };
 
         Ok(format!(
-            "{}://{userinfo}{}/{}",
+            "{}://{userinfo}{}/{}{}",
             self.driver.scheme(),
             self.authority(),
-            encode(&self.database)
+            encode(&self.database),
+            self.query()
         ))
     }
+}
+
+/// `SET SESSION sql_mode = …`, adding or removing MySQL's strict modes and
+/// leaving every other mode in place.
+///
+/// Written as an edit of `@@sql_mode` rather than an assignment of a fixed
+/// list, and that is the load-bearing part. A connection arrives with modes on
+/// it that are not this setting's business — the driver appends its own before
+/// this runs, and a deployment's parameter group has its own — so assigning a
+/// list would silently drop whichever of those were not in it.
+///
+/// The wrapping in commas is what makes the removal exact: with `@@sql_mode`
+/// held as `,A,B,`, every mode is bounded by separators on both sides, so
+/// replacing `,B,` with `,` cannot match a mode that merely *ends* in `B` and
+/// leaves no doubled separator behind. `TRIM` then takes the wrapping off,
+/// including the case where the result is empty.
+fn strict_sql_mode(strict: bool) -> String {
+    // Both, because they are not the same rule: `STRICT_TRANS_TABLES` still
+    // truncates in a non-transactional table, where `STRICT_ALL_TABLES` errors.
+    const MODES: [&str; 2] = ["STRICT_TRANS_TABLES", "STRICT_ALL_TABLES"];
+
+    let mut without = "CONCAT(',', @@sql_mode, ',')".to_string();
+    for mode in MODES {
+        without = format!("REPLACE({without}, ',{mode},', ',')");
+    }
+
+    // Removed first even when they are about to be added back, so a connection
+    // that already had one does not end up naming it twice.
+    let value = if strict { format!("CONCAT({without}, '{}')", MODES.join(",")) } else { without };
+
+    format!("SET SESSION sql_mode = TRIM(BOTH ',' FROM {value})")
 }
 
 /// Names the server and never the password.
@@ -814,10 +1130,19 @@ impl std::fmt::Debug for DatabaseCredentials {
 /// is why this has none of them to set: a builder method that quietly did
 /// nothing because the DSN already said otherwise would be the same
 /// silently-ignored setting the wire form refuses.
+///
+/// The one exception is [`strict`](Self::strict), and it is an exception for
+/// the reason the rest are not: a MySQL connection string has no parameter for
+/// `sql_mode`. There is nothing inside the DSN for it to contradict, so setting
+/// it here is not a second answer to a question the URL already answered — and
+/// refusing it would leave the shape most deployments actually get, one
+/// injected DSN, with no way to say whether an over-long value errors.
 #[derive(Clone)]
 pub struct DsnDatabase {
     driver: DatabaseDriver,
     url: String,
+    /// `None` leaves MySQL's `sql_mode` alone. See [`ServerDatabase::strict`].
+    strict: Option<bool>,
 }
 
 impl DsnDatabase {
@@ -826,7 +1151,39 @@ impl DsnDatabase {
     /// Use when the driver is already known. [`from_url`](Self::from_url) reads
     /// it off the scheme instead, which is what a bare `DATABASE_URL` needs.
     pub fn new(driver: DatabaseDriver, url: impl Into<String>) -> Self {
-        Self { driver, url: url.into() }
+        Self { driver, url: url.into(), strict: None }
+    }
+
+    /// Whether an over-long or out-of-range value is an error. MySQL only.
+    ///
+    /// The one setting a DSN cannot carry, so the one that may be declared
+    /// beside it — see this type's own documentation, and
+    /// [`ServerDatabase::strict`] for what the two answers mean.
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = Some(strict);
+        self
+    }
+
+    /// Whether this connection was declared strict, when it says either way.
+    pub fn strict_mode(&self) -> Option<bool> {
+        self.strict
+    }
+
+    /// SQL run on every connection this declaration's pool opens.
+    fn session_statements(&self) -> Vec<String> {
+        self.strict.map(|strict| vec![strict_sql_mode(strict)]).unwrap_or_default()
+    }
+
+    /// Whether this declaration can be opened.
+    fn validate(&self) -> Result<()> {
+        if self.strict.is_some() && self.driver != DatabaseDriver::MySql {
+            return Err(Error::internal(format!(
+                "the `{}` driver has no `strict` mode; it is MySQL's `sql_mode`, and accepting the \
+                 setting here would put a value in the file that the server never hears",
+                self.driver
+            )));
+        }
+        Ok(())
     }
 
     /// A connection to `url`, with the driver taken from its scheme.
@@ -1065,6 +1422,30 @@ struct RawDatabase {
     username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    charset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    collation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    strict: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unix_socket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssl_ca: Option<String>,
+
+    // Named here so that declaring one is refused with the reason rather than
+    // as an unknown key. A section ported from a framework that has them is
+    // going to carry them, and "unknown field `prefix`" says the spelling is
+    // wrong when the truth is that the setting is not honoured — which sends
+    // somebody looking for the right spelling instead of for what to do
+    // instead. They are never produced on the way out: the checked form has
+    // nowhere to hold them, because nothing reads them.
+    #[serde(default, skip_serializing)]
+    prefix: Option<String>,
+    #[serde(default, skip_serializing)]
+    prefix_indexes: Option<bool>,
+    #[serde(default, skip_serializing)]
+    engine: Option<String>,
 }
 
 impl RawDatabase {
@@ -1076,13 +1457,18 @@ impl RawDatabase {
     /// how that belief survives to production, where it looks like a database
     /// that has lost everything since the last deploy.
     fn reject_settings_it_ignores(&self, used: &[&str]) -> Result<()> {
-        let declared: [(&str, bool); 6] = [
+        let declared: [(&str, bool); 11] = [
             ("url", self.url.is_some()),
             ("host", self.host.is_some()),
             ("port", self.port.is_some()),
             ("database", self.database.is_some()),
             ("username", self.username.is_some()),
             ("password", self.password.is_some()),
+            ("charset", self.charset.is_some()),
+            ("collation", self.collation.is_some()),
+            ("strict", self.strict.is_some()),
+            ("unix_socket", self.unix_socket.is_some()),
+            ("ssl_ca", self.ssl_ca.is_some()),
         ];
 
         let ignored: Vec<String> = declared
@@ -1115,12 +1501,19 @@ impl RawDatabase {
             return Ok(());
         }
 
+        // `strict` is deliberately absent: it is the one setting a connection
+        // string has no parameter for, so declaring it beside a `url` is not
+        // two answers to one question — see `DsnDatabase`.
         let also: Vec<String> = [
             ("host", self.host.is_some()),
             ("port", self.port.is_some()),
             ("database", self.database.is_some()),
             ("username", self.username.is_some()),
             ("password", self.password.is_some()),
+            ("charset", self.charset.is_some()),
+            ("collation", self.collation.is_some()),
+            ("unix_socket", self.unix_socket.is_some()),
+            ("ssl_ca", self.ssl_ca.is_some()),
         ]
         .iter()
         .filter(|(_, present)| *present)
@@ -1132,9 +1525,70 @@ impl RawDatabase {
         }
 
         Err(Error::internal(format!(
-            "this connection declares `url` and also {}; a DSN carries the host, the database and \
-             the credentials inline, so one of the two is ignored — and which one is not visible \
-             from the file. Declare either the URL or the fields, not both",
+            "this connection declares `url` and also {}; a DSN carries the host, the database, the \
+             credentials and the driver's own parameters inline, so one of the two is ignored — \
+             and which one is not visible from the file. Declare either the URL or the fields, not \
+             both",
+            also.join(", ")
+        )))
+    }
+
+    /// Refuse the settings this section does not honour, by name.
+    ///
+    /// The alternative is not "accept them": it is a file that says `prefix`
+    /// and a database that never hears about one. Refusing an unknown key
+    /// already happens through `deny_unknown_fields`; this exists so the
+    /// message is the reason rather than the spelling.
+    fn reject_settings_nothing_reads(&self) -> Result<()> {
+        if self.prefix.is_some() || self.prefix_indexes.is_some() {
+            return Err(Error::internal(
+                "this connection declares `prefix` or `prefix_indexes`, and a table prefix is not \
+                 supported. It cannot be applied everywhere a table name is rendered — an entity \
+                 names its table as a constant, a foreign key names its parent as a string, and a \
+                 migration step or a raw statement is SQL already written — and a prefix that \
+                 reaches some of those and not the rest sends queries to a table that exists and \
+                 is empty, which reads as missing data rather than as a misconfiguration",
+            ));
+        }
+
+        if self.engine.is_some() {
+            return Err(Error::internal(
+                "this connection declares `engine`, and the table engine is not settable here. It \
+                 is a `CREATE TABLE` clause, and a migration renders from a dialect without ever \
+                 seeing the connection's declaration — so accepting it would put a value in the \
+                 file that the server never hears, and the table would be created with the \
+                 server's default while the configuration said otherwise",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Refuse a `host` or a `port` written down beside a `unix_socket`.
+    ///
+    /// Its own rejection rather than "the driver does not use it", because the
+    /// driver does — just not on this connection. A socket connection never
+    /// dials anything, so the host sitting in the file is read by whoever
+    /// repoints the connection next and used by nothing.
+    fn reject_a_socket_beside_a_host(&self) -> Result<()> {
+        if self.unix_socket.is_none() {
+            return Ok(());
+        }
+
+        let also: Vec<String> = [("host", self.host.is_some()), ("port", self.port.is_some())]
+            .iter()
+            .filter(|(_, present)| *present)
+            .map(|(name, _)| format!("`{name}`"))
+            .collect();
+
+        if also.is_empty() {
+            return Ok(());
+        }
+
+        Err(Error::internal(format!(
+            "this connection declares `unix_socket` and also {}; a connection over a local socket \
+             never dials a host, so the host would be read by everyone who opens the file and used \
+             by nothing. Declare either the socket or the host, not both",
             also.join(", ")
         )))
     }
@@ -1144,15 +1598,25 @@ impl TryFrom<RawDatabase> for DatabaseConfig {
     type Error = Error;
 
     fn try_from(raw: RawDatabase) -> Result<Self> {
+        // First, because a setting nothing reads is refused whichever driver
+        // and whichever shape it was written beside.
+        raw.reject_settings_nothing_reads()?;
+
         // Checked before the driver's own settings, because a `url` beside a
         // `host` has a reason of its own and `does not use` would not be it.
         raw.reject_a_url_beside_its_own_parts()?;
+        raw.reject_a_socket_beside_a_host()?;
 
         // Whichever driver it names, a `url` is the whole connection. The
         // scheme is not re-derived from it: the declaration already said which
         // driver this is, and reading it twice is two answers to one question.
         if let Some(url) = raw.url {
-            return Ok(Self::Dsn(DsnDatabase::new(raw.driver, url)));
+            let mut dsn = DsnDatabase::new(raw.driver, url);
+            if let Some(strict) = raw.strict {
+                dsn = dsn.strict(strict);
+            }
+            dsn.validate()?;
+            return Ok(Self::Dsn(dsn));
         }
 
         match raw.driver {
@@ -1170,12 +1634,36 @@ impl TryFrom<RawDatabase> for DatabaseConfig {
             }
 
             driver => {
-                let host = raw.host.ok_or_else(|| {
-                    Error::internal(format!(
-                        "a `{driver}` connection needs a `host` to connect to, or a `url` that \
-                         names one"
-                    ))
-                })?;
+                // Every setting a server connection can carry. `charset`,
+                // `collation` and `strict` are named for MySQL only, so a
+                // PostgreSQL connection declaring one is told the driver does
+                // not use it rather than having it rendered and dropped.
+                let mut used = vec![
+                    "url",
+                    "host",
+                    "port",
+                    "database",
+                    "username",
+                    "password",
+                    "unix_socket",
+                    "ssl_ca",
+                ];
+                if driver == DatabaseDriver::MySql {
+                    used.extend(["charset", "collation", "strict"]);
+                }
+                raw.reject_settings_it_ignores(&used)?;
+
+                let host = match (raw.host, &raw.unix_socket) {
+                    (Some(host), _) => host,
+                    // A socket is the address, so there is no host to require.
+                    (None, Some(_)) => String::new(),
+                    (None, None) => {
+                        return Err(Error::internal(format!(
+                            "a `{driver}` connection needs a `host` to connect to, a `unix_socket` \
+                             to open, or a `url` that names one"
+                        )))
+                    }
+                };
                 let database = raw.database.ok_or_else(|| {
                     Error::internal(format!(
                         "a `{driver}` connection needs the name of the `database` to open; \
@@ -1205,7 +1693,18 @@ impl TryFrom<RawDatabase> for DatabaseConfig {
                     }
                 };
 
-                let server = ServerDatabase { driver, host, port: raw.port, database, credentials };
+                let server = ServerDatabase {
+                    driver,
+                    host,
+                    port: raw.port,
+                    socket: raw.unix_socket,
+                    database,
+                    credentials,
+                    charset: raw.charset,
+                    collation: raw.collation,
+                    strict: raw.strict,
+                    ssl_ca: raw.ssl_ca,
+                };
                 server.validate()?;
 
                 Ok(Self::Server(server))
@@ -1224,10 +1723,22 @@ impl From<DatabaseConfig> for RawDatabase {
             database: None,
             username: None,
             password: None,
+            charset: None,
+            collation: None,
+            strict: None,
+            unix_socket: None,
+            ssl_ca: None,
+            // Nothing reads these, so the checked form never held one and
+            // there is nothing to write back out.
+            prefix: None,
+            prefix_indexes: None,
+            engine: None,
         };
 
         match database {
-            DatabaseConfig::Dsn(dsn) => Self { url: Some(dsn.url), ..blank(dsn.driver) },
+            DatabaseConfig::Dsn(dsn) => {
+                Self { url: Some(dsn.url), strict: dsn.strict, ..blank(dsn.driver) }
+            }
 
             DatabaseConfig::Sqlite(sqlite) => {
                 Self { database: Some(sqlite.database), ..blank(DatabaseDriver::Sqlite) }
@@ -1241,12 +1752,21 @@ impl From<DatabaseConfig> for RawDatabase {
                         (Some(username), Some(password))
                     }
                 };
+                // A socket connection has no host to write back: it was never
+                // declared, and rendering an empty one would round-trip into a
+                // declaration that is refused.
+                let host = server.socket.is_none().then_some(server.host);
                 Self {
-                    host: Some(server.host),
+                    host,
                     port: server.port,
                     database: Some(server.database),
                     username,
                     password,
+                    charset: server.charset,
+                    collation: server.collation,
+                    strict: server.strict,
+                    unix_socket: server.socket,
+                    ssl_ca: server.ssl_ca,
                     ..blank(server.driver)
                 }
             }
@@ -1567,6 +2087,355 @@ mod tests {
         assert!(DatabaseConfig::sqlite("storage/app.sqlite").pool().max_connections > 1);
     }
 
+    // --- what happens to a value once it arrives ----------------------------
+
+    #[test]
+    fn a_charset_and_collation_reach_the_connection_rather_than_the_file() {
+        // The parameter names are the driver's, not this module's: sqlx reads
+        // `charset` and `collation` off the connection string and issues
+        // `SET NAMES … COLLATE …` on every connection it opens. Spelled any
+        // other way they would be parsed as unknown, dropped, and the
+        // connection would negotiate whatever it would have anyway — which is
+        // the three-byte `utf8` this setting exists to get away from.
+        let dsn = DatabaseConfig::from(
+            ServerDatabase::mysql("app")
+                .host("db.example.com")
+                .charset("utf8mb4")
+                .collation("utf8mb4_unicode_ci"),
+        )
+        .dsn()
+        .unwrap();
+
+        assert_eq!(
+            dsn,
+            "mysql://db.example.com:3306/app?charset=utf8mb4&collation=utf8mb4_unicode_ci"
+        );
+    }
+
+    #[test]
+    fn a_charset_and_collation_round_trip_through_the_wire_form() {
+        let declared: DatabaseConfig = serde_json::from_value(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "charset": "utf8mb4",
+            "collation": "utf8mb4_unicode_ci",
+        }))
+        .unwrap();
+
+        let DatabaseConfig::Server(ref server) = declared else { panic!("declared as mysql") };
+        assert_eq!(server.charset_name(), Some("utf8mb4"));
+        assert_eq!(server.collation_name(), Some("utf8mb4_unicode_ci"));
+
+        assert_eq!(
+            serde_json::to_value(&declared).unwrap(),
+            json!({
+                "driver": "mysql",
+                "host": "db.example.com",
+                "database": "app",
+                "charset": "utf8mb4",
+                "collation": "utf8mb4_unicode_ci",
+            })
+        );
+    }
+
+    #[test]
+    fn a_charset_alone_is_a_declaration_and_a_collation_alone_is_not() {
+        // A character set has one default collation, which is the engine's own
+        // convention — the same kind of thing as the default port. A collation
+        // has no default character set, so alone it is checked against whatever
+        // the driver assumes.
+        let charset_only: DatabaseConfig = serde_json::from_value(json!({
+            "driver": "mysql", "host": "h", "database": "app", "charset": "utf8mb4",
+        }))
+        .unwrap();
+        assert_eq!(charset_only.dsn().unwrap(), "mysql://h:3306/app?charset=utf8mb4");
+
+        let err = serde_json::from_value::<DatabaseConfig>(json!({
+            "driver": "mysql", "host": "h", "database": "app", "collation": "utf8mb4_unicode_ci",
+        }))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("`collation`"), "{err}");
+        assert!(err.contains("no `charset`"), "{err}");
+    }
+
+    #[test]
+    fn a_setting_only_one_engine_has_is_refused_on_the_others() {
+        // Accepted, it would render into the connection string, be parsed as an
+        // unknown parameter and dropped — a value in the file the server never
+        // hears.
+        for setting in [
+            json!({ "charset": "utf8mb4" }),
+            json!({ "charset": "utf8mb4", "collation": "utf8mb4_unicode_ci" }),
+            json!({ "strict": true }),
+        ] {
+            let mut declaration =
+                json!({ "driver": "postgres", "host": "db.example.com", "database": "app" });
+            let object = declaration.as_object_mut().unwrap();
+            for (key, value) in setting.as_object().unwrap() {
+                object.insert(key.clone(), value.clone());
+            }
+
+            let err =
+                serde_json::from_value::<DatabaseConfig>(declaration).unwrap_err().to_string();
+            assert!(err.contains("does not use") || err.contains("has no"), "{err}");
+        }
+    }
+
+    #[test]
+    fn strict_edits_the_servers_sql_mode_rather_than_replacing_it() {
+        // A connection arrives with modes on it that are not this setting's
+        // business — the driver appends its own, and a parameter group has its
+        // own. Assigning a list would drop whichever of those were not in it,
+        // silently, and this is the assertion that stops somebody simplifying
+        // the statement into one.
+        let on = strict_sql_mode(true);
+        let off = strict_sql_mode(false);
+
+        for statement in [&on, &off] {
+            assert!(statement.starts_with("SET SESSION sql_mode = "), "{statement}");
+            assert!(
+                statement.contains("@@sql_mode"),
+                "the server's own modes survive: {statement}"
+            );
+            // Comma-wrapped, so a removal cannot match a mode that merely ends
+            // in the name being removed, and leaves no doubled separator.
+            assert!(statement.contains("CONCAT(',', @@sql_mode, ',')"), "{statement}");
+            assert!(statement.contains("TRIM(BOTH ','"), "{statement}");
+        }
+
+        // Both directions remove first: on, so a mode already present is not
+        // named twice; off, because removing is the whole job.
+        assert!(on.contains("REPLACE"), "{on}");
+        assert!(off.contains("REPLACE"), "{off}");
+        assert!(on.ends_with("'STRICT_TRANS_TABLES,STRICT_ALL_TABLES'))"), "{on}");
+        assert!(!off.contains("'STRICT_TRANS_TABLES,STRICT_ALL_TABLES'"), "{off}");
+    }
+
+    #[test]
+    fn strict_is_carried_to_the_pool_because_no_connection_string_holds_it() {
+        // The distinction that matters: `charset` is a connection-string
+        // parameter and `strict` is not, so one is in the DSN and the other has
+        // to reach every connection the pool opens by another route.
+        let declared: DatabaseConfig = serde_json::from_value(json!({
+            "driver": "mysql", "host": "db.example.com", "database": "app", "strict": true,
+        }))
+        .unwrap();
+
+        assert_eq!(declared.dsn().unwrap(), "mysql://db.example.com:3306/app");
+        assert!(!declared.dsn().unwrap().contains("sql_mode"));
+
+        let session = declared.session_statements();
+        assert_eq!(session.len(), 1, "{session:?}");
+        assert!(session[0].contains("STRICT_ALL_TABLES"), "{session:?}");
+
+        // Undeclared is undeclared: the server's own `sql_mode` is left alone
+        // rather than being set to a guess about which way it should run.
+        let silent: DatabaseConfig = serde_json::from_value(
+            json!({ "driver": "mysql", "host": "db.example.com", "database": "app" }),
+        )
+        .unwrap();
+        assert!(silent.session_statements().is_empty());
+
+        // …and `false` is a declaration too, not an absence.
+        let lenient: DatabaseConfig = serde_json::from_value(json!({
+            "driver": "mysql", "host": "db.example.com", "database": "app", "strict": false,
+        }))
+        .unwrap();
+        assert_eq!(lenient.session_statements().len(), 1);
+    }
+
+    #[test]
+    fn strict_may_be_declared_beside_a_url_because_a_dsn_cannot_carry_it() {
+        // The one setting that is not two answers to one question: MySQL
+        // connection strings have no `sql_mode` parameter, so the platform's
+        // injected DSN and this cannot contradict each other.
+        let declared: DatabaseConfig = serde_json::from_value(json!({
+            "driver": "mysql",
+            "url": "mysql://app:shh@db.example.com/app",
+            "strict": true,
+        }))
+        .unwrap();
+
+        assert_eq!(declared.dsn().unwrap(), "mysql://app:shh@db.example.com/app");
+        assert_eq!(declared.session_statements().len(), 1);
+
+        // And it survives the wire form, so a dump and a reload declare the
+        // same connection.
+        assert_eq!(
+            serde_json::to_value(&declared).unwrap(),
+            json!({
+                "driver": "mysql",
+                "url": "mysql://app:shh@db.example.com/app",
+                "strict": true,
+            })
+        );
+
+        // The settings a DSN *does* carry are still refused beside it.
+        let err = serde_json::from_value::<DatabaseConfig>(json!({
+            "driver": "mysql", "url": "mysql://db.example.com/app", "charset": "utf8mb4",
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("declares `url` and also"), "{err}");
+        assert!(err.contains("`charset`"), "{err}");
+
+        // A DSN on an engine with no strict mode is refused rather than
+        // carrying a statement nothing would run.
+        let wrong_engine = serde_json::from_value::<DatabaseConfig>(json!({
+            "driver": "postgres", "url": "postgres://db.example.com/app", "strict": true,
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(wrong_engine.contains("has no `strict`"), "{wrong_engine}");
+    }
+
+    // --- reaching the server another way ------------------------------------
+
+    #[test]
+    fn a_unix_socket_replaces_the_host_rather_than_standing_beside_it() {
+        // Both engines read the socket from a place the URL has to have
+        // something in, so the path is the authority. `localhost` there would
+        // put a host in the boot log for a connection that never opens one.
+        let mysql = DatabaseConfig::from(
+            ServerDatabase::mysql("app").unix_socket("/var/run/mysqld/mysqld.sock").user("app"),
+        );
+        assert_eq!(
+            mysql.dsn().unwrap(),
+            "mysql://app@%2Fvar%2Frun%2Fmysqld%2Fmysqld.sock/app\
+             ?socket=%2Fvar%2Frun%2Fmysqld%2Fmysqld.sock"
+        );
+
+        // PostgreSQL takes a host beginning with `/` as a socket path, so the
+        // authority is the whole of it; MySQL only reads the parameter, so it
+        // gets both.
+        let postgres = DatabaseConfig::from(
+            ServerDatabase::postgres("app").unix_socket("/var/run/postgresql").user("app"),
+        );
+        assert_eq!(postgres.dsn().unwrap(), "postgres://app@%2Fvar%2Frun%2Fpostgresql/app");
+
+        // No port, either: there is nothing listening on one.
+        assert!(!postgres.dsn().unwrap().contains("5432"));
+    }
+
+    #[test]
+    fn a_socket_beside_a_host_is_refused_rather_than_one_winning() {
+        for beside in [json!({ "host": "db.example.com" }), json!({ "port": 3306 })] {
+            let mut declaration = json!({
+                "driver": "mysql", "database": "app", "unix_socket": "/var/run/mysqld.sock",
+            });
+            let object = declaration.as_object_mut().unwrap();
+            for (key, value) in beside.as_object().unwrap() {
+                object.insert(key.clone(), value.clone());
+            }
+
+            let err =
+                serde_json::from_value::<DatabaseConfig>(declaration).unwrap_err().to_string();
+            assert!(err.contains("declares `unix_socket` and also"), "{err}");
+            assert!(err.contains("not both"), "{err}");
+        }
+
+        // …and a socket alone satisfies the requirement a host otherwise does,
+        // because it is the address.
+        let declared: DatabaseConfig = serde_json::from_value(json!({
+            "driver": "mysql", "database": "app", "unix_socket": "/var/run/mysqld.sock",
+        }))
+        .unwrap();
+        let DatabaseConfig::Server(ref server) = declared else { panic!("declared as mysql") };
+        assert_eq!(server.socket_path(), Some("/var/run/mysqld.sock"));
+        assert_eq!(server.host_name(), "");
+    }
+
+    #[test]
+    fn a_tls_ca_is_one_setting_both_engines_read() {
+        // `ssl-ca` is MySQL's spelling and one of PostgreSQL's accepted aliases
+        // for `sslrootcert`, so the section names it once.
+        let mysql =
+            DatabaseConfig::from(ServerDatabase::mysql("app").host("h").tls_ca("/etc/ssl/rds.pem"));
+        assert_eq!(mysql.dsn().unwrap(), "mysql://h:3306/app?ssl-ca=%2Fetc%2Fssl%2Frds.pem");
+
+        let postgres = DatabaseConfig::from(
+            ServerDatabase::postgres("app").host("h").tls_ca("/etc/ssl/rds.pem"),
+        );
+        assert_eq!(postgres.dsn().unwrap(), "postgres://h:5432/app?ssl-ca=%2Fetc%2Fssl%2Frds.pem");
+
+        // A CA is not a credential, but the redacted rendering drops the query
+        // wholesale, so it is not in a log either.
+        assert_eq!(mysql.url_without_credentials(), "mysql://h:3306/app");
+    }
+
+    #[test]
+    fn a_socket_and_the_settings_beside_it_round_trip_through_the_wire_form() {
+        for original in [
+            json!({
+                "driver": "mysql",
+                "database": "app",
+                "unix_socket": "/var/run/mysqld/mysqld.sock",
+                "username": "app",
+            }),
+            json!({
+                "driver": "mysql",
+                "host": "db.example.com",
+                "database": "app",
+                "charset": "utf8mb4",
+                "collation": "utf8mb4_unicode_ci",
+                "strict": true,
+                "ssl_ca": "/etc/ssl/rds.pem",
+            }),
+            json!({
+                "driver": "postgres",
+                "host": "db.example.com",
+                "database": "app",
+                "ssl_ca": "/etc/ssl/rds.pem",
+            }),
+        ] {
+            let database: DatabaseConfig = serde_json::from_value(original.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&database).unwrap(), original);
+        }
+    }
+
+    // --- settings this section does not honour ------------------------------
+
+    #[test]
+    fn a_table_prefix_is_refused_by_name_and_with_the_reason() {
+        // Refused rather than accepted, because a prefix that reached the
+        // entities and not the raw statements would send some queries to a
+        // table that exists and is empty — which reads as missing data.
+        for declaration in [
+            json!({ "driver": "mysql", "host": "h", "database": "app", "prefix": "app_" }),
+            json!({ "driver": "mysql", "host": "h", "database": "app", "prefix_indexes": true }),
+            json!({ "driver": "sqlite", "database": "app.sqlite", "prefix": "app_" }),
+            json!({ "driver": "mysql", "url": "mysql://h/app", "prefix": "app_" }),
+        ] {
+            let err =
+                serde_json::from_value::<DatabaseConfig>(declaration).unwrap_err().to_string();
+
+            assert!(err.contains("`prefix`"), "{err}");
+            assert!(err.contains("not supported"), "{err}");
+            // The message is the reason, not the spelling: an unknown-key error
+            // sends somebody looking for the right name.
+            assert!(err.contains("everywhere a table name is rendered"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_table_engine_is_refused_because_nothing_would_render_it() {
+        // An accepted-and-ignored setting is worse than a refused one: the file
+        // would say `InnoDB` and the table would be created with whatever the
+        // server's default is.
+        let err = serde_json::from_value::<DatabaseConfig>(json!({
+            "driver": "mysql", "host": "h", "database": "app", "engine": "InnoDB",
+        }))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("`engine`"), "{err}");
+        assert!(err.contains("not settable here"), "{err}");
+        assert!(err.contains("never hears"), "{err}");
+    }
+
     // --- credentials --------------------------------------------------------
 
     #[test]
@@ -1660,6 +2529,52 @@ mod tests {
         // And the DSN — the one string that does carry it — is only ever
         // produced by asking for it by name.
         assert!(DatabaseConfig::from(server).dsn().unwrap().contains("super-secret"));
+    }
+
+    #[test]
+    fn the_settings_added_beside_a_credential_do_not_bring_it_into_a_log() {
+        // The same guarantee as the two tests above, held with every setting a
+        // connection can now carry — a new field that widened `Debug`, or a DSN
+        // rendering that started being printed, fails here.
+        let server = ServerDatabase::mysql("app_db")
+            .host("db.example.com")
+            .credentials("app_user", "super-secret")
+            .charset("utf8mb4")
+            .collation("utf8mb4_unicode_ci")
+            .strict(true)
+            .tls_ca("/etc/ssl/rds.pem");
+        let socketed = ServerDatabase::postgres("app_db")
+            .unix_socket("/var/run/postgresql")
+            .credentials("app_user", "super-secret");
+        let dsn = DsnDatabase::new(
+            DatabaseDriver::MySql,
+            "mysql://app_user:super-secret@db.example.com/app_db",
+        )
+        .strict(true);
+
+        for rendered in [
+            format!("{server:?}"),
+            format!("{socketed:?}"),
+            format!("{dsn:?}"),
+            format!("{:?}", DatabaseConfig::from(server.clone())),
+            format!("{:?}", DatabaseConfig::from(socketed.clone())),
+            format!("{:?}", DatabaseConfig::from(dsn.clone())),
+            server.url_without_credentials(),
+            socketed.url_without_credentials(),
+            dsn.url_without_credentials(),
+            // The statements are SQL about `sql_mode` and nothing else; this is
+            // what stops a later one being built out of the declaration.
+            DatabaseConfig::from(server.clone()).session_statements().join(" "),
+            DatabaseConfig::from(dsn.clone()).session_statements().join(" "),
+        ] {
+            assert!(!rendered.contains("super-secret"), "{rendered}");
+        }
+
+        // Still enough to tell the connections apart — which is what stops this
+        // passing because it renders nothing at all.
+        assert!(format!("{server:?}").contains("db.example.com"));
+        assert!(format!("{socketed:?}").contains("postgresql"));
+        assert!(format!("{server:?}").contains("app_user"), "the username is not the secret");
     }
 
     #[test]

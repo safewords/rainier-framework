@@ -15,22 +15,35 @@ Rainier adds the four things a framework needs on top:
 
 ## Connecting
 
-```rust
-use rainier_orm::{PoolConfig, SeaOrmExecutor};
-use rainier_framework::database::Database;
-
-let url = env.string("DATABASE_URL", "sqlite::memory:");
-let executor = SeaOrmExecutor::connect(&url, &PoolConfig::default()).await?;
-
-Rainier::new(".").with_database(Database::new(executor))
-```
-
 ```env
 DATABASE_URL=sqlite::memory:
 DATABASE_URL=sqlite://storage/app.sqlite
 DATABASE_URL=mysql://user:pass@localhost/app
 DATABASE_URL=postgres://user:pass@localhost/app
 ```
+
+That is the whole of it: `Rainier::boot()` opens the connection, and binds it
+both as a `Database` — which is what repositories, the `DB` facade and
+`migrate` take — and as the default of a `DatabaseManager` with nothing else in
+it. Leave `DATABASE_URL` unset and **no database is opened at all**, which is
+what an application that has none should get; a seeded `sqlite::memory:` would
+accept every statement, migrate cleanly and answer every question about the
+application's own data with no rows.
+
+To build the connection yourself — a test double, or a backend no
+configuration file can describe — hand one over instead:
+
+```rust
+use rainier_orm::{PoolConfig, SeaOrmExecutor};
+use rainier_framework::database::Database;
+
+let executor = SeaOrmExecutor::connect(&url, &PoolConfig::default()).await?;
+
+Rainier::new(".").with_database(Database::new(executor))
+```
+
+`with_database` wins over anything declared, the way `with_storage` wins over
+declared disks: it sits in the builder chain a reviewer is already reading.
 
 Nothing else in the application changes between those — that is the ORM's whole
 premise.
@@ -75,17 +88,25 @@ manager.connection("replica");               // Some(&Database)
 manager.connection("replicaa");              // None — never the default
 ```
 
-The same thing from the configuration tree, which is the shape a `database`
-section already has:
+Hand that to the builder and the framework opens every connection at boot:
+
+```rust
+Rainier::new(".").with_databases(databases)
+```
+
+which writes it to the `databases` key, so the same thing can come from the
+configuration tree instead:
 
 ```json
 {
-  "default": "primary",
-  "connections": {
-    "primary":   { "driver": "mysql", "host": "db.internal", "database": "app",
-                   "username": "app", "password": "…" },
-    "replica":   { "driver": "postgres", "url": "postgres://reader:…@replica.internal/app" },
-    "reporting": { "driver": "sqlite", "database": "storage/reporting.sqlite" }
+  "databases": {
+    "default": "primary",
+    "connections": {
+      "primary":   { "driver": "mysql", "host": "db.internal", "database": "app",
+                     "username": "app", "password": "…" },
+      "replica":   { "driver": "postgres", "url": "postgres://reader:…@replica.internal/app" },
+      "reporting": { "driver": "sqlite", "database": "storage/reporting.sqlite" }
+    }
   }
 }
 ```
@@ -95,6 +116,26 @@ say so:
 
 ```rust
 let manager = Databases::from_url(&url)?.build().await?;
+```
+
+### Never both
+
+`DATABASE_URL` and a `databases` section each name the **default connection**,
+so setting both is two answers to one question and fails the boot. There is no
+precedence rule on purpose: whichever declaration lost would still be sitting in
+the configuration being read by whoever changes it next, so repointing the
+database by editing the visible one would review cleanly, deploy cleanly and
+change nothing — and the query that then ran against the other database would
+come back with rows rather than an error.
+
+When the platform injects `DATABASE_URL` and you need a second connection, read
+it while building rather than leaving both in force:
+
+```rust
+let builder = Rainier::new(".");
+let url = builder.env().require("DATABASE_URL")?;
+
+builder.with_databases(Databases::from_url(&url)?.with("replica", replica))
 ```
 
 The driver comes from the DSN's scheme (`mysql`, `mariadb`, `postgres`,
