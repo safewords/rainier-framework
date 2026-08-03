@@ -28,14 +28,16 @@
 
 use rainier_orm::sea_query::{
     Alias, Asterisk, ColumnRef, Cond, Expr, Func, IntoColumnRef, JoinType, OnConflict, Order,
-    Query as SqQuery, SimpleExpr, Value,
+    Query as SqQuery, SelectStatement, SimpleExpr, SubQueryStatement, Value,
 };
 use rainier_orm::{
     key_condition, key_route, row_key_condition, Dialect, Entity, Result, ShardRoute, SingleKey,
     Upsert,
 };
 
-use crate::criteria::{Criteria, DatePart, JoinKind, Projection};
+use crate::criteria::{
+    Assignment, Comparison, Criteria, DatePart, JoinKind, Projection, Subquery, SubqueryPredicate,
+};
 
 /// A rendered statement: SQL, its ordered bind values, and where to run it.
 ///
@@ -172,7 +174,7 @@ pub fn select_by_column<E: Entity>(
     Prepared { sql, params: params.0, route }
 }
 
-/// Render a [`Projection`] for this dialect.
+/// Render a [`Projection`] against the outer query's own table.
 ///
 /// The date parts are the reason this is a function and not a string in the
 /// caller: MySQL writes `MONTH(x)`, SQLite has no such function and needs
@@ -180,7 +182,20 @@ pub fn select_by_column<E: Entity>(
 /// `date_part('month', x)`. Application code that picks one works on one
 /// deployment and 500s on the others — including the SQLite its own tests run.
 fn projection_expr<E: Entity>(dialect: Dialect, projection: &Projection) -> SimpleExpr {
-    let col = |name: &str| Expr::col(column_ref::<E>(name));
+    projection_expr_in(dialect, projection, &column_ref::<E>)
+}
+
+/// [`projection_expr`] with the scope its columns resolve against left open.
+///
+/// A subquery's projection reads *its* table, not the outer one, so the two
+/// callers differ by nothing but that resolver. Duplicating the dialect branches
+/// to say so is how one copy quietly keeps a `MONTH()` that SQLite cannot run.
+fn projection_expr_in(
+    dialect: Dialect,
+    projection: &Projection,
+    resolve: &dyn Fn(&str) -> ColumnRef,
+) -> SimpleExpr {
+    let col = |name: &str| Expr::col(resolve(name));
 
     match projection {
         Projection::Column(c) => col(c).into(),
@@ -237,6 +252,151 @@ fn projection_expr<E: Entity>(dialect: Dialect, projection: &Projection) -> Simp
     }
 }
 
+/// The alias every subquery's table is given.
+///
+/// Always applied, and never chosen by the caller. A correlation is only a
+/// correlation because its two sides name *different* scopes, and an unaliased
+/// subquery over the outer query's own table has only one name for both — so a
+/// self-correlated `EXISTS`, which is what any parent/child tree needs, would
+/// render `t.parent_id = t.id` with both sides bound to the inner scope. The
+/// predicate stops mentioning the outer row at all and the `EXISTS` collapses to
+/// a constant: true for every row, or false for every row, with no error either
+/// way. A fixed alias makes that unreachable, and leaving it out of the API
+/// means no caller can reintroduce it by picking the outer table's name.
+///
+/// Reserved-looking on purpose: it only has to differ from the tables the outer
+/// query names, and every one of those is a real table. Sibling subqueries may
+/// share it — each is its own `FROM` scope — and a subquery cannot contain
+/// another, so there is no nesting for it to shadow.
+const SUBQUERY_ALIAS: &str = "_rainier_sub";
+
+/// `"name"` → the subquery's own table; `"table.name"` → that table.
+///
+/// The same rule as [`column_ref`], so the outer half of a correlation can be
+/// written the way every other column spec in this layer is.
+fn subquery_column(spec: &str) -> ColumnRef {
+    match spec.split_once('.') {
+        Some((table, column)) => (alias(table), alias(column)).into_column_ref(),
+        None => (alias(SUBQUERY_ALIAS), alias(spec)).into_column_ref(),
+    }
+}
+
+/// The inner `SELECT` of a [`Subquery`], correlated to `E`'s row.
+///
+/// `existence_only` swaps the projection for `SELECT 1`. That is not a
+/// shortcut: `EXISTS (SELECT COUNT(*) …)` is true for every outer row, because
+/// an aggregate with no `GROUP BY` returns one row even when it counts nothing.
+/// Emitting the caller's projection inside an `EXISTS` would turn the most
+/// natural way to write the subquery into a filter that matches everything.
+fn subquery_select<E: Entity>(
+    dialect: Dialect,
+    subquery: &Subquery,
+    existence_only: bool,
+) -> SelectStatement {
+    let mut stmt = SqQuery::select();
+    stmt.from_as(alias(subquery.table()), alias(SUBQUERY_ALIAS));
+
+    if existence_only {
+        // A constant, not `Expr::val(1)`, which sea-query would *bind* — every
+        // `EXISTS` would then push a meaningless `1` into the parameter list,
+        // between the caller's own values and in front of the ones that follow.
+        // Nothing about it is caller-supplied, so nothing about it is injectable.
+        stmt.expr(SimpleExpr::Constant(Value::Int(Some(1))));
+    } else {
+        stmt.expr(projection_expr_in(dialect, subquery.projection(), &subquery_column));
+    }
+
+    let mut condition = Cond::all();
+    // The correlation first, so it is the visible head of the predicate in a
+    // query plan and in anything that logs the SQL.
+    for (inner, outer) in subquery.correlations() {
+        condition = condition.add(Expr::col(subquery_column(inner)).equals(column_ref::<E>(outer)));
+    }
+    for constraint in subquery.constraints() {
+        condition = condition.add(constraint.to_expr(subquery_column(constraint.column())));
+    }
+    stmt.cond_where(condition);
+
+    stmt
+}
+
+/// A [`Subquery`] as a scalar expression: `(SELECT … )`.
+fn subquery_scalar<E: Entity>(dialect: Dialect, subquery: &Subquery) -> SimpleExpr {
+    SimpleExpr::SubQuery(
+        None,
+        Box::new(SubQueryStatement::SelectStatement(subquery_select::<E>(
+            dialect, subquery, false,
+        ))),
+    )
+}
+
+/// Render one [`SubqueryPredicate`] against `E`'s row.
+fn subquery_predicate_expr<E: Entity>(
+    dialect: Dialect,
+    predicate: &SubqueryPredicate,
+) -> SimpleExpr {
+    match predicate {
+        SubqueryPredicate::Exists(subquery) => {
+            Expr::exists(subquery_select::<E>(dialect, subquery, true))
+        }
+        SubqueryPredicate::NotExists(subquery) => {
+            Expr::exists(subquery_select::<E>(dialect, subquery, true)).not()
+        }
+        SubqueryPredicate::Compare(subquery, comparison, value) => {
+            let scalar = Expr::expr(subquery_scalar::<E>(dialect, subquery));
+            let value = value.clone();
+            match comparison {
+                Comparison::Eq => scalar.eq(value),
+                Comparison::Ne => scalar.ne(value),
+                Comparison::Gt => scalar.gt(value),
+                Comparison::Gte => scalar.gte(value),
+                Comparison::Lt => scalar.lt(value),
+                Comparison::Lte => scalar.lte(value),
+            }
+        }
+    }
+}
+
+/// The `WHERE` a [`Criteria`] implies, and the shard route its equalities pin.
+///
+/// One function rather than the copy every statement kind used to keep: a
+/// `SELECT`, an `UPDATE` and a `DELETE` built from the same criteria have to
+/// filter identically, and four copies of the loop is four places for a new
+/// predicate kind to be added to three of.
+fn criteria_condition<E: Entity>(dialect: Dialect, criteria: &Criteria) -> (Cond, ShardRoute) {
+    let mut condition = Cond::all();
+    let mut route = ShardRoute::Global;
+
+    for constraint in criteria.constraints() {
+        // An equality on a shard-encoded column pins the query to one shard,
+        // exactly as Rainier ORM's query builder does.
+        if let (Some((column, value)), true) =
+            (constraint.as_equality(), matches!(route, ShardRoute::Global))
+        {
+            route = route_for::<E>(column, value);
+        }
+        condition = condition.add(constraint.to_expr(column_ref::<E>(constraint.column())));
+    }
+    // Each `or_where` group is one parenthesised `OR`, `AND`-ed with the rest —
+    // the shape it has in SQL, so there is no precedence to get wrong.
+    for group in criteria.or_groups() {
+        let mut any = Cond::any();
+        for constraint in group {
+            any = any.add(constraint.to_expr(column_ref::<E>(constraint.column())));
+        }
+        condition = condition.add(any);
+    }
+    // Subqueries never move the route. The shard is chosen by the outer row's
+    // own key, and the inner table's rows for that row live wherever they live —
+    // a correlated subquery cannot name a shard, so pretending it could would
+    // send the whole statement somewhere the outer rows are not.
+    for predicate in criteria.subquery_predicates() {
+        condition = condition.add(subquery_predicate_expr::<E>(dialect, predicate));
+    }
+
+    (condition, route)
+}
+
 /// `SELECT <projections> … GROUP BY …` under a [`Criteria`].
 ///
 /// The escape hatch that means an application never has to write raw SQL for
@@ -249,7 +409,7 @@ pub fn select_aggregate<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Pre
         stmt.expr_as(projection_expr::<E>(dialect, projection), alias(name));
     }
 
-    let route = apply_criteria::<E>(&mut stmt, criteria, true);
+    let route = apply_criteria::<E>(dialect, &mut stmt, criteria, true);
 
     for projection in criteria.groups() {
         stmt.add_group_by([projection_expr::<E>(dialect, projection)]);
@@ -267,7 +427,7 @@ pub fn select_aggregate<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Pre
 /// `SELECT <model columns>` under a [`Criteria`]'s filters, joins and paging.
 pub fn select_matching<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Prepared {
     let mut stmt = select_columns::<E>();
-    let route = apply_criteria::<E>(&mut stmt, criteria, true);
+    let route = apply_criteria::<E>(dialect, &mut stmt, criteria, true);
 
     let (sql, params) = dialect.build_query(&stmt);
     Prepared { sql, params: params.0, route }
@@ -280,7 +440,7 @@ pub fn select_matching<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Prep
 pub fn count_matching<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Prepared {
     let mut stmt = SqQuery::select();
     stmt.from(alias(E::table()));
-    let route = apply_criteria::<E>(&mut stmt, criteria, false);
+    let route = apply_criteria::<E>(dialect, &mut stmt, criteria, false);
     stmt.expr_as(Func::count(Expr::col(Asterisk)), alias("cnt"));
 
     let (sql, params) = dialect.build_query(&stmt);
@@ -294,7 +454,7 @@ pub fn count_matching<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Prepa
 pub fn count_grouped<E: Entity>(dialect: Dialect, column: &str, criteria: &Criteria) -> Prepared {
     let mut stmt = SqQuery::select();
     stmt.from(alias(E::table()));
-    let route = apply_criteria::<E>(&mut stmt, criteria, false);
+    let route = apply_criteria::<E>(dialect, &mut stmt, criteria, false);
 
     stmt.column(column_ref::<E>(column));
     stmt.expr_as(Func::count(Expr::col(Asterisk)), alias("cnt"));
@@ -323,7 +483,8 @@ pub fn select_pivot(dialect: Dialect, query: &crate::relation::PivotQuery) -> Pr
 
 /// Apply a criteria to a select. Returns the route the filters imply.
 fn apply_criteria<E: Entity>(
-    stmt: &mut rainier_orm::sea_query::SelectStatement,
+    dialect: Dialect,
+    stmt: &mut SelectStatement,
     criteria: &Criteria,
     with_paging: bool,
 ) -> ShardRoute {
@@ -347,29 +508,7 @@ fn apply_criteria<E: Entity>(
         stmt.join(join, alias(table), on);
     }
 
-    let mut condition = Cond::all();
-    let mut route = ShardRoute::Global;
-
-    for constraint in criteria.constraints() {
-        // An equality on a shard-encoded column pins the query to one shard,
-        // exactly as Rainier ORM's query builder does.
-        if let (Some((column, value)), true) =
-            (constraint.as_equality(), matches!(route, ShardRoute::Global))
-        {
-            route = route_for::<E>(column, value);
-        }
-        condition = condition.add(constraint.to_expr(column_ref::<E>(constraint.column())));
-    }
-    // Each `or_where` group is one parenthesised `OR`, `AND`-ed with the rest —
-    // the shape it has in SQL, so there is no precedence to get wrong.
-    for group in criteria.or_groups() {
-        let mut any = Cond::any();
-        for constraint in group {
-            any = any.add(constraint.to_expr(column_ref::<E>(constraint.column())));
-        }
-        condition = condition.add(any);
-    }
-
+    let (condition, route) = criteria_condition::<E>(dialect, criteria);
     stmt.cond_where(condition);
 
     for (column, descending) in criteria.orders() {
@@ -536,32 +675,68 @@ pub fn update_matching<E: Entity>(
     criteria: &Criteria,
     set: Vec<(String, Value)>,
 ) -> Prepared {
+    let set = set.into_iter().map(|(column, value)| (column, Assignment::Value(value))).collect();
+    update_matching_with::<E>(dialect, criteria, set)
+}
+
+/// `UPDATE table SET … WHERE <criteria>`, where a column may be assigned a
+/// **correlated subquery** rather than a value.
+///
+/// The general form of [`update_matching`], and the only single-statement way to
+/// recompute a denormalised counter across a table:
+///
+/// ```
+/// # use rainier_database::{Assignment, Criteria, Projection, Subquery};
+/// # use rainier_orm::Dialect;
+/// # #[derive(rainier_orm::Entity, Clone, Debug)]
+/// # #[orm(table = "parents")]
+/// # struct Parent {
+/// #     #[orm(pk, auto_increment)]
+/// #     id: u64,
+/// #     children_count: i64,
+/// # }
+/// let recount = Assignment::Subquery(
+///     Subquery::count("children").correlate("parent_id", "id").where_eq("approved", true),
+/// );
+///
+/// let prepared = rainier_database::statement::update_matching_with::<Parent>(
+///     Dialect::Sqlite,
+///     &Criteria::new(),
+///     vec![("children_count".to_string(), recount)],
+/// );
+/// assert!(prepared.sql.contains("SELECT COUNT(*)"), "{}", prepared.sql);
+/// assert_eq!(prepared.params.len(), 1, "only `approved`; the correlation binds nothing");
+/// ```
+///
+/// Why one statement rather than a loop over the counts: a `COUNT` of zero
+/// produces no grouped row to drive an update, so a loop has to zero every
+/// counter first and fill the non-zero ones back in — and between those two
+/// steps every row in the table reads zero. The correlated subquery has no such
+/// window, because a scalar `COUNT` over no rows *is* `0` and is written like
+/// any other result.
+///
+/// A subquery assignment does not move the shard route, and cannot: it is
+/// evaluated on whatever shard the outer rows are on, so — like a join — it
+/// reaches only the inner rows that live there.
+pub fn update_matching_with<E: Entity>(
+    dialect: Dialect,
+    criteria: &Criteria,
+    set: Vec<(String, Assignment)>,
+) -> Prepared {
     let mut stmt = SqQuery::update();
     stmt.table(alias(E::table()));
-    for (column, value) in set {
-        stmt.value(alias(&column), value);
+    // `SET` before `WHERE`, which is also the order the placeholders come out
+    // in — a subquery in the `SET` binds its values ahead of the filter's.
+    for (column, assignment) in set {
+        match assignment {
+            Assignment::Value(value) => stmt.value(alias(&column), value),
+            Assignment::Subquery(subquery) => {
+                stmt.value(alias(&column), subquery_scalar::<E>(dialect, &subquery))
+            }
+        };
     }
 
-    let mut condition = Cond::all();
-    let mut route = ShardRoute::Global;
-    for constraint in criteria.constraints() {
-        if let (Some((column, value)), true) =
-            (constraint.as_equality(), matches!(route, ShardRoute::Global))
-        {
-            route = route_for::<E>(column, value);
-        }
-        condition = condition.add(constraint.to_expr(column_ref::<E>(constraint.column())));
-    }
-    // Each `or_where` group is one parenthesised `OR`, `AND`-ed with the rest —
-    // the shape it has in SQL, so there is no precedence to get wrong.
-    for group in criteria.or_groups() {
-        let mut any = Cond::any();
-        for constraint in group {
-            any = any.add(constraint.to_expr(column_ref::<E>(constraint.column())));
-        }
-        condition = condition.add(any);
-    }
-
+    let (condition, route) = criteria_condition::<E>(dialect, criteria);
     stmt.cond_where(condition);
 
     let (sql, params) = dialect.build_query(&stmt);
@@ -604,26 +779,7 @@ pub fn delete_matching<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Prep
     let mut stmt = SqQuery::delete();
     stmt.from_table(alias(E::table()));
 
-    let mut condition = Cond::all();
-    let mut route = ShardRoute::Global;
-    for constraint in criteria.constraints() {
-        if let (Some((column, value)), true) =
-            (constraint.as_equality(), matches!(route, ShardRoute::Global))
-        {
-            route = route_for::<E>(column, value);
-        }
-        condition = condition.add(constraint.to_expr(column_ref::<E>(constraint.column())));
-    }
-    // Each `or_where` group is one parenthesised `OR`, `AND`-ed with the rest —
-    // the shape it has in SQL, so there is no precedence to get wrong.
-    for group in criteria.or_groups() {
-        let mut any = Cond::any();
-        for constraint in group {
-            any = any.add(constraint.to_expr(column_ref::<E>(constraint.column())));
-        }
-        condition = condition.add(any);
-    }
-
+    let (condition, route) = criteria_condition::<E>(dialect, criteria);
     stmt.cond_where(condition);
 
     let (sql, params) = dialect.build_query(&stmt);
@@ -1024,5 +1180,423 @@ mod tests {
             r#"UPDATE "posts" SET "title" = ?, "published" = ? WHERE "id" = ?"#
         );
         assert_eq!(prepared.params.len(), 3);
+    }
+
+    // --- correlated subqueries ---------------------------------------------
+
+    /// A parent whose counter is denormalised — the shape a correlated
+    /// `UPDATE … SET` exists to recompute.
+    #[derive(rainier_orm::Entity, Clone, Debug)]
+    #[orm(table = "parents")]
+    struct Parent {
+        #[orm(pk, auto_increment)]
+        id: u64,
+        children_count: i64,
+    }
+
+    /// Self-referential, so the inner and outer table are the same name — the
+    /// case an alias has to keep apart.
+    #[derive(rainier_orm::Entity, Clone, Debug)]
+    #[orm(table = "nodes")]
+    struct Node {
+        #[orm(pk, auto_increment)]
+        id: u64,
+        parent_id: u64,
+    }
+
+    fn children() -> Subquery {
+        Subquery::count("children").correlate("parent_id", "id")
+    }
+
+    #[test]
+    fn an_exists_renders_its_correlation_on_every_dialect() {
+        let criteria = Criteria::new().where_exists(children());
+
+        assert_eq!(
+            select_matching::<Parent>(Dialect::Sqlite, &criteria).sql,
+            concat!(
+                r#"SELECT "parents"."id", "parents"."children_count" FROM "parents" WHERE "#,
+                r#"EXISTS(SELECT 1 FROM "children" AS "_rainier_sub" "#,
+                r#"WHERE "_rainier_sub"."parent_id" = "parents"."id")"#,
+            )
+        );
+        assert_eq!(
+            select_matching::<Parent>(Dialect::MySql, &criteria).sql,
+            concat!(
+                "SELECT `parents`.`id`, `parents`.`children_count` FROM `parents` WHERE ",
+                "EXISTS(SELECT 1 FROM `children` AS `_rainier_sub` ",
+                "WHERE `_rainier_sub`.`parent_id` = `parents`.`id`)",
+            )
+        );
+        assert_eq!(
+            select_matching::<Parent>(Dialect::Postgres, &criteria).sql,
+            concat!(
+                r#"SELECT "parents"."id", "parents"."children_count" FROM "parents" WHERE "#,
+                r#"EXISTS(SELECT 1 FROM "children" AS "_rainier_sub" "#,
+                r#"WHERE "_rainier_sub"."parent_id" = "parents"."id")"#,
+            )
+        );
+    }
+
+    #[test]
+    fn the_correlation_names_two_different_scopes() {
+        // The single assertion the whole feature rests on. Both sides of
+        // `_rainier_sub.parent_id = parents.id` are columns, and they are
+        // qualified to *different* tables — an inner-only predicate would read
+        // `"children"."parent_id" = "children"."id"` and match every outer row.
+        for dialect in [Dialect::Sqlite, Dialect::MySql, Dialect::Postgres] {
+            let sql =
+                select_matching::<Parent>(dialect, &Criteria::new().where_exists(children())).sql;
+
+            let inner = sql.find("_rainier_sub").expect("the inner scope");
+            let outer = sql.rfind("parents").expect("the outer scope");
+            assert!(inner < outer, "{dialect:?}: inner = outer, not inner = value: {sql}");
+        }
+    }
+
+    #[test]
+    fn an_exists_ignores_the_projection_and_selects_a_constant() {
+        // `EXISTS (SELECT COUNT(*) …)` is true for *every* row — an aggregate
+        // with no GROUP BY always returns one row, even counting nothing. So a
+        // counting subquery in existence position must not render its count.
+        let sql = select_matching::<Parent>(
+            Dialect::Sqlite,
+            &Criteria::new().where_exists(Subquery::count("children").correlate("parent_id", "id")),
+        )
+        .sql;
+
+        assert!(sql.contains("EXISTS(SELECT 1 FROM"), "{sql}");
+        assert!(!sql.contains("COUNT"), "a count inside EXISTS matches everything: {sql}");
+    }
+
+    #[test]
+    fn a_constant_projection_costs_no_parameter() {
+        // `Expr::val(1)` would bind, pushing a meaningless value into the list
+        // ahead of every parameter that follows it.
+        let prepared =
+            select_matching::<Parent>(Dialect::Sqlite, &Criteria::new().where_exists(children()));
+        assert!(prepared.params.is_empty(), "{:?}", prepared.params);
+    }
+
+    #[test]
+    fn a_not_exists_negates_the_same_subquery() {
+        for dialect in [Dialect::Sqlite, Dialect::MySql, Dialect::Postgres] {
+            let sql =
+                select_matching::<Parent>(dialect, &Criteria::new().where_not_exists(children()))
+                    .sql;
+            assert!(sql.contains("NOT EXISTS(SELECT 1 FROM"), "{dialect:?}: {sql}");
+        }
+    }
+
+    #[test]
+    fn a_scalar_subquery_compares_against_a_bound_value() {
+        let criteria = Criteria::new().where_subquery(children(), Comparison::Eq, 2_i64);
+
+        assert_eq!(
+            select_matching::<Parent>(Dialect::Sqlite, &criteria).sql,
+            concat!(
+                r#"SELECT "parents"."id", "parents"."children_count" FROM "parents" WHERE "#,
+                r#"(SELECT COUNT(*) FROM "children" AS "_rainier_sub" "#,
+                r#"WHERE "_rainier_sub"."parent_id" = "parents"."id") = ?"#,
+            )
+        );
+        // Postgres numbers the placeholder rather than repeating `?`, and the
+        // subquery must not throw the numbering off.
+        assert_eq!(
+            select_matching::<Parent>(Dialect::Postgres, &criteria).sql,
+            concat!(
+                r#"SELECT "parents"."id", "parents"."children_count" FROM "parents" WHERE "#,
+                r#"(SELECT COUNT(*) FROM "children" AS "_rainier_sub" "#,
+                r#"WHERE "_rainier_sub"."parent_id" = "parents"."id") = $1"#,
+            )
+        );
+        assert_eq!(
+            select_matching::<Parent>(Dialect::MySql, &criteria).params,
+            vec![Value::from(2_i64)]
+        );
+    }
+
+    #[test]
+    fn every_comparison_renders_its_operator() {
+        for (comparison, operator) in [
+            (Comparison::Eq, "= ?"),
+            (Comparison::Ne, "<> ?"),
+            (Comparison::Gt, "> ?"),
+            (Comparison::Gte, ">= ?"),
+            (Comparison::Lt, "< ?"),
+            (Comparison::Lte, "<= ?"),
+        ] {
+            let sql = select_matching::<Parent>(
+                Dialect::Sqlite,
+                &Criteria::new().where_subquery(children(), comparison, 2_i64),
+            )
+            .sql;
+            assert!(sql.ends_with(operator), "{comparison:?}: {sql}");
+        }
+    }
+
+    #[test]
+    fn a_subquerys_parameters_interleave_with_the_outer_querys_in_sql_order() {
+        // The failure this catches is silent and total: the values are all
+        // present and all bound, but one lands in another's placeholder, so the
+        // query runs and answers about the wrong rows.
+        let criteria = Criteria::new()
+            .where_eq("children_count", 1_i64)
+            .where_exists(children().where_eq("kind", "a"))
+            .where_gt("id", 10_u64)
+            .where_subquery(children().where_eq("kind", "b"), Comparison::Gte, 3_i64)
+            .where_ne("children_count", 99_i64)
+            .limit(5);
+
+        let prepared = select_matching::<Parent>(Dialect::Sqlite, &criteria);
+
+        // The two subquery predicates render *after* the plain constraints, so
+        // their values do too — and the inner `kind` sits inside its own
+        // subquery, before that subquery's own comparison value.
+        assert_eq!(
+            prepared.params,
+            vec![
+                Value::from(1_i64),  // children_count = ?
+                Value::from(10_u64), // id > ?
+                Value::from(99_i64), // children_count <> ?
+                Value::from("a"),    // EXISTS (… kind = ?)
+                Value::from("b"),    // (SELECT … kind = ?)
+                Value::from(3_i64),  // … ) >= ?
+                Value::from(5_u64),  // LIMIT ?
+            ],
+            "{}",
+            prepared.sql
+        );
+        assert_eq!(prepared.sql.matches('?').count(), prepared.params.len());
+    }
+
+    #[test]
+    fn a_subquery_binds_its_values_rather_than_inlining_them() {
+        // The injection this layer exists to make unwritable. A subquery
+        // assembled by concatenation is the single most dangerous thing here,
+        // because it is the one place a caller's string would sit next to
+        // structural SQL.
+        let hostile = "'); DROP TABLE parents; --";
+        let prepared = select_matching::<Parent>(
+            Dialect::Sqlite,
+            &Criteria::new().where_exists(children().where_eq("kind", hostile)),
+        );
+
+        assert!(!prepared.sql.contains("DROP TABLE"), "{}", prepared.sql);
+        assert_eq!(prepared.params, vec![Value::from(hostile)]);
+    }
+
+    #[test]
+    fn a_correlation_can_name_a_joined_outer_table() {
+        // `"table.column"` on the outer side, read exactly as everywhere else
+        // in this layer — so a subquery can correlate to something the outer
+        // query joined rather than only to the model's own table.
+        let sql = select_matching::<Parent>(
+            Dialect::Sqlite,
+            &Criteria::new()
+                .join("owners", "id", "parent_id")
+                .where_exists(Subquery::count("audits").correlate("owner_id", "owners.id")),
+        )
+        .sql;
+
+        assert!(sql.contains(r#""_rainier_sub"."owner_id" = "owners"."id""#), "{sql}");
+    }
+
+    #[test]
+    fn a_self_correlated_subquery_keeps_the_two_scopes_apart() {
+        // The alias earns its keep here. Without it both sides would render as
+        // `"nodes"."…"`, the predicate would stop mentioning the outer row, and
+        // the `EXISTS` would collapse to a constant — true for every node, or
+        // false for every node, with no error either way.
+        let sql = select_matching::<Node>(
+            Dialect::Sqlite,
+            &Criteria::new().where_exists(Subquery::count("nodes").correlate("parent_id", "id")),
+        )
+        .sql;
+
+        assert!(sql.contains(r#"FROM "nodes" AS "_rainier_sub""#), "{sql}");
+        assert!(sql.contains(r#""_rainier_sub"."parent_id" = "nodes"."id""#), "{sql}");
+    }
+
+    #[test]
+    fn a_subquery_can_carry_more_than_one_correlation() {
+        // A composite foreign key. Matching on half of it over-matches exactly
+        // the way no correlation at all does, only less obviously.
+        let sql = select_matching::<Parent>(
+            Dialect::Sqlite,
+            &Criteria::new().where_exists(
+                Subquery::count("children").correlate("parent_id", "id").correlate("tenant", "id"),
+            ),
+        )
+        .sql;
+
+        assert!(sql.contains(r#""_rainier_sub"."parent_id" = "parents"."id""#), "{sql}");
+        assert!(sql.contains(r#""_rainier_sub"."tenant" = "parents"."id""#), "{sql}");
+    }
+
+    #[test]
+    fn a_subquerys_own_projection_resolves_against_its_own_table() {
+        // Not the outer one — a `SUM` inside the subquery reads the inner
+        // table's column, and qualifying it to the outer table would either
+        // error or, worse, silently sum the wrong column of the wrong row.
+        let sql = select_matching::<Parent>(
+            Dialect::Sqlite,
+            &Criteria::new().where_subquery(
+                Subquery::select("children", Projection::Sum("weight".into()))
+                    .correlate("parent_id", "id"),
+                Comparison::Gt,
+                10_i64,
+            ),
+        )
+        .sql;
+
+        assert!(sql.contains(r#"SUM("_rainier_sub"."weight")"#), "{sql}");
+    }
+
+    #[test]
+    fn a_dialect_specific_projection_inside_a_subquery_is_still_per_dialect() {
+        // The refactor's real risk: a second copy of the date-part branches
+        // that keeps a `MONTH()` SQLite cannot run.
+        let criteria = |dialect| {
+            select_matching::<Parent>(
+                dialect,
+                &Criteria::new().where_subquery(
+                    Subquery::select(
+                        "children",
+                        Projection::DatePart(DatePart::Month, "born_at".into()),
+                    )
+                    .correlate("parent_id", "id"),
+                    Comparison::Eq,
+                    3_i64,
+                ),
+            )
+            .sql
+        };
+
+        assert!(criteria(Dialect::Sqlite).contains("strftime"), "{}", criteria(Dialect::Sqlite));
+        assert!(criteria(Dialect::MySql).contains("MONTH("), "{}", criteria(Dialect::MySql));
+        assert!(
+            criteria(Dialect::Postgres).contains("date_part"),
+            "{}",
+            criteria(Dialect::Postgres)
+        );
+    }
+
+    #[test]
+    fn a_delete_filters_by_subquery_too() {
+        // The condition is built once for every statement kind, so a `DELETE`
+        // scoped by an `EXISTS` cannot quietly drop the predicate and remove
+        // the whole table.
+        let sql = delete_matching::<Parent>(
+            Dialect::Sqlite,
+            &Criteria::new().where_not_exists(children()),
+        )
+        .sql;
+        assert!(sql.starts_with(r#"DELETE FROM "parents" WHERE"#), "{sql}");
+        assert!(sql.contains("NOT EXISTS(SELECT 1 FROM"), "{sql}");
+    }
+
+    #[test]
+    fn a_subquery_never_moves_the_shard_route() {
+        // It cannot name a shard, and guessing would send the statement where
+        // the outer rows are not.
+        let pinned = Criteria::new()
+            .where_eq("user_id", 42_u64)
+            .where_exists(Subquery::count("audits").correlate("token_id", "id"));
+        assert_eq!(
+            select_matching::<Token>(Dialect::Sqlite, &pinned).route,
+            ShardRoute::Key(42),
+            "the equality still pins it"
+        );
+
+        let unpinned =
+            Criteria::new().where_exists(Subquery::count("audits").correlate("token_id", "id"));
+        assert_eq!(select_matching::<Token>(Dialect::Sqlite, &unpinned).route, ShardRoute::Global);
+    }
+
+    // --- UPDATE … SET <subquery> -------------------------------------------
+
+    fn recount() -> Vec<(String, Assignment)> {
+        vec![(
+            "children_count".to_string(),
+            Assignment::Subquery(children().where_eq("approved", true)),
+        )]
+    }
+
+    #[test]
+    fn an_update_can_assign_a_correlated_subquery_on_every_dialect() {
+        // The bulk recompute in full, with no outer filter — every row, one
+        // statement. The trailing `WHERE TRUE` is what an empty criteria has
+        // always rendered here, and it is what "every row" means.
+        assert_eq!(
+            update_matching_with::<Parent>(Dialect::Sqlite, &Criteria::new(), recount()).sql,
+            concat!(
+                r#"UPDATE "parents" SET "children_count" = "#,
+                r#"(SELECT COUNT(*) FROM "children" AS "_rainier_sub" "#,
+                r#"WHERE "_rainier_sub"."parent_id" = "parents"."id" "#,
+                r#"AND "_rainier_sub"."approved" = ?) WHERE TRUE"#,
+            )
+        );
+        assert_eq!(
+            update_matching_with::<Parent>(Dialect::MySql, &Criteria::new(), recount()).sql,
+            concat!(
+                "UPDATE `parents` SET `children_count` = ",
+                "(SELECT COUNT(*) FROM `children` AS `_rainier_sub` ",
+                "WHERE `_rainier_sub`.`parent_id` = `parents`.`id` ",
+                "AND `_rainier_sub`.`approved` = ?) WHERE TRUE",
+            )
+        );
+        assert_eq!(
+            update_matching_with::<Parent>(Dialect::Postgres, &Criteria::new(), recount()).sql,
+            concat!(
+                r#"UPDATE "parents" SET "children_count" = "#,
+                r#"(SELECT COUNT(*) FROM "children" AS "_rainier_sub" "#,
+                r#"WHERE "_rainier_sub"."parent_id" = "parents"."id" "#,
+                r#"AND "_rainier_sub"."approved" = $1) WHERE TRUE"#,
+            )
+        );
+    }
+
+    #[test]
+    fn an_assigned_subquerys_parameters_come_before_the_filters() {
+        // `SET` is rendered before `WHERE`, so its binds are too. Getting this
+        // backwards swaps a filter value into the subquery and vice versa —
+        // both are integers often enough for it to run and answer wrongly.
+        let mut set = recount();
+        set.push(("id".to_string(), Assignment::Value(7_u64.into())));
+
+        let prepared = update_matching_with::<Parent>(
+            Dialect::Sqlite,
+            &Criteria::new().where_gt("id", 100_u64),
+            set,
+        );
+
+        assert_eq!(
+            prepared.params,
+            vec![
+                Value::from(true),    // inside the assigned subquery
+                Value::from(7_u64),   // the plain assignment beside it
+                Value::from(100_u64), // the filter
+            ],
+            "{}",
+            prepared.sql
+        );
+    }
+
+    #[test]
+    fn a_plain_value_update_is_unchanged_by_the_assignment_form() {
+        // `update_matching` now delegates, so this is the proof the delegation
+        // did not alter what every existing caller renders.
+        let prepared = update_matching::<Parent>(
+            Dialect::Sqlite,
+            &Criteria::new().where_eq("id", 3_u64),
+            vec![("children_count".to_string(), Value::from(9_i64))],
+        );
+
+        assert_eq!(
+            prepared.sql,
+            r#"UPDATE "parents" SET "children_count" = ? WHERE "parents"."id" = ?"#
+        );
+        assert_eq!(prepared.params, vec![Value::from(9_i64), Value::from(3_u64)]);
     }
 }

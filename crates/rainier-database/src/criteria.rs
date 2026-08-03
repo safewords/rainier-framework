@@ -178,6 +178,303 @@ impl Projection {
     }
 }
 
+/// How a scalar subquery's one value is compared against a bound value.
+///
+/// An enum rather than six `where_subquery_gte`-shaped methods: the left-hand
+/// operand is a whole [`Subquery`], so every one of those would have to repeat
+/// the subquery argument, and the set of operators would still be closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Comparison {
+    /// `=`.
+    Eq,
+    /// `<>`.
+    Ne,
+    /// `>`.
+    Gt,
+    /// `>=`.
+    Gte,
+    /// `<`.
+    Lt,
+    /// `<=`.
+    Lte,
+}
+
+/// A subquery over another table, run once for each row the outer query
+/// examines, and tied to that row.
+///
+/// The tie is the whole point. `EXISTS (SELECT 1 FROM t WHERE t.owner = <the
+/// outer row>.id)` compares a column against **another column**, not against a
+/// bound value, and a builder that only knows `column = value` cannot say it —
+/// which is why the two query shapes this type exists for were the last ones an
+/// application still had to write as raw SQL.
+///
+/// # Why it cannot be built uncorrelated
+///
+/// Forgetting the correlation produces the worst kind of wrong answer.
+/// `EXISTS (SELECT 1 FROM t)` is true for *every* outer row the moment `t` holds
+/// a single row, so the predicate silently matches the entire table. Nothing
+/// errors, the SQL reads plausibly, and the only symptom is more rows than the
+/// caller meant to expose — which, for a visibility filter, is the rows of every
+/// other user.
+///
+/// So a `Subquery` cannot be constructed at all without one:
+/// [`Subquery::count`] and [`Subquery::select`] hand back a [`SubqueryDraft`],
+/// [`SubqueryDraft::correlate`] is the only way to turn a draft into a
+/// `Subquery`, and every method that accepts a subquery accepts the correlated
+/// type. The mistake is not caught late — it is unwritable.
+///
+/// ```
+/// # use rainier_database::{Criteria, Subquery};
+/// // "rows that have at least one approved child"
+/// let scope = Criteria::new().where_exists(
+///     Subquery::count("children").correlate("parent_id", "id").where_eq("approved", true),
+/// );
+/// assert_eq!(scope.subquery_predicates().len(), 1);
+/// ```
+///
+/// # What it deliberately cannot do
+///
+/// A subquery holds `AND`-combined column-against-value predicates and its
+/// correlations, and nothing else: no joins, no `OR` groups, and no subquery of
+/// its own. That bound is enforced by the type rather than documented and
+/// dropped at render time — there is no closure here through which a nested
+/// predicate could be handed in and then quietly ignored.
+#[derive(Debug, Clone)]
+pub struct Subquery {
+    table: String,
+    projection: Projection,
+    /// `(inner_column, outer_column)`, never empty — see the type's docs.
+    correlations: Vec<(String, String)>,
+    constraints: Vec<Constraint>,
+}
+
+/// A [`Subquery`] that is not correlated yet, and so cannot be used.
+///
+/// It exists only to be consumed by [`correlate`](Self::correlate). See
+/// [`Subquery`] for why the uncorrelated state is worth a type of its own.
+#[derive(Debug, Clone)]
+#[must_use = "a draft is not a subquery until `correlate` ties it to the outer row"]
+pub struct SubqueryDraft {
+    table: String,
+    projection: Projection,
+}
+
+impl SubqueryDraft {
+    /// Tie the subquery to the outer row: `inner_column = outer_column`.
+    ///
+    /// `inner_column` is a column of the subquery's own table.
+    /// `outer_column` is read like every other column spec in this module —
+    /// `"name"` is a column of the outer query's own table, `"table.name"` one
+    /// of a table it joined.
+    ///
+    /// Call it again on the result to correlate on a second column, which is
+    /// what a composite foreign key needs; matching on only half of one is the
+    /// same silent over-match a missing correlation is.
+    pub fn correlate(
+        self,
+        inner_column: impl Into<String>,
+        outer_column: impl Into<String>,
+    ) -> Subquery {
+        Subquery {
+            table: self.table,
+            projection: self.projection,
+            correlations: vec![(inner_column.into(), outer_column.into())],
+            constraints: Vec::new(),
+        }
+    }
+}
+
+impl Subquery {
+    /// `SELECT COUNT(*) FROM table …` — the counting form.
+    ///
+    /// Returns a [`SubqueryDraft`]; correlate it to get a usable `Subquery`.
+    pub fn count(table: impl Into<String>) -> SubqueryDraft {
+        Self::select(table, Projection::CountAll)
+    }
+
+    /// `SELECT <projection> FROM table …` — the general form.
+    ///
+    /// Any [`Projection`] the outer query could select is available here, so a
+    /// `SUM` or a `MAX` over related rows needs nothing new. Mind the empty-set
+    /// behaviour when the result is assigned: `COUNT` of no rows is `0`, but
+    /// `SUM`, `MIN`, `MAX` and `AVG` of no rows are `NULL` — which writes `NULL`
+    /// into the target column, or fails outright if it is `NOT NULL`.
+    pub fn select(table: impl Into<String>, projection: Projection) -> SubqueryDraft {
+        SubqueryDraft { table: table.into(), projection }
+    }
+
+    /// Correlate on a further column pair — see [`SubqueryDraft::correlate`].
+    pub fn correlate(
+        mut self,
+        inner_column: impl Into<String>,
+        outer_column: impl Into<String>,
+    ) -> Self {
+        self.correlations.push((inner_column.into(), outer_column.into()));
+        self
+    }
+
+    /// `column = value`, on the subquery's own table.
+    pub fn where_eq(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.and(Constraint::Eq(column.into(), value.into()))
+    }
+
+    /// `column <> value`.
+    pub fn where_ne(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.and(Constraint::Ne(column.into(), value.into()))
+    }
+
+    /// `LOWER(column) = LOWER(value)` — see [`Criteria::where_eq_ci`].
+    pub fn where_eq_ci(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.and(Constraint::EqCi(column.into(), value.into()))
+    }
+
+    /// `column > value`.
+    pub fn where_gt(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.and(Constraint::Gt(column.into(), value.into()))
+    }
+
+    /// `column >= value`.
+    pub fn where_gte(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.and(Constraint::Gte(column.into(), value.into()))
+    }
+
+    /// `column < value`.
+    pub fn where_lt(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.and(Constraint::Lt(column.into(), value.into()))
+    }
+
+    /// `column <= value`.
+    pub fn where_lte(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.and(Constraint::Lte(column.into(), value.into()))
+    }
+
+    /// `column LIKE pattern`.
+    pub fn where_like(self, column: impl Into<String>, pattern: impl Into<String>) -> Self {
+        self.and(Constraint::Like(column.into(), pattern.into()))
+    }
+
+    /// `column NOT LIKE pattern`.
+    pub fn where_not_like(self, column: impl Into<String>, pattern: impl Into<String>) -> Self {
+        self.and(Constraint::NotLike(column.into(), pattern.into()))
+    }
+
+    /// `column IN (values)`. An empty set matches nothing.
+    pub fn where_in<V: Into<Value>>(
+        self,
+        column: impl Into<String>,
+        values: impl IntoIterator<Item = V>,
+    ) -> Self {
+        let values = values.into_iter().map(Into::into).collect();
+        self.and(Constraint::In(column.into(), values))
+    }
+
+    /// `column NOT IN (values)`.
+    pub fn where_not_in<V: Into<Value>>(
+        self,
+        column: impl Into<String>,
+        values: impl IntoIterator<Item = V>,
+    ) -> Self {
+        let values = values.into_iter().map(Into::into).collect();
+        self.and(Constraint::NotIn(column.into(), values))
+    }
+
+    /// `column IS NULL`.
+    pub fn where_null(self, column: impl Into<String>) -> Self {
+        self.and(Constraint::Null(column.into()))
+    }
+
+    /// `column IS NOT NULL`.
+    pub fn where_not_null(self, column: impl Into<String>) -> Self {
+        self.and(Constraint::NotNull(column.into()))
+    }
+
+    fn and(mut self, constraint: Constraint) -> Self {
+        self.constraints.push(constraint);
+        self
+    }
+
+    /// The table the subquery reads.
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// What it selects — ignored where only existence is asked for.
+    pub fn projection(&self) -> &Projection {
+        &self.projection
+    }
+
+    /// The `(inner_column, outer_column)` pairs tying it to the outer row.
+    /// Never empty.
+    pub fn correlations(&self) -> &[(String, String)] {
+        &self.correlations
+    }
+
+    /// Its own predicates, `AND`-combined with the correlations.
+    pub fn constraints(&self) -> &[Constraint] {
+        &self.constraints
+    }
+}
+
+/// A predicate whose left-hand side is a whole [`Subquery`] rather than a
+/// column.
+///
+/// Kept apart from [`Constraint`] because a `Constraint` is defined by the
+/// column it applies to — [`Constraint::column`] returns one, and shard routing
+/// reads it. A subquery predicate has no such column, so folding it in would
+/// mean either a lying `column()` or an `Option` at every existing call site.
+#[derive(Debug, Clone)]
+pub enum SubqueryPredicate {
+    /// `EXISTS (…)`.
+    Exists(Subquery),
+    /// `NOT EXISTS (…)`.
+    NotExists(Subquery),
+    /// `(…) <op> value` — the scalar form.
+    Compare(Subquery, Comparison, Value),
+}
+
+impl SubqueryPredicate {
+    /// The subquery this predicate runs.
+    pub fn subquery(&self) -> &Subquery {
+        match self {
+            SubqueryPredicate::Exists(sub)
+            | SubqueryPredicate::NotExists(sub)
+            | SubqueryPredicate::Compare(sub, _, _) => sub,
+        }
+    }
+}
+
+/// What an `UPDATE … SET` writes into a column.
+///
+/// A bound value is the ordinary case. The subquery case is what makes a bulk
+/// counter recomputation one statement: `SET n = (SELECT COUNT(*) … WHERE …
+/// = <this row>.id)` visits every row once, and — because a `COUNT` over no
+/// rows is `0` rather than no row at all — it writes zero to the rows with no
+/// related records instead of leaving whatever was there before.
+///
+/// The loop it replaces cannot do that. A `GROUP BY` produces no group for a
+/// count of zero, so a per-row loop has to zero every counter first and fill
+/// them back in, leaving a window in which every row on the platform reads zero.
+/// One statement has no such window.
+#[derive(Debug, Clone)]
+pub enum Assignment {
+    /// A bound value.
+    Value(Value),
+    /// A correlated subquery, re-evaluated for each updated row.
+    Subquery(Subquery),
+}
+
+impl From<Value> for Assignment {
+    fn from(value: Value) -> Self {
+        Assignment::Value(value)
+    }
+}
+
+impl From<Subquery> for Assignment {
+    fn from(subquery: Subquery) -> Self {
+        Assignment::Subquery(subquery)
+    }
+}
+
 /// How two tables are joined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinKind {
@@ -208,6 +505,9 @@ pub struct Criteria {
     groups: Vec<Projection>,
     /// Predicate groups combined with `OR` internally, `AND`-ed with the rest.
     or_groups: Vec<Vec<Constraint>>,
+    /// Predicates whose left side is a correlated subquery, `AND`-ed with the
+    /// rest.
+    subqueries: Vec<SubqueryPredicate>,
     /// `SELECT DISTINCT`.
     distinct: bool,
     /// `(alias, descending)` — ordering by a selected projection's alias.
@@ -396,6 +696,76 @@ impl Criteria {
         &self.or_groups
     }
 
+    /// `EXISTS (<subquery>)` — keep the rows a related table has a match for.
+    ///
+    /// The reason to reach for this over a join: a join that matches twice
+    /// duplicates the outer row, so "posts with at least one comment" has to be
+    /// followed by a `DISTINCT` that then has to be kept in step with every
+    /// column the query selects. `EXISTS` stops at the first matching inner row
+    /// and cannot change the outer row count.
+    ///
+    /// The subquery's own projection is ignored here and `SELECT 1` is emitted
+    /// instead — deliberately, because `EXISTS (SELECT COUNT(*) …)` is true for
+    /// every row: an aggregate with no `GROUP BY` always returns exactly one
+    /// row, even when it counts nothing.
+    ///
+    /// ```
+    /// # use rainier_database::{Criteria, Subquery};
+    /// Criteria::new().where_exists(
+    ///     Subquery::count("comments").correlate("post_id", "id").where_null("deleted_at"),
+    /// );
+    /// ```
+    pub fn where_exists(mut self, subquery: Subquery) -> Self {
+        self.subqueries.push(SubqueryPredicate::Exists(subquery));
+        self
+    }
+
+    /// `NOT EXISTS (<subquery>)` — keep the rows a related table has *no* match
+    /// for.
+    ///
+    /// The anti-join. Its usual stand-in — `LEFT JOIN … WHERE right.col IS
+    /// NULL` — reads "no matching row" off a null, so it is wrong for any
+    /// column the matching row could itself hold null in: the row is there and
+    /// the test says it is not.
+    pub fn where_not_exists(mut self, subquery: Subquery) -> Self {
+        self.subqueries.push(SubqueryPredicate::NotExists(subquery));
+        self
+    }
+
+    /// `(<subquery>) <op> value` — compare a correlated scalar against a bound
+    /// value.
+    ///
+    /// What answers "rows whose related table holds exactly *n* matches" —
+    /// which `EXISTS` cannot state, since it stops at the first match. The
+    /// alternative is a join with `GROUP BY … HAVING COUNT(*) = ?`, and that
+    /// changes the outer query rather than filtering it: the result becomes one
+    /// row per group, and every column being selected has to join the `GROUP BY`
+    /// to stay legal. A correlated scalar leaves the outer query's shape alone.
+    ///
+    /// ```
+    /// # use rainier_database::{Comparison, Criteria, Subquery};
+    /// // rows related to exactly two others
+    /// Criteria::new().where_subquery(
+    ///     Subquery::count("links").correlate("parent_id", "id"),
+    ///     Comparison::Eq,
+    ///     2_i64,
+    /// );
+    /// ```
+    pub fn where_subquery(
+        mut self,
+        subquery: Subquery,
+        comparison: Comparison,
+        value: impl Into<Value>,
+    ) -> Self {
+        self.subqueries.push(SubqueryPredicate::Compare(subquery, comparison, value.into()));
+        self
+    }
+
+    /// The subquery predicates, each `AND`-ed with the rest.
+    pub fn subquery_predicates(&self) -> &[SubqueryPredicate] {
+        &self.subqueries
+    }
+
     /// `GROUP BY projection`.
     pub fn group_by(mut self, projection: Projection) -> Self {
         self.groups.push(projection);
@@ -464,6 +834,10 @@ impl Criteria {
     pub fn merge(mut self, other: Criteria) -> Self {
         self.constraints.extend(other.constraints);
         self.joins.extend(other.joins);
+        // Dropping these would *widen* the result: a scope whose whole purpose
+        // is an `EXISTS` — "only the chats I am in" — would merge into an
+        // unfiltered query and return everything.
+        self.subqueries.extend(other.subqueries);
         self.orders.extend(other.orders);
         self.limit = other.limit.or(self.limit);
         self.offset = other.offset.or(self.offset);
@@ -481,8 +855,16 @@ impl Criteria {
 
     /// Whether any filter or join is recorded. Ordering and paging alone do
     /// not make a criteria non-empty.
+    ///
+    /// Every form of filtering counts, including the ones that are not plain
+    /// constraints. A criteria whose only predicate is an `OR` group or an
+    /// `EXISTS` is filtering just as hard, and reporting it empty invites a
+    /// caller to skip the `WHERE` and read the whole table.
     pub fn is_empty(&self) -> bool {
-        self.constraints.is_empty() && self.joins.is_empty()
+        self.constraints.is_empty()
+            && self.joins.is_empty()
+            && self.or_groups.is_empty()
+            && self.subqueries.is_empty()
     }
 
     /// The recorded predicates.
@@ -596,5 +978,84 @@ mod tests {
     fn ordering_records_its_direction() {
         let criteria = Criteria::new().order_by("a").order_by_desc("b");
         assert_eq!(criteria.orders(), &[("a".to_string(), false), ("b".to_string(), true)]);
+    }
+
+    // --- correlated subqueries ---------------------------------------------
+
+    fn children() -> Subquery {
+        Subquery::count("children").correlate("parent_id", "id")
+    }
+
+    #[test]
+    fn a_subquery_is_correlated_the_moment_it_exists() {
+        // The guarantee the two-type split buys: there is no path to a
+        // `Subquery` that skips `correlate`, so `correlations()` is never empty
+        // and an `EXISTS` can never degenerate into "the inner table has rows".
+        //
+        // The compile-time half of this cannot be asserted here — it is that
+        // `Criteria::where_exists` takes a `Subquery` and `Subquery::count`
+        // returns a `SubqueryDraft`, so an uncorrelated one does not typecheck.
+        assert_eq!(children().correlations(), &[("parent_id".to_string(), "id".to_string())]);
+    }
+
+    #[test]
+    fn a_subquery_records_its_table_projection_and_predicates() {
+        let subquery = Subquery::select("children", Projection::Sum("weight".into()))
+            .correlate("parent_id", "id")
+            .where_eq("approved", true)
+            .where_null("deleted_at");
+
+        assert_eq!(subquery.table(), "children");
+        assert_eq!(subquery.projection(), &Projection::Sum("weight".into()));
+        assert_eq!(subquery.constraints().len(), 2);
+        assert_eq!(subquery.constraints()[0].column(), "approved");
+        assert_eq!(subquery.constraints()[1].column(), "deleted_at");
+    }
+
+    #[test]
+    fn correlating_again_adds_a_pair_rather_than_replacing_one() {
+        let subquery = children().correlate("tenant_id", "tenant_id");
+        assert_eq!(subquery.correlations().len(), 2, "a composite key needs both halves");
+    }
+
+    #[test]
+    fn a_criteria_filtered_only_by_a_subquery_is_not_empty() {
+        // Reporting it empty invites a caller to skip the `WHERE` — and this
+        // particular filter is usually the one deciding whose rows these are.
+        assert!(!Criteria::new().where_exists(children()).is_empty());
+        assert!(!Criteria::new().where_not_exists(children()).is_empty());
+        assert!(!Criteria::new().where_subquery(children(), Comparison::Eq, 2_i64).is_empty());
+        assert!(!Criteria::new().or_where(|any| any.where_eq("a", 1_i64)).is_empty());
+    }
+
+    #[test]
+    fn subquery_predicates_are_recorded_in_order_with_their_kind() {
+        let criteria = Criteria::new()
+            .where_exists(children())
+            .where_not_exists(Subquery::count("bans").correlate("parent_id", "id"))
+            .where_subquery(children(), Comparison::Gte, 3_i64);
+
+        let recorded = criteria.subquery_predicates();
+        assert_eq!(recorded.len(), 3);
+        assert!(matches!(recorded[0], SubqueryPredicate::Exists(_)));
+        assert!(matches!(recorded[1], SubqueryPredicate::NotExists(_)));
+        assert!(matches!(recorded[2], SubqueryPredicate::Compare(_, Comparison::Gte, _)));
+        assert_eq!(recorded[1].subquery().table(), "bans");
+    }
+
+    #[test]
+    fn merging_carries_the_subquery_predicates_across() {
+        // Dropping them widens the result, which is the direction that leaks.
+        let visible = Criteria::new().where_exists(children());
+        let newest = Criteria::new().order_by_desc("id").limit(10);
+
+        assert_eq!(visible.clone().merge(newest.clone()).subquery_predicates().len(), 1);
+        assert_eq!(newest.merge(visible).subquery_predicates().len(), 1, "either direction");
+    }
+
+    #[test]
+    fn an_assignment_converts_from_both_a_value_and_a_subquery() {
+        assert!(matches!(Assignment::from(Value::from(1_i64)), Assignment::Value(_)));
+        assert!(matches!(Assignment::from(children()), Assignment::Subquery(_)));
     }
 }
