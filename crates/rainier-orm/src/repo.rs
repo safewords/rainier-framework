@@ -6,6 +6,26 @@
 //! written anywhere — this module *is* the repository for every derived
 //! struct.
 //!
+//! # Soft deletes are scoped for you
+//!
+//! If the entity marks a column `#[orm(soft_delete)]`, every **read** here —
+//! [`find_by_pk`], [`find_by_keys`], [`find_by`], [`find_one_by`], [`all`] and
+//! each page of a [`Cursor`] — appends `deleted_at IS NULL`, so a tombstoned row
+//! is not returned by any of them. See [`crate::trash`] for the argument; the
+//! short version is that the alternative is a predicate every call site has to
+//! remember, whose omission raises nothing and shows deleted rows to users.
+//!
+//! The reads here take no scope argument, and that is not an oversight: they are
+//! the shorthands, and a shorthand that needed a scope parameter would stop being
+//! one. To read tombstoned rows deliberately, use the builder —
+//! [`query`]`::<E>()` carries [`with_trashed`](crate::Query::with_trashed) and
+//! [`only_trashed`](crate::Query::only_trashed) and can express everything below
+//! — or a [`Cursor`], which carries both for the purge case.
+//!
+//! The **writes** here are not scoped: [`update`], [`delete_by_pk`] and
+//! [`delete_by_keys`] name a row by its key and act on it whether or not it is
+//! tombstoned. That is what makes a restore and a purge writable at all.
+//!
 //! # Every future here must be `Send`
 //!
 //! `sea_query`'s statement builders hold `Rc<dyn Iden>`, which is `!Send`. A
@@ -37,12 +57,33 @@
 
 use crate::key::{key_condition, key_route, row_key_condition};
 use crate::route::route_for;
+use crate::trash::{scope_predicate, SoftDeletes, TrashScope};
 use crate::{Entity, Executor, Result, ShardRoute, SingleKey};
 use core::future::Future;
-use sea_query::{Alias, Expr, OnConflict, Order, Query, SimpleExpr, Value};
+use sea_query::{
+    Alias, Expr, IntoColumnRef, OnConflict, Order, Query, SelectStatement, SimpleExpr, Value,
+};
 
 fn col(name: &str) -> Alias {
     Alias::new(name)
+}
+
+/// Append the soft-delete predicate to a `SELECT` this module is building.
+///
+/// Every read below calls it, and none of the writes do. Columns are left
+/// unqualified because that is how the rest of this module writes them and
+/// nothing here joins, so there is no other table for the name to collide with.
+///
+/// A `TrashScope` parameter rather than a hardcoded `Active`, so the one caller
+/// that legitimately walks tombstoned rows — [`Cursor`], which a purge job
+/// drives — goes through the same function as everything else instead of
+/// building its own predicate.
+fn scope_select<E: Entity>(stmt: &mut SelectStatement, scope: TrashScope) {
+    if let Some(predicate) =
+        scope_predicate::<E>(scope, |name| Alias::new(name.to_owned()).into_column_ref())
+    {
+        stmt.and_where(predicate);
+    }
 }
 
 /// The shard route for an entity instance: the first of its `(column, value)`
@@ -268,6 +309,7 @@ where
             .columns(E::columns().iter().map(|c| col(c.name)))
             .and_where(Expr::col(col(E::primary_key())).eq(pk_val))
             .limit(1);
+        scope_select::<E>(&mut stmt, TrashScope::Active);
 
         let (sql, params) = exec.dialect().build_query(&stmt);
         (route, sql, into_vec(params))
@@ -305,6 +347,7 @@ where
             .columns(E::columns().iter().map(|c| col(c.name)))
             .cond_where(condition)
             .limit(1);
+        scope_select::<E>(&mut stmt, TrashScope::Active);
 
         let (sql, params) = exec.dialect().build_query(&stmt);
         (route, sql, into_vec(params))
@@ -337,6 +380,7 @@ where
         stmt.from(col(E::table()))
             .columns(E::columns().iter().map(|c| col(c.name)))
             .and_where(Expr::col(col(column)).eq(val));
+        scope_select::<E>(&mut stmt, TrashScope::Active);
 
         let (sql, params) = exec.dialect().build_query(&stmt);
         (route, sql, into_vec(params))
@@ -362,6 +406,7 @@ where
             .columns(E::columns().iter().map(|c| col(c.name)))
             .and_where(Expr::col(col(column)).eq(val))
             .limit(1);
+        scope_select::<E>(&mut stmt, TrashScope::Active);
 
         let (sql, params) = exec.dialect().build_query(&stmt);
         (route, sql, into_vec(params))
@@ -386,6 +431,7 @@ where
     let (sql, params) = {
         let mut stmt = Query::select();
         stmt.from(col(E::table())).columns(E::columns().iter().map(|c| col(c.name)));
+        scope_select::<E>(&mut stmt, TrashScope::Active);
 
         let (sql, params) = exec.dialect().build_query(&stmt);
         (sql, into_vec(params))
@@ -509,6 +555,7 @@ pub struct Cursor<'a, E, X> {
     page_size: u64,
     after: Option<Value>,
     done: bool,
+    trash: TrashScope,
     _entity: core::marker::PhantomData<E>,
 }
 
@@ -523,6 +570,7 @@ where
             page_size: page_size.max(1),
             after: None,
             done: false,
+            trash: TrashScope::Active,
             _entity: core::marker::PhantomData,
         }
     }
@@ -532,6 +580,32 @@ where
     /// one D1 HTTP call per invocation).
     pub fn after(mut self, pk: impl Into<Value>) -> Self {
         self.after = Some(pk.into());
+        self
+    }
+
+    /// Walk tombstoned rows as well as live ones.
+    ///
+    /// See [`crate::trash`]; bounded on [`SoftDeletes`] so it cannot be written
+    /// against a table with no tombstone column.
+    pub fn with_trashed(mut self) -> Self
+    where
+        E: SoftDeletes,
+    {
+        self.trash = TrashScope::WithTrashed;
+        self
+    }
+
+    /// Walk **only** tombstoned rows — what a purge job wants.
+    ///
+    /// Worth having on the cursor specifically, rather than leaving purges to
+    /// [`query`]: purging is the one soft-delete chore whose input is unbounded,
+    /// so it is the one that has to be paged, and a cursor that could not be
+    /// pointed at the tombstones would push every purge back to raw SQL.
+    pub fn only_trashed(mut self) -> Self
+    where
+        E: SoftDeletes,
+    {
+        self.trash = TrashScope::OnlyTrashed;
         self
     }
 
@@ -553,6 +627,7 @@ where
             if let Some(after) = &self.after {
                 stmt.and_where(Expr::col(col(pk)).gt(after.clone()));
             }
+            scope_select::<E>(&mut stmt, self.trash);
 
             // Route by the keyset position when it's a shard-encoded pk (walks one
             // shard); otherwise `Global` (a single/global table).

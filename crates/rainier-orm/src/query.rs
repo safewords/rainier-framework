@@ -38,8 +38,17 @@
 //! backends (that's impossible) and it does not decode the joined table. To
 //! assemble data across entities (or across backends), query each and compose
 //! in your code; see [`crate::repo::find_by`].
+//!
+//! **Reads of a soft-deleting entity exclude tombstoned rows.** If `E` marks a
+//! column `#[orm(soft_delete)]`, [`all`](Query::all), [`first`](Query::first)
+//! and [`count`](Query::count) append `deleted_at IS NULL` without being asked;
+//! [`with_trashed`](Query::with_trashed) and
+//! [`only_trashed`](Query::only_trashed) are how you get the tombstoned rows
+//! back. The write terminals are not scoped, so a restore and a purge still work
+//! — see [`crate::trash`] for why that split is the safe one.
 
 use crate::route::route_for;
+use crate::trash::{scope_predicate, SoftDeletes, TrashScope};
 use crate::{repo, Entity, Executor, Result, ShardRoute};
 use core::future::Future;
 use core::marker::PhantomData;
@@ -57,6 +66,10 @@ pub struct Query<E> {
     limit: Option<u64>,
     offset: Option<u64>,
     route: ShardRoute,
+    /// Which rows of a soft-deleting table the **reads** may see. Ignored
+    /// entirely by an entity with no tombstone column, and by the write
+    /// terminals — see [`with_trashed`](Self::with_trashed).
+    trash: TrashScope,
     _entity: PhantomData<E>,
 }
 
@@ -76,6 +89,7 @@ impl<E: Entity> Query<E> {
             limit: None,
             offset: None,
             route: ShardRoute::Global,
+            trash: TrashScope::Active,
             _entity: PhantomData,
         }
     }
@@ -174,6 +188,61 @@ impl<E: Entity> Query<E> {
         self
     }
 
+    // --- soft deletes -----------------------------------------------------
+
+    /// Include tombstoned rows in this query's **reads**.
+    ///
+    /// A read over a soft-deleting entity appends `deleted_at IS NULL` on its
+    /// own (see [`crate::trash`]); this suppresses that. It is what a restore
+    /// endpoint, an admin trash view or a purge job needs, and it is the reason
+    /// those three are worth naming: under an automatic scope each of them
+    /// otherwise returns nothing, with no error to say the rows were filtered
+    /// rather than absent.
+    ///
+    /// Bounded on [`SoftDeletes`], so it cannot be written against a table with
+    /// no tombstone column — where it would be a no-op that reads as a
+    /// precaution.
+    ///
+    /// ```ignore
+    /// let trashed_too: Vec<Document> =
+    ///     repo::query::<Document>().where_eq("owner_id", id).with_trashed().all(&db).await?;
+    /// ```
+    pub fn with_trashed(mut self) -> Self
+    where
+        E: SoftDeletes,
+    {
+        self.trash = TrashScope::WithTrashed;
+        self
+    }
+
+    /// Restrict this query's **reads** to tombstoned rows only —
+    /// `deleted_at IS NOT NULL`. What a trash listing selects, and what a purge
+    /// job walks.
+    ///
+    /// Bounded on [`SoftDeletes`] for a sharper reason than
+    /// [`with_trashed`](Self::with_trashed): "only the deleted rows" of a table
+    /// that cannot delete rows is a question with no answer, and a version that
+    /// compiled would have to return either every row or none.
+    pub fn only_trashed(mut self) -> Self
+    where
+        E: SoftDeletes,
+    {
+        self.trash = TrashScope::OnlyTrashed;
+        self
+    }
+
+    /// This query's condition with the soft-delete predicate appended.
+    ///
+    /// Every read renders through here, so a `SELECT` and its `COUNT` cannot
+    /// disagree about which rows exist. The write terminals deliberately do not
+    /// — see the note above them.
+    fn read_condition(&self) -> Cond {
+        match scope_predicate::<E>(self.trash, col_ref::<E>) {
+            Some(predicate) => self.cond.clone().add(predicate),
+            None => self.cond.clone(),
+        }
+    }
+
     // --- joins (single backend, root-entity selection only) ---------------
 
     /// `INNER JOIN foreign_table ON E.local_col = foreign_table.foreign_col`.
@@ -248,7 +317,7 @@ impl<E: Entity> Query<E> {
         for (kind, table, on) in &self.joins {
             stmt.join(*kind, Alias::new(table.clone()), on.clone());
         }
-        stmt.cond_where(self.cond.clone());
+        stmt.cond_where(self.read_condition());
         for (col, ord) in &self.orders {
             stmt.order_by(col.clone(), ord.clone());
         }
@@ -270,12 +339,27 @@ impl<E: Entity> Query<E> {
         for (kind, table, on) in &self.joins {
             stmt.join(*kind, Alias::new(table.clone()), on.clone());
         }
-        stmt.cond_where(self.cond.clone());
+        stmt.cond_where(self.read_condition());
         stmt.expr_as(Func::count(Expr::col(Asterisk)), Alias::new("cnt"));
 
         let (sql, params) = dialect.build_query(&stmt);
         (self.route, sql, params.0)
     }
+
+    // The three writers below render `self.cond` **unscoped**, and that
+    // asymmetry with the readers above is deliberate.
+    //
+    // A soft-delete scope on a write breaks the two operations a soft delete
+    // exists for. *Restore* is `UPDATE … SET deleted_at = NULL` against a row
+    // that is by definition tombstoned; under a scope it matches nothing and
+    // silently fails to restore anything. *Purge* is `DELETE … WHERE deleted_at
+    // < cutoff`; under a scope it matches nothing, forever, and the only symptom
+    // is a table that never stops growing. Both are the natural spelling, both
+    // would be wrong, and neither would raise anything.
+    //
+    // The converse cost is small: an unscoped `UPDATE` may also touch a
+    // tombstoned row, which is a row of the table that the caller's own `WHERE`
+    // named. See `crate::trash` for the whole argument.
 
     /// Render an `UPDATE` setting `set` under this query's filters.
     fn render_update(
@@ -408,6 +492,11 @@ impl<E: Entity> Query<E> {
     /// `DELETE` every row matching the filters. Joins are ignored (portable
     /// `DELETE` takes no joins); express the condition with `WHERE`/subqueries
     /// instead. Returns rows affected.
+    ///
+    /// A hard delete, and **not** soft-delete scoped even on an entity that
+    /// marks a tombstone column: a purge job asks for the tombstoned rows
+    /// precisely, and a scope would leave it matching nothing forever with
+    /// nothing to say so.
     pub fn delete<'a, X: Executor>(self, exec: &'a X) -> impl Future<Output = Result<u64>> + 'a {
         let (route, sql, params) = self.render_delete(exec.dialect());
         async move { Ok(exec.execute_routed(route, &sql, params).await?.rows_affected) }

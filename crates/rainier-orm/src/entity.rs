@@ -120,6 +120,30 @@ pub trait Entity: Sized {
         &[]
     }
 
+    /// The **tombstone column** of a soft-deleting table, or `None`.
+    ///
+    /// `Some` for exactly the structs carrying an `#[orm(soft_delete)]` field,
+    /// and every read builder in the framework appends `<column> IS NULL` when
+    /// it is set — see [`crate::trash`] for what that means and how to suppress
+    /// it. A `None` entity builds precisely the SQL it built before soft-delete
+    /// scoping existed, which is what makes the feature safe to add underneath
+    /// an application that has never heard of it.
+    ///
+    /// This is metadata rather than a marker trait because the layers above are
+    /// entity-erased at the point they need the answer — a repository behind an
+    /// `Arc<dyn …>` still has to build the predicate. The compile-time half of
+    /// the story is [`SoftDeletes`](crate::SoftDeletes), which is what the APIs
+    /// that *ask about* tombstoned rows are bounded on.
+    ///
+    /// Note what it is not: a search for a column *named* `deleted_at`. Some
+    /// tables record a deletion date as domain data rather than as row
+    /// lifecycle, and inferring the scope from the name would silently stop such
+    /// a table returning most of its rows — the same class of quiet wrongness
+    /// this scope exists to remove, arrived at from the other side.
+    fn soft_delete_column() -> Option<&'static str> {
+        None
+    }
+
     /// Decode one row into `Self`. Generated to read each field through its
     /// [`FromColumn`](crate::FromColumn) impl.
     fn from_row(row: &dyn Row) -> Result<Self>;
