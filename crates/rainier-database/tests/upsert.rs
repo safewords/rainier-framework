@@ -39,6 +39,20 @@ struct Label {
     total: i64,
 }
 
+/// A row whose primary key the database assigns, carrying a natural key of its
+/// own. The two keys are the whole point: `id` is the one a caller reaches for
+/// as a conflict target and the one the `INSERT` never supplies, and `path` is
+/// the one that actually arbitrates the collision.
+#[derive(Debug, Clone, PartialEq, rainier_orm::Entity)]
+#[orm(table = "hits")]
+struct Hit {
+    #[orm(pk, auto_increment)]
+    id: i64,
+    #[orm(unique)]
+    path: String,
+    views: i64,
+}
+
 async fn world() -> SeaOrmExecutor {
     let exec = SeaOrmExecutor::connect("sqlite::memory:", &PoolConfig::serverless())
         .await
@@ -49,6 +63,7 @@ async fn world() -> SeaOrmExecutor {
     for sql in rainier_orm::schema::schema_ddl::<Tally>(Dialect::Sqlite)
         .into_iter()
         .chain(rainier_orm::schema::schema_ddl::<Label>(Dialect::Sqlite))
+        .chain(rainier_orm::schema::schema_ddl::<Hit>(Dialect::Sqlite))
     {
         exec.execute(&sql, Vec::new()).await.expect("create table");
     }
@@ -199,6 +214,55 @@ async fn a_plan_with_no_conflict_columns_is_refused_without_touching_the_table()
     assert!(refused.is_err(), "an inferred conflict target is a MySQL-only statement");
     let rows = repo::all::<Label, _>(&exec).await.expect("all");
     assert_eq!(rows[0].note, "first", "the table is untouched");
+}
+
+#[tokio::test]
+async fn conflicting_on_an_auto_increment_key_is_refused_rather_than_appending_rows() {
+    // The failure that reports success. `id` is auto-increment, so the insert
+    // omits it and there is nothing for the stored row to collide with: the
+    // statement takes the insert branch every time, returns one row affected,
+    // and leaves a table full of duplicates under a key meant to be unique.
+    //
+    // Two calls, so the assertion is on the row count rather than on the error
+    // alone — one row means the second call really was stopped, not merely
+    // reported.
+    let exec = world().await;
+    let plan = Upsert::on(["id"]).increment(["views"]);
+
+    repo::insert(&exec, &Hit { id: 0, path: "/a".into(), views: 1 }).await.expect("seed");
+
+    for _ in 0..2 {
+        let refused = repo::upsert_with(&exec, &Hit { id: 0, path: "/a".into(), views: 1 }, &plan)
+            .await
+            .err()
+            .expect("a plan that can only ever insert must not reach the database");
+
+        assert!(refused.to_string().contains("id"), "{refused}");
+    }
+
+    let rows = repo::all::<Hit, _>(&exec).await.expect("all");
+    assert_eq!(rows.len(), 1, "the table is untouched; each call would otherwise append a row");
+    assert_eq!(rows[0].views, 1, "and nothing was counted");
+}
+
+#[tokio::test]
+async fn the_natural_key_is_what_the_same_counter_conflicts_on() {
+    // The working form of the test above, against the same table: conflict on
+    // the column the insert actually supplies and that carries a `UNIQUE`, and
+    // the counter accumulates on one row exactly as intended. Without this the
+    // refusal above could be satisfied by a check that rejects everything.
+    let exec = world().await;
+    let plan = Upsert::on(["path"]).increment(["views"]);
+
+    for _ in 0..3 {
+        repo::upsert_with(&exec, &Hit { id: 0, path: "/a".into(), views: 1 }, &plan)
+            .await
+            .expect("upsert");
+    }
+
+    let rows = repo::all::<Hit, _>(&exec).await.expect("all");
+    assert_eq!(rows.len(), 1, "one row per path");
+    assert_eq!(rows[0].views, 3);
 }
 
 #[tokio::test]

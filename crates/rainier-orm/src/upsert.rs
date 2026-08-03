@@ -33,6 +33,30 @@
 //! [`Upsert::on`] is therefore the only constructor, and an empty target is
 //! refused at render time rather than quietly dropped.
 //!
+//! ## Why the conflict target must be a column the `INSERT` supplies
+//!
+//! An upsert collides on the values it inserts. A conflict target naming a
+//! column the statement leaves out therefore cannot collide with anything: the
+//! database has nothing to match the stored row against, so it takes the insert
+//! branch, writes a new row, and reports one row affected.
+//!
+//! That is worse than an error, because the caller is told it worked. An
+//! `Upsert::on(["id"]).increment(["views"])` meant to raise one row's counter
+//! instead appends a fresh row per call, and the count the caller reads back is
+//! whatever the last insert happened to carry. The table fills with duplicates
+//! under a key that is supposed to be unique, and nothing in the result says so.
+//!
+//! An **auto-increment primary key** is how this is reached in practice, and it
+//! is the first target a caller reaches for, because `id` is the key they think
+//! in. [`Entity::insert_values`](crate::Entity::insert_values) omits an
+//! auto-increment key on purpose — assigning it is the database's job — so
+//! `on(["id"])` names a column that is never in the statement. The two designs
+//! are individually right and silently incompatible, which is why
+//! [`Upsert::to_on_conflict`] refuses the combination rather than rendering it.
+//!
+//! Conflict on the columns that carry the uniqueness the upsert is arbitrating:
+//! the natural key the row is identified by, matching a `UNIQUE` constraint.
+//!
 //! ## Why `Increment` is its own action
 //!
 //! [`UpsertAction::Replace`] writes the value being inserted over the stored
@@ -155,6 +179,10 @@ impl Upsert {
     ///   Postgres would not; refusing means the mistake surfaces on whichever
     ///   database the caller happens to develop against, instead of on the one
     ///   they deploy to. See the module docs.
+    /// - A **conflict column** the `INSERT` does not supply. Nothing the
+    ///   statement inserts can collide on a key it leaves unset, so the update
+    ///   never runs and every call inserts another row — see the module docs
+    ///   for why that is the worst of the three failures.
     /// - An action naming a column the `INSERT` does not supply. Every action
     ///   reads the value being inserted (`excluded.col`, or MySQL's
     ///   `VALUES(col)`), so a column that is not in the statement has no such
@@ -172,6 +200,24 @@ impl Upsert {
                  colliding key but SQLite and Postgres require `ON CONFLICT (…)`, so \
                  this would run on one dialect and be a syntax error on the others"
             )));
+        }
+
+        // Checked before the actions, because the target decides whether the
+        // update branch can be reached at all. A plan naming the same missing
+        // column in both places is worth reporting as a target: told about the
+        // action, a caller drops that column from the update list and is left
+        // with a statement that still only ever inserts.
+        for column in &self.conflict {
+            if !inserted.contains(&column.as_str()) {
+                return Err(Error::msg(format!(
+                    "an upsert on `{table}` conflicts on `{column}`, which the INSERT does not \
+                     supply; nothing it inserts can collide on that key, so every call would \
+                     insert a new row and report success instead of updating the stored one. \
+                     An auto-increment primary key is the usual way to reach this — the insert \
+                     omits it deliberately so the database assigns a fresh value each time, \
+                     which is precisely why it cannot be a conflict target"
+                )));
+            }
         }
 
         for (column, _) in &self.actions {
@@ -337,6 +383,62 @@ mod tests {
 
         assert!(error.contains("conflict columns"), "{error}");
         assert!(error.contains('t'), "the error names the table: {error}");
+    }
+
+    #[test]
+    fn a_conflict_target_the_insert_omits_is_refused() {
+        // The check that has to exist for its own sake: `n` is inserted and is
+        // a perfectly good thing to increment, so the *action* list is clean and
+        // only the target is wrong. Remove the target check and this plan
+        // renders, runs, and inserts a new row on every call while reporting
+        // success — so this test is what stops that being deleted as redundant.
+        let error = Upsert::on(["missing"])
+            .increment(["n"])
+            .to_on_conflict(Dialect::Sqlite, "t", &["a", "n"])
+            .err()
+            .expect("a target that cannot collide must not render")
+            .to_string();
+
+        assert!(error.contains("missing"), "the error names the column: {error}");
+        assert!(error.contains('t'), "…and the table: {error}");
+        assert!(
+            error.contains("insert a new row"),
+            "the error has to say what goes wrong, because the failure returns success: {error}"
+        );
+    }
+
+    #[test]
+    fn an_auto_increment_primary_key_cannot_be_the_conflict_target() {
+        // The shape a caller reaches for first, because `id` is the key they
+        // think in: "conflict on the row's id, add to its counter". The insert
+        // omits an auto-increment key deliberately, so there is no `id` to
+        // collide on and the row is appended instead of updated.
+        let plan = Upsert::on(["id"]).increment(["n"]);
+
+        for dialect in [Dialect::MySql, Dialect::Sqlite, Dialect::Postgres] {
+            // MySQL too. It infers the colliding key rather than being told
+            // one, so it is the dialect where this looks most like it works —
+            // and the one where an unset auto-increment key guarantees it does
+            // not.
+            let error = plan
+                .to_on_conflict(dialect, "t", &["a", "n"])
+                .err()
+                .expect("a plan that can only ever insert must not render")
+                .to_string();
+
+            assert!(error.contains("id"), "{dialect:?}: {error}");
+            assert!(error.contains("auto-increment"), "{dialect:?}: name the cause: {error}");
+        }
+    }
+
+    #[test]
+    fn a_conflict_target_the_insert_supplies_still_renders() {
+        // The other half: the check must reject only what cannot collide. Every
+        // column of a composite target is inserted here, so nothing is refused.
+        assert!(Upsert::on(["a", "b"])
+            .increment(["n"])
+            .to_on_conflict(Dialect::Sqlite, "t", &["a", "b", "n"])
+            .is_ok());
     }
 
     #[test]

@@ -53,6 +53,45 @@
 //! it be passed to the APIs taking one key value (`find_by_pk`, `delete_by_pk`,
 //! `cursor`). A composite struct does not, so those calls fail to compile rather
 //! than building a `WHERE` from the first column alone.
+//!
+//! ## Soft deletes
+//!
+//! One field may be marked `#[orm(soft_delete)]`. That makes the struct report
+//! its tombstone column through `Entity::soft_delete_column`, gets it an
+//! `impl SoftDeletes`, and from then on **every read builder appends
+//! `<column> IS NULL` by itself**:
+//!
+//! ```ignore
+//! #[derive(Entity)]
+//! #[orm(table = "documents")]
+//! struct Document {
+//!     #[orm(pk, auto_increment)]
+//!     id: u64,
+//!     #[orm(soft_delete)]
+//!     deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+//! }
+//! ```
+//!
+//! The marker is deliberate in three ways, each of which prevents a query that
+//! silently returns the wrong rows:
+//!
+//! - **It is opt-in, never inferred from a column called `deleted_at`.** Some
+//!   tables record a deletion date as domain data; scoping those on a name match
+//!   would quietly hide most of their rows.
+//! - **It sits on the field, not the struct.** The column is whatever the marked
+//!   field resolves to — `#[orm(column = "…")]` renaming included — so the
+//!   attribute cannot name a column that does not exist. A struct-level
+//!   `soft_deletes = "deletd_at"` would compile and put the typo into the
+//!   `WHERE` of every read.
+//! - **The field must be nullable, and a `NOT NULL` one fails to compile.** A
+//!   tombstone that is never `NULL` makes `IS NULL` match no row, so every
+//!   scoped read of the table would return empty with nothing to say why.
+//!
+//! Marking two fields is an error: two tombstones has no meaning, and picking
+//! the first would be a coin flip deciding what the whole table returns.
+//!
+//! See `rainier_orm::trash` for the scope itself, and for how a trash view or a
+//! purge job asks for the rows it hides.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -110,6 +149,7 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
         unique: bool,
         index: bool,
         shard: bool,
+        soft_delete: bool,
         references: Option<(String, String)>, // (foreign_table, foreign_column)
         on_delete: Option<String>,
         on_update: Option<String>,
@@ -138,6 +178,7 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
         let mut unique = false;
         let mut index = false;
         let mut shard = false;
+        let mut soft_delete = false;
         let mut references = None;
         let mut on_delete = None;
         let mut on_update = None;
@@ -154,6 +195,8 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
                         index = true;
                     } else if meta.path.is_ident("shard_key") {
                         shard = true;
+                    } else if meta.path.is_ident("soft_delete") {
+                        soft_delete = true;
                     } else if meta.path.is_ident("column") {
                         column = meta.value()?.parse::<LitStr>()?.value();
                     } else if meta.path.is_ident("references") {
@@ -180,6 +223,7 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
             unique,
             index,
             shard,
+            soft_delete,
             references,
             on_delete,
             on_update,
@@ -205,6 +249,55 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
         quote! { impl ::rainier_orm::SingleKey for #ident {} }
     } else {
         quote! {}
+    };
+
+    // --- soft deletes: the tombstone column, if the struct marked one ---------
+    //
+    // Marked on the *field* rather than named in a struct-level attribute, and
+    // that is the whole safety argument: the column is whatever the marked field
+    // resolves to, `#[orm(column = "…")]` renaming included, so the attribute
+    // cannot name a column the entity does not have. A struct-level
+    // `soft_deletes = "deletd_at"` would compile and put a typo into the `WHERE`
+    // of every read of that table.
+    let soft_deletes: Vec<&FieldMeta> = metas.iter().filter(|m| m.soft_delete).collect();
+    if soft_deletes.len() > 1 {
+        // Two tombstones has no meaning, and picking the first would be a coin
+        // flip that decides which rows the whole table returns.
+        return compile_err("Entity allows only one field marked `#[orm(soft_delete)]`");
+    }
+    let (soft_delete_impl, soft_deletes_marker, soft_delete_guard) = match soft_deletes.first() {
+        None => (
+            // Nothing emitted, so the trait's own `None` default stands and the
+            // entity keeps building exactly the SQL it built before.
+            quote! {},
+            quote! {},
+            quote! {},
+        ),
+        Some(m) => {
+            let column = &m.column;
+            let ty = &m.ty;
+            let message = format!(
+                "`#[orm(soft_delete)]` needs a nullable column, and `{column}` is NOT NULL. \
+                 A tombstone that is never NULL means `{column} IS NULL` matches no row, \
+                 so every scoped read of this table would come back empty — silently. \
+                 Declare it as an `Option<…>`."
+            );
+            (
+                quote! {
+                    fn soft_delete_column() -> ::core::option::Option<&'static str> {
+                        ::core::option::Option::Some(#column)
+                    }
+                },
+                quote! { impl ::rainier_orm::SoftDeletes for #ident {} },
+                // The one thing about this feature that *can* be caught at
+                // compile time on the declaring side, so it is.
+                quote! {
+                    const _: () = {
+                        assert!(<#ty as ::rainier_orm::SqlType>::NULLABLE, #message);
+                    };
+                },
+            )
+        }
     };
 
     let col_specs = metas.iter().map(|m| {
@@ -318,6 +411,7 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
             fn shard_columns() -> &'static [&'static str] {
                 &[ #(#shard_cols),* ]
             }
+            #soft_delete_impl
             fn from_row(row: &dyn ::rainier_orm::Row)
                 -> ::core::result::Result<Self, ::rainier_orm::Error>
             {
@@ -342,6 +436,8 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
         }
 
         #single_key_impl
+        #soft_deletes_marker
+        #soft_delete_guard
     }
     .into()
 }
