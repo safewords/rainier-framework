@@ -145,7 +145,8 @@ fn scope_select<E: Entity>(stmt: &mut SelectStatement, scope: TrashScope) {
 /// `SELECT … FROM table` — every row.
 ///
 /// Every row that is not tombstoned, on a soft-deleting entity. So are the rest
-/// of the readers below; see [`scope_select`].
+/// of the readers below — they all route through the same private scoping step,
+/// which is what stops one of them being left unscoped.
 pub fn select_all<E: Entity>(dialect: Dialect) -> Prepared {
     let mut stmt = select_columns::<E>();
     scope_select::<E>(&mut stmt, TrashScope::Active);

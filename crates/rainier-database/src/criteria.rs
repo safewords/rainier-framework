@@ -757,7 +757,7 @@ impl Criteria {
     ///
     /// A read over a model that marks a column `#[orm(soft_delete)]` appends
     /// `deleted_at IS NULL` on its own — see
-    /// [`rainier_orm::trash`](rainier_orm::trash) — and this suppresses that.
+    /// [`rainier_orm::trash`] — and this suppresses that.
     ///
     /// # When you need it, and why it is worth saying out loud
     ///
