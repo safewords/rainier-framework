@@ -99,7 +99,7 @@
 //! | `block_for` | no driver here blocks; `reserve` returns immediately and the **worker** does the waiting | nothing; a worker's own `sleep` |
 //! | `table` | the queue's tables are named on their entities at compile time, not per connection | nothing; run the driver's own migrations |
 //! | `prefix`, `suffix` on `sqs` | they compose a queue *URL* out of parts, and an `sqs` connection is given the whole URL | `queue_url` |
-//! | `connection` on `redis` | nothing in this framework declares a named Redis connection for it to point at | `url`, on the connection itself |
+//! | `connection` on `redis` | it would point at the cache's named stores, which is the queue sharing the cache's database index — the failure it existed to prevent | `url`, on the connection itself, with its own index |
 //! | `max_connections`, `min_connections`, `pool_size` | no driver here pools, and the Redis one **multiplexes** — one socket, every command | `response_timeout_ms` and `reconnect`, which address what a pool would have |
 //!
 //! Each is covered in more detail on [`ConnectionConfig`], which is where a
@@ -638,17 +638,24 @@ impl std::fmt::Debug for QueueResources {
 /// deliberately not the cache's, because flushing the cache flushes that index
 /// — and every job waiting in it goes with it.
 ///
-/// This framework has no such section. `rainier-database` declares no Redis
-/// connections at all, and `rainier-cache` builds its Redis store from a URL
-/// rather than from a named registry, so there is nothing for a `connection` to
-/// point at. A [`RedisConnection`] therefore carries its own `url`, which is
-/// also the honest place to keep the queue on its own index: give it a
-/// different one from the cache's, in the URL's path.
+/// This framework has no such section, and `rainier-database` declares no Redis
+/// connections at all. `rainier-cache` does now declare **named stores** in
+/// `cache.stores`, which looks like something a `connection` could point at and
+/// is precisely the thing it must not: those are the *cache's* stores, and a
+/// queue pointed at one is a queue sharing the cache's database index. Flushing
+/// the cache empties that index, and every job waiting in it goes too — which
+/// is the failure a dedicated `connection` existed to prevent, arrived at by
+/// implementing it.
+///
+/// A [`RedisConnection`] therefore carries its own `url`, which is also the
+/// honest place to keep the queue on its own index: give it a different one
+/// from the cache's, in the URL's path.
 ///
 /// Inventing a named-Redis registry inside this crate would be worse than the
-/// gap. Two competing notions of "a Redis connection" — one here, one wherever
-/// it belongs — is how a queue and a cache end up on the same index by
-/// agreeing on a name and disagreeing about what it means.
+/// gap, and borrowing another section's would be worse still. Two competing
+/// notions of "a Redis connection" — one here, one wherever it belongs — is how
+/// a queue and a cache end up on the same index by agreeing on a name and
+/// disagreeing about what it means.
 ///
 /// # A connection pool is refused
 ///

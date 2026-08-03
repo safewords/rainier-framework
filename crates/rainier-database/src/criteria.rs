@@ -18,8 +18,15 @@
 //! let front_page = published.merge(newest);
 //! assert_eq!(front_page.limit_value(), Some(10));
 //! ```
+//!
+//! One filter a criteria does **not** have to record is the soft-delete one: if
+//! the model marks a tombstone column, every statement built from a criteria
+//! appends `deleted_at IS NULL` by itself. [`with_trashed`](Criteria::with_trashed)
+//! and [`only_trashed`](Criteria::only_trashed) are how a query that means to
+//! see deleted rows says so.
 
 use rainier_orm::sea_query::{ColumnRef, Expr, Func, SimpleExpr, Value};
+use rainier_orm::TrashScope;
 
 /// One recorded predicate.
 #[derive(Debug, Clone)]
@@ -443,6 +450,176 @@ impl SubqueryPredicate {
     }
 }
 
+/// One [`or_where`](Criteria::or_where) group: predicates combined with `OR`
+/// and, as a whole, `AND`-ed with the rest of the query.
+///
+/// # Why this is a type and not a [`Criteria`]
+///
+/// The closure used to receive a `Criteria` and only its plain constraints were
+/// kept, which made two silent wrongs writable. A group mixing a column
+/// predicate with a [`where_exists`](Self::where_exists) lost the `EXISTS`
+/// branch, so the result *narrowed*. Worse, a group holding **only** an
+/// `EXISTS` came out empty and was skipped entirely — the whole `AND (…)`
+/// vanished and the query returned rows it was written to exclude. Both compile,
+/// both run, and neither says anything.
+///
+/// So the bound is the type, exactly as it is for [`Subquery`]: an `OR` group
+/// holds predicates and nothing else, and what cannot be `OR`-ed is not a method
+/// here. A join, a limit, an ordering or a nested group is a compile error
+/// rather than something quietly dropped on the way to SQL — there is no
+/// argument through which one can be handed in and then ignored.
+///
+/// ```
+/// # use rainier_database::{Criteria, Subquery};
+/// // "active, and either named like this or owned by someone who is"
+/// let scope = Criteria::new().where_eq("state", "active").or_where(|any| {
+///     any.where_like("name", "%ada%")
+///         .where_exists(Subquery::count("owners").correlate("thing_id", "id"))
+/// });
+///
+/// let group = &scope.or_groups()[0];
+/// assert_eq!(group.constraints().len(), 1);
+/// assert_eq!(group.subquery_predicates().len(), 1, "the EXISTS is a branch of the OR");
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct OrGroup {
+    constraints: Vec<Constraint>,
+    subqueries: Vec<SubqueryPredicate>,
+}
+
+impl OrGroup {
+    /// An empty group — nothing to `OR`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `LOWER(column) = LOWER(value)` — see [`Criteria::where_eq_ci`].
+    pub fn where_eq_ci(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.or(Constraint::EqCi(column.into(), value.into()))
+    }
+
+    /// `column = value`.
+    pub fn where_eq(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.or(Constraint::Eq(column.into(), value.into()))
+    }
+
+    /// `column <> value`.
+    pub fn where_ne(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.or(Constraint::Ne(column.into(), value.into()))
+    }
+
+    /// `column > value`.
+    pub fn where_gt(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.or(Constraint::Gt(column.into(), value.into()))
+    }
+
+    /// `column >= value`.
+    pub fn where_gte(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.or(Constraint::Gte(column.into(), value.into()))
+    }
+
+    /// `column < value`.
+    pub fn where_lt(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.or(Constraint::Lt(column.into(), value.into()))
+    }
+
+    /// `column <= value`.
+    pub fn where_lte(self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.or(Constraint::Lte(column.into(), value.into()))
+    }
+
+    /// `column LIKE pattern` — use `%` and `_` wildcards.
+    pub fn where_like(self, column: impl Into<String>, pattern: impl Into<String>) -> Self {
+        self.or(Constraint::Like(column.into(), pattern.into()))
+    }
+
+    /// `column NOT LIKE pattern`.
+    pub fn where_not_like(self, column: impl Into<String>, pattern: impl Into<String>) -> Self {
+        self.or(Constraint::NotLike(column.into(), pattern.into()))
+    }
+
+    /// `column IN (values)`. An empty set matches nothing.
+    pub fn where_in<V: Into<Value>>(
+        self,
+        column: impl Into<String>,
+        values: impl IntoIterator<Item = V>,
+    ) -> Self {
+        let values = values.into_iter().map(Into::into).collect();
+        self.or(Constraint::In(column.into(), values))
+    }
+
+    /// `column NOT IN (values)`.
+    pub fn where_not_in<V: Into<Value>>(
+        self,
+        column: impl Into<String>,
+        values: impl IntoIterator<Item = V>,
+    ) -> Self {
+        let values = values.into_iter().map(Into::into).collect();
+        self.or(Constraint::NotIn(column.into(), values))
+    }
+
+    /// `column IS NULL`.
+    pub fn where_null(self, column: impl Into<String>) -> Self {
+        self.or(Constraint::Null(column.into()))
+    }
+
+    /// `column IS NOT NULL`.
+    pub fn where_not_null(self, column: impl Into<String>) -> Self {
+        self.or(Constraint::NotNull(column.into()))
+    }
+
+    /// `EXISTS (<subquery>)` as one branch of the `OR` — see
+    /// [`Criteria::where_exists`].
+    pub fn where_exists(mut self, subquery: Subquery) -> Self {
+        self.subqueries.push(SubqueryPredicate::Exists(subquery));
+        self
+    }
+
+    /// `NOT EXISTS (<subquery>)` as one branch — see
+    /// [`Criteria::where_not_exists`].
+    pub fn where_not_exists(mut self, subquery: Subquery) -> Self {
+        self.subqueries.push(SubqueryPredicate::NotExists(subquery));
+        self
+    }
+
+    /// `(<subquery>) <op> value` as one branch — see
+    /// [`Criteria::where_subquery`].
+    pub fn where_subquery(
+        mut self,
+        subquery: Subquery,
+        comparison: Comparison,
+        value: impl Into<Value>,
+    ) -> Self {
+        self.subqueries.push(SubqueryPredicate::Compare(subquery, comparison, value.into()));
+        self
+    }
+
+    /// The column predicates in this group.
+    pub fn constraints(&self) -> &[Constraint] {
+        &self.constraints
+    }
+
+    /// The subquery predicates in this group, `OR`-ed with the constraints
+    /// rather than `AND`-ed with the query.
+    pub fn subquery_predicates(&self) -> &[SubqueryPredicate] {
+        &self.subqueries
+    }
+
+    /// Whether the group holds no predicate of any kind.
+    ///
+    /// Every kind counts. Reporting a group of one `EXISTS` as empty is what let
+    /// the `AND (…)` around it disappear, and a disappearing filter returns
+    /// *more* rows — the direction that leaks.
+    pub fn is_empty(&self) -> bool {
+        self.constraints.is_empty() && self.subqueries.is_empty()
+    }
+
+    fn or(mut self, constraint: Constraint) -> Self {
+        self.constraints.push(constraint);
+        self
+    }
+}
+
 /// What an `UPDATE … SET` writes into a column.
 ///
 /// A bound value is the ordinary case. The subquery case is what makes a bulk
@@ -459,6 +636,34 @@ impl SubqueryPredicate {
 pub enum Assignment {
     /// A bound value.
     Value(Value),
+    /// `column = column + amount` — add to the stored value without reading it.
+    ///
+    /// [`Value`](Assignment::Value) cannot express this, because the new total
+    /// is not known until the stored one is. Working it out in the process means
+    /// reading the row, adding, and writing the result back — and under any
+    /// concurrency that loses additions: two callers read the same stored value,
+    /// both compute the same total, and the second write overwrites the first.
+    /// No statement errors and no row count says a write was dropped; the number
+    /// is merely too low, so the only way to notice is to already know what it
+    /// should have been. Doing the arithmetic inside the statement makes the
+    /// read and the write one operation, which the database serialises on the
+    /// row it is already locking.
+    ///
+    /// [`Subquery`](Assignment::Subquery) is not a stand-in for this, on two
+    /// counts. [`Projection`] has no arithmetic, so there is nothing to write
+    /// `n + ?` with; and a subquery reading the table being updated is MySQL
+    /// error 1093 — a restriction with no portable way around it.
+    ///
+    /// The amount is **signed**, so a decrement is this same primitive with a
+    /// negative argument rather than a second variant. One rendering means one
+    /// place for the `+` to be right, and it keeps a decrement from being
+    /// spelled as an unsigned subtraction that wraps underneath.
+    ///
+    /// `NULL + n` is `NULL` on every dialect, so this leaves a counter that has
+    /// never been set at `NULL` rather than raising it to `n`. Give such a
+    /// column a `NOT NULL DEFAULT 0` — the arithmetic cannot fix it, and it
+    /// fails by writing nothing rather than by erroring.
+    Increment(i64),
     /// A correlated subquery, re-evaluated for each updated row.
     Subquery(Subquery),
 }
@@ -504,7 +709,7 @@ pub struct Criteria {
     /// What to group by.
     groups: Vec<Projection>,
     /// Predicate groups combined with `OR` internally, `AND`-ed with the rest.
-    or_groups: Vec<Vec<Constraint>>,
+    or_groups: Vec<OrGroup>,
     /// Predicates whose left side is a correlated subquery, `AND`-ed with the
     /// rest.
     subqueries: Vec<SubqueryPredicate>,
@@ -516,6 +721,9 @@ pub struct Criteria {
     orders: Vec<(String, bool)>,
     limit: Option<u64>,
     offset: Option<u64>,
+    /// Which rows of a soft-deleting model this criteria may see. Means nothing
+    /// to a model with no tombstone column — see [`with_trashed`](Criteria::with_trashed).
+    trash: TrashScope,
 }
 
 impl Criteria {
@@ -541,6 +749,63 @@ impl Criteria {
     pub fn distinct(mut self) -> Self {
         self.distinct = true;
         self
+    }
+
+    // --- soft deletes ------------------------------------------------------
+
+    /// Include tombstoned rows.
+    ///
+    /// A read over a model that marks a column `#[orm(soft_delete)]` appends
+    /// `deleted_at IS NULL` on its own — see
+    /// [`rainier_orm::trash`](rainier_orm::trash) — and this suppresses that.
+    ///
+    /// # When you need it, and why it is worth saying out loud
+    ///
+    /// A restore endpoint, an admin trash view, a purge job and a support
+    /// lookup all mean to see tombstoned rows. Under an automatic scope each of
+    /// them returns **nothing**, and nothing about the empty result says the
+    /// rows were filtered rather than absent. That is the one hazard automatic
+    /// scoping introduces, and this method is the whole of the cure — so a
+    /// query that means to see deleted rows must say so, in the source, where a
+    /// reviewer can see it too.
+    ///
+    /// ```
+    /// # use rainier_database::Criteria;
+    /// # use rainier_orm::TrashScope;
+    /// let restorable = Criteria::new().where_eq("owner_id", 7_u64).with_trashed();
+    /// assert_eq!(restorable.trash_scope(), TrashScope::WithTrashed);
+    /// ```
+    ///
+    /// Harmless on a model with no tombstone column: there was no predicate to
+    /// suppress. Unlike [`Query::with_trashed`](rainier_orm::Query::with_trashed),
+    /// which refuses that case at compile time, a `Criteria` is built without
+    /// knowing which model it will be run against, so there is no type here to
+    /// refuse it with.
+    pub fn with_trashed(mut self) -> Self {
+        self.trash = TrashScope::WithTrashed;
+        self
+    }
+
+    /// Match **only** tombstoned rows — `deleted_at IS NOT NULL`. What a trash
+    /// listing selects, and what a purge counts.
+    ///
+    /// On a model with **no** tombstone column this matches nothing, rather
+    /// than everything. The empty set is the honest answer — a table that
+    /// cannot delete rows has no deleted ones — and it is the safe direction:
+    /// the alternative reading ("no column, so no predicate") hands a trash view
+    /// every live row in the table.
+    pub fn only_trashed(mut self) -> Self {
+        self.trash = TrashScope::OnlyTrashed;
+        self
+    }
+
+    /// Which rows of a soft-deleting model this criteria may see.
+    ///
+    /// [`Active`](TrashScope::Active) unless [`with_trashed`](Self::with_trashed)
+    /// or [`only_trashed`](Self::only_trashed) was called — the default that
+    /// makes forgetting to choose the safe outcome rather than the leaky one.
+    pub fn trash_scope(&self) -> TrashScope {
+        self.trash
     }
 
     /// Whether the query is `DISTINCT`.
@@ -683,16 +948,26 @@ impl Criteria {
     /// ```
     ///
     /// renders `state = ? AND (username LIKE ? OR display_name LIKE ?)`.
-    pub fn or_where(mut self, group: impl FnOnce(Criteria) -> Criteria) -> Self {
-        let built = group(Criteria::new());
-        if !built.constraints.is_empty() {
-            self.or_groups.push(built.constraints);
+    ///
+    /// The closure builds an [`OrGroup`], not a `Criteria`, and every kind of
+    /// predicate it can hold — including an
+    /// [`EXISTS`](OrGroup::where_exists) — is carried into the SQL. See
+    /// [`OrGroup`] for what happened when it was not, and for why the things an
+    /// `OR` group cannot express are absent rather than ignored.
+    ///
+    /// A group with no predicates at all is dropped, because `AND ()` is not
+    /// SQL. That is the one empty case: a group holding only a subquery
+    /// predicate is *not* empty and is not dropped.
+    pub fn or_where(mut self, group: impl FnOnce(OrGroup) -> OrGroup) -> Self {
+        let built = group(OrGroup::new());
+        if !built.is_empty() {
+            self.or_groups.push(built);
         }
         self
     }
 
     /// The `OR` groups, each `AND`-ed with the top-level predicates.
-    pub fn or_groups(&self) -> &[Vec<Constraint>] {
+    pub fn or_groups(&self) -> &[OrGroup] {
         &self.or_groups
     }
 
@@ -830,17 +1105,27 @@ impl Criteria {
     }
 
     /// Combine with `other`: its constraints, joins and orders are appended,
-    /// and its paging wins wherever it sets any.
+    /// its paging wins wherever it sets any, and a soft-delete scope on either
+    /// side survives.
     pub fn merge(mut self, other: Criteria) -> Self {
         self.constraints.extend(other.constraints);
         self.joins.extend(other.joins);
-        // Dropping these would *widen* the result: a scope whose whole purpose
-        // is an `EXISTS` — "only the chats I am in" — would merge into an
-        // unfiltered query and return everything.
+        // Dropping either of these would *widen* the result: a scope whose whole
+        // purpose is an `EXISTS` — "only the chats I am in" — would merge into
+        // an unfiltered query and return everything, and an `OR` group is one
+        // `AND`-ed parenthesised predicate that goes the same way.
         self.subqueries.extend(other.subqueries);
+        self.or_groups.extend(other.or_groups);
         self.orders.extend(other.orders);
         self.limit = other.limit.or(self.limit);
         self.offset = other.offset.or(self.offset);
+        // A soft-delete scope only ever *widens*, so it can only be set by
+        // somebody who meant to: the safe value is the default, and a merge that
+        // let it be reset would take a deliberate `with_trashed()` back off a
+        // query silently — the trash view that stops showing trash, again.
+        if other.trash != TrashScope::Active {
+            self.trash = other.trash;
+        }
         self
     }
 
@@ -1051,6 +1336,58 @@ mod tests {
 
         assert_eq!(visible.clone().merge(newest.clone()).subquery_predicates().len(), 1);
         assert_eq!(newest.merge(visible).subquery_predicates().len(), 1, "either direction");
+    }
+
+    // --- OR groups ----------------------------------------------------------
+
+    #[test]
+    fn an_or_group_carries_both_kinds_of_predicate() {
+        let criteria = Criteria::new().where_eq("state", "active").or_where(|any| {
+            any.where_like("name", "%ada%").where_exists(children()).where_subquery(
+                children(),
+                Comparison::Gte,
+                2_i64,
+            )
+        });
+
+        assert_eq!(criteria.constraints().len(), 1, "the top-level predicate stays where it is");
+        let group = &criteria.or_groups()[0];
+        assert_eq!(group.constraints().len(), 1);
+        assert_eq!(group.subquery_predicates().len(), 2, "the EXISTS branches survive the group");
+    }
+
+    #[test]
+    fn a_group_of_only_a_subquery_is_kept_rather_than_vanishing() {
+        // The silent over-match. If a subquery-only group counts as empty it is
+        // dropped, the `AND (…)` around it disappears, and the query returns the
+        // rows that group existed to exclude — with nothing to say so.
+        let criteria = Criteria::new().or_where(|any| any.where_not_exists(children()));
+
+        assert_eq!(criteria.or_groups().len(), 1, "the group must not be dropped");
+        assert!(criteria.or_groups()[0].constraints().is_empty());
+        assert_eq!(criteria.or_groups()[0].subquery_predicates().len(), 1);
+        assert!(!criteria.is_empty(), "it is filtering, so it is not empty");
+    }
+
+    #[test]
+    fn a_group_with_no_predicates_at_all_is_still_dropped() {
+        // The one thing that legitimately disappears, because `AND ()` is not
+        // SQL. Both halves have to be empty for that.
+        assert!(Criteria::new().or_where(|any| any).or_groups().is_empty());
+        assert!(!OrGroup::new().where_exists(children()).is_empty());
+        assert!(!OrGroup::new().where_eq("a", 1_i64).is_empty());
+        assert!(OrGroup::new().is_empty());
+    }
+
+    #[test]
+    fn merging_carries_the_or_groups_across() {
+        // Same reason as the subquery predicates beside them: an `OR` group is
+        // one `AND`-ed predicate, so dropping it on a merge widens the result.
+        let named = Criteria::new().or_where(|any| any.where_exists(children()));
+        let newest = Criteria::new().order_by_desc("id").limit(10);
+
+        assert_eq!(named.clone().merge(newest.clone()).or_groups().len(), 1);
+        assert_eq!(newest.merge(named).or_groups().len(), 1, "either direction");
     }
 
     #[test]

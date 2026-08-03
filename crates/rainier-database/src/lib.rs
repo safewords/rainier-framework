@@ -82,8 +82,8 @@ pub mod testing;
 
 pub use connection::{Connection, Database};
 pub use criteria::{
-    Assignment, Comparison, Constraint, Criteria, DatePart, JoinKind, Projection, Subquery,
-    SubqueryDraft, SubqueryPredicate,
+    Assignment, Comparison, Constraint, Criteria, DatePart, JoinKind, OrGroup, Projection,
+    Subquery, SubqueryDraft, SubqueryPredicate,
 };
 pub use databases::{
     DatabaseConfig, DatabaseCredentials, DatabaseDriver, DatabaseRole, Databases, DsnDatabase,

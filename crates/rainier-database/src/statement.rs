@@ -32,7 +32,7 @@ use rainier_orm::sea_query::{
 };
 use rainier_orm::{
     key_condition, key_route, row_key_condition, Dialect, Entity, Result, ShardRoute, SingleKey,
-    Upsert,
+    TrashScope, Upsert,
 };
 
 use crate::criteria::{
@@ -122,9 +122,34 @@ fn select_columns<E: Entity>() -> rainier_orm::sea_query::SelectStatement {
     stmt
 }
 
+/// Append the soft-delete predicate `scope` implies for `E`, if any.
+///
+/// **Every read builder in this module calls this**, and that uniformity is the
+/// point rather than a tidiness: a `SELECT` and its `COUNT` disagreeing about
+/// which rows exist is a paginator reporting a total it cannot produce, and one
+/// builder honouring the scope while its neighbour does not is a difference no
+/// call site can see. `no_select_builder_is_left_unscoped` in
+/// `tests/soft_deletes.rs` fails if a new builder here skips it.
+///
+/// The column is qualified to `E`'s table, like everything else this module
+/// writes. That is load-bearing rather than stylistic: a criteria may join, and
+/// a bare `deleted_at` is ambiguous the moment the joined table has one too — an
+/// error out of the database, and only on the deployments whose schema happens
+/// to collide.
+fn scope_select<E: Entity>(stmt: &mut SelectStatement, scope: TrashScope) {
+    if let Some(predicate) = rainier_orm::scope_predicate::<E>(scope, column_ref::<E>) {
+        stmt.and_where(predicate);
+    }
+}
+
 /// `SELECT … FROM table` — every row.
+///
+/// Every row that is not tombstoned, on a soft-deleting entity. So are the rest
+/// of the readers below; see [`scope_select`].
 pub fn select_all<E: Entity>(dialect: Dialect) -> Prepared {
-    let stmt = select_columns::<E>();
+    let mut stmt = select_columns::<E>();
+    scope_select::<E>(&mut stmt, TrashScope::Active);
+
     let (sql, params) = dialect.build_query(&stmt);
     Prepared { sql, params: params.0, route: ShardRoute::Global }
 }
@@ -137,6 +162,7 @@ pub fn select_by_pk<E: Entity + SingleKey>(dialect: Dialect, key: Value) -> Prep
     let route = route_for::<E>(E::primary_key(), &key);
     let mut stmt = select_columns::<E>();
     stmt.and_where(Expr::col(alias(E::primary_key())).eq(key)).limit(1);
+    scope_select::<E>(&mut stmt, TrashScope::Active);
 
     let (sql, params) = dialect.build_query(&stmt);
     Prepared { sql, params: params.0, route }
@@ -151,6 +177,7 @@ pub fn select_by_keys<E: Entity>(dialect: Dialect, keys: &[Value]) -> Result<Pre
     let route = key_route::<E>(keys);
     let mut stmt = select_columns::<E>();
     stmt.cond_where(key_condition::<E>(keys)?).limit(1);
+    scope_select::<E>(&mut stmt, TrashScope::Active);
 
     let (sql, params) = dialect.build_query(&stmt);
     Ok(Prepared { sql, params: params.0, route })
@@ -166,6 +193,7 @@ pub fn select_by_column<E: Entity>(
     let route = route_for::<E>(column, &value);
     let mut stmt = select_columns::<E>();
     stmt.and_where(Expr::col(alias(column)).eq(value));
+    scope_select::<E>(&mut stmt, TrashScope::Active);
     if let Some(limit) = limit {
         stmt.limit(limit);
     }
@@ -378,11 +406,17 @@ fn criteria_condition<E: Entity>(dialect: Dialect, criteria: &Criteria) -> (Cond
         condition = condition.add(constraint.to_expr(column_ref::<E>(constraint.column())));
     }
     // Each `or_where` group is one parenthesised `OR`, `AND`-ed with the rest —
-    // the shape it has in SQL, so there is no precedence to get wrong.
+    // the shape it has in SQL, so there is no precedence to get wrong. Both
+    // kinds of predicate are branches of that `OR`: a group that dropped its
+    // `EXISTS` here would narrow, and one that held nothing else would render as
+    // no group at all and match rows the caller excluded.
     for group in criteria.or_groups() {
         let mut any = Cond::any();
-        for constraint in group {
+        for constraint in group.constraints() {
             any = any.add(constraint.to_expr(column_ref::<E>(constraint.column())));
+        }
+        for predicate in group.subquery_predicates() {
+            any = any.add(subquery_predicate_expr::<E>(dialect, predicate));
         }
         condition = condition.add(any);
     }
@@ -680,7 +714,7 @@ pub fn update_matching<E: Entity>(
 }
 
 /// `UPDATE table SET … WHERE <criteria>`, where a column may be assigned a
-/// **correlated subquery** rather than a value.
+/// **correlated subquery** or an **increment** rather than a value.
 ///
 /// The general form of [`update_matching`], and the only single-statement way to
 /// recompute a denormalised counter across a table:
@@ -715,6 +749,33 @@ pub fn update_matching<E: Entity>(
 /// window, because a scalar `COUNT` over no rows *is* `0` and is written like
 /// any other result.
 ///
+/// [`Assignment::Increment`] covers the other half of the same problem: raising
+/// a stored number by a step rather than recomputing it. `SET n = n + ?` is not
+/// a value the caller can bind, because the new total is not known until the
+/// stored one is — and computing it in the process loses additions under
+/// concurrency, silently. It is not a subquery either: reading the table being
+/// updated is MySQL error 1093.
+///
+/// ```
+/// # use rainier_database::{Assignment, Criteria};
+/// # use rainier_orm::Dialect;
+/// # #[derive(rainier_orm::Entity, Clone, Debug)]
+/// # #[orm(table = "parents")]
+/// # struct Parent {
+/// #     #[orm(pk, auto_increment)]
+/// #     id: u64,
+/// #     children_count: i64,
+/// # }
+/// let prepared = rainier_database::statement::update_matching_with::<Parent>(
+///     Dialect::Sqlite,
+///     &Criteria::new().where_eq("id", 3_u64),
+///     // The amount is signed, so `Increment(-1)` is the decrement — one
+///     // rendering rather than two.
+///     vec![("children_count".to_string(), Assignment::Increment(1))],
+/// );
+/// assert!(prepared.sql.contains(r#""children_count" = "children_count" + ?"#), "{}", prepared.sql);
+/// ```
+///
 /// A subquery assignment does not move the shard route, and cannot: it is
 /// evaluated on whatever shard the outer rows are on, so — like a join — it
 /// reaches only the inner rows that live there.
@@ -730,6 +791,13 @@ pub fn update_matching_with<E: Entity>(
     for (column, assignment) in set {
         match assignment {
             Assignment::Value(value) => stmt.value(alias(&column), value),
+            // `n = n + ?`, with the amount bound like any other value. The
+            // column reference stays unqualified: inside an `UPDATE` it can
+            // only mean the row being written, and unlike the `excluded` half
+            // of an upsert there is no second value it could be confused with.
+            Assignment::Increment(amount) => {
+                stmt.value(alias(&column), Expr::col(alias(&column)).add(amount))
+            }
             Assignment::Subquery(subquery) => {
                 stmt.value(alias(&column), subquery_scalar::<E>(dialect, &subquery))
             }
@@ -1514,6 +1582,84 @@ mod tests {
         assert_eq!(select_matching::<Token>(Dialect::Sqlite, &unpinned).route, ShardRoute::Global);
     }
 
+    // --- OR groups ----------------------------------------------------------
+
+    #[test]
+    fn an_or_group_renders_its_subquery_branch_beside_its_columns() {
+        // A mixed group. Losing the `EXISTS` branch here narrows the result:
+        // rows that matched only through the subquery stop coming back, and the
+        // SQL that remains is perfectly valid.
+        let sql = select_matching::<Parent>(
+            Dialect::Sqlite,
+            &Criteria::new()
+                .where_eq("id", 1_u64)
+                .or_where(|any| any.where_gt("children_count", 0_i64).where_exists(children())),
+        )
+        .sql;
+
+        assert!(sql.contains(r#""parents"."id" = ?"#), "{sql}");
+        assert!(
+            sql.contains(r#"("parents"."children_count" > ? OR EXISTS(SELECT 1 FROM"#),
+            "the subquery has to be a branch of the OR, not a separate AND: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_group_of_only_a_subquery_still_renders_a_group() {
+        // The silent over-match, at the layer that would have produced it. An
+        // empty group is skipped, so a group whose only member was dropped
+        // becomes no `WHERE` clause at all — and the statement returns every
+        // row instead of the filtered ones.
+        let prepared = select_matching::<Parent>(
+            Dialect::Sqlite,
+            &Criteria::new().or_where(|any| any.where_not_exists(children())),
+        );
+
+        assert!(prepared.sql.contains("NOT EXISTS(SELECT 1 FROM"), "{}", prepared.sql);
+        assert!(
+            !prepared.sql.ends_with("WHERE TRUE"),
+            "an unfiltered SELECT is the failure this guards: {}",
+            prepared.sql
+        );
+    }
+
+    #[test]
+    fn an_or_groups_subquery_binds_its_own_values_in_order() {
+        // Two branches, two binds, and the group's values sit between the
+        // top-level predicate's and the paging — so a dropped branch shows up
+        // as a missing parameter rather than as a wrong answer.
+        let prepared = select_matching::<Parent>(
+            Dialect::Sqlite,
+            &Criteria::new().where_eq("id", 1_u64).or_where(|any| {
+                any.where_gt("children_count", 5_i64)
+                    .where_exists(children().where_eq("approved", true))
+            }),
+        );
+
+        assert_eq!(
+            prepared.params,
+            vec![Value::from(1_u64), Value::from(5_i64), Value::from(true)],
+            "{}",
+            prepared.sql
+        );
+    }
+
+    #[test]
+    fn an_or_groups_subquery_does_not_move_the_shard_route() {
+        // Same rule as an `AND`-ed one, and more so: a branch of an `OR` need
+        // not hold for a matching row at all, so pinning a shard from inside one
+        // would send the statement away from rows that match the other branch.
+        let criteria = Criteria::new().where_eq("user_id", 42_u64).or_where(|any| {
+            any.where_exists(Subquery::count("audits").correlate("token_id", "id"))
+        });
+
+        assert_eq!(
+            select_matching::<Token>(Dialect::Sqlite, &criteria).route,
+            ShardRoute::Key(42),
+            "the top-level equality still pins it"
+        );
+    }
+
     // --- UPDATE … SET <subquery> -------------------------------------------
 
     fn recount() -> Vec<(String, Assignment)> {
@@ -1580,6 +1726,116 @@ mod tests {
             ],
             "{}",
             prepared.sql
+        );
+    }
+
+    // --- UPDATE … SET n = n + ? --------------------------------------------
+
+    #[test]
+    fn an_increment_assignment_reads_the_column_it_writes_on_every_dialect() {
+        // The shape no bound value can express, and the one an application
+        // otherwise drops to raw SQL for — which then only runs on the dialect
+        // it was written against.
+        for (dialect, expected) in [
+            (
+                Dialect::Sqlite,
+                r#"UPDATE "parents" SET "children_count" = "children_count" + ? WHERE TRUE"#
+                    .to_string(),
+            ),
+            (
+                Dialect::MySql,
+                "UPDATE `parents` SET `children_count` = `children_count` + ? WHERE TRUE"
+                    .to_string(),
+            ),
+            (
+                Dialect::Postgres,
+                r#"UPDATE "parents" SET "children_count" = "children_count" + $1 WHERE TRUE"#
+                    .to_string(),
+            ),
+        ] {
+            let prepared = update_matching_with::<Parent>(
+                dialect,
+                &Criteria::new(),
+                vec![("children_count".to_string(), Assignment::Increment(1))],
+            );
+
+            assert_eq!(prepared.sql, expected, "{dialect:?}");
+            assert_eq!(
+                prepared.params,
+                vec![Value::from(1_i64)],
+                "{dialect:?}: the amount is bound, not pasted in"
+            );
+        }
+    }
+
+    #[test]
+    fn an_increment_is_never_a_plain_assignment() {
+        // The regression guard. `SET n = ?` renders, runs and reports the same
+        // row count as `SET n = n + ?`; the only difference is that the stored
+        // total is replaced by the step instead of raised by it. So the
+        // assertion is that the column appears on *both* sides.
+        for dialect in [Dialect::Sqlite, Dialect::MySql, Dialect::Postgres] {
+            let incremented = update_matching_with::<Parent>(
+                dialect,
+                &Criteria::new(),
+                vec![("children_count".to_string(), Assignment::Increment(1))],
+            )
+            .sql;
+            let assigned = update_matching_with::<Parent>(
+                dialect,
+                &Criteria::new(),
+                vec![("children_count".to_string(), Assignment::Value(1_i64.into()))],
+            )
+            .sql;
+
+            assert!(incremented.contains('+'), "{dialect:?} lost the addition: {incremented}");
+            assert!(!assigned.contains('+'), "{dialect:?}: a value assignment must not add");
+            assert_ne!(incremented, assigned, "{dialect:?}");
+        }
+    }
+
+    #[test]
+    fn a_negative_increment_is_the_decrement() {
+        // Signed on purpose: one rendering, so there is one place for the sign
+        // to be right, and no unsigned subtraction to wrap underneath.
+        let prepared = update_matching_with::<Parent>(
+            Dialect::Sqlite,
+            &Criteria::new().where_eq("id", 3_u64),
+            vec![("children_count".to_string(), Assignment::Increment(-2))],
+        );
+
+        assert_eq!(
+            prepared.sql,
+            r#"UPDATE "parents" SET "children_count" = "children_count" + ? WHERE "parents"."id" = ?"#
+        );
+        assert_eq!(prepared.params, vec![Value::from(-2_i64), Value::from(3_u64)]);
+    }
+
+    #[test]
+    fn an_increment_composes_with_the_other_assignments_in_one_statement() {
+        // An increment beside a plain value, in one `UPDATE`. Two statements
+        // would leave the row half-written in between, and the bind order is
+        // what proves the increment's amount did not displace the filter's.
+        let prepared = update_matching_with::<Parent>(
+            Dialect::Sqlite,
+            &Criteria::new().where_gt("id", 100_u64),
+            vec![
+                ("children_count".to_string(), Assignment::Increment(3)),
+                ("id".to_string(), Assignment::Value(7_u64.into())),
+            ],
+        );
+
+        assert_eq!(
+            prepared.sql,
+            concat!(
+                r#"UPDATE "parents" SET "children_count" = "children_count" + ?, "#,
+                r#""id" = ? WHERE "parents"."id" > ?"#,
+            )
+        );
+        assert_eq!(
+            prepared.params,
+            vec![Value::from(3_i64), Value::from(7_u64), Value::from(100_u64)],
+            "SET binds before WHERE, in declaration order"
         );
     }
 

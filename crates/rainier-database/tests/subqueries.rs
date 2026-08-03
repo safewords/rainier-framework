@@ -288,6 +288,139 @@ async fn an_assigned_subquerys_own_predicate_is_bound_and_applied() {
 }
 
 #[tokio::test]
+async fn an_or_group_holding_only_an_exists_still_filters() {
+    // The silent over-match, end to end. The group has no plain constraint, so
+    // a builder that measures emptiness by those alone drops it, the `WHERE`
+    // goes with it, and the statement returns every parent while erroring on
+    // nothing. One row against three is the difference.
+    let db = world().await;
+
+    let childless = Criteria::new().or_where(|any| {
+        any.where_not_exists(Subquery::count("children").correlate("parent_id", "id"))
+    });
+
+    assert_eq!(
+        names(&db, childless).await,
+        vec!["none".to_string()],
+        "a dropped group would return all three"
+    );
+}
+
+#[tokio::test]
+async fn a_mixed_or_group_keeps_its_exists_branch() {
+    // The narrowing half. The two branches match disjoint sets of rows —
+    // parent 3 has no children and matches only by name, parents 1 and 2 match
+    // only through the subquery — so losing either branch changes the answer,
+    // and `AND`-ing them instead of `OR`-ing returns nothing at all.
+    let db = world().await;
+
+    let either = Criteria::new().or_where(|any| {
+        any.where_eq("name", "none").where_exists(
+            Subquery::count("children").correlate("parent_id", "id").where_eq("approved", true),
+        )
+    });
+
+    assert_eq!(
+        names(&db, either).await,
+        vec!["none".to_string(), "one".to_string(), "two".to_string()],
+        "one name plus two parents with an approved child"
+    );
+}
+
+#[tokio::test]
+async fn an_or_group_survives_a_merge() {
+    // A scope built somewhere else and merged in. Dropping the group here is
+    // the same over-match reached by a different route, and the merged-in scope
+    // is usually the one deciding whose rows these are.
+    let db = world().await;
+
+    let visible = Criteria::new().or_where(|any| {
+        any.where_not_exists(Subquery::count("children").correlate("parent_id", "id"))
+    });
+
+    assert_eq!(names(&db, Criteria::new().order_by("id").merge(visible)).await, vec!["none"]);
+}
+
+#[tokio::test]
+async fn an_increment_accumulates_rather_than_assigning() {
+    // *The* test for the increment assignment, and the reason it runs against a
+    // driver rather than against rendered text: `SET n = ?` and `SET n = n + ?`
+    // both render, both run, and both report the same rows affected. The only
+    // thing that tells them apart is the stored number after the second call.
+    //
+    // Two increments of one from a start of 999. Accumulating leaves 1001;
+    // seeing 1000 means the second statement assigned instead of adding, which
+    // is exactly what a read-modify-write in the process does when two callers
+    // race.
+    let db = world().await;
+
+    for _ in 0..2 {
+        let prepared = statement::update_matching_with::<Parent>(
+            db.dialect(),
+            &Criteria::new().where_eq("name", "two"),
+            vec![("children_count".to_string(), Assignment::Increment(1))],
+        );
+        assert_eq!(db.execute(prepared).await.expect("increment").rows_affected, 1);
+    }
+
+    assert_eq!(
+        counts(&db).await,
+        vec![("none".to_string(), 999), ("one".to_string(), 999), ("two".to_string(), 1001)],
+        "1001, not 1000: two steps of one landed, and only on the filtered row"
+    );
+}
+
+#[tokio::test]
+async fn two_increments_of_one_leave_two_not_one() {
+    // The same arithmetic from zero, which is where an assignment is hardest to
+    // notice: `SET n = 1` twice also leaves a plausible-looking small number.
+    // Starting at zero and ending at two is the smallest fact that separates
+    // them.
+    let db = world().await;
+
+    let zero = statement::update_matching_with::<Parent>(
+        db.dialect(),
+        &Criteria::new(),
+        vec![("children_count".to_string(), Assignment::Value(0_i64.into()))],
+    );
+    db.execute(zero).await.expect("zero the counters");
+
+    for _ in 0..2 {
+        let step = statement::update_matching_with::<Parent>(
+            db.dialect(),
+            &Criteria::new(),
+            vec![("children_count".to_string(), Assignment::Increment(1))],
+        );
+        db.execute(step).await.expect("increment");
+    }
+
+    assert_eq!(
+        counts(&db).await,
+        vec![("none".to_string(), 2), ("one".to_string(), 2), ("two".to_string(), 2)],
+    );
+}
+
+#[tokio::test]
+async fn a_negative_increment_subtracts() {
+    // Signed, so a decrement is the same primitive. Down past zero on purpose:
+    // an unsigned amount with a separate `decrement` rendering is where the
+    // wrap-around lives, and there is no second rendering here to get wrong.
+    let db = world().await;
+
+    let prepared = statement::update_matching_with::<Parent>(
+        db.dialect(),
+        &Criteria::new().where_eq("name", "none"),
+        vec![("children_count".to_string(), Assignment::Increment(-1000))],
+    );
+    db.execute(prepared).await.expect("decrement");
+
+    assert_eq!(
+        counts(&db).await,
+        vec![("none".to_string(), -1), ("one".to_string(), 999), ("two".to_string(), 999)],
+    );
+}
+
+#[tokio::test]
 async fn a_hostile_value_inside_a_subquery_stays_a_value() {
     // End to end, through a driver that would happily execute a second
     // statement if one had been concatenated in.
