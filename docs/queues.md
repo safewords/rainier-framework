@@ -70,8 +70,17 @@ let registry = JobRegistry::new().with::<NotifyAuthor>().with::<SendInvoice>();
 ```
 
 A job the registry does not know cannot be run, so this is the one piece of
-wiring you cannot skip. Doing it in a [provider](providers.md) keeps it in one
-place.
+wiring you cannot skip.
+
+When the framework builds the queue for you — `QUEUE_DRIVER`, or a `queues`
+section — declare it on the builder instead, because a provider runs *after*
+the queue is built:
+
+```rust
+Rainier::new(".").with_jobs(JobRegistry::new().with::<NotifyAuthor>())
+```
+
+A registry passed to a `QueueManager` you built yourself needs neither.
 
 ## Dispatching
 
@@ -236,6 +245,49 @@ end, and it is the one a deploy script wants: everything but `sync` needs a
 QUEUE_DRIVER=sync
 QUEUE_DRIVER=database
 ```
+
+That declares **one** connection, named after its driver, and the framework
+builds it at boot and binds the `QueueManager` over it. The settings the driver
+needs come from the environment beside it — `REDIS_URL`, `SQS_QUEUE_URL`,
+`KAFKA_BROKERS` and friends — and a driver whose settings are missing fails the
+boot naming the variable rather than connecting to whatever a default would have
+pointed at. Leave `QUEUE_DRIVER` unset and **no queue is built at all**.
+
+### More than one connection
+
+One `QUEUE_DRIVER` is one backend. Two — jobs on the database and a bulk lane on
+SQS — are a **section**: a `default` naming one entry, and each entry naming its
+own driver and settings.
+
+```rust
+use rainier_framework::queue::{ConnectionConfig, Connections, SqsConnection};
+
+Rainier::new(".").with_queues(
+    Connections::new("primary")
+        .with("primary", ConnectionConfig::database())
+        .with("bulk", SqsConnection::new(bulk_url).region("us-east-1")),
+)
+```
+
+which writes it to the `queues` key, so it can come from the configuration tree
+instead. Then `Queue::instance().pending(job)?.on_connection("bulk")` reaches
+it, and a connection nobody declared is an error rather than the default —
+because falling back would push the job to a backend nobody named and hand the
+caller an id for it.
+
+Each connection is built from **its own** declaration. There is no shared client
+to inherit: the version of this that built them from one produced a second
+connection with the right *name* pointed at the wrong store, accepting every job
+pushed to it and running none of them.
+
+### Never both
+
+`QUEUE_DRIVER` and a `queues` section each name the default connection, so
+setting both fails the boot rather than resolving by precedence. The reason is
+the same as for [`DATABASE_URL` and a `databases` section](database.md#never-both),
+only quieter: a dispatch to the connection that lost is still accepted, still
+returns an id, and then waits in a store nothing drains. Nothing raises, nothing
+retries, and there is no failed-job row — the job never failed. It was never run.
 
 **`sync` runs jobs inline, so a failed job fails the request that dispatched
 it.** That is fine in development and wrong in production — it is exactly the

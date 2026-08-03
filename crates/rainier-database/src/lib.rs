@@ -80,7 +80,10 @@ pub mod statement;
 pub mod testing;
 
 pub use connection::{Connection, Database};
-pub use criteria::{Constraint, Criteria, DatePart, JoinKind, Projection};
+pub use criteria::{
+    Assignment, Comparison, Constraint, Criteria, DatePart, JoinKind, Projection, Subquery,
+    SubqueryDraft, SubqueryPredicate,
+};
 pub use databases::{
     DatabaseConfig, DatabaseCredentials, DatabaseDriver, Databases, DsnDatabase, ServerDatabase,
     SqliteDatabase,

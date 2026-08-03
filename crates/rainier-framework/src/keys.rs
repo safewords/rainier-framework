@@ -76,9 +76,10 @@
 use rainier_cache::CacheDriver;
 use rainier_config::{config_keys, AppEnv};
 use rainier_crypt::{CryptScheme, HashDriver};
+use rainier_database::Databases;
 use rainier_filesystem::Disks;
 use rainier_mail::{MailDriver, MailEncryption};
-use rainier_queue::QueueDriver;
+use rainier_queue::{Connections as QueueConnections, QueueDriver};
 use rainier_session::SessionDriver;
 use rainier_telemetry::LogFormat;
 
@@ -223,7 +224,61 @@ config_keys! {
     // --- database ----------------------------------------------------------
 
     /// The database DSN — `sqlite::memory:`, `mysql://…`, `postgres://…`.
+    ///
+    /// One connection written as one string, which is the whole of the database
+    /// configuration for nearly every application: set it and the framework
+    /// opens exactly one database, bound as a
+    /// [`Database`](rainier_database::Database) and as the default of a
+    /// [`DatabaseManager`](rainier_database::DatabaseManager) with nothing else
+    /// in it. Leave it unset and no database is opened at all, which is what an
+    /// application that has none should get.
+    ///
+    /// It declares the **default connection** the way `FILESYSTEM_DISK` names
+    /// the default disk. More than one connection is [`DATABASES`], and the two
+    /// are refused together — see there.
     pub DATABASE_URL: String = "database.url";
+
+    /// Every database connection the application declares, and which of them is
+    /// the default.
+    ///
+    /// A whole section rather than a scalar, for the reason [`FILESYSTEMS`] is
+    /// one: a connection is not a single setting. It names its own engine, host,
+    /// database and credentials, and a read replica, a reporting warehouse and a
+    /// database some other system also writes to share none of them. Building
+    /// the second from the first's DSN gives it the right *name* pointed at the
+    /// wrong database — which is the quietest failure the framework has, because
+    /// a query against the wrong database does not raise. It **answers**: the
+    /// rows come back, the types match, and the report renders.
+    ///
+    /// ```
+    /// use rainier_framework::config::Config;
+    /// use rainier_framework::database::{Databases, SqliteDatabase};
+    /// use rainier_framework::keys;
+    ///
+    /// let config = Config::new();
+    /// config.set(keys::DATABASES, Databases::new("reporting")
+    ///     .with("reporting", SqliteDatabase::new("storage/reporting.sqlite"))).unwrap();
+    ///
+    /// assert_eq!(config.string(keys::DATABASE_DEFAULT).as_deref(), Some("reporting"));
+    /// ```
+    ///
+    /// Unlike `filesystems`, the framework seeds **nothing** here. A seeded disk
+    /// costs a directory nobody writes to; a seeded connection opens a pool at
+    /// boot against a database the application never asked for.
+    ///
+    /// Declaring this **and** [`DATABASE_URL`] is a boot failure rather than a
+    /// precedence rule. Both name the default connection, so one of them would
+    /// be inert while still sitting in the configuration being read by whoever
+    /// changes it next — and the query that then runs against the winner comes
+    /// back with rows rather than an error.
+    pub DATABASES: Databases = "databases";
+
+    /// Which declared connection a query naming none runs against.
+    ///
+    /// A connection that is not declared is a **boot failure**, not a fallback
+    /// to whichever one is first: the fallback would answer, from a database
+    /// nobody named, in a way no caller can tell from a correct answer.
+    pub DATABASE_DEFAULT: String = "databases.default";
 
     // --- filesystems -------------------------------------------------------
 
@@ -294,10 +349,67 @@ config_keys! {
     // --- queue -------------------------------------------------------------
 
     /// Where queued jobs wait.
+    ///
+    /// One backend, which is the whole of the queue configuration for nearly
+    /// every application: set it and the framework builds exactly one
+    /// connection, named after the driver, and binds the
+    /// [`QueueManager`](rainier_queue::QueueManager) over it. Leave it unset and
+    /// no queue is built at all.
+    ///
+    /// The settings that connection needs come from the environment beside it —
+    /// `REDIS_URL` for `redis`, `SQS_QUEUE_URL` for `sqs`, [`KAFKA_BROKERS`] and
+    /// friends for `kafka` — because one backend needs no section to name it.
+    /// More than one is [`QUEUES`], and the two are refused together.
     pub QUEUE_DRIVER: QueueDriver = "queue.driver";
 
     /// The queue a job goes on when it does not name one.
+    ///
+    /// A *queue*, not a connection: the lane a job waits in inside whichever
+    /// backend it was dispatched to. [`QUEUE_DEFAULT_CONNECTION`] is the other
+    /// question, and the two are worth keeping apart — `high` and `bulk` are
+    /// queues on one Redis, while `primary` and `bulk` may be two Redises.
     pub QUEUE_DEFAULT: String = "queue.default";
+
+    /// Every queue connection the application declares, and which of them is the
+    /// default.
+    ///
+    /// A whole section rather than a driver name and one set of settings, for
+    /// the reason [`FILESYSTEMS`] is one: two connections on two backends share
+    /// no client, no credential and no endpoint, and building the second from
+    /// the first's client gives it the right *name* pointed at the wrong store.
+    ///
+    /// The failure that produces is quieter than the filesystem's. A disk on the
+    /// wrong bucket reads back empty and somebody notices a missing file. A job
+    /// pushed to the wrong backend is **accepted** — the push succeeds, an id
+    /// comes back, the caller carries on — and then waits in a store no worker
+    /// drains. Nothing raises, nothing retries, and there is no failed-job row,
+    /// because the job never failed. It was never run.
+    ///
+    /// ```
+    /// use rainier_framework::config::Config;
+    /// use rainier_framework::keys;
+    /// use rainier_framework::queue::{ConnectionConfig, Connections};
+    ///
+    /// let config = Config::new();
+    /// config.set(keys::QUEUES, Connections::new("bulk")
+    ///     .with("bulk", ConnectionConfig::memory())).unwrap();
+    ///
+    /// assert_eq!(config.string(keys::QUEUE_DEFAULT_CONNECTION).as_deref(), Some("bulk"));
+    /// ```
+    ///
+    /// Declaring this **and** [`QUEUE_DRIVER`] is a boot failure rather than a
+    /// precedence rule, for the same reason [`DATABASES`] and [`DATABASE_URL`]
+    /// are — except that here the losing declaration stays invisible for longer,
+    /// since a queue nobody drains reports nothing at all.
+    pub QUEUES: QueueConnections = "queues";
+
+    /// Which declared connection a dispatch naming none goes to.
+    ///
+    /// Not [`QUEUE_DEFAULT`], which names a queue inside a connection. A
+    /// connection that is not declared is a **boot failure**, not a fallback:
+    /// falling back would push the job to a backend nobody named and hand the
+    /// caller an id for it.
+    pub QUEUE_DEFAULT_CONNECTION: String = "queues.default";
 
     // --- kafka -------------------------------------------------------------
 
@@ -433,6 +545,7 @@ mod tests {
             ("SERVER", SERVER_REQUEST_TIMEOUT_SECS.path()),
             ("SERVER", SERVER_COMPRESSION.path()),
             ("DATABASE", DATABASE_URL.path()),
+            ("DATABASES", DATABASE_DEFAULT.path()),
             ("FILESYSTEMS", FILESYSTEM_DEFAULT.path()),
             ("HASHING", HASH_DRIVER.path()),
             ("CACHE", CACHE_DRIVER.path()),
@@ -445,6 +558,7 @@ mod tests {
             ("SESSION", SESSION_SECURE.path()),
             ("QUEUE", QUEUE_DRIVER.path()),
             ("QUEUE", QUEUE_DEFAULT.path()),
+            ("QUEUES", QUEUE_DEFAULT_CONNECTION.path()),
             ("KAFKA", KAFKA_BROKERS.path()),
             ("KAFKA", KAFKA_GROUP.path()),
             ("KAFKA", KAFKA_TLS.path()),
@@ -489,6 +603,8 @@ mod tests {
             SERVER_REQUEST_TIMEOUT_SECS.path(),
             SERVER_COMPRESSION.path(),
             DATABASE_URL.path(),
+            DATABASES.path(),
+            DATABASE_DEFAULT.path(),
             FILESYSTEMS.path(),
             FILESYSTEM_DEFAULT.path(),
             HASH_DRIVER.path(),
@@ -502,6 +618,8 @@ mod tests {
             SESSION_SECURE.path(),
             QUEUE_DRIVER.path(),
             QUEUE_DEFAULT.path(),
+            QUEUES.path(),
+            QUEUE_DEFAULT_CONNECTION.path(),
             KAFKA_BROKERS.path(),
             KAFKA_GROUP.path(),
             KAFKA_TOPIC_PREFIX.path(),

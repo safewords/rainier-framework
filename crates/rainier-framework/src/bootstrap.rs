@@ -13,12 +13,15 @@ use rainier_cache::CacheManager;
 use rainier_config::{Config, Env};
 use rainier_container::{Application, ServiceProvider};
 use rainier_crypt::{Encryption, Key, KeyRing};
-use rainier_database::Database;
+use rainier_database::{Database, DatabaseManager, Databases};
 use rainier_events::Dispatcher;
 use rainier_filesystem::Storage;
 use rainier_mail::Mailer;
 use rainier_middleware::MiddlewareRegistry;
-use rainier_queue::QueueManager;
+use rainier_queue::{
+    ConnectionConfig, Connections as QueueConnections, JobRegistry, KafkaConnection, QueueDriver,
+    QueueManager, QueueResources, RedisConnection, SqsConnection,
+};
 use rainier_routing::{Router, UrlGenerator};
 use rainier_server::Kernel;
 use rainier_session::{MemorySessionStore, SessionManager};
@@ -60,6 +63,7 @@ pub struct Rainier {
     views: Option<Arc<dyn ViewEngine>>,
     database: Option<Database>,
     queue: Option<QueueManager>,
+    jobs: Option<Arc<JobRegistry>>,
     mailer: Option<Mailer>,
     sessions: Option<SessionManager>,
     crypt: Option<Encryption>,
@@ -105,6 +109,7 @@ impl Rainier {
             views: None,
             database: None,
             queue: None,
+            jobs: None,
             mailer: None,
             sessions: None,
             crypt: None,
@@ -163,14 +168,134 @@ impl Rainier {
     }
 
     /// Use this database.
+    ///
+    /// Takes a built [`Database`], so it is the escape hatch — a test's fake
+    /// connection, or a backend no configuration file can describe, such as a
+    /// D1 or libSQL executor over a caller-supplied transport. Declaring
+    /// connections is [`with_databases`](Self::with_databases) or `DATABASE_URL`,
+    /// both of which open each connection from its own settings.
+    ///
+    /// It wins over both, exactly as [`with_storage`](Self::with_storage) wins
+    /// over the declared disks: it is in the builder chain a reviewer is already
+    /// reading, next to whatever it overrides, rather than in an environment a
+    /// platform injected.
     pub fn with_database(mut self, database: Database) -> Self {
         self.database = Some(database);
         self
     }
 
+    /// Declare the database connections, and let the framework open them.
+    ///
+    /// ```no_run
+    /// # use rainier_framework::Rainier;
+    /// use rainier_framework::database::{Databases, ServerDatabase, SqliteDatabase};
+    ///
+    /// # #[tokio::main] async fn main() -> rainier_support::Result<()> {
+    /// let app = Rainier::new(".")
+    ///     .with_databases(
+    ///         Databases::new("primary")
+    ///             .with("primary", ServerDatabase::mysql("app").host("db.internal"))
+    ///             .with("reporting", SqliteDatabase::new("storage/reporting.sqlite")),
+    ///     )
+    ///     .boot()
+    ///     .await?;
+    /// # let _ = app; Ok(()) }
+    /// ```
+    ///
+    /// Written into the configuration tree rather than held aside, so
+    /// `config.get(keys::DATABASES)` answers with what the application actually
+    /// declared and a later [`configure`](Self::configure) can still add to it.
+    ///
+    /// Every declared connection is opened at [`boot`](Self::boot), which is why
+    /// a replica that is down stops the process starting: a handle that has not
+    /// connected is a handle that might not be a database, and the alternative
+    /// moves every DSN mistake from a boot failure a deploy can catch to a
+    /// runtime failure at whatever hour the query first runs.
+    ///
+    /// Declaring this **and** setting `DATABASE_URL` fails the boot — see
+    /// [`keys::DATABASES`].
+    pub fn with_databases(mut self, databases: Databases) -> Self {
+        if let Err(e) = self.config.set(keys::DATABASES, databases) {
+            self.deferred = self.deferred.or(Some(e));
+        }
+        self
+    }
+
     /// Use this queue.
+    ///
+    /// Takes a built [`QueueManager`], so it is the escape hatch — a
+    /// [`fake`](QueueManager::fake) for a test, or a backend built in code.
+    /// Declaring connections is [`with_queues`](Self::with_queues) or
+    /// `QUEUE_DRIVER`, and it wins over both for the reason
+    /// [`with_database`](Self::with_database) does.
     pub fn with_queue(mut self, queue: QueueManager) -> Self {
         self.queue = Some(queue);
+        self
+    }
+
+    /// Declare the queue connections, and let the framework build them.
+    ///
+    /// ```no_run
+    /// # use rainier_framework::Rainier;
+    /// use rainier_framework::queue::{ConnectionConfig, Connections, SqsConnection};
+    ///
+    /// # #[tokio::main] async fn main() -> rainier_support::Result<()> {
+    /// let app = Rainier::new(".")
+    ///     .with_queues(
+    ///         Connections::new("primary")
+    ///             .with("primary", ConnectionConfig::database())
+    ///             .with("bulk", SqsConnection::new("https://sqs.example.com/0/bulk")),
+    ///     )
+    ///     .boot()
+    ///     .await?;
+    /// # let _ = app; Ok(()) }
+    /// ```
+    ///
+    /// Written into the configuration tree, like
+    /// [`with_databases`](Self::with_databases). The three things a connection
+    /// needs that a file cannot hold arrive from the booting application: the
+    /// job registry [`with_jobs`](Self::with_jobs) declares, the container a
+    /// `sync` job resolves its dependencies from, and the database a `database`
+    /// connection stores its jobs in — so the database is opened first, and a
+    /// `database` connection declared without one fails naming what is missing.
+    ///
+    /// Declaring this **and** setting `QUEUE_DRIVER` fails the boot — see
+    /// [`keys::QUEUES`].
+    pub fn with_queues(mut self, queues: QueueConnections) -> Self {
+        if let Err(e) = self.config.set(keys::QUEUES, queues) {
+            self.deferred = self.deferred.or(Some(e));
+        }
+        self
+    }
+
+    /// Declare the jobs a worker can turn back into code.
+    ///
+    /// A job travels as a name and a payload, so something has to map the name
+    /// back to a type before it can be run. That is this — and it is needed
+    /// wherever the *framework* builds the queue, because a
+    /// [`QueueManager`] cannot be constructed without a registry and an empty
+    /// one runs nothing.
+    ///
+    /// ```no_run
+    /// # use rainier_framework::{queue::{Job, JobContext, JobRegistry}, Rainier};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Serialize, Deserialize)] struct SendInvoice;
+    /// # #[rainier_framework::queue::async_trait]
+    /// # impl Job for SendInvoice {
+    /// #     const NAME: &'static str = "billing.send-invoice";
+    /// #     async fn handle(&self, _: &JobContext) -> rainier_support::Result<()> { Ok(()) }
+    /// # }
+    /// Rainier::new(".").with_jobs(JobRegistry::new().with::<SendInvoice>())
+    /// # ;
+    /// ```
+    ///
+    /// An application that hands over its own [`with_queue`](Self::with_queue)
+    /// already gave that manager a registry and does not need this. Registering
+    /// jobs in a provider does not reach the framework's own queue either: a
+    /// provider runs *after* the queue is built, because a provider may
+    /// legitimately resolve one.
+    pub fn with_jobs(mut self, jobs: JobRegistry) -> Self {
+        self.jobs = Some(Arc::new(jobs));
         self
     }
 
@@ -512,10 +637,43 @@ impl Rainier {
         };
         app.instance(storage);
 
-        if let Some(database) = self.database {
-            app.instance(database);
+        // An explicit `with_database` wins; otherwise the declared connections
+        // are opened, each from its own settings. Both the manager and its
+        // default connection are bound, because they answer different
+        // questions: `Database` is "the application's database", which is all
+        // most code ever needs, and `DatabaseManager` is "which of them", which
+        // only a query that names one asks.
+        let databases = match self.database {
+            Some(database) => Some(DatabaseManager::from(database)),
+            None => {
+                build_databases(app.resolve::<Env>()?.as_ref(), app.resolve::<Config>()?.as_ref())
+                    .await?
+            }
+        };
+        if let Some(databases) = databases {
+            app.instance(databases.default_connection().clone());
+            app.instance(databases);
         }
-        if let Some(queue) = self.queue {
+
+        // Bound only when the application declared some, so nothing gains an
+        // empty registry it did not ask for.
+        if let Some(jobs) = &self.jobs {
+            app.instance_arc(Arc::clone(jobs));
+        }
+
+        let queue = match self.queue {
+            Some(queue) => Some(queue),
+            None => {
+                let resources = queue_resources(&app, self.jobs.unwrap_or_default())?;
+                build_queues(
+                    app.resolve::<Env>()?.as_ref(),
+                    app.resolve::<Config>()?.as_ref(),
+                    &resources,
+                )
+                .await?
+            }
+        };
+        if let Some(queue) = queue {
             // Given the same locks as everything else, so `unique_id` is
             // enforced against the cache the application actually shares.
             // Without this a job declaring one is dispatched anyway, with a
@@ -715,6 +873,185 @@ async fn build_storage(config: &Config, base_path: &std::path::Path) -> Result<S
     // declared" and "declared, and wrong", and the second must not read as the
     // first and quietly leave every upload in a container's directory.
     config.require(keys::FILESYSTEMS)?.build().await
+}
+
+/// Open the database connections the application declared, if it declared any.
+///
+/// Two ways to declare them, and **never both at once**. `DATABASE_URL` is one
+/// connection written as one string, which is the whole configuration for
+/// nearly every application; a `databases` section is the one that can express
+/// a replica or a warehouse. Each names the *default* connection, so having
+/// both is two answers to one question.
+///
+/// This refuses to pick between them rather than applying a precedence rule,
+/// and it is the loudest of the available options on purpose. Whichever
+/// declaration lost would still be sitting in the configuration, read by
+/// everyone who opens the file and used by nothing — so repointing the database
+/// by editing the visible one would review cleanly, deploy cleanly and change
+/// nothing. Then the query runs against the *other* database and **answers**:
+/// rows come back, the types match, the page renders. There is no failure to
+/// notice, which is what makes silently preferring one the worst outcome here
+/// and a boot failure the best.
+///
+/// Declaring neither opens nothing. That is not a degraded mode — an
+/// application without a database should not have one invented for it, and a
+/// seeded `sqlite::memory:` would accept every statement, migrate cleanly and
+/// answer every question about the application's own data with no rows.
+async fn build_databases(env: &Env, config: &Config) -> Result<Option<DatabaseManager>> {
+    let declared = config.has(keys::DATABASES);
+
+    // The environment, not the configuration tree: `database.url` is seeded
+    // with a fallback whether or not a deployment set one, and a fallback
+    // nobody chose must not read as a second declaration.
+    let url = env.get("DATABASE_URL").filter(|url| !url.trim().is_empty());
+
+    match (declared, url) {
+        (true, Some(_)) => Err(Error::internal(
+            "`DATABASE_URL` is set and a `databases` section is declared, and both name the \
+             default database connection. Rainier will not choose between them: the one that \
+             lost would stay in the configuration being read by whoever changes it next, and a \
+             query against the one that won comes back with rows rather than an error, so \
+             nothing would ever report the mistake. Keep one — drop the section and let \
+             `DATABASE_URL` declare the single connection, or unset `DATABASE_URL` and declare \
+             every connection in the section. When the platform injects the variable and you \
+             need more than one connection, read it while building: \
+             `Databases::from_url(&builder.env().require(\"DATABASE_URL\")?)?.with(\"replica\", …)`",
+        )),
+
+        // `require` rather than `get`: `get` answers `None` for both "nothing
+        // declared" and "declared, and wrong", and the second must not read as
+        // the first and quietly leave the application with no database at all.
+        (true, None) => Ok(Some(config.require(keys::DATABASES)?.build().await?)),
+
+        (false, Some(url)) => {
+            let databases = Databases::from_url(&url)?;
+
+            // Written into the tree, so `config.get(keys::DATABASES)` describes
+            // what was actually opened rather than answering `None` for a
+            // database the application demonstrably has.
+            config.set(keys::DATABASES, databases.clone())?;
+            Ok(Some(databases.build().await?))
+        }
+
+        (false, None) => Ok(None),
+    }
+}
+
+/// Build the queue connections the application declared, if it declared any.
+///
+/// The same rule as [`build_databases`], and the reason to hold it here is
+/// stronger rather than weaker. A query against the wrong database at least
+/// returns something a person could look at; a job pushed to the wrong backend
+/// returns an id and then waits in a store no worker drains. Nothing fails, so
+/// nothing is logged, and there is no failed-job row — the job never failed. It
+/// was never run.
+async fn build_queues(
+    env: &Env,
+    config: &Config,
+    resources: &QueueResources,
+) -> Result<Option<QueueManager>> {
+    let declared = config.has(keys::QUEUES);
+    let driver = env.get("QUEUE_DRIVER").filter(|driver| !driver.trim().is_empty());
+
+    match (declared, driver) {
+        (true, Some(_)) => Err(Error::internal(
+            "`QUEUE_DRIVER` is set and a `queues` section is declared, and both name the default \
+             queue connection. Rainier will not choose between them: a dispatch to the one that \
+             lost is still accepted, still returns an id, and then waits in a store nothing \
+             drains — so unlike a misconfigured database, this one reports nothing at all. Keep \
+             one — drop the section and let `QUEUE_DRIVER` declare the single connection, or \
+             unset `QUEUE_DRIVER` and declare every connection in the section",
+        )),
+
+        (true, None) => Ok(Some(config.require(keys::QUEUES)?.build(resources).await?)),
+
+        (false, Some(_)) => {
+            let queues = queues_from_env(env)?;
+            config.set(keys::QUEUES, queues.clone())?;
+            Ok(Some(queues.build(resources).await?))
+        }
+
+        (false, None) => Ok(None),
+    }
+}
+
+/// The one connection `QUEUE_DRIVER` declares, named after its driver.
+///
+/// Named after the driver rather than something like `default` because that is
+/// already this section's convention for a connection nobody named — see
+/// [`Connections`](rainier_queue::Connections) — and because it is the one name
+/// that cannot be a lie about what the connection is.
+///
+/// Each driver reads the settings it needs from the environment beside it, and
+/// nothing else: there is no shared client for a second connection to inherit,
+/// because there is no second connection. A driver whose settings are missing
+/// fails here, naming the variable, rather than connecting to whatever a
+/// default would have pointed at.
+fn queues_from_env(env: &Env) -> Result<QueueConnections> {
+    let driver: QueueDriver = env.setting("QUEUE_DRIVER")?;
+
+    let connection: ConnectionConfig = match driver {
+        QueueDriver::Sync => ConnectionConfig::sync(),
+        QueueDriver::Memory => ConnectionConfig::memory(),
+        QueueDriver::Database => ConnectionConfig::database(),
+
+        // The same variable and the same fallback the cache reads, because
+        // "we have a Redis at this URL" is one fact about a deployment. A
+        // fallback is safe to have here in a way it is not for SQS: this
+        // connection is opened at boot, so a localhost Redis that is not there
+        // stops the process rather than accepting jobs into nothing.
+        QueueDriver::Redis => {
+            RedisConnection::new(env.string("REDIS_URL", "redis://127.0.0.1:6379/")).into()
+        }
+
+        // No fallback: an SQS queue *is* a URL, so there is nothing to guess
+        // that would not be a queue in somebody else's account.
+        QueueDriver::Sqs => SqsConnection::new(env.require("SQS_QUEUE_URL")?).into(),
+
+        QueueDriver::Kafka => {
+            // Empties dropped, so `KAFKA_BROKERS=` and a stray trailing comma
+            // both arrive as "no brokers" and are refused as such, rather than
+            // as a broker whose host is the empty string.
+            let brokers: Vec<String> = env
+                .string("KAFKA_BROKERS", "")
+                .split(',')
+                .map(str::trim)
+                .filter(|broker| !broker.is_empty())
+                .map(str::to_string)
+                .collect();
+
+            let mut kafka = KafkaConnection::new(brokers);
+            if let Some(group) = env.get("KAFKA_GROUP").filter(|g| !g.trim().is_empty()) {
+                kafka = kafka.group(group);
+            }
+            if let Some(prefix) = env.get("KAFKA_TOPIC_PREFIX").filter(|p| !p.trim().is_empty()) {
+                kafka = kafka.topic_prefix(prefix);
+            }
+            kafka.into()
+        }
+    };
+
+    let name = driver.as_str();
+    Ok(QueueConnections::new(name).with(name, connection))
+}
+
+/// What a queue connection needs that the configuration tree cannot hold.
+///
+/// The registry and the container are always there. The database is there only
+/// when the application has one, and a `database` connection declared without
+/// one fails at boot naming the missing piece rather than becoming something
+/// else. The lock store is the cache the rest of the application shares, so
+/// `Job::unique_id` and Kafka's partition leases exclude whatever the
+/// deployment's locks exclude — including, when that is an in-process cache,
+/// nothing, which the Kafka driver refuses outright.
+fn queue_resources(app: &Application, jobs: Arc<JobRegistry>) -> Result<QueueResources> {
+    let mut resources = QueueResources::new(jobs, Arc::clone(app.container()))
+        .with_lock_store(Arc::clone(app.resolve::<CacheManager>()?.store()));
+
+    if let Some(database) = app.try_resolve::<Database>() {
+        resources = resources.with_database(database.as_ref().clone());
+    }
+    Ok(resources)
 }
 
 /// The keys encryption and signing use.
@@ -1300,5 +1637,398 @@ mod storage_tests {
             .unwrap();
 
         assert_eq!(app.resolve::<Storage>().unwrap().driver(), "memory");
+    }
+}
+
+#[cfg(test)]
+mod database_and_queue_tests {
+    use super::*;
+    use rainier_container::Container;
+    use rainier_database::testing::{fake_database, MemoryConnection};
+    use rainier_database::{Dialect, SqliteDatabase};
+
+    /// The two things a queue connection needs that no configuration holds.
+    ///
+    /// Neither a database nor a lock store, so the drivers that need one say so
+    /// by name — which is what the tests below assert.
+    fn resources() -> QueueResources {
+        QueueResources::new(Arc::new(JobRegistry::new()), Arc::new(Container::new()))
+    }
+
+    /// An environment that ignores the process's, so a `DATABASE_URL` exported
+    /// in the shell running the suite cannot state a test's premise for it.
+    fn env(pairs: &[(&str, &str)]) -> Env {
+        Env::from_map(pairs.iter().copied())
+    }
+
+    // --- declaring nothing --------------------------------------------------
+
+    #[tokio::test]
+    async fn declaring_nothing_opens_no_database_and_builds_no_queue() {
+        // Not a degraded mode. An application with no database should not have
+        // one invented for it: a seeded `sqlite::memory:` accepts every
+        // statement, migrates cleanly, and answers every question about the
+        // application's own data with no rows.
+        let config = Config::new();
+
+        assert!(build_databases(&env(&[]), &config).await.unwrap().is_none());
+        assert!(build_queues(&env(&[]), &config, &resources()).await.unwrap().is_none());
+    }
+
+    // --- one scalar, which is what nearly every application has --------------
+
+    #[tokio::test]
+    async fn a_database_url_alone_still_opens_the_one_database() {
+        let built =
+            build_databases(&env(&[("DATABASE_URL", "sqlite::memory:")]), &Config::new()).await;
+
+        if cfg!(feature = "sea-orm-executor") {
+            let manager = built.expect("opens").expect("declared");
+
+            // Reachable both ways, and the same handle either way — a second
+            // pool for `sqlite::memory:` would be a second, empty database.
+            assert!(manager.connection(rainier_database::Databases::DEFAULT_NAME).is_some());
+            assert_eq!(manager.resolve(None).unwrap().dialect(), Dialect::Sqlite);
+        } else {
+            // Loud, and naming the fix. Never a substitution.
+            let err = built.err().expect("no executor was compiled in");
+            assert!(err.message().contains("sea-orm-executor"), "{}", err.message());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_queue_driver_alone_still_builds_the_one_queue() {
+        let manager =
+            build_queues(&env(&[("QUEUE_DRIVER", "memory")]), &Config::new(), &resources())
+                .await
+                .unwrap()
+                .expect("declared");
+
+        // Named after its driver, and the default, and one backend under both.
+        assert_eq!(manager.queue().name(), "memory");
+        assert!(manager.connection("memory").is_some());
+    }
+
+    #[tokio::test]
+    async fn what_a_scalar_declared_is_written_into_the_configuration() {
+        // Otherwise `config.get(keys::QUEUES)` answers `None` for a queue the
+        // application demonstrably has, and a config dump describes a
+        // deployment that is not the one running.
+        let config = Config::new();
+        build_queues(&env(&[("QUEUE_DRIVER", "sync")]), &config, &resources()).await.unwrap();
+
+        assert_eq!(config.string(keys::QUEUE_DEFAULT_CONNECTION).as_deref(), Some("sync"));
+        assert_eq!(config.require(keys::QUEUES).unwrap().names().collect::<Vec<_>>(), vec!["sync"]);
+    }
+
+    #[test]
+    fn each_driver_declares_a_connection_named_after_itself() {
+        for (driver, settings) in [
+            ("sync", &[][..]),
+            ("memory", &[]),
+            ("database", &[]),
+            ("redis", &[]),
+            ("sqs", &[("SQS_QUEUE_URL", "https://sqs.example.com/0/jobs")]),
+            ("kafka", &[("KAFKA_BROKERS", "one:9092,two:9092")]),
+        ] {
+            let mut pairs = vec![("QUEUE_DRIVER", driver)];
+            pairs.extend_from_slice(settings);
+
+            let queues = queues_from_env(&env(&pairs)).expect(driver);
+
+            assert_eq!(queues.default_name(), driver);
+            assert_eq!(queues.get(driver).expect(driver).driver().as_str(), driver);
+        }
+    }
+
+    #[test]
+    fn an_sqs_connection_with_no_queue_url_names_the_variable() {
+        // No fallback: an SQS queue *is* a URL, so anything guessed here is a
+        // queue in somebody else's account that accepts every job and runs none.
+        let err = queues_from_env(&env(&[("QUEUE_DRIVER", "sqs")])).unwrap_err();
+
+        assert!(err.message().contains("SQS_QUEUE_URL"), "{}", err.message());
+    }
+
+    #[test]
+    fn an_empty_broker_list_is_no_brokers_rather_than_one_empty_broker() {
+        let queues = queues_from_env(&env(&[("QUEUE_DRIVER", "kafka"), ("KAFKA_BROKERS", " , ")]))
+            .expect("declaring it is not what fails");
+
+        let rendered = format!("{:?}", queues.get("kafka").unwrap());
+        assert!(rendered.contains("brokers: []"), "{rendered}");
+    }
+
+    // --- a section, which is what the rest have ------------------------------
+
+    #[tokio::test]
+    async fn a_declared_queue_section_is_built_and_reachable_by_name() {
+        let config = Config::new();
+        config
+            .set(
+                keys::QUEUES,
+                QueueConnections::new("primary")
+                    .with("primary", ConnectionConfig::memory())
+                    .with("bulk", ConnectionConfig::memory()),
+            )
+            .unwrap();
+
+        let manager =
+            build_queues(&env(&[]), &config, &resources()).await.unwrap().expect("declared");
+
+        assert!(manager.connection("primary").is_some());
+        assert!(manager.connection("bulk").is_some());
+        // Still no falling back for one nobody declared.
+        assert!(manager.connection("scratch").is_none());
+    }
+
+    #[cfg(feature = "sea-orm-executor")]
+    #[tokio::test]
+    async fn a_declared_database_section_is_opened_and_reachable_by_name() {
+        let config = Config::new();
+        config
+            .set(
+                keys::DATABASES,
+                Databases::new("primary")
+                    .with("primary", SqliteDatabase::in_memory())
+                    .with("reporting", SqliteDatabase::in_memory()),
+            )
+            .unwrap();
+
+        let manager = build_databases(&env(&[]), &config).await.unwrap().expect("declared");
+
+        assert!(manager.connection("primary").is_some());
+        assert!(manager.connection("reporting").is_some());
+        assert!(manager.connection("reportng").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_database_default_naming_an_undeclared_connection_stops_the_boot() {
+        // Checked before anything is opened, so it holds without an executor:
+        // falling back would answer, from a database nobody named, in a way no
+        // caller can tell from a correct answer.
+        let config = Config::new();
+        config
+            .set(
+                keys::DATABASES,
+                Databases::new("primary").with("reporting", SqliteDatabase::in_memory()),
+            )
+            .unwrap();
+
+        let err = build_databases(&env(&[]), &config).await.err().expect("`primary` is undeclared");
+
+        assert!(err.message().contains("`primary`"), "{}", err.message());
+        assert!(err.message().contains("`reporting`"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn a_queue_default_naming_an_undeclared_connection_stops_the_boot() {
+        let config = Config::new();
+        config
+            .set(
+                keys::QUEUES,
+                QueueConnections::new("primary").with("bulk", ConnectionConfig::memory()),
+            )
+            .unwrap();
+
+        let err = build_queues(&env(&[]), &config, &resources())
+            .await
+            .err()
+            .expect("`primary` is undeclared");
+
+        assert!(err.message().contains("`primary`"), "{}", err.message());
+        assert!(err.message().contains("`bulk`"), "{}", err.message());
+    }
+
+    // --- both, which is the one that has no safe reading ---------------------
+
+    #[tokio::test]
+    async fn a_database_url_beside_a_declared_section_is_refused_rather_than_resolved() {
+        // The loudest available answer, and the reason is that every quieter
+        // one is invisible: the losing declaration stays in the file being
+        // read, and the query that runs against the winner answers with rows.
+        let config = Config::new();
+        config
+            .set(
+                keys::DATABASES,
+                Databases::new("primary").with("primary", SqliteDatabase::in_memory()),
+            )
+            .unwrap();
+
+        let err = build_databases(&env(&[("DATABASE_URL", "sqlite::memory:")]), &config)
+            .await
+            .err()
+            .expect("two declarations of the default connection");
+
+        assert!(err.message().contains("DATABASE_URL"), "{}", err.message());
+        assert!(err.message().contains("databases"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn a_queue_driver_beside_a_declared_section_is_refused_rather_than_resolved() {
+        let config = Config::new();
+        config
+            .set(
+                keys::QUEUES,
+                QueueConnections::new("primary").with("primary", ConnectionConfig::memory()),
+            )
+            .unwrap();
+
+        let err = build_queues(&env(&[("QUEUE_DRIVER", "memory")]), &config, &resources())
+            .await
+            .err()
+            .expect("two declarations of the default connection");
+
+        assert!(err.message().contains("QUEUE_DRIVER"), "{}", err.message());
+        assert!(err.message().contains("queues"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn an_empty_scalar_is_not_a_declaration() {
+        // A platform that sets the variable to nothing has not named a
+        // database, and refusing the boot over it would be a conflict with
+        // something that declares no connection at all.
+        let config = Config::new();
+        config
+            .set(
+                keys::DATABASES,
+                Databases::new("primary").with("primary", SqliteDatabase::in_memory()),
+            )
+            .unwrap();
+
+        let built = build_databases(&env(&[("DATABASE_URL", "  ")]), &config).await;
+
+        if cfg!(feature = "sea-orm-executor") {
+            assert!(built.unwrap().is_some());
+        } else {
+            assert!(built.unwrap_err().message().contains("sea-orm-executor"));
+        }
+    }
+
+    // --- through the builder -------------------------------------------------
+
+    #[tokio::test]
+    async fn a_handed_over_database_is_bound_as_both_the_handle_and_the_manager() {
+        // The single-database application, unchanged: `with_database` binds a
+        // `Database`, which is what every repository and the `DB` facade take.
+        let (database, _) = fake_database(MemoryConnection::new(Dialect::MySql));
+
+        let app = Rainier::new(".")
+            .without_facades()
+            .without_tracing()
+            .with_database(database)
+            .boot()
+            .await
+            .unwrap();
+
+        assert_eq!(app.resolve::<Database>().unwrap().dialect(), Dialect::MySql);
+        // …and the manager over it, with no names, because there is nothing to
+        // distinguish.
+        assert_eq!(app.resolve::<DatabaseManager>().unwrap().connection_names().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_handed_over_queue_is_still_the_one_that_is_bound() {
+        let app = Rainier::new(".")
+            .without_facades()
+            .without_tracing()
+            .with_queue(QueueManager::fake())
+            .boot()
+            .await
+            .unwrap();
+
+        assert!(app.resolve::<QueueManager>().unwrap().is_faking());
+    }
+
+    #[tokio::test]
+    async fn declared_queues_are_reachable_by_name_after_boot() {
+        let app = Rainier::new(".")
+            .without_facades()
+            .without_tracing()
+            .with_queues(
+                QueueConnections::new("primary")
+                    .with("primary", ConnectionConfig::memory())
+                    .with("bulk", ConnectionConfig::memory()),
+            )
+            .boot()
+            .await
+            .unwrap();
+
+        let manager = app.resolve::<QueueManager>().unwrap();
+
+        assert!(manager.connection("primary").is_some());
+        assert!(manager.connection("bulk").is_some());
+        assert!(manager.connection("scratch").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_declared_database_default_nobody_declared_fails_the_boot() {
+        let err = Rainier::new(".")
+            .without_facades()
+            .without_tracing()
+            .with_databases(
+                Databases::new("primary").with("reporting", SqliteDatabase::in_memory()),
+            )
+            .boot()
+            .await
+            .err()
+            .expect("the default is not declared");
+
+        assert!(err.message().contains("`primary`"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn a_declared_job_registry_reaches_the_queue_the_framework_builds() {
+        // Without it the framework's own queue could dispatch nothing: a job
+        // travels as a name, and an empty registry maps no name back to code.
+        use rainier_queue::{Job, JobContext};
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize)]
+        struct Ping;
+
+        #[async_trait::async_trait]
+        impl Job for Ping {
+            const NAME: &'static str = "test.bootstrap-ping";
+            async fn handle(&self, _: &JobContext) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let app = Rainier::new(".")
+            .without_facades()
+            .without_tracing()
+            .with_jobs(JobRegistry::new().with::<Ping>())
+            .with_queues(
+                QueueConnections::new("primary").with("primary", ConnectionConfig::memory()),
+            )
+            .boot()
+            .await
+            .unwrap();
+
+        let manager = app.resolve::<QueueManager>().unwrap();
+        manager.dispatch(Ping).await.unwrap();
+
+        assert_eq!(manager.connection("primary").unwrap().size("default").await.unwrap(), 1);
+        assert!(app.resolve::<JobRegistry>().unwrap().names().contains(&"test.bootstrap-ping"));
+    }
+
+    #[tokio::test]
+    async fn a_database_queue_connection_without_a_database_names_what_is_missing() {
+        // The one resource a `queues` section cannot declare for itself, and a
+        // connection that quietly became something else would accept every job.
+        let err = Rainier::new(".")
+            .without_facades()
+            .without_tracing()
+            .with_queues(
+                QueueConnections::new("primary").with("primary", ConnectionConfig::database()),
+            )
+            .boot()
+            .await
+            .err()
+            .expect("no database was declared");
+
+        assert!(err.message().contains("`primary`"), "{}", err.message());
+        assert!(err.message().contains("database"), "{}", err.message());
     }
 }

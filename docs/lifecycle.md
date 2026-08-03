@@ -84,8 +84,11 @@ the config with framework defaults. Everything after it is a builder method:
 | `.with_middleware(\|registry\|)` | register global middleware |
 | `.with_routes(\|router\|)` | declare routes |
 | `.with_views(engine)` | override the view engine |
-| `.with_database(db)` | bind a `Database` |
-| `.with_queue(manager)` | bind a `QueueManager` |
+| `.with_database(db)` | bind a `Database` you built |
+| `.with_databases(dbs)` | declare the connections and let the framework open them |
+| `.with_queue(manager)` | bind a `QueueManager` you built |
+| `.with_queues(conns)` | declare the connections and let the framework build them |
+| `.with_jobs(registry)` | declare the jobs a worker can run |
 | `.with_mailer(mailer)` | bind a `Mailer` |
 | `.with_provider(provider)` | register a service provider |
 | `.without_facades()` | do not install the process-global facade app |
