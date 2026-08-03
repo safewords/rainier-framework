@@ -81,8 +81,34 @@ pub trait Setting: Copy + Eq + Sized + 'static {
     /// whitespace, letter case, and `_` where the canonical spelling uses `-`.
     /// `Redis_Cluster` is what someone means by `redis-cluster`; `redys` is
     /// not, and no amount of guessing makes it so.
+    ///
+    /// # The exact spelling is tried first, and that ordering is the point
+    ///
+    /// The `_`-to-`-` tolerance exists for environment variables, where nobody
+    /// should have to remember which separator a driver name uses. Applied
+    /// *before* an exact match, it silently breaks every variant whose own wire
+    /// value contains an underscore: `parse("all_posts")` rewrote its input to
+    /// `all-posts` and then failed to find `all_posts`, producing an error that
+    /// listed the value it had just rejected among the valid ones.
+    ///
+    /// That is not only confusing, it is unrecoverable from the caller's side —
+    /// and it reaches much further than configuration. Anything decoding an
+    /// enum column out of a database goes through here, so a row storing
+    /// `all_posts` could be written and never read back. The failure appears at
+    /// hydration, long after the write that looked fine.
+    ///
+    /// So: exact first, tolerance second. Both spellings still work and no
+    /// value can be shadowed by the normalisation of another.
     fn parse(raw: &str) -> Result<Self> {
-        let wanted = raw.trim().replace('_', "-");
+        let trimmed = raw.trim();
+
+        if let Some(variant) =
+            Self::ALL.iter().copied().find(|variant| variant.as_str().eq_ignore_ascii_case(trimmed))
+        {
+            return Ok(variant);
+        }
+
+        let wanted = trimmed.replace('_', "-");
         Self::ALL
             .iter()
             .copied()
@@ -224,6 +250,53 @@ mod tests {
             Memory = "memory",
             Redis = "redis",
             RedisCluster = "redis-cluster",
+        }
+    }
+
+    setting_enum! {
+        /// An enum whose own wire values carry underscores — the shape a
+        /// database column holds, as opposed to the hyphenated shape an
+        /// environment variable tends to use.
+        pub enum Scope: "access scope" {
+            #[default]
+            AllPosts = "all_posts",
+            NewPostsOnly = "new_posts_only",
+        }
+    }
+
+    #[test]
+    fn a_wire_value_containing_an_underscore_parses_as_itself() {
+        // The regression this ordering exists for. Normalising `_` to `-`
+        // before looking for an exact match meant `all_posts` was rewritten to
+        // `all-posts` and then not found — and the error listed `all_posts`
+        // among the valid values, having just rejected it.
+        //
+        // It is not only a configuration concern. Enum columns decode through
+        // here, so a row could be written and never read back, and the failure
+        // surfaces at hydration rather than at the write that caused it.
+        assert_eq!(Scope::parse("all_posts").unwrap(), Scope::AllPosts);
+        assert_eq!(Scope::parse("new_posts_only").unwrap(), Scope::NewPostsOnly);
+    }
+
+    #[test]
+    fn the_underscore_tolerance_still_applies_where_nothing_exact_matches() {
+        // The ergonomics the normalisation was added for, unchanged: nobody
+        // should have to remember which separator a driver name uses.
+        assert_eq!(Driver::parse("redis_cluster").unwrap(), Driver::RedisCluster);
+        assert_eq!(Driver::parse("Redis_Cluster").unwrap(), Driver::RedisCluster);
+    }
+
+    #[test]
+    fn a_round_trip_holds_for_every_variant_of_both_shapes() {
+        // The general property, rather than the two cases above: whatever
+        // `as_str` writes, `parse` must read. A column round-trips or it does
+        // not, and this is the assertion that would have caught the original
+        // bug for any enum, not just the ones somebody thought to test.
+        for variant in Scope::ALL {
+            assert_eq!(Scope::parse(variant.as_str()).unwrap(), *variant);
+        }
+        for variant in Driver::ALL {
+            assert_eq!(Driver::parse(variant.as_str()).unwrap(), *variant);
         }
     }
 
