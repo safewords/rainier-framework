@@ -566,8 +566,16 @@ impl Migrator {
     }
 
     /// Every ledger row, as `(name, batch)`.
+    ///
+    /// Read from the **write** endpoint, and that is not a preference. The
+    /// ledger was created by the statement immediately above and every row in
+    /// it was written by this migrator moments ago, so a connection that splits
+    /// its reads would ask a replica about a table it may not have replicated
+    /// yet — and be told, with no error, that no migration has ever run. The
+    /// migrator would then apply every step a second time.
     async fn ledger_rows(&self, db: &Database) -> Result<Vec<(String, i64)>> {
         self.ensure_ledger(db).await?;
+        let db = db.writer();
 
         let prepared = crate::statement::Prepared {
             sql: format!("SELECT name, batch FROM {LEDGER}"),

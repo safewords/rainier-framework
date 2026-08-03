@@ -103,6 +103,17 @@
 //! | `charset`, `collation` or `strict` on a driver with no such setting | the driver drops it, and the connection negotiates whatever it would have anyway |
 //! | `collation` with no `charset` | a collation orders **one** character set; alone it is matched against whichever one the driver assumes |
 //! | `unix_socket` beside `host` or `port` | a socket connection never dials a host, so the host in the file is read by everyone and used by nothing |
+//! | a `read` or `write` role that resolves to no host | the role has nowhere to go, and inheriting the *other* role's host would put writes on a replica or reads on a primary without saying so |
+//! | an empty `read` or `write` role | it says nothing the connection does not already say, and reads as a split that is not one |
+//! | `sticky` with neither `read` nor `write` | there is one endpoint, so there is nothing a read could be stale against |
+//! | `read` or `write` beside `unix_socket` | a socket reaches one server on this machine; a role names another one |
+//! | a role naming its own `driver`, `database` or `unix_socket` | a replica of a *different* database answers every query, correctly, about the wrong rows |
+//! | an `options` key the driver's own URL parser does not read | it is dropped on arrival, and the connection is not configured the way the file says |
+//! | an `options` key some other setting already settles | two spellings of one answer, and which one wins is not visible from the file |
+//! | an empty `pool` | it names nothing, so it changes nothing, and reads as sizing that was applied |
+//! | `max_connections` of `0`, or a `min_connections` above the maximum | a pool that can hand out nothing, and a floor above its own ceiling |
+//! | `acquire_timeout` of `0` | every query fails the moment every connection is busy, which is a normal condition and not an error |
+//! | a `pool` on an in-memory SQLite database that is not a pool of exactly one, kept forever | the database *is* the connection: a second one is a second, empty database, and reaping the first drops the schema |
 //! | `prefix` or `prefix_indexes` | not supported at all — see below, and a half-applied prefix reads as missing data |
 //! | `engine` | nothing renders it, and a setting the database never sees is worse than one that was refused |
 //!
@@ -132,8 +143,120 @@
 //! settles it for every connection in the pool rather than for whichever
 //! connection happened to be checked out.
 //!
+//! ## Splitting reads from writes
+//!
+//! A connection may name a `read` role and a `write` role, each with its own
+//! hosts and, if it needs them, its own credentials. Everything a role does not
+//! name it takes from the connection around it, so the common case is short:
+//!
+//! ```
+//! # use rainier_database::Databases;
+//! # use serde_json::json;
+//! let databases: Databases = serde_json::from_value(json!({
+//!     "default": "primary",
+//!     "connections": {
+//!         "primary": {
+//!             "driver": "mysql",
+//!             "host": "writer.example.com",
+//!             "read": { "host": ["replica-a.example.com", "replica-b.example.com"] },
+//!             "sticky": true,
+//!             "database": "app",
+//!             "username": "app",
+//!             "password": "…",
+//!         },
+//!     },
+//! })).unwrap();
+//!
+//! assert!(databases.get("primary").unwrap().is_split());
+//! ```
+//!
+//! A connection that names neither role is one connection and behaves exactly
+//! as it did before any of this existed — same endpoint, same pool, same
+//! connection string.
+//!
+//! **Which endpoint a statement reaches is decided by the method that ran it**,
+//! not by reading the SQL: a fetch reads and an execute writes. Every host of
+//! a role is opened at boot and they are used in turn, round-robin — see
+//! [`Database::with_endpoints`](crate::Database::with_endpoints) for why that
+//! rather than the random pick this shape is ported from.
+//!
+//! `sticky` is the one setting here whose failure is a *data* failure, and it
+//! has a module of its own: a read that follows a write can otherwise land on a
+//! replica that has not caught up and answer from before the write, with no
+//! error anywhere. [`sticky`](crate::sticky) documents what a scope is, what it
+//! covers, and — importantly before declaring it — what a sticky connection
+//! does when nothing has entered one.
+//!
+//! ## Sizing the pool
+//!
+//! A connection may declare a `pool`, and so may either of its roles. Every
+//! field is optional and an absent one keeps the value the connection would
+//! have had anyway, so a declaration says only what it is changing:
+//!
+//! ```
+//! # use rainier_database::Databases;
+//! # use serde_json::json;
+//! let databases: Databases = serde_json::from_value(json!({
+//!     "default": "primary",
+//!     "connections": {
+//!         "primary": {
+//!             "driver": "postgres",
+//!             "host": "writer.example.com",
+//!             "database": "app",
+//!             "pool": { "max_connections": 8, "acquire_timeout": 5 },
+//!             "read": { "host": "replica.example.com", "pool": { "max_connections": 20 } },
+//!         },
+//!     },
+//! })).unwrap();
+//!
+//! assert_eq!(databases.get("primary").unwrap().pool().max_connections, 8);
+//! assert_eq!(databases.get("primary").unwrap().read_pool().max_connections, 20);
+//! ```
+//!
+//! Durations are whole seconds, which is this family's spelling. `0` means
+//! *never* for the two that can be disabled — `idle_timeout` and `max_lifetime`
+//! — and is refused for the two where it means "give up instantly".
+//!
+//! There is deliberately no preset to name here.
+//! [`PoolConfig::serverless`](rainier_orm::PoolConfig::serverless) is
+//! expressible field by field, and a preset *name* in a configuration file is a
+//! value whose meaning moves when the library changes underneath it — where six
+//! numbers are six things a review can check against the database in front of
+//! it.
+//!
+//! **The roles are sized separately because they are sized differently.** A
+//! primary takes writes from every process and its connection budget is the
+//! scarce one; replicas take the read traffic and there are usually several of
+//! them. A role that declares no `pool` takes the connection's, so the common
+//! case stays one block.
+//!
+//! Three of these are worth reading before setting them, because each fails in
+//! a way that does not look like a pool problem:
+//!
+//! **`max_connections` is a share of a budget, not a limit on this process.**
+//! The database accepts some total number of connections and every app process
+//! opens up to its own maximum, so the number to write down is the database's
+//! budget divided by the process count — and on a split connection, divided
+//! again by the number of hosts in the role, because each host is its own pool.
+//! Too high does not show up as slowness: the processes that started first keep
+//! working and the next one to start is refused outright, which reads as a
+//! partial outage rather than as a setting.
+//!
+//! **`acquire_timeout` chooses which failure saturation produces.** Too short
+//! and requests fail while the database is healthy and merely busy. Too long and
+//! they queue past the point the caller gave up, so the pool spends its capacity
+//! on work whose answer nobody is waiting for — which keeps the queue full and
+//! is how a brief spike becomes a sustained one.
+//!
+//! **`max_lifetime` is the guard against a connection that is not there.** A
+//! load balancer or a database that drops long-lived connections leaves the pool
+//! holding sockets that look open and fail on first use, so the failures land on
+//! whichever query happened to draw a dead one. Recycling on an age is what
+//! stops that presenting as intermittent errors nobody can reproduce.
+//!
 //! ## What this section deliberately does not carry
 //!
+
 //! **A table prefix.** Not supported, and refused rather than accepted,
 //! because it cannot be applied *everywhere* a table name is rendered.
 //! `Entity::table()` is a `&'static str` with no connection in scope; a
@@ -144,8 +267,17 @@
 //! unprefixed ones, and a query against a table that exists but is not the one
 //! holding the rows comes back **empty** rather than failing. That reads as
 //! missing data, and it is the same silent-wrong-database failure the rest of
-//! this module exists to refuse. If it is wanted, it belongs in the statement
-//! layer where every table name is rendered, not here.
+//! this module exists to refuse.
+//!
+//! The place it stops being a matter of effort is Rainier ORM. A
+//! [`Database`] *is* an `Executor`, so `repo::query::<E>()`
+//! and the whole `repo::` surface render `E::table()` inside a crate that has
+//! never heard of this section and takes no prefix — and they are a documented,
+//! first-class way to query. Threading a prefix through every table name
+//! [`statement`](crate::statement) renders would therefore still leave half the
+//! framework's queries unprefixed, which is precisely the split-brain outcome
+//! above rather than a step towards avoiding it. If it is wanted it belongs in
+//! the ORM, where every table name is rendered, and not here.
 //!
 //! **`engine`.** MySQL's table engine is a `CREATE TABLE` clause, and nothing
 //! between a declaration and the schema builder carries it: a migration renders
@@ -155,13 +287,17 @@
 //! the server used whatever its default is, and the only way to find out would
 //! be to look at the table.
 //!
-//! **Pool settings.** [`PoolConfig`](rainier_orm::PoolConfig) is chosen from
-//! the connection rather than declared, because the one case where getting it
-//! wrong is silent — an in-memory SQLite database with more than one connection
-//! is more than one *database* — has exactly one right answer and no reason to
-//! be spelled out. Sizing a pool is a tuning decision with no wrong-data
-//! failure mode; when it needs to be declarable it can be added here without
-//! changing anything else.
+//! **Anything `options` names that the driver would not read.** `options` is
+//! the escape hatch for a driver parameter this section has no field for, and
+//! it is an allow-list rather than a passthrough. The reason is what the
+//! driver does with a parameter it does not recognise: sqlx's MySQL URL parser
+//! ignores it outright and its PostgreSQL one logs and moves on. Neither
+//! fails. So a passthrough would let a file say `sslmode=verify-full` under a
+//! spelling the driver does not read, and the connection would be established
+//! unverified — with the setting sitting in the file, reviewed, and doing
+//! nothing. Only the keys that engine's own parser reads are accepted, and a
+//! key some other setting on this connection already settles is refused as the
+//! second answer it would be.
 //!
 //! **The `d1` and `libsql` drivers.** Their executors are generic over a
 //! caller-supplied transport — a `fetch` binding inside a Worker, an HTTP
@@ -450,6 +586,286 @@ impl std::fmt::Debug for Databases {
     }
 }
 
+/// How a connection's pool is sized, as a declaration rather than as a
+/// [`PoolConfig`](rainier_orm::PoolConfig).
+///
+/// Every field is optional, and that is the whole design: an absent one keeps
+/// the value the connection would have had with no `pool` at all. A declaration
+/// therefore says only what it is changing, and — the part that matters — a
+/// connection that declares nothing is sized exactly as it was before any of
+/// this was declarable.
+///
+/// ```
+/// use rainier_database::PoolSettings;
+///
+/// // Everything else stays as it was.
+/// let settings = PoolSettings::new().max_connections(25);
+/// assert_eq!(settings.max().unwrap(), 25);
+/// assert!(settings.acquire_timeout_period().is_none());
+/// ```
+///
+/// The three settings whose failures do not look like pool failures —
+/// `max_connections`, `acquire_timeout` and `max_lifetime` — are written up in
+/// this module's header rather than repeated on each method.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_connections: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_connections: Option<u32>,
+    /// Seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acquire_timeout: Option<u64>,
+    /// Seconds; `0` disables reaping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idle_timeout: Option<u64>,
+    /// Seconds; `0` disables recycling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_lifetime: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    test_before_acquire: Option<bool>,
+}
+
+impl PoolSettings {
+    /// Change nothing.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The ceiling on connections **this process** opens to **this endpoint**.
+    ///
+    /// A share of the database's budget rather than a limit on this process —
+    /// see this module's header for what going over it looks like, which is not
+    /// slowness.
+    pub fn max_connections(mut self, connections: u32) -> Self {
+        self.max_connections = Some(connections);
+        self
+    }
+
+    /// Connections kept open while idle. `0` lets the pool drain between
+    /// bursts.
+    pub fn min_connections(mut self, connections: u32) -> Self {
+        self.min_connections = Some(connections);
+        self
+    }
+
+    /// How long a query waits for a free connection before failing, in seconds.
+    ///
+    /// Chooses which failure saturation produces; `0` is refused, because
+    /// failing the instant every connection is busy makes an error out of a
+    /// normal condition.
+    pub fn acquire_timeout(mut self, seconds: u64) -> Self {
+        self.acquire_timeout = Some(seconds);
+        self
+    }
+
+    /// Close a connection idle for longer than this, in seconds. `0` never
+    /// reaps.
+    pub fn idle_timeout(mut self, seconds: u64) -> Self {
+        self.idle_timeout = Some(seconds);
+        self
+    }
+
+    /// Recycle a connection older than this regardless of use, in seconds. `0`
+    /// never recycles.
+    ///
+    /// The guard against a socket that is open here and closed at the other
+    /// end — see this module's header.
+    pub fn max_lifetime(mut self, seconds: u64) -> Self {
+        self.max_lifetime = Some(seconds);
+        self
+    }
+
+    /// Ping a connection before handing it out. Costs a round trip and
+    /// guarantees liveness.
+    pub fn test_before_acquire(mut self, test: bool) -> Self {
+        self.test_before_acquire = Some(test);
+        self
+    }
+
+    /// The declared ceiling, when one was declared.
+    pub fn max(&self) -> Option<u32> {
+        self.max_connections
+    }
+
+    /// The declared floor, when one was declared.
+    pub fn min(&self) -> Option<u32> {
+        self.min_connections
+    }
+
+    /// The declared acquire timeout, when one was declared.
+    pub fn acquire_timeout_period(&self) -> Option<std::time::Duration> {
+        self.acquire_timeout.map(std::time::Duration::from_secs)
+    }
+
+    /// The declared idle timeout: `Some(None)` is "never reap".
+    pub fn idle_timeout_period(&self) -> Option<Option<std::time::Duration>> {
+        self.idle_timeout.map(disableable)
+    }
+
+    /// The declared maximum lifetime: `Some(None)` is "never recycle".
+    pub fn max_lifetime_period(&self) -> Option<Option<std::time::Duration>> {
+        self.max_lifetime.map(disableable)
+    }
+
+    /// Whether a connection is pinged before it is handed out, when declared.
+    pub fn tests_before_acquire(&self) -> Option<bool> {
+        self.test_before_acquire
+    }
+
+    /// Whether this declares anything at all.
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// This declaration over `base`, field by field.
+    ///
+    /// `base` is what the connection would have used with no `pool` declared,
+    /// which is what makes an absent field mean "leave it alone" rather than
+    /// "take the library's default": an in-memory SQLite database that declares
+    /// only `acquire_timeout` keeps every one of the four settings that make it
+    /// survive.
+    fn applied_to(&self, mut base: rainier_orm::PoolConfig) -> rainier_orm::PoolConfig {
+        if let Some(max) = self.max_connections {
+            base.max_connections = max;
+        }
+        if let Some(min) = self.min_connections {
+            base.min_connections = min;
+        }
+        if let Some(seconds) = self.acquire_timeout {
+            base.acquire_timeout = std::time::Duration::from_secs(seconds);
+        }
+        if let Some(seconds) = self.idle_timeout {
+            base.idle_timeout = disableable(seconds);
+        }
+        if let Some(seconds) = self.max_lifetime {
+            base.max_lifetime = disableable(seconds);
+        }
+        if let Some(test) = self.test_before_acquire {
+            base.test_before_acquire = test;
+        }
+        base
+    }
+}
+
+/// A declared duration where `0` means "never".
+///
+/// The two settings that take one are `Option<Duration>` in the pool and there
+/// is no other way to write `None` down. `0` is the honest spelling: a timeout
+/// of no time at all is not a thing anybody wants, so the value is free to mean
+/// the only other thing it could.
+fn disableable(seconds: u64) -> Option<std::time::Duration> {
+    match seconds {
+        0 => None,
+        seconds => Some(std::time::Duration::from_secs(seconds)),
+    }
+}
+
+/// The pool a connection has when it declares none.
+///
+/// The choice this section made before a pool was declarable, unchanged: one
+/// case is not tuning, and it is the silent one. An in-memory SQLite database
+/// exists only as long as the connection holding it, so a second pooled
+/// connection is a second, *empty* database and a query landing on it returns
+/// no rows rather than an error.
+fn base_pool(in_memory: bool) -> rainier_orm::PoolConfig {
+    if in_memory {
+        rainier_orm::PoolConfig::in_memory()
+    } else {
+        rainier_orm::PoolConfig::default()
+    }
+}
+
+/// Refuse a resolved pool that cannot work, naming `what` it belongs to.
+///
+/// Checked against the **resolved** pool rather than the declaration, because
+/// the interesting mistake is a cross-field one: `min_connections: 20` is
+/// perfectly reasonable text and is a floor above a ceiling nobody restated.
+fn check_pool(pool: &rainier_orm::PoolConfig, what: &str) -> Result<()> {
+    if pool.max_connections == 0 {
+        return Err(Error::internal(format!(
+            "the {what} pool declares `max_connections: 0`; a pool that may open no connections \
+             has nothing to hand a query, so every statement waits for the acquire timeout and \
+             then fails"
+        )));
+    }
+    if pool.min_connections > pool.max_connections {
+        return Err(Error::internal(format!(
+            "the {what} pool declares `min_connections` of {} above its `max_connections` of {}; \
+             the floor cannot be higher than the ceiling, and only one of the two is what somebody \
+             meant",
+            pool.min_connections, pool.max_connections
+        )));
+    }
+    if pool.acquire_timeout.is_zero() {
+        return Err(Error::internal(format!(
+            "the {what} pool declares `acquire_timeout: 0`; every connection being busy is a \
+             normal condition under load rather than an error, and a pool that gives up instantly \
+             turns the first burst of traffic into failed requests against a database that is \
+             healthy. Write the number of seconds a caller is willing to wait"
+        )));
+    }
+    Ok(())
+}
+
+/// A `pool` that names nothing.
+///
+/// Refused rather than ignored for the reason every empty block here is: it
+/// reads, to whoever opens the file next, as sizing that was thought about and
+/// applied.
+fn empty_pool() -> Error {
+    Error::internal(
+        "this connection declares an empty `pool`; it names no size and no timeout, so it changes \
+         nothing — while reading as sizing that took effect",
+    )
+}
+
+/// Refuse a pool an in-memory SQLite database would not survive.
+///
+/// Every one of these is silent rather than loud, which is why they are refused
+/// rather than left to whoever sized it: the database *is* the connection, so a
+/// second connection is a second and empty database, and closing the one that
+/// exists takes the schema with it. The symptom is a process that migrates
+/// cleanly at boot and answers `no such table` to the first real request.
+fn check_in_memory_pool(pool: &rainier_orm::PoolConfig) -> Result<()> {
+    let refusal = |setting: &str, because: &str| {
+        Err(Error::internal(format!(
+            "this connection is an in-memory SQLite database and its pool declares {setting}; \
+             {because}. An in-memory database exists only as long as the connection holding it, so \
+             its pool is exactly one connection kept for the life of the process — declare a file \
+             path instead if this needs to be a real pool"
+        )))
+    };
+
+    if pool.max_connections != 1 {
+        return refusal(
+            "more than one connection",
+            "the second one opens a second, empty database",
+        );
+    }
+    if pool.min_connections != 1 {
+        return refusal(
+            "a floor below one",
+            "the pool closes its only connection while nothing is happening, and the schema goes \
+             with it",
+        );
+    }
+    if pool.idle_timeout.is_some() {
+        return refusal(
+            "an `idle_timeout`",
+            "the connection is reaped between queries and every table disappears with it",
+        );
+    }
+    if pool.max_lifetime.is_some() {
+        return refusal(
+            "a `max_lifetime`",
+            "the connection is recycled on an age and the replacement is an empty database",
+        );
+    }
+    Ok(())
+}
+
 /// One connection: which driver, and the settings that driver needs.
 ///
 /// An enum rather than a struct of optionals, so the settings a shape does not
@@ -468,6 +884,14 @@ impl std::fmt::Debug for Databases {
 /// credential.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(try_from = "RawDatabase", into = "RawDatabase")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a server declaration carries every setting a server has and is far larger than a \
+              DSN, which is one string. There are as many of these as an application declares \
+              connections — usually one — and each is built once at boot and then left alone, so \
+              the indirection the lint suggests would buy a few hundred bytes at startup and cost \
+              a pointer chase on a public pattern match"
+)]
 pub enum DatabaseConfig {
     /// A database on a server, from discrete fields.
     Server(ServerDatabase),
@@ -550,11 +974,72 @@ impl DatabaseConfig {
     pub fn dsn(&self) -> Result<String> {
         match self {
             Self::Server(server) => server.dsn(),
-            Self::Sqlite(sqlite) => Ok(sqlite.dsn()),
+            Self::Sqlite(sqlite) => {
+                sqlite.validate()?;
+                Ok(sqlite.dsn())
+            }
             Self::Dsn(dsn) => {
                 dsn.validate()?;
                 Ok(dsn.dsn().to_string())
             }
+        }
+    }
+
+    /// Whether this declaration reaches its reads and its writes through
+    /// different endpoints.
+    ///
+    /// True as soon as either a `read` or a `write` role is named — a role that
+    /// is absent takes the connection's own host, which still makes two
+    /// endpoints if the other role names its own.
+    pub fn is_split(&self) -> bool {
+        match self {
+            Self::Server(server) => server.is_split(),
+            Self::Sqlite(_) | Self::Dsn(_) => false,
+        }
+    }
+
+    /// Whether a write pins this connection's reads for the rest of the
+    /// [scope](crate::sticky).
+    pub fn is_sticky(&self) -> bool {
+        match self {
+            Self::Server(server) => server.is_sticky(),
+            Self::Sqlite(_) | Self::Dsn(_) => false,
+        }
+    }
+
+    /// Every connection string a **write** may be sent to. Never empty.
+    ///
+    /// One entry for an ordinary connection, and it is the same string
+    /// [`dsn`](Self::dsn) answers. Several when the `write` role names several
+    /// hosts.
+    ///
+    /// **Carries the password inline**, exactly as [`dsn`](Self::dsn) does, and
+    /// with the same rule: never render one.
+    ///
+    /// # Errors
+    ///
+    /// When the declaration does not make sense — see [`dsn`](Self::dsn).
+    pub fn write_dsns(&self) -> Result<Vec<String>> {
+        match self {
+            Self::Server(server) => server.role_dsns(Which::Write),
+            _ => Ok(vec![self.dsn()?]),
+        }
+    }
+
+    /// Every connection string a **read** may be sent to.
+    ///
+    /// **Empty** for a connection that does not split, which means reads go
+    /// wherever writes do rather than that there is nowhere to read from.
+    ///
+    /// **Carries the password inline** — see [`dsn`](Self::dsn).
+    ///
+    /// # Errors
+    ///
+    /// When the declaration does not make sense — see [`dsn`](Self::dsn).
+    pub fn read_dsns(&self) -> Result<Vec<String>> {
+        match self {
+            Self::Server(server) if server.is_split() => server.role_dsns(Which::Read),
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -575,19 +1060,53 @@ impl DatabaseConfig {
         }
     }
 
-    /// How a pool for this connection has to be shaped.
+    /// How a pool for this connection's **writes** has to be shaped.
     ///
-    /// Only one case is load-bearing, and it is load-bearing in the silent
-    /// direction: an in-memory SQLite database exists only as long as the
-    /// connection holding it, so a second pooled connection is a second, empty
-    /// database — and a query that lands on it returns no rows rather than an
-    /// error. Read off the connection string rather than off the shape it was
-    /// declared in, so `sqlite::memory:` gets the same treatment whether it
-    /// arrived as a `database` or as a `url`.
+    /// The connection's own pool, and the only one there is when it does not
+    /// split — see [`read_pool`](Self::read_pool) for the other half.
+    ///
+    /// One case is not tuning, and it is load-bearing in the silent direction:
+    /// an in-memory SQLite database exists only as long as the connection
+    /// holding it, so a second pooled connection is a second, empty database —
+    /// and a query that lands on it returns no rows rather than an error. Read
+    /// off the connection string rather than off the shape it was declared in,
+    /// so `sqlite::memory:` gets the same treatment whether it arrived as a
+    /// `database` or as a `url`. A declaration that would break it is refused
+    /// when it is read, not quietly overridden here.
+    ///
+    /// A connection that declares no `pool` gets exactly what it got before a
+    /// pool was declarable.
     pub fn pool(&self) -> rainier_orm::PoolConfig {
-        match self.dsn() {
-            Ok(dsn) if is_in_memory(&dsn) => rainier_orm::PoolConfig::in_memory(),
-            _ => rainier_orm::PoolConfig::default(),
+        self.pool_for(Which::Write)
+    }
+
+    /// How a pool for this connection's **reads** has to be shaped.
+    ///
+    /// The `read` role's, when it declares one; the connection's otherwise. The
+    /// roles are separate because they are sized differently — a primary's
+    /// connection budget is the scarce one and there is usually more than one
+    /// replica — and because on a split connection each *host* of a role is its
+    /// own pool, so a role's ceiling is multiplied by the number of hosts in it.
+    pub fn read_pool(&self) -> rainier_orm::PoolConfig {
+        self.pool_for(Which::Read)
+    }
+
+    /// One role's resolved pool.
+    fn pool_for(&self, which: Which) -> rainier_orm::PoolConfig {
+        match self {
+            Self::Server(server) => server.resolved_pool(which),
+            // Neither shape has roles to differ between.
+            Self::Sqlite(sqlite) => sqlite.resolved_pool(),
+            Self::Dsn(dsn) => dsn.resolved_pool(),
+        }
+    }
+
+    /// The pool settings this connection declared, ignoring any role.
+    pub fn pool_settings(&self) -> Option<&PoolSettings> {
+        match self {
+            Self::Server(server) => server.pool_settings(),
+            Self::Sqlite(sqlite) => sqlite.pool_settings(),
+            Self::Dsn(dsn) => dsn.pool_settings(),
         }
     }
 
@@ -597,25 +1116,47 @@ impl DatabaseConfig {
     /// opened from two declarations share nothing — not a pool, not a
     /// credential, not a host.
     ///
+    /// A declaration that splits its reads opens **one pool per endpoint**, all
+    /// of them here. That is the same choice
+    /// [`Databases::build`](Databases::build) makes about connections as a
+    /// whole and for the same reason: a replica that cannot be reached is a
+    /// boot failure a deploy catches, rather than a query that fails at
+    /// whichever hour it first runs.
+    ///
     /// # Errors
     ///
     /// When the declaration does not make sense, when no executor was compiled
-    /// in, or when the database refuses the connection.
+    /// in, or when any endpoint refuses the connection.
     pub async fn build(&self) -> Result<Database> {
-        let dsn = self.dsn()?;
+        let writes = self.write_dsns()?;
+        let reads = self.read_dsns()?;
 
         #[cfg(feature = "sea-orm-executor")]
         {
             // The session statements go to the pool, not to a connection: they
             // have to reach every connection it opens, including the ones it
-            // opens later to replace a socket the server timed out.
-            let executor = rainier_drivers::sql::SeaOrmExecutor::connect_with_session(
-                &dsn,
-                &self.pool(),
-                &self.session_statements(),
-            )
-            .await?;
-            Ok(Database::new(executor))
+            // opens later to replace a socket the server timed out. Every
+            // endpoint gets the same ones — a replica whose `sql_mode` differs
+            // from its primary's answers the same query differently.
+            let session = self.session_statements();
+
+            // Each role's own sizing, and each *host* of a role its own pool of
+            // that size — which is the arithmetic to have in mind when reading
+            // `max_connections` off a file: three replicas at twenty is sixty
+            // sockets from this process, not twenty.
+            let write_pool = self.pool();
+            let read_pool = self.read_pool();
+
+            let mut opened_writes = Vec::with_capacity(writes.len());
+            for dsn in &writes {
+                opened_writes.push(open_endpoint(dsn, &write_pool, &session).await?);
+            }
+            let mut opened_reads = Vec::with_capacity(reads.len());
+            for dsn in &reads {
+                opened_reads.push(open_endpoint(dsn, &read_pool, &session).await?);
+            }
+
+            Database::with_endpoints(opened_writes, opened_reads, self.is_sticky())
         }
 
         // Loud, and naming the fix. There is nothing to fall back to that would
@@ -624,7 +1165,7 @@ impl DatabaseConfig {
         // application's own data with no rows.
         #[cfg(not(feature = "sea-orm-executor"))]
         {
-            let _ = dsn;
+            let _ = (writes, reads);
             Err(Error::internal(format!(
                 "this connection uses the `{}` driver for `{}`, but rainier-database was built \
                  without the `sea-orm-executor` feature",
@@ -633,6 +1174,23 @@ impl DatabaseConfig {
             )))
         }
     }
+}
+
+/// Open one endpoint's pool.
+///
+/// Every endpoint of a connection is opened the same way, with the same pool
+/// shape and the same session statements — a replica configured differently
+/// from its primary answers the same query differently, which is the whole
+/// class of failure this module is about.
+#[cfg(feature = "sea-orm-executor")]
+async fn open_endpoint(
+    dsn: &str,
+    pool: &rainier_orm::PoolConfig,
+    session: &[String],
+) -> Result<std::sync::Arc<dyn crate::Connection>> {
+    let executor =
+        rainier_drivers::sql::SeaOrmExecutor::connect_with_session(dsn, pool, session).await?;
+    Ok(std::sync::Arc::new(executor))
 }
 
 impl From<ServerDatabase> for DatabaseConfig {
@@ -687,6 +1245,176 @@ pub struct ServerDatabase {
     strict: Option<bool>,
     /// A CA certificate to verify the server against.
     ssl_ca: Option<String>,
+    /// Where reads go. `None` means "wherever writes go".
+    read: Option<DatabaseRole>,
+    /// Where writes go. `None` means the host on this struct.
+    write: Option<DatabaseRole>,
+    /// `None` and `Some(false)` mean the same thing to the connection and
+    /// different things to the file, and the file round-trips.
+    sticky: Option<bool>,
+    /// Extra parameters for the driver's own URL parser.
+    ///
+    /// A `BTreeMap` so the rendered query string is stable: a connection string
+    /// that reorders itself between runs makes two boot logs look like two
+    /// different connections.
+    options: BTreeMap<String, String>,
+    /// How this connection's pool is sized. A role may override it.
+    pool: Option<PoolSettings>,
+}
+
+/// Which half of a split connection an endpoint belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Which {
+    /// Where [`Database::fetch`](crate::Database::fetch) goes.
+    Read,
+    /// Where [`Database::execute`](crate::Database::execute) goes.
+    Write,
+}
+
+impl Which {
+    /// The name this role is written down under.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+/// One half of a connection that splits its reads from its writes.
+///
+/// Holds only what can differ between the two halves: the hosts, the port and
+/// the credentials. Everything else — the driver, the database, the character
+/// set, the TLS certificate, `strict` — is a property of the *data*, not of
+/// which server is being asked, and is taken from the connection the role
+/// belongs to. A role that could name its own database would be a replica of
+/// something else, answering every query correctly about the wrong rows.
+///
+/// A role that names no host uses the connection's own, which is what makes
+/// `read` alone the short and common spelling: replicas here, and writes
+/// wherever they were already going.
+#[derive(Clone, Default)]
+pub struct DatabaseRole {
+    hosts: Vec<String>,
+    port: Option<u16>,
+    /// `None` inherits the connection's credentials.
+    credentials: Option<DatabaseCredentials>,
+    /// `None` inherits the connection's pool sizing.
+    pool: Option<PoolSettings>,
+}
+
+impl DatabaseRole {
+    /// This role reaches `host`.
+    pub fn on(host: impl Into<String>) -> Self {
+        Self { hosts: vec![host.into()], ..Self::default() }
+    }
+
+    /// This role reaches each of `hosts`, in turn.
+    ///
+    /// They must be interchangeable: any query for this role may go to any of
+    /// them, so a host that is a *different* database is one that answers some
+    /// fraction of the application's queries from the wrong rows.
+    pub fn across(hosts: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self { hosts: hosts.into_iter().map(Into::into).collect(), ..Self::default() }
+    }
+
+    /// This role uses the connection's hosts and only differs in what follows.
+    ///
+    /// For the arrangement where the replicas are reached as a read-only user:
+    /// same servers, different credentials.
+    pub fn inherited() -> Self {
+        Self::default()
+    }
+
+    /// The port these hosts listen on. Defaults to the connection's, then to
+    /// the engine's standard one.
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = Some(port);
+        self
+    }
+
+    /// Authenticate to these hosts as `username` with `password`.
+    ///
+    /// Undeclared, the role authenticates as the connection does — which is
+    /// usually right, and is wrong exactly when the replicas have their own
+    /// read-only user.
+    pub fn credentials(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+        self.credentials = Some(DatabaseCredentials::Password {
+            username: username.into(),
+            password: password.into(),
+        });
+        self
+    }
+
+    /// Authenticate to these hosts as `username` with no password.
+    pub fn user(mut self, username: impl Into<String>) -> Self {
+        self.credentials = Some(DatabaseCredentials::User { username: username.into() });
+        self
+    }
+
+    /// Size this role's pools differently from the connection's.
+    ///
+    /// Applied over the connection's own sizing field by field, so a role that
+    /// only raises `max_connections` keeps everything else. **Per host**: a
+    /// role with three hosts opens three pools of this size.
+    pub fn pool(mut self, pool: PoolSettings) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// The hosts this role names, which is empty when it takes the
+    /// connection's.
+    pub fn hosts(&self) -> &[String] {
+        &self.hosts
+    }
+
+    /// The port this role declared, when it declared one.
+    pub fn port_number(&self) -> Option<u16> {
+        self.port
+    }
+
+    /// How this role authenticates, when it says.
+    pub fn credential_source(&self) -> Option<&DatabaseCredentials> {
+        self.credentials.as_ref()
+    }
+
+    /// How this role sizes its pools, when it says.
+    pub fn pool_settings(&self) -> Option<&PoolSettings> {
+        self.pool.as_ref()
+    }
+
+    /// Whether this role says anything at all.
+    fn is_empty(&self) -> bool {
+        self.hosts.is_empty()
+            && self.port.is_none()
+            && self.credentials.is_none()
+            && self.pool.is_none()
+    }
+}
+
+/// Names the hosts and never the password.
+///
+/// Hand-written for the same reason [`ServerDatabase`]'s is: a role can carry
+/// its own credential, so a derived `Debug` would put a second password in the
+/// boot log of every process that started.
+impl std::fmt::Debug for DatabaseRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseRole")
+            .field("hosts", &self.hosts)
+            .field("port", &self.port)
+            // `DatabaseCredentials`' own `Debug` names the username and
+            // redacts the rest.
+            .field("credentials", &self.credentials)
+            .field("pool", &self.pool)
+            .finish()
+    }
+}
+
+/// One endpoint of one role: where to dial, and who as.
+struct Endpoint<'a> {
+    host: &'a str,
+    port: Option<u16>,
+    credentials: &'a DatabaseCredentials,
 }
 
 impl ServerDatabase {
@@ -716,6 +1444,11 @@ impl ServerDatabase {
             collation: None,
             strict: None,
             ssl_ca: None,
+            read: None,
+            write: None,
+            sticky: None,
+            options: BTreeMap::new(),
+            pool: None,
         }
     }
 
@@ -801,6 +1534,78 @@ impl ServerDatabase {
         self
     }
 
+    /// Send reads to this role rather than to the connection's own host.
+    ///
+    /// Declaring either role splits the connection. What the other role does
+    /// not name it takes from here, so `read` alone means "replicas there,
+    /// writes where they already went".
+    ///
+    /// A read arriving before its write has replicated is answered from before
+    /// the write, silently — [`sticky`](Self::sticky) is the setting for that,
+    /// and [`crate::sticky`] is what it costs and covers.
+    pub fn read(mut self, role: DatabaseRole) -> Self {
+        self.read = Some(role);
+        self
+    }
+
+    /// Send writes to this role rather than to the connection's own host.
+    pub fn write(mut self, role: DatabaseRole) -> Self {
+        self.write = Some(role);
+        self
+    }
+
+    /// After a write, read from the endpoint that took it — within a
+    /// [scope](crate::sticky).
+    ///
+    /// Needs a [`read`](Self::read) or [`write`](Self::write) role beside it:
+    /// on a connection with one endpoint there is nothing for a read to be
+    /// stale against, and the setting is refused rather than accepted and
+    /// ignored.
+    ///
+    /// Read [`crate::sticky`] before declaring it. It is not free and it is not
+    /// automatic: a sticky connection that no scope is tracking serves its
+    /// reads from the write endpoint, because the alternative is the stale row
+    /// the setting exists to prevent.
+    pub fn sticky(mut self, sticky: bool) -> Self {
+        self.sticky = Some(sticky);
+        self
+    }
+
+    /// A parameter for the driver's own URL parser.
+    ///
+    /// The escape hatch for a setting this section has no field for —
+    /// `ssl-mode`, `application_name`, a client certificate. Only the keys the
+    /// engine's parser actually reads are accepted: sqlx ignores one it does
+    /// not recognise without failing, so a passthrough would let a file declare
+    /// a TLS mode under a spelling that never reaches the driver and connect
+    /// unverified anyway.
+    ///
+    /// A key some other setting on this connection already settles — `charset`,
+    /// `socket`, `dbname` — is refused as the second answer it would be.
+    pub fn option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.options.insert(key.into(), value.into());
+        self
+    }
+
+    /// Several [`option`](Self::option)s at once.
+    pub fn options(
+        mut self,
+        options: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.options.extend(options.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self
+    }
+
+    /// Size this connection's pool.
+    ///
+    /// Applied over what the connection would have used anyway, field by field
+    /// — see [`PoolSettings`] and this module's header. A role may override it
+    /// for its own half.
+    pub fn pool(mut self, pool: PoolSettings) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
     /// Which engine this speaks.
     pub fn driver(&self) -> DatabaseDriver {
         self.driver
@@ -851,12 +1656,84 @@ impl ServerDatabase {
         self.ssl_ca.as_deref()
     }
 
+    /// Where this connection's reads go, when they go somewhere of their own.
+    pub fn read_role(&self) -> Option<&DatabaseRole> {
+        self.read.as_ref()
+    }
+
+    /// Where this connection's writes go, when they go somewhere of their own.
+    pub fn write_role(&self) -> Option<&DatabaseRole> {
+        self.write.as_ref()
+    }
+
+    /// Whether this connection reaches its reads and writes through different
+    /// endpoints.
+    pub fn is_split(&self) -> bool {
+        self.read.is_some() || self.write.is_some()
+    }
+
+    /// Whether a write pins this connection's reads for the rest of the
+    /// [scope](crate::sticky).
+    pub fn is_sticky(&self) -> bool {
+        self.sticky.unwrap_or(false)
+    }
+
+    /// The driver parameters this connection declared.
+    pub fn driver_options(&self) -> &BTreeMap<String, String> {
+        &self.options
+    }
+
+    /// How this connection sizes its pools, ignoring any role.
+    pub fn pool_settings(&self) -> Option<&PoolSettings> {
+        self.pool.as_ref()
+    }
+
+    /// One role's fully resolved pool.
+    ///
+    /// Three layers, each one only saying what it changes: what a connection
+    /// gets with no `pool` at all, then this connection's, then this role's.
+    /// That is what lets a role raise `max_connections` alone and keep the
+    /// timeouts the connection settled.
+    fn resolved_pool(&self, which: Which) -> rainier_orm::PoolConfig {
+        // A server connection is never the in-memory SQLite database the base
+        // exists to protect.
+        let mut pool = base_pool(false);
+        if let Some(connection) = &self.pool {
+            pool = connection.applied_to(pool);
+        }
+        let role = match which {
+            Which::Read => self.read.as_ref(),
+            Which::Write => self.write.as_ref(),
+        };
+        if let Some(role) = role.and_then(|role| role.pool.as_ref()) {
+            pool = role.applied_to(pool);
+        }
+        pool
+    }
+
     /// The server this connects to, with any credentials removed.
     ///
     /// Enough to tell two connections apart in a log, and not enough to
     /// authenticate with.
+    ///
+    /// A split connection renders the hosts **writes** go to, comma-separated
+    /// where there is more than one — the endpoint that defines which database
+    /// this is. It is a description rather than a connection string, which is
+    /// all this has ever been; the read hosts are in this type's `Debug`, and
+    /// each endpoint's real DSN comes from
+    /// [`DatabaseConfig::write_dsns`](DatabaseConfig::write_dsns) and
+    /// [`read_dsns`](DatabaseConfig::read_dsns).
     pub fn url_without_credentials(&self) -> String {
-        format!("{}://{}/{}", self.driver.scheme(), self.authority(), self.database)
+        let authority = if self.is_split() {
+            self.endpoints(Which::Write)
+                .iter()
+                .map(|endpoint| self.authority_of(endpoint))
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            self.authority()
+        };
+        format!("{}://{}/{}", self.driver.scheme(), authority, self.database)
     }
 
     /// `host:port`, with the engine's standard port when none was declared —
@@ -877,6 +1754,47 @@ impl ServerDatabase {
             Some(port) => format!("{}:{port}", self.host),
             None => self.host.clone(),
         }
+    }
+
+    /// The same, for one endpoint of one role.
+    fn authority_of(&self, endpoint: &Endpoint<'_>) -> String {
+        if let Some(socket) = &self.socket {
+            return encode(socket);
+        }
+        match endpoint.port.or_else(|| self.driver.default_port()) {
+            Some(port) => format!("{}:{port}", endpoint.host),
+            None => endpoint.host.to_string(),
+        }
+    }
+
+    /// Every endpoint of one role, in the order they were declared.
+    ///
+    /// Resolution is one rule applied three times: what the role names, or what
+    /// the connection names. That is what lets `read` name only its hosts, or
+    /// only its credentials, and be understood either way — and it is why a
+    /// role cannot name a `database`, because the one field where "or what the
+    /// connection names" would be a *different database* is not a field a role
+    /// has.
+    ///
+    /// A connection with no roles has exactly one endpoint and it is the
+    /// connection itself, which is why nothing below this line behaves
+    /// differently for one.
+    fn endpoints(&self, which: Which) -> Vec<Endpoint<'_>> {
+        let role = match which {
+            Which::Read => self.read.as_ref(),
+            Which::Write => self.write.as_ref(),
+        };
+
+        let credentials =
+            role.and_then(|role| role.credentials.as_ref()).unwrap_or(&self.credentials);
+        let port = role.and_then(|role| role.port).or(self.port);
+
+        let hosts: &[String] = match role {
+            Some(role) if !role.hosts.is_empty() => &role.hosts,
+            _ => std::slice::from_ref(&self.host),
+        };
+
+        hosts.iter().map(|host| Endpoint { host, port, credentials }).collect()
     }
 
     /// The settings the driver reads off the connection string's query.
@@ -908,6 +1826,13 @@ impl ServerDatabase {
             // One spelling for both: `ssl-ca` is MySQL's name for it and one of
             // PostgreSQL's accepted aliases for `sslrootcert`.
             params.push(format!("ssl-ca={}", encode(ca)));
+        }
+
+        // Last, and in a stable order. Each of these was checked against the
+        // list of parameters this driver's URL parser actually reads when the
+        // declaration was validated, so nothing here is rendered and dropped.
+        for (key, value) in &self.options {
+            params.push(format!("{}={}", encode(key), encode(value)));
         }
 
         if params.is_empty() {
@@ -943,7 +1868,16 @@ impl ServerDatabase {
                 self.driver, self.database
             )));
         }
-        if self.socket.is_none() && self.host.trim().is_empty() {
+        if self.socket.is_some() && self.is_split() {
+            return Err(Error::internal(format!(
+                "the `{}` connection to `{}` declares a `unix_socket` and also a `read` or `write` \
+                 role; a socket reaches one server on this machine and a role names another one, \
+                 so one of the two would be opened and the other read by whoever changes the file \
+                 next",
+                self.driver, self.database
+            )));
+        }
+        if self.socket.is_none() && !self.is_split() && self.host.trim().is_empty() {
             return Err(Error::internal(format!(
                 "the `{}` connection to `{}` declares no `host` or `unix_socket`; a guessed host \
                  is a different database, and the obvious guess is one that very often exists and \
@@ -951,6 +1885,73 @@ impl ServerDatabase {
                 self.driver, self.database
             )));
         }
+        for which in [Which::Write, Which::Read] {
+            if self.socket.is_none()
+                && self.is_split()
+                && self.endpoints(which).iter().any(|endpoint| endpoint.host.trim().is_empty())
+            {
+                return Err(Error::internal(format!(
+                    "the `{}` connection to `{}` splits its reads from its writes, and its `{}` \
+                     role resolves to no host: the role names none and neither does the \
+                     connection. Taking the other role's host would put writes on a replica, or \
+                     reads on the primary the split exists to spare, without saying so",
+                    self.driver,
+                    self.database,
+                    which.name()
+                )));
+            }
+        }
+        for (which, role) in
+            [(Which::Read, self.read.as_ref()), (Which::Write, self.write.as_ref())]
+        {
+            let Some(role) = role else { continue };
+            if role.is_empty() {
+                return Err(Error::internal(format!(
+                    "the `{}` connection to `{}` declares an empty `{}`; it names no host, no port \
+                     and no credentials, so it says nothing the connection does not already say \
+                     — while reading, to everyone who opens the file, as a split that is not one",
+                    self.driver,
+                    self.database,
+                    which.name()
+                )));
+            }
+            if role.hosts.iter().any(|host| host.trim().is_empty()) {
+                return Err(Error::internal(format!(
+                    "the `{}` connection to `{}` declares an empty host in its `{}`; there is \
+                     nothing there to dial",
+                    self.driver,
+                    self.database,
+                    which.name()
+                )));
+            }
+        }
+        if self.sticky.is_some() && !self.is_split() {
+            return Err(Error::internal(format!(
+                "the `{}` connection to `{}` declares `sticky` and neither a `read` nor a `write` \
+                 role; `sticky` sends the reads that follow a write to the endpoint that took it, \
+                 and this connection has one endpoint — so there is nothing for a read to be \
+                 stale against and nothing for the setting to do",
+                self.driver, self.database
+            )));
+        }
+        if self.pool.as_ref().is_some_and(PoolSettings::is_empty) {
+            return Err(empty_pool());
+        }
+        for (which, role) in [(Which::Read, &self.read), (Which::Write, &self.write)] {
+            if role.as_ref().and_then(|role| role.pool.as_ref()).is_some_and(PoolSettings::is_empty)
+            {
+                return Err(Error::internal(format!(
+                    "the `{}` role declares an empty `pool`; it names nothing, so this role is \
+                     sized exactly as the connection is — while reading as sizing of its own",
+                    which.name()
+                )));
+            }
+            // Resolved rather than as-declared, because a role that raises only
+            // `min_connections` is a floor checked against a ceiling the
+            // connection set two lines earlier.
+            check_pool(&self.resolved_pool(which), &format!("`{}` role's", which.name()))?;
+        }
+        self.reject_options_the_driver_would_not_read()?;
         if self.socket.as_ref().is_some_and(|socket| socket.trim().is_empty()) {
             return Err(Error::internal(format!(
                 "the `{}` connection to `{}` declares an empty `unix_socket`; there is no path to \
@@ -999,14 +2000,76 @@ impl ServerDatabase {
         Ok(())
     }
 
+    /// Refuse an `options` key that would not reach the driver, or that some
+    /// other setting on this connection already answers.
+    ///
+    /// The whole reason `options` is checked rather than passed through: sqlx's
+    /// MySQL parser drops a parameter it does not recognise and its PostgreSQL
+    /// one logs and carries on. Neither refuses. So `sslMode=VERIFY_CA` —
+    /// right value, wrong spelling — is a connection that is *not* verifying
+    /// anything, with the setting sitting in the file being reviewed.
+    fn reject_options_the_driver_would_not_read(&self) -> Result<()> {
+        for key in self.options.keys() {
+            // Compared exactly, because that is how the driver compares it. Both
+            // parsers match a query parameter's name literally, so `sslMode` is
+            // not a spelling of `ssl-mode` — it is a parameter neither of them
+            // has ever heard of, silently dropped, and a connection that is not
+            // verifying anything while the file says `VERIFY_CA`.
+            let key = key.as_str();
+
+            if let Some(setting) = setting_that_already_answers(key) {
+                return Err(Error::internal(format!(
+                    "the `{}` connection to `{}` declares the option `{key}`, which is the same \
+                     question `{setting}` answers on this connection. Two spellings of one \
+                     setting means one of them is ignored, and which one is not visible from the \
+                     file — declare `{setting}`",
+                    self.driver, self.database
+                )));
+            }
+
+            if !reads_option(self.driver, key) {
+                return Err(Error::internal(format!(
+                    "the `{}` driver does not read the connection parameter `{key}`; it is \
+                     dropped on arrival without failing, so the connection would be opened \
+                     without it while the file says otherwise. The parameters this driver reads \
+                     are {}",
+                    self.driver,
+                    driver_options(self.driver)
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The connection string this opens. Carries the password inline.
+    ///
+    /// The **write** endpoint of a split connection, and the first of them when
+    /// the role names several: the one string that can run any statement. Every
+    /// endpoint is in [`role_dsns`](Self::role_dsns).
     fn dsn(&self) -> Result<String> {
         self.validate()?;
 
+        let endpoints = self.endpoints(Which::Write);
+        let first = endpoints.first().expect("`validate` refuses a role with no endpoint");
+        Ok(self.dsn_of(first))
+    }
+
+    /// Every connection string one role opens, in declaration order.
+    fn role_dsns(&self, which: Which) -> Result<Vec<String>> {
+        self.validate()?;
+        Ok(self.endpoints(which).iter().map(|endpoint| self.dsn_of(endpoint)).collect())
+    }
+
+    /// One endpoint as a connection string. Carries the password inline.
+    fn dsn_of(&self, endpoint: &Endpoint<'_>) -> String {
         // Percent-encoded, and this is not cosmetic: a password containing `@`
         // or `/` splits the URL somewhere else, and the host the driver then
         // dials is not the host that was declared.
-        let userinfo = match &self.credentials {
+        let userinfo = match endpoint.credentials {
             DatabaseCredentials::None => String::new(),
             DatabaseCredentials::User { username } => format!("{}@", encode(username)),
             DatabaseCredentials::Password { username, password } => {
@@ -1014,14 +2077,86 @@ impl ServerDatabase {
             }
         };
 
-        Ok(format!(
+        format!(
             "{}://{userinfo}{}/{}{}",
             self.driver.scheme(),
-            self.authority(),
+            self.authority_of(endpoint),
             encode(&self.database),
             self.query()
-        ))
+        )
     }
+}
+
+/// The connection parameters a driver's own URL parser reads, beyond the ones
+/// this section has a field for.
+///
+/// Taken from sqlx's `MySqlConnectOptions::from_url` and
+/// `PgConnectOptions::from_url`, which is the only list that matters: a
+/// parameter outside it is dropped by the parser, and a connection opened
+/// without a setting the file declares is exactly what refusing it prevents.
+/// It is a short list on purpose — a parameter added here is a promise that
+/// this build's driver reads it.
+fn driver_options(driver: DatabaseDriver) -> &'static [&'static str] {
+    match driver {
+        DatabaseDriver::MySql => &[
+            "ssl-mode",
+            "sslmode",
+            "ssl-cert",
+            "sslcert",
+            "ssl-key",
+            "sslkey",
+            "statement-cache-capacity",
+            "timezone",
+            "time-zone",
+        ],
+        DatabaseDriver::Postgres => &[
+            "ssl-mode",
+            "sslmode",
+            "ssl-cert",
+            "sslcert",
+            "ssl-key",
+            "sslkey",
+            "statement-cache-capacity",
+            "application_name",
+            "options",
+        ],
+        // Never reached: a SQLite connection is refused an `options` map
+        // before this, because its shape has no host to hang parameters off —
+        // a file that wants `mode=` or `vfs=` writes them into a `url`.
+        DatabaseDriver::Sqlite => &[],
+    }
+}
+
+/// Whether this driver's parser reads `key`.
+fn reads_option(driver: DatabaseDriver, key: &str) -> bool {
+    if driver_options(driver).contains(&key) {
+        return true;
+    }
+    // PostgreSQL's per-parameter form, `options[search_path]`, which is a
+    // family rather than a name.
+    driver == DatabaseDriver::Postgres && key.starts_with("options[") && key.ends_with(']')
+}
+
+/// The setting on this connection that already answers `key`, if one does.
+///
+/// Refused with its own message rather than as an unread parameter, because
+/// these *would* reach the driver — which is what makes them dangerous. A
+/// `dbname` in `options` beside a `database` field is two names for the
+/// database this connection opens, and the one that loses is the one still
+/// being read by whoever repoints the connection next.
+fn setting_that_already_answers(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "charset" => "charset",
+        "collation" => "collation",
+        "socket" => "unix_socket",
+        "ssl-ca" | "sslca" | "sslrootcert" | "ssl-root-cert" => "ssl_ca",
+        "host" | "hostaddr" => "host",
+        "port" => "port",
+        "dbname" => "database",
+        "user" => "username",
+        "password" => "password",
+        _ => return None,
+    })
 }
 
 /// `SET SESSION sql_mode = …`, adding or removing MySQL's strict modes and
@@ -1063,14 +2198,33 @@ fn strict_sql_mode(strict: bool) -> String {
 /// that started.
 impl std::fmt::Debug for ServerDatabase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServerDatabase")
-            .field("driver", &self.driver)
+        let mut out = f.debug_struct("ServerDatabase");
+        out.field("driver", &self.driver)
             .field("url", &self.url_without_credentials())
             // The credential is deliberately absent rather than redacted in
             // place: see `DatabaseCredentials`, whose own `Debug` names the
             // username and nothing else.
-            .field("credentials", &self.credentials)
-            .finish()
+            .field("credentials", &self.credentials);
+
+        // Only when there is something to say, so an ordinary connection's
+        // dump reads exactly as it did before splitting existed. A role's own
+        // `Debug` redacts its own password.
+        if let Some(read) = &self.read {
+            out.field("read", read);
+        }
+        if let Some(write) = &self.write {
+            out.field("write", write);
+        }
+        if self.is_split() {
+            out.field("sticky", &self.is_sticky());
+        }
+        if !self.options.is_empty() {
+            // Keys only. Every value here reached the allow-list, and nothing
+            // on it is a secret today — but `options` is the field a password
+            // will eventually be smuggled through, and a dump is a log line.
+            out.field("options", &self.options.keys().collect::<Vec<_>>());
+        }
+        out.finish()
     }
 }
 
@@ -1143,6 +2297,9 @@ pub struct DsnDatabase {
     url: String,
     /// `None` leaves MySQL's `sql_mode` alone. See [`ServerDatabase::strict`].
     strict: Option<bool>,
+    /// How this connection's pool is sized — the second setting no connection
+    /// string can carry. See [`ServerDatabase::pool`].
+    pool: Option<PoolSettings>,
 }
 
 impl DsnDatabase {
@@ -1151,7 +2308,7 @@ impl DsnDatabase {
     /// Use when the driver is already known. [`from_url`](Self::from_url) reads
     /// it off the scheme instead, which is what a bare `DATABASE_URL` needs.
     pub fn new(driver: DatabaseDriver, url: impl Into<String>) -> Self {
-        Self { driver, url: url.into(), strict: None }
+        Self { driver, url: url.into(), strict: None, pool: None }
     }
 
     /// Whether an over-long or out-of-range value is an error. MySQL only.
@@ -1169,6 +2326,31 @@ impl DsnDatabase {
         self.strict
     }
 
+    /// Size this connection's pool.
+    ///
+    /// The other setting a DSN cannot carry, and so the other one that may be
+    /// declared beside it — which matters here more than anywhere, because one
+    /// injected `DATABASE_URL` is the shape most deployments get and a pool
+    /// nobody can size is a pool sized for somebody else's process count.
+    pub fn pool(mut self, pool: PoolSettings) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// How this connection sizes its pool, when it says.
+    pub fn pool_settings(&self) -> Option<&PoolSettings> {
+        self.pool.as_ref()
+    }
+
+    /// This connection's fully resolved pool.
+    fn resolved_pool(&self) -> rainier_orm::PoolConfig {
+        let base = base_pool(is_in_memory(&self.url));
+        match &self.pool {
+            Some(pool) => pool.applied_to(base),
+            None => base,
+        }
+    }
+
     /// SQL run on every connection this declaration's pool opens.
     fn session_statements(&self) -> Vec<String> {
         self.strict.map(|strict| vec![strict_sql_mode(strict)]).unwrap_or_default()
@@ -1176,6 +2358,17 @@ impl DsnDatabase {
 
     /// Whether this declaration can be opened.
     fn validate(&self) -> Result<()> {
+        if let Some(pool) = &self.pool {
+            if pool.is_empty() {
+                return Err(empty_pool());
+            }
+        }
+        let resolved = self.resolved_pool();
+        check_pool(&resolved, "connection's")?;
+        if is_in_memory(&self.url) {
+            check_in_memory_pool(&resolved)?;
+        }
+
         if self.strict.is_some() && self.driver != DatabaseDriver::MySql {
             return Err(Error::internal(format!(
                 "the `{}` driver has no `strict` mode; it is MySQL's `sql_mode`, and accepting the \
@@ -1264,6 +2457,9 @@ impl std::fmt::Debug for DsnDatabase {
 #[derive(Clone, Debug)]
 pub struct SqliteDatabase {
     database: String,
+    /// How this connection's pool is sized. Heavily constrained when the
+    /// database is in memory — see [`check_in_memory_pool`].
+    pool: Option<PoolSettings>,
 }
 
 impl SqliteDatabase {
@@ -1276,7 +2472,7 @@ impl SqliteDatabase {
     /// default. A deployment that wants the file created says so, as a
     /// [`DsnDatabase`] with the `mode` it means.
     pub fn new(path: impl Into<String>) -> Self {
-        Self { database: path.into() }
+        Self { database: path.into(), pool: None }
     }
 
     /// A database in memory, for tests.
@@ -1287,7 +2483,47 @@ impl SqliteDatabase {
     /// because a pool that opens a second connection opens a second *database*
     /// — empty, and answering rather than failing.
     pub fn in_memory() -> Self {
-        Self { database: ":memory:".to_string() }
+        Self { database: ":memory:".to_string(), pool: None }
+    }
+
+    /// Size this connection's pool.
+    ///
+    /// Almost entirely constrained when the database is in memory: it *is* the
+    /// connection, so the pool is one connection kept for the life of the
+    /// process, and a declaration that would change that is refused rather than
+    /// applied. On a file it is an ordinary pool like any other.
+    pub fn pool(mut self, pool: PoolSettings) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// How this connection sizes its pool, when it says.
+    pub fn pool_settings(&self) -> Option<&PoolSettings> {
+        self.pool.as_ref()
+    }
+
+    /// This connection's fully resolved pool.
+    fn resolved_pool(&self) -> rainier_orm::PoolConfig {
+        let base = base_pool(self.is_in_memory());
+        match &self.pool {
+            Some(pool) => pool.applied_to(base),
+            None => base,
+        }
+    }
+
+    /// Whether this declaration can be opened.
+    fn validate(&self) -> Result<()> {
+        if let Some(pool) = &self.pool {
+            if pool.is_empty() {
+                return Err(empty_pool());
+            }
+        }
+        let resolved = self.resolved_pool();
+        check_pool(&resolved, "connection's")?;
+        if self.is_in_memory() {
+            check_in_memory_pool(&resolved)?;
+        }
+        Ok(())
     }
 
     /// The path, or `:memory:`, this was declared with.
@@ -1432,6 +2668,16 @@ struct RawDatabase {
     unix_socket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ssl_ca: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    read: Option<RawRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    write: Option<RawRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sticky: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    options: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool: Option<PoolSettings>,
 
     // Named here so that declaring one is refused with the reason rather than
     // as an unknown key. A section ported from a framework that has them is
@@ -1448,6 +2694,145 @@ struct RawDatabase {
     engine: Option<String>,
 }
 
+/// One half of a split connection, as it is written down.
+///
+/// The four fields a role may differ in, plus the three it is refused by name
+/// — a role that named its own `driver`, `database` or `unix_socket` would be
+/// pointed at a different database, which is this module's headline failure
+/// wearing a `read` key. `deny_unknown_fields` would refuse them anyway, and
+/// with a message about spelling rather than about what would happen.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRole {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<RoleHosts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool: Option<PoolSettings>,
+
+    #[serde(default, skip_serializing)]
+    driver: Option<String>,
+    #[serde(default, skip_serializing)]
+    database: Option<String>,
+    #[serde(default, skip_serializing)]
+    unix_socket: Option<String>,
+}
+
+/// One host, or several. Both spellings are in the wild and both mean the same
+/// thing, so both are read; one host is written back as one.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum RoleHosts {
+    /// `"host": "replica.example.com"`.
+    One(String),
+    /// `"host": ["replica-a.example.com", "replica-b.example.com"]`.
+    Many(Vec<String>),
+}
+
+impl RoleHosts {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(host) => vec![host],
+            Self::Many(hosts) => hosts,
+        }
+    }
+
+    fn from_vec(hosts: Vec<String>) -> Option<Self> {
+        match hosts.len() {
+            0 => None,
+            1 => Some(Self::One(hosts.into_iter().next().expect("just checked"))),
+            _ => Some(Self::Many(hosts)),
+        }
+    }
+}
+
+impl RawRole {
+    /// This role, checked.
+    ///
+    /// # Errors
+    ///
+    /// When it names something a role may not name, or a `password` with
+    /// nobody to own it.
+    fn into_role(self, which: Which) -> Result<DatabaseRole> {
+        let misplaced: Vec<&str> = [
+            ("driver", self.driver.is_some()),
+            ("database", self.database.is_some()),
+            ("unix_socket", self.unix_socket.is_some()),
+        ]
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(name, _)| *name)
+        .collect();
+
+        if !misplaced.is_empty() {
+            return Err(Error::internal(format!(
+                "the `{}` role declares {}; a role says which *servers* this half of the \
+                 connection reaches, and nothing about what is in them. A role on another driver \
+                 renders its SQL in the wrong dialect, and a role on another database answers \
+                 every query it is given — correctly, about rows that belong to something else",
+                which.name(),
+                misplaced.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ")
+            )));
+        }
+
+        let credentials = match (self.username, self.password) {
+            (None, None) => None,
+            (Some(username), None) => Some(DatabaseCredentials::User { username }),
+            (Some(username), Some(password)) => {
+                Some(DatabaseCredentials::Password { username, password })
+            }
+            // The same refusal the connection itself makes, for the same
+            // reason: there is nobody for the password to belong to, so it is
+            // dropped and this half of the connection authenticates as
+            // whatever ambient user the environment supplies.
+            (None, Some(_)) => {
+                return Err(Error::internal(format!(
+                    "the `{}` role declares a `password` and no `username`; there is nobody for it \
+                     to belong to, so it would be dropped and this half of the connection would \
+                     authenticate as whatever ambient user the environment supplies",
+                    which.name()
+                )))
+            }
+        };
+
+        Ok(DatabaseRole {
+            hosts: self.host.map(RoleHosts::into_vec).unwrap_or_default(),
+            port: self.port,
+            credentials,
+            pool: self.pool,
+        })
+    }
+}
+
+impl From<DatabaseRole> for RawRole {
+    fn from(role: DatabaseRole) -> Self {
+        let (username, password) = match role.credentials {
+            None | Some(DatabaseCredentials::None) => (None, None),
+            Some(DatabaseCredentials::User { username }) => (Some(username), None),
+            Some(DatabaseCredentials::Password { username, password }) => {
+                (Some(username), Some(password))
+            }
+        };
+
+        Self {
+            host: RoleHosts::from_vec(role.hosts),
+            port: role.port,
+            username,
+            password,
+            pool: role.pool,
+            // Nothing reads these, so the checked form never held one.
+            driver: None,
+            database: None,
+            unix_socket: None,
+        }
+    }
+}
+
 impl RawDatabase {
     /// Refuse settings this driver would ignore.
     ///
@@ -1457,7 +2842,7 @@ impl RawDatabase {
     /// how that belief survives to production, where it looks like a database
     /// that has lost everything since the last deploy.
     fn reject_settings_it_ignores(&self, used: &[&str]) -> Result<()> {
-        let declared: [(&str, bool); 11] = [
+        let declared: [(&str, bool); 16] = [
             ("url", self.url.is_some()),
             ("host", self.host.is_some()),
             ("port", self.port.is_some()),
@@ -1469,6 +2854,11 @@ impl RawDatabase {
             ("strict", self.strict.is_some()),
             ("unix_socket", self.unix_socket.is_some()),
             ("ssl_ca", self.ssl_ca.is_some()),
+            ("read", self.read.is_some()),
+            ("write", self.write.is_some()),
+            ("sticky", self.sticky.is_some()),
+            ("options", !self.options.is_empty()),
+            ("pool", self.pool.is_some()),
         ];
 
         let ignored: Vec<String> = declared
@@ -1503,7 +2893,9 @@ impl RawDatabase {
 
         // `strict` is deliberately absent: it is the one setting a connection
         // string has no parameter for, so declaring it beside a `url` is not
-        // two answers to one question — see `DsnDatabase`.
+        // two answers to one question — see `DsnDatabase`. `read`, `write` and
+        // `options` are not in that position: a DSN is one endpoint and carries
+        // its own query string.
         let also: Vec<String> = [
             ("host", self.host.is_some()),
             ("port", self.port.is_some()),
@@ -1514,6 +2906,7 @@ impl RawDatabase {
             ("collation", self.collation.is_some()),
             ("unix_socket", self.unix_socket.is_some()),
             ("ssl_ca", self.ssl_ca.is_some()),
+            ("options", !self.options.is_empty()),
         ]
         .iter()
         .filter(|(_, present)| *present)
@@ -1529,6 +2922,40 @@ impl RawDatabase {
              credentials and the driver's own parameters inline, so one of the two is ignored — \
              and which one is not visible from the file. Declare either the URL or the fields, not \
              both",
+            also.join(", ")
+        )))
+    }
+
+    /// Refuse a split written down beside a `url`.
+    ///
+    /// Its own rejection, because this one is not two answers to one question:
+    /// a DSN names one endpoint and there is no spelling of a second inside it,
+    /// so the roles would simply not happen. A split connection is written as
+    /// discrete fields.
+    fn reject_a_split_beside_a_url(&self) -> Result<()> {
+        if self.url.is_none() {
+            return Ok(());
+        }
+
+        let also: Vec<String> = [
+            ("read", self.read.is_some()),
+            ("write", self.write.is_some()),
+            ("sticky", self.sticky.is_some()),
+        ]
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(name, _)| format!("`{name}`"))
+        .collect();
+
+        if also.is_empty() {
+            return Ok(());
+        }
+
+        Err(Error::internal(format!(
+            "this connection declares `url` and also {}; a connection string names one endpoint \
+             and has no room for a second, so the split would be read by everyone who opens the \
+             file and would never happen. A connection that separates its reads from its writes \
+             is written as `host`, `database` and the roles beside them",
             also.join(", ")
         )))
     }
@@ -1604,6 +3031,7 @@ impl TryFrom<RawDatabase> for DatabaseConfig {
 
         // Checked before the driver's own settings, because a `url` beside a
         // `host` has a reason of its own and `does not use` would not be it.
+        raw.reject_a_split_beside_a_url()?;
         raw.reject_a_url_beside_its_own_parts()?;
         raw.reject_a_socket_beside_a_host()?;
 
@@ -1615,13 +3043,19 @@ impl TryFrom<RawDatabase> for DatabaseConfig {
             if let Some(strict) = raw.strict {
                 dsn = dsn.strict(strict);
             }
+            if let Some(pool) = raw.pool {
+                dsn = dsn.pool(pool);
+            }
             dsn.validate()?;
             return Ok(Self::Dsn(dsn));
         }
 
         match raw.driver {
             DatabaseDriver::Sqlite => {
-                raw.reject_settings_it_ignores(&["url", "database"])?;
+                // `pool` is here rather than refused: a file database pools
+                // like any other, and the in-memory one is checked against what
+                // it can survive rather than told it may not be sized.
+                raw.reject_settings_it_ignores(&["url", "database", "pool"])?;
 
                 let database = raw.database.ok_or_else(|| {
                     Error::internal(
@@ -1630,7 +3064,9 @@ impl TryFrom<RawDatabase> for DatabaseConfig {
                          and answers every query with no rows",
                     )
                 })?;
-                Ok(Self::Sqlite(SqliteDatabase::new(database)))
+                let sqlite = SqliteDatabase { database, pool: raw.pool };
+                sqlite.validate()?;
+                Ok(Self::Sqlite(sqlite))
             }
 
             driver => {
@@ -1647,17 +3083,30 @@ impl TryFrom<RawDatabase> for DatabaseConfig {
                     "password",
                     "unix_socket",
                     "ssl_ca",
+                    "read",
+                    "write",
+                    "sticky",
+                    "options",
+                    "pool",
                 ];
                 if driver == DatabaseDriver::MySql {
                     used.extend(["charset", "collation", "strict"]);
                 }
                 raw.reject_settings_it_ignores(&used)?;
 
-                let host = match (raw.host, &raw.unix_socket) {
-                    (Some(host), _) => host,
+                let read = raw.read.map(|role| role.into_role(Which::Read)).transpose()?;
+                let write = raw.write.map(|role| role.into_role(Which::Write)).transpose()?;
+                let split = read.is_some() || write.is_some();
+
+                let host = match (raw.host, &raw.unix_socket, split) {
+                    (Some(host), _, _) => host,
                     // A socket is the address, so there is no host to require.
-                    (None, Some(_)) => String::new(),
-                    (None, None) => {
+                    (None, Some(_), _) => String::new(),
+                    // The roles carry the addresses. Whether they carry enough
+                    // of them is `ServerDatabase::validate`'s question, and it
+                    // answers it per role rather than for the connection.
+                    (None, None, true) => String::new(),
+                    (None, None, false) => {
                         return Err(Error::internal(format!(
                             "a `{driver}` connection needs a `host` to connect to, a `unix_socket` \
                              to open, or a `url` that names one"
@@ -1704,6 +3153,11 @@ impl TryFrom<RawDatabase> for DatabaseConfig {
                     collation: raw.collation,
                     strict: raw.strict,
                     ssl_ca: raw.ssl_ca,
+                    read,
+                    write,
+                    sticky: raw.sticky,
+                    options: raw.options,
+                    pool: raw.pool,
                 };
                 server.validate()?;
 
@@ -1728,6 +3182,11 @@ impl From<DatabaseConfig> for RawDatabase {
             strict: None,
             unix_socket: None,
             ssl_ca: None,
+            read: None,
+            write: None,
+            sticky: None,
+            options: BTreeMap::new(),
+            pool: None,
             // Nothing reads these, so the checked form never held one and
             // there is nothing to write back out.
             prefix: None,
@@ -1737,12 +3196,14 @@ impl From<DatabaseConfig> for RawDatabase {
 
         match database {
             DatabaseConfig::Dsn(dsn) => {
-                Self { url: Some(dsn.url), strict: dsn.strict, ..blank(dsn.driver) }
+                Self { url: Some(dsn.url), strict: dsn.strict, pool: dsn.pool, ..blank(dsn.driver) }
             }
 
-            DatabaseConfig::Sqlite(sqlite) => {
-                Self { database: Some(sqlite.database), ..blank(DatabaseDriver::Sqlite) }
-            }
+            DatabaseConfig::Sqlite(sqlite) => Self {
+                database: Some(sqlite.database),
+                pool: sqlite.pool,
+                ..blank(DatabaseDriver::Sqlite)
+            },
 
             DatabaseConfig::Server(server) => {
                 let (username, password) = match server.credentials {
@@ -1754,8 +3215,13 @@ impl From<DatabaseConfig> for RawDatabase {
                 };
                 // A socket connection has no host to write back: it was never
                 // declared, and rendering an empty one would round-trip into a
-                // declaration that is refused.
-                let host = server.socket.is_none().then_some(server.host);
+                // declaration that is refused. Nor has a split whose roles
+                // carry every address between them.
+                let host = server
+                    .socket
+                    .is_none()
+                    .then_some(server.host)
+                    .filter(|host| !host.trim().is_empty());
                 Self {
                     host,
                     port: server.port,
@@ -1767,6 +3233,11 @@ impl From<DatabaseConfig> for RawDatabase {
                     strict: server.strict,
                     unix_socket: server.socket,
                     ssl_ca: server.ssl_ca,
+                    read: server.read.map(RawRole::from),
+                    write: server.write.map(RawRole::from),
+                    sticky: server.sticky,
+                    options: server.options,
+                    pool: server.pool,
                     ..blank(server.driver)
                 }
             }
@@ -2760,5 +4231,850 @@ mod tests {
         // And a name nobody declared is still not the default.
         assert!(manager.connection("reporting").is_none());
         assert!(manager.resolve(Some("reporting")).is_err());
+    }
+
+    // --- splitting reads from writes ----------------------------------------
+
+    /// The declaration filed under `primary`, or the error reading it.
+    fn connection(declaration: serde_json::Value) -> Result<DatabaseConfig> {
+        serde_json::from_value::<DatabaseConfig>(declaration)
+            .map_err(|e| Error::internal(e.to_string()))
+    }
+
+    #[test]
+    fn a_connection_that_names_no_role_is_the_connection_it_always_was() {
+        // The declaration every existing deployment has. One endpoint, and the
+        // same string it rendered before any of this existed.
+        let config = connection(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "username": "app",
+            "password": "secret",
+        }))
+        .expect("declared");
+
+        assert!(!config.is_split());
+        assert!(!config.is_sticky());
+        assert_eq!(config.write_dsns().unwrap(), vec![config.dsn().unwrap()]);
+        assert!(config.read_dsns().unwrap().is_empty(), "there is nowhere else to read from");
+        assert_eq!(config.dsn().unwrap(), "mysql://app:secret@db.example.com:3306/app");
+    }
+
+    #[test]
+    fn a_read_role_takes_the_reads_and_leaves_everything_else_where_it_was() {
+        let config = connection(json!({
+            "driver": "mysql",
+            "host": "writer.example.com",
+            "read": { "host": ["replica-a.example.com", "replica-b.example.com"] },
+            "database": "app",
+            "username": "app",
+            "password": "secret",
+        }))
+        .expect("declared");
+
+        assert!(config.is_split());
+
+        // The write role named nothing, so it is the connection's own host —
+        // and its credentials, its port and its database.
+        assert_eq!(
+            config.write_dsns().unwrap(),
+            vec!["mysql://app:secret@writer.example.com:3306/app"]
+        );
+        assert_eq!(
+            config.read_dsns().unwrap(),
+            vec![
+                "mysql://app:secret@replica-a.example.com:3306/app",
+                "mysql://app:secret@replica-b.example.com:3306/app",
+            ]
+        );
+    }
+
+    #[test]
+    fn one_host_and_a_list_of_one_are_the_same_declaration() {
+        let string = connection(json!({
+            "driver": "postgres",
+            "host": "writer.example.com",
+            "read": { "host": "replica.example.com" },
+            "database": "app",
+        }))
+        .expect("declared");
+        let list = connection(json!({
+            "driver": "postgres",
+            "host": "writer.example.com",
+            "read": { "host": ["replica.example.com"] },
+            "database": "app",
+        }))
+        .expect("declared");
+
+        assert_eq!(string.read_dsns().unwrap(), list.read_dsns().unwrap());
+        assert_eq!(string.read_dsns().unwrap(), vec!["postgres://replica.example.com:5432/app"]);
+    }
+
+    #[test]
+    fn a_role_may_authenticate_as_somebody_else_and_only_that_role_does() {
+        // The arrangement the replicas usually arrive in: same servers or
+        // different ones, reached as a read-only user.
+        let config = connection(json!({
+            "driver": "mysql",
+            "host": "writer.example.com",
+            "database": "app",
+            "username": "app",
+            "password": "secret",
+            "read": { "host": "replica.example.com", "username": "reader", "password": "other" },
+        }))
+        .expect("declared");
+
+        assert_eq!(
+            config.read_dsns().unwrap(),
+            vec!["mysql://reader:other@replica.example.com:3306/app"]
+        );
+        assert_eq!(
+            config.write_dsns().unwrap(),
+            vec!["mysql://app:secret@writer.example.com:3306/app"]
+        );
+    }
+
+    #[test]
+    fn a_role_may_differ_in_nothing_but_its_credentials() {
+        let config = connection(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "username": "app",
+            "password": "secret",
+            "read": { "username": "reader", "password": "other" },
+        }))
+        .expect("declared");
+
+        assert_eq!(
+            config.read_dsns().unwrap(),
+            vec!["mysql://reader:other@db.example.com:3306/app"]
+        );
+    }
+
+    #[test]
+    fn a_role_may_be_reached_on_its_own_port() {
+        let config = connection(json!({
+            "driver": "mysql",
+            "host": "writer.example.com",
+            "port": 3307,
+            "database": "app",
+            "read": { "host": "replica.example.com", "port": 3308 },
+        }))
+        .expect("declared");
+
+        assert_eq!(config.write_dsns().unwrap(), vec!["mysql://writer.example.com:3307/app"]);
+        assert_eq!(config.read_dsns().unwrap(), vec!["mysql://replica.example.com:3308/app"]);
+    }
+
+    #[test]
+    fn a_write_role_may_carry_every_address_and_leave_the_connection_none() {
+        let config = connection(json!({
+            "driver": "postgres",
+            "database": "app",
+            "read": { "host": ["replica-a.example.com", "replica-b.example.com"] },
+            "write": { "host": "writer.example.com" },
+        }))
+        .expect("declared");
+
+        assert_eq!(config.write_dsns().unwrap(), vec!["postgres://writer.example.com:5432/app"]);
+        assert_eq!(config.read_dsns().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_role_that_resolves_to_no_host_is_refused_by_name() {
+        // `write` names hosts and `read` does not, and neither does the
+        // connection: reads would have to borrow the primary, which is the one
+        // server the split exists to spare.
+        let err = connection(json!({
+            "driver": "mysql",
+            "database": "app",
+            "write": { "host": "writer.example.com" },
+            "read": { "username": "reader" },
+        }))
+        .expect_err("no host for the reads");
+
+        assert!(err.message().contains("`read`"), "{}", err.message());
+        assert!(err.message().contains("resolves to no host"), "{}", err.message());
+    }
+
+    #[test]
+    fn an_empty_role_is_refused_rather_than_read_as_a_split() {
+        let err = connection(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "read": {},
+        }))
+        .expect_err("an empty role");
+
+        assert!(err.message().contains("empty `read`"), "{}", err.message());
+    }
+
+    #[test]
+    fn sticky_with_nothing_to_be_sticky_about_is_refused() {
+        let err = connection(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "sticky": true,
+        }))
+        .expect_err("nothing to pin");
+
+        assert!(err.message().contains("`sticky`"), "{}", err.message());
+        assert!(err.message().contains("one endpoint"), "{}", err.message());
+
+        // …and beside a role it is a setting.
+        let config = connection(json!({
+            "driver": "mysql",
+            "host": "writer.example.com",
+            "database": "app",
+            "read": { "host": "replica.example.com" },
+            "sticky": true,
+        }))
+        .expect("declared");
+        assert!(config.is_sticky());
+    }
+
+    #[test]
+    fn a_role_that_names_another_database_or_driver_is_refused() {
+        for (field, value) in [
+            ("database", json!("reporting")),
+            ("driver", json!("postgres")),
+            ("unix_socket", json!("/tmp/x.sock")),
+        ] {
+            let err = connection(json!({
+                "driver": "mysql",
+                "host": "writer.example.com",
+                "database": "app",
+                "read": { "host": "replica.example.com", field: value },
+            }))
+            .expect_err("a role may not name it");
+
+            assert!(err.message().contains(field), "{}: {}", field, err.message());
+        }
+    }
+
+    #[test]
+    fn a_roles_password_with_nobody_to_own_it_is_refused_too() {
+        let err = connection(json!({
+            "driver": "mysql",
+            "host": "writer.example.com",
+            "database": "app",
+            "read": { "host": "replica.example.com", "password": "secret" },
+        }))
+        .expect_err("nobody to own it");
+
+        assert!(err.message().contains("`read`"), "{}", err.message());
+        assert!(err.message().contains("ambient user"), "{}", err.message());
+    }
+
+    #[test]
+    fn a_role_beside_a_socket_is_refused_rather_than_one_winning() {
+        let err = connection(json!({
+            "driver": "mysql",
+            "unix_socket": "/var/run/mysqld/mysqld.sock",
+            "database": "app",
+            "read": { "host": "replica.example.com" },
+        }))
+        .expect_err("a socket has no second endpoint");
+
+        assert!(err.message().contains("unix_socket"), "{}", err.message());
+        assert!(err.message().contains("read"), "{}", err.message());
+    }
+
+    #[test]
+    fn a_split_beside_a_url_is_refused_because_a_dsn_names_one_endpoint() {
+        for field in ["read", "write"] {
+            let err = connection(json!({
+                "driver": "mysql",
+                "url": "mysql://db.example.com/app",
+                field: { "host": "replica.example.com" },
+            }))
+            .expect_err("a DSN has no room for a second endpoint");
+
+            assert!(err.message().contains(field), "{}", err.message());
+            assert!(err.message().contains("one endpoint"), "{}", err.message());
+        }
+    }
+
+    #[test]
+    fn a_split_is_refused_on_a_driver_that_has_no_second_server() {
+        let err = connection(json!({
+            "driver": "sqlite",
+            "database": "storage/app.sqlite",
+            "read": { "host": "replica.example.com" },
+        }))
+        .expect_err("a file has no replica");
+
+        assert!(err.message().contains("`read`"), "{}", err.message());
+    }
+
+    #[test]
+    fn a_split_round_trips_through_its_wire_form() {
+        let declaration = json!({
+            "driver": "mysql",
+            "host": "writer.example.com",
+            "database": "app",
+            "username": "app",
+            "password": "secret",
+            "read": {
+                "host": ["replica-a.example.com", "replica-b.example.com"],
+                "username": "reader",
+                "password": "other",
+            },
+            "sticky": true,
+            "options": { "ssl-mode": "VERIFY_CA" },
+        });
+
+        let config = connection(declaration.clone()).expect("declared");
+        let written = serde_json::to_value(&config).expect("serialise");
+        assert_eq!(
+            written, declaration,
+            "a section rewritten from a declaration is not the same one"
+        );
+
+        // And reading it back gives the same endpoints, credentials included.
+        let again = connection(written).expect("declared");
+        assert_eq!(again.read_dsns().unwrap(), config.read_dsns().unwrap());
+        assert_eq!(again.write_dsns().unwrap(), config.write_dsns().unwrap());
+    }
+
+    #[test]
+    fn no_rendering_of_a_split_discloses_a_roles_credential() {
+        // A role carries its own password, so there is a second one to leak.
+        let config = connection(json!({
+            "driver": "mysql",
+            "host": "writer.example.com",
+            "database": "app",
+            "username": "app",
+            "password": "hunter2",
+            "read": { "host": "replica.example.com", "username": "reader", "password": "hunter3" },
+            "sticky": true,
+            "options": { "ssl-mode": "VERIFY_CA" },
+        }))
+        .unwrap_or_else(|e| panic!("{}", e.message()));
+
+        for rendered in [
+            format!("{config:?}"),
+            config.url_without_credentials(),
+            format!("{:?}", Databases::new("primary").with("primary", config.clone())),
+        ] {
+            assert!(!rendered.contains("hunter2"), "{rendered}");
+            assert!(!rendered.contains("hunter3"), "{rendered}");
+            // The usernames are not secrets, and two roles reaching one host as
+            // two users are otherwise indistinguishable in a log.
+            assert!(rendered.contains("replica.example.com") || !rendered.contains("reader"));
+        }
+
+        // The dump still says enough to tell what this connection is.
+        let dumped = format!("{config:?}");
+        assert!(dumped.contains("writer.example.com"), "{dumped}");
+        assert!(dumped.contains("reader"), "{dumped}");
+        assert!(dumped.contains("sticky"), "{dumped}");
+    }
+
+    #[test]
+    fn a_url_that_a_role_could_not_survive_is_still_refused_whole() {
+        // The `read` DSN carries the role's own password inline, exactly as the
+        // write one does — and the safe rendering drops both.
+        let config = connection(json!({
+            "driver": "postgres",
+            "host": "writer.example.com",
+            "database": "app",
+            "read": { "host": "replica.example.com", "username": "reader", "password": "hunter3" },
+        }))
+        .expect("declared");
+
+        let dsn = &config.read_dsns().unwrap()[0];
+        assert!(dsn.contains("hunter3"), "the DSN is the one place it belongs");
+        assert!(!super::without_credentials(dsn).contains("hunter3"));
+    }
+
+    // --- driver options -----------------------------------------------------
+
+    #[test]
+    fn an_option_the_driver_reads_reaches_the_connection_string() {
+        let config = connection(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "options": { "ssl-mode": "VERIFY_IDENTITY", "statement-cache-capacity": "0" },
+        }))
+        .expect("declared");
+
+        let dsn = config.dsn().unwrap();
+        assert!(dsn.contains("ssl-mode=VERIFY_IDENTITY"), "{dsn}");
+        assert!(dsn.contains("statement-cache-capacity=0"), "{dsn}");
+    }
+
+    #[test]
+    fn an_option_the_driver_would_drop_is_refused_rather_than_rendered() {
+        // The failure this exists for: sqlx ignores a parameter it does not
+        // recognise, so the connection would be opened unverified while the
+        // file said `VERIFY_CA`.
+        let err = connection(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "options": { "sslMode": "VERIFY_CA" },
+        }))
+        .expect_err("a spelling the parser does not read");
+
+        assert!(err.message().contains("sslMode"), "{}", err.message());
+        assert!(err.message().contains("dropped on arrival"), "{}", err.message());
+        // And it names what it would have accepted.
+        assert!(err.message().contains("`ssl-mode`"), "{}", err.message());
+    }
+
+    #[test]
+    fn an_option_that_another_setting_already_answers_is_refused() {
+        for (key, setting) in [
+            ("charset", "charset"),
+            ("dbname", "database"),
+            ("ssl-ca", "ssl_ca"),
+            ("password", "password"),
+        ] {
+            let err = connection(json!({
+                "driver": "mysql",
+                "host": "db.example.com",
+                "database": "app",
+                "options": { key: "…" },
+            }))
+            .expect_err("two answers to one question");
+
+            assert!(err.message().contains(setting), "{key}: {}", err.message());
+        }
+    }
+
+    #[test]
+    fn each_driver_reads_its_own_parameters() {
+        // `application_name` is PostgreSQL's and `timezone` is MySQL's, and
+        // each is dropped in silence by the other's parser.
+        let postgres = connection(json!({
+            "driver": "postgres",
+            "host": "db.example.com",
+            "database": "app",
+            "options": { "application_name": "reports", "options[search_path]": "public" },
+        }))
+        .expect("declared");
+        assert!(postgres.dsn().unwrap().contains("application_name=reports"));
+
+        let refused = connection(json!({
+            "driver": "postgres",
+            "host": "db.example.com",
+            "database": "app",
+            "options": { "timezone": "+00:00" },
+        }))
+        .expect_err("PostgreSQL's parser does not read it");
+        assert!(refused.message().contains("timezone"), "{}", refused.message());
+
+        assert!(connection(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "options": { "timezone": "+00:00" },
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn options_are_refused_on_a_driver_with_no_url_to_hang_them_on() {
+        let err = connection(json!({
+            "driver": "sqlite",
+            "database": "storage/app.sqlite",
+            "options": { "mode": "rwc" },
+        }))
+        .expect_err("a file connection writes them into a url");
+
+        assert!(err.message().contains("`options`"), "{}", err.message());
+    }
+
+    #[test]
+    fn an_option_value_that_would_split_the_url_is_encoded_rather_than_pasted() {
+        let config = connection(json!({
+            "driver": "postgres",
+            "host": "db.example.com",
+            "database": "app",
+            "options": { "application_name": "reports&sslmode=disable" },
+        }))
+        .expect("declared");
+
+        let dsn = config.dsn().unwrap();
+        assert!(!dsn.contains("&sslmode=disable"), "a value became a second parameter: {dsn}");
+        assert!(dsn.contains("%26sslmode%3Ddisable"), "{dsn}");
+    }
+
+    // --- sizing the pool -----------------------------------------------------
+
+    #[test]
+    fn a_connection_that_declares_no_pool_is_sized_exactly_as_it_was() {
+        // The assertion that every existing application depends on, including
+        // every test suite that opens an in-memory database.
+        let default = rainier_orm::PoolConfig::default();
+        let in_memory = rainier_orm::PoolConfig::in_memory();
+
+        for (declaration, expected) in [
+            (json!({ "driver": "mysql", "host": "db.example.com", "database": "app" }), &default),
+            (json!({ "driver": "postgres", "url": "postgres://db.example.com/app" }), &default),
+            (json!({ "driver": "sqlite", "database": "storage/app.sqlite" }), &default),
+            // The one that is not tuning.
+            (json!({ "driver": "sqlite", "database": ":memory:" }), &in_memory),
+            (json!({ "driver": "sqlite", "url": "sqlite::memory:" }), &in_memory),
+        ] {
+            let config = connection(declaration.clone()).expect("declared");
+            let pool = config.pool();
+
+            assert_eq!(pool.max_connections, expected.max_connections, "{declaration}");
+            assert_eq!(pool.min_connections, expected.min_connections, "{declaration}");
+            assert_eq!(pool.acquire_timeout, expected.acquire_timeout, "{declaration}");
+            assert_eq!(pool.idle_timeout, expected.idle_timeout, "{declaration}");
+            assert_eq!(pool.max_lifetime, expected.max_lifetime, "{declaration}");
+            assert_eq!(pool.test_before_acquire, expected.test_before_acquire, "{declaration}");
+
+            // And with no split, reads are sized by the same declaration.
+            assert_eq!(config.read_pool().max_connections, pool.max_connections);
+            assert!(config.pool_settings().is_none());
+        }
+    }
+
+    #[test]
+    fn a_declared_field_changes_that_field_and_leaves_the_rest() {
+        let config = connection(json!({
+            "driver": "postgres",
+            "host": "db.example.com",
+            "database": "app",
+            "pool": { "max_connections": 40, "acquire_timeout": 3 },
+        }))
+        .expect("declared");
+
+        let pool = config.pool();
+        let untouched = rainier_orm::PoolConfig::default();
+
+        assert_eq!(pool.max_connections, 40);
+        assert_eq!(pool.acquire_timeout, std::time::Duration::from_secs(3));
+        assert_eq!(pool.min_connections, untouched.min_connections);
+        assert_eq!(pool.idle_timeout, untouched.idle_timeout);
+        assert_eq!(pool.max_lifetime, untouched.max_lifetime);
+        assert_eq!(pool.test_before_acquire, untouched.test_before_acquire);
+    }
+
+    #[test]
+    fn zero_turns_off_the_two_settings_that_can_be_turned_off() {
+        // The only spelling of `None` a whole number of seconds has, and it is
+        // needed: a connection with nothing in front of it that drops sockets
+        // has no reason to recycle them.
+        let config = connection(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "pool": { "idle_timeout": 0, "max_lifetime": 0 },
+        }))
+        .expect("declared");
+
+        assert_eq!(config.pool().idle_timeout, None);
+        assert_eq!(config.pool().max_lifetime, None);
+
+        // And a real number is still a real number.
+        let recycled = connection(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "pool": { "max_lifetime": 120 },
+        }))
+        .expect("declared");
+        assert_eq!(recycled.pool().max_lifetime, Some(std::time::Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn a_role_is_sized_over_the_connection_rather_than_instead_of_it() {
+        // The reason the roles are separate: the primary's budget is the scarce
+        // one and there are three replicas sharing the read traffic.
+        let config = connection(json!({
+            "driver": "postgres",
+            "host": "writer.example.com",
+            "database": "app",
+            "pool": { "max_connections": 8, "acquire_timeout": 4 },
+            "read": {
+                "host": ["replica-a.example.com", "replica-b.example.com"],
+                "pool": { "max_connections": 25 },
+            },
+        }))
+        .expect("declared");
+
+        assert_eq!(config.pool().max_connections, 8);
+        assert_eq!(config.read_pool().max_connections, 25);
+
+        // The role changed one field; the connection's other answer survived.
+        assert_eq!(config.read_pool().acquire_timeout, std::time::Duration::from_secs(4));
+        assert_eq!(config.pool().acquire_timeout, std::time::Duration::from_secs(4));
+    }
+
+    #[test]
+    fn a_role_that_declares_no_pool_is_sized_like_the_connection() {
+        let config = connection(json!({
+            "driver": "postgres",
+            "host": "writer.example.com",
+            "database": "app",
+            "pool": { "max_connections": 12 },
+            "read": { "host": "replica.example.com" },
+        }))
+        .expect("declared");
+
+        assert_eq!(config.pool().max_connections, 12);
+        assert_eq!(config.read_pool().max_connections, 12);
+    }
+
+    #[test]
+    fn a_pool_that_could_hand_out_nothing_is_refused() {
+        let err = connection(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "pool": { "max_connections": 0 },
+        }))
+        .expect_err("nothing to hand a query");
+
+        assert!(err.message().contains("max_connections"), "{}", err.message());
+    }
+
+    #[test]
+    fn a_floor_above_its_own_ceiling_is_refused_even_when_the_ceiling_is_elsewhere() {
+        // The cross-field mistake that only the *resolved* pool shows: 20 is a
+        // perfectly reasonable number, against a maximum nobody restated.
+        let err = connection(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "pool": { "min_connections": 20 },
+        }))
+        .expect_err("a floor above the default ceiling");
+
+        assert!(err.message().contains("min_connections"), "{}", err.message());
+        assert!(err.message().contains("max_connections"), "{}", err.message());
+
+        // …and the same mistake made across the two layers.
+        let across = connection(json!({
+            "driver": "mysql",
+            "host": "writer.example.com",
+            "database": "app",
+            "pool": { "max_connections": 4 },
+            "read": { "host": "replica.example.com", "pool": { "min_connections": 6 } },
+        }))
+        .expect_err("the role's floor is above the connection's ceiling");
+        assert!(across.message().contains("`read` role's"), "{}", across.message());
+    }
+
+    #[test]
+    fn an_acquire_timeout_of_no_time_at_all_is_refused() {
+        let err = connection(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "pool": { "acquire_timeout": 0 },
+        }))
+        .expect_err("every connection being busy is not an error");
+
+        assert!(err.message().contains("acquire_timeout"), "{}", err.message());
+    }
+
+    #[test]
+    fn an_empty_pool_is_refused_wherever_it_is_written() {
+        let connection_level = connection(json!({
+            "driver": "mysql",
+            "host": "db.example.com",
+            "database": "app",
+            "pool": {},
+        }))
+        .expect_err("it names nothing");
+        assert!(
+            connection_level.message().contains("empty `pool`"),
+            "{}",
+            connection_level.message()
+        );
+
+        let role_level = connection(json!({
+            "driver": "mysql",
+            "host": "writer.example.com",
+            "database": "app",
+            "read": { "host": "replica.example.com", "pool": {} },
+        }))
+        .expect_err("it names nothing");
+        assert!(role_level.message().contains("`read`"), "{}", role_level.message());
+    }
+
+    #[test]
+    fn an_in_memory_database_refuses_every_pool_it_would_not_survive() {
+        // Each of these is silent: the database *is* the connection, so the
+        // symptom is a process that migrates cleanly and then answers
+        // `no such table`.
+        for pool in [
+            json!({ "max_connections": 5 }),
+            json!({ "min_connections": 0 }),
+            json!({ "idle_timeout": 60 }),
+            json!({ "max_lifetime": 60 }),
+        ] {
+            for declaration in [
+                json!({ "driver": "sqlite", "database": ":memory:", "pool": pool.clone() }),
+                json!({ "driver": "sqlite", "url": "sqlite::memory:", "pool": pool.clone() }),
+            ] {
+                let err = connection(declaration).expect_err("an in-memory database survives none");
+                assert!(err.message().contains("in-memory"), "{pool}: {}", err.message());
+            }
+        }
+
+        // The two that change nothing load-bearing are still settings.
+        let allowed = connection(json!({
+            "driver": "sqlite",
+            "database": ":memory:",
+            "pool": { "acquire_timeout": 3, "test_before_acquire": true },
+        }))
+        .expect("neither of these can lose the schema");
+        assert_eq!(allowed.pool().max_connections, 1);
+        assert_eq!(allowed.pool().acquire_timeout, std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_file_backed_sqlite_database_pools_like_anything_else() {
+        let config = connection(json!({
+            "driver": "sqlite",
+            "database": "storage/app.sqlite",
+            "pool": { "max_connections": 4, "idle_timeout": 0 },
+        }))
+        .expect("a file is not the connection");
+
+        assert_eq!(config.pool().max_connections, 4);
+        assert_eq!(config.pool().idle_timeout, None);
+    }
+
+    #[test]
+    fn a_pool_may_be_declared_beside_a_url_because_a_dsn_cannot_carry_one() {
+        // The shape most deployments get — one injected `DATABASE_URL` — and
+        // the one that most needs sizing, because the default is sized for
+        // somebody else's process count.
+        let config = connection(json!({
+            "driver": "postgres",
+            "url": "postgres://app:secret@db.example.com/app",
+            "pool": { "max_connections": 5, "max_lifetime": 300 },
+        }))
+        .expect("declared");
+
+        assert_eq!(config.pool().max_connections, 5);
+        assert_eq!(config.pool().max_lifetime, Some(std::time::Duration::from_secs(300)));
+        // And the URL is still the whole connection.
+        assert_eq!(config.dsn().unwrap(), "postgres://app:secret@db.example.com/app");
+    }
+
+    #[test]
+    fn a_pool_round_trips_through_its_wire_form_in_every_shape() {
+        for declaration in [
+            json!({
+                "driver": "mysql",
+                "host": "writer.example.com",
+                "database": "app",
+                "pool": { "max_connections": 8, "idle_timeout": 0 },
+                "read": { "host": "replica.example.com", "pool": { "max_connections": 30 } },
+            }),
+            json!({
+                "driver": "postgres",
+                "url": "postgres://db.example.com/app",
+                "pool": { "acquire_timeout": 2, "test_before_acquire": true },
+            }),
+            json!({
+                "driver": "sqlite",
+                "database": "storage/app.sqlite",
+                "pool": { "min_connections": 1 },
+            }),
+        ] {
+            let config = connection(declaration.clone()).expect("declared");
+            let written = serde_json::to_value(&config).expect("serialise");
+            assert_eq!(written, declaration, "a section rewritten is not the one that was read");
+        }
+    }
+
+    #[test]
+    fn a_pool_is_refused_on_a_driver_whose_declaration_cannot_hold_one() {
+        // There is no such driver today — every shape pools — so this asserts
+        // the opposite: `pool` reaches all three rather than being quietly
+        // dropped by the one that forgot to list it.
+        for declaration in [
+            json!({ "driver": "mysql", "host": "db.example.com", "database": "app",
+                    "pool": { "max_connections": 3 } }),
+            json!({ "driver": "sqlite", "database": "storage/app.sqlite",
+                    "pool": { "max_connections": 3 } }),
+            json!({ "driver": "postgres", "url": "postgres://db.example.com/app",
+                    "pool": { "max_connections": 3 } }),
+        ] {
+            let config = connection(declaration.clone()).expect("declared");
+            assert_eq!(config.pool().max_connections, 3, "{declaration}");
+        }
+    }
+
+    // --- assembled in code rather than read from a file ----------------------
+
+    #[test]
+    fn a_declaration_assembled_in_code_splits_and_fails_the_same_way() {
+        let config = DatabaseConfig::from(
+            ServerDatabase::mysql("app")
+                .host("writer.example.com")
+                .credentials("app", "secret")
+                .read(
+                    DatabaseRole::across(["replica-a.example.com", "replica-b.example.com"])
+                        .user("reader"),
+                )
+                .sticky(true),
+        );
+
+        assert!(config.is_split());
+        assert!(config.is_sticky());
+        assert_eq!(
+            config.read_dsns().unwrap(),
+            vec![
+                "mysql://reader@replica-a.example.com:3306/app",
+                "mysql://reader@replica-b.example.com:3306/app",
+            ]
+        );
+
+        // The same refusal a file gets, from the same check.
+        let refused =
+            DatabaseConfig::from(ServerDatabase::mysql("app").host("db.example.com").sticky(true));
+        assert!(refused.dsn().is_err());
+
+        let bad_option = DatabaseConfig::from(
+            ServerDatabase::mysql("app").host("db.example.com").option("sslMode", "VERIFY_CA"),
+        );
+        assert!(bad_option.dsn().is_err());
+    }
+
+    #[test]
+    fn a_pool_assembled_in_code_resolves_and_fails_the_same_way() {
+        let split = DatabaseConfig::from(
+            ServerDatabase::postgres("app")
+                .host("writer.example.com")
+                .pool(PoolSettings::new().max_connections(6).max_lifetime(0))
+                .read(
+                    DatabaseRole::on("replica.example.com")
+                        .pool(PoolSettings::new().max_connections(30)),
+                ),
+        );
+
+        assert_eq!(split.pool().max_connections, 6);
+        assert_eq!(split.read_pool().max_connections, 30);
+        // The role took the connection's answer for everything it did not name.
+        assert_eq!(split.read_pool().max_lifetime, None);
+
+        // The same refusals a file gets, from the same checks.
+        let in_memory = DatabaseConfig::from(
+            SqliteDatabase::in_memory().pool(PoolSettings::new().max_connections(4)),
+        );
+        assert!(in_memory.dsn().is_err(), "a second connection is a second, empty database");
+
+        let instant = DatabaseConfig::from(
+            ServerDatabase::mysql("app")
+                .host("db.example.com")
+                .pool(PoolSettings::new().acquire_timeout(0)),
+        );
+        assert!(instant.dsn().is_err());
     }
 }

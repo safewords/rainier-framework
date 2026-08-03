@@ -39,8 +39,28 @@
 //! repository. It is no longer a workaround — it is how the repository renders
 //! SQL — but the constraint that forced it is gone, and the
 //! `the_orms_own_futures_are_send…` test in this crate's root asserts as much.
+//!
+//! ## One handle, more than one endpoint
+//!
+//! A [`Database`] is usually one connection, and everything above describes
+//! that case unchanged. When its declaration splits reads from writes it holds
+//! several, and the method that was called decides which one a statement
+//! reaches: [`fetch`](Database::fetch) and its decoders read, and
+//! [`execute`](Database::execute) and [`statement`](Database::statement)
+//! write. Nothing inspects the SQL to decide.
+//!
+//! That last sentence is the one to remember when writing SQL by hand. A
+//! `DELETE … RETURNING` or a `WITH … INSERT` handed to a *fetch* is a write
+//! sent to a replica, where at best it is refused and at worst it lands on a
+//! server nothing else reads. [`writer`](Database::writer) is the handle for
+//! it: same connection, reads included, pinned to the endpoint that accepts
+//! writes.
+//!
+//! Reading your own writes is [`sticky`]'s subject, not this
+//! module's.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Once};
 
 use rainier_orm::sea_query::Value;
 use rainier_orm::{Dialect, ExecOutcome, Executor, Row, ShardRoute};
@@ -48,6 +68,7 @@ use rainier_support::{BoxFuture, Error, Result};
 
 use crate::row::{ColumnRequest, OwnedRow};
 use crate::statement::Prepared;
+use crate::sticky;
 
 /// A `dyn`-safe database backend.
 ///
@@ -224,23 +245,142 @@ crate::bind_executor!(rainier_drivers::sql::SeaOrmExecutor);
 /// console commands freely.
 #[derive(Clone)]
 pub struct Database {
+    /// The endpoint writes go to, and the only endpoint of an ordinary
+    /// connection. Held out of [`Split`] as well as in it so that a handle with
+    /// no split costs one `Arc` and no allocation, which is nearly all of them.
     connection: Arc<dyn Connection>,
+
+    /// The other endpoints, when the declaration named any. `None` is the
+    /// unsplit connection, and every path through this type is the one it was
+    /// before splitting existed.
+    split: Option<Arc<Split>>,
+
+    /// This handle sends its reads to the writer — see [`Database::writer`].
+    to_the_writer: bool,
 }
 
 impl Database {
     /// Wrap a concrete connection.
     pub fn new(connection: impl Connection) -> Self {
-        Self { connection: Arc::new(connection) }
+        Self::from_arc(Arc::new(connection))
     }
 
     /// Wrap an already-shared connection.
     pub fn from_arc(connection: Arc<dyn Connection>) -> Self {
-        Self { connection }
+        Self { connection, split: None, to_the_writer: false }
+    }
+
+    /// A handle over separate write and read endpoints.
+    ///
+    /// `writes` is where [`execute`](Self::execute) and
+    /// [`statement`](Self::statement) go; `reads` is where
+    /// [`fetch`](Self::fetch) goes, and an empty `reads` means reads go to the
+    /// writer like everything else. `sticky` asks for
+    /// [read-your-own-writes](crate::sticky) within a scope.
+    ///
+    /// Built from a declaration by
+    /// [`DatabaseConfig::build`](crate::DatabaseConfig::build), and reachable
+    /// here for a backend a configuration tree cannot describe — the same door
+    /// [`DatabaseManager::with_connection`](crate::DatabaseManager::with_connection)
+    /// exists for.
+    ///
+    /// A single write endpoint with no read endpoints collapses to the ordinary
+    /// shape, because that is what it is: one connection, with nothing to route
+    /// between and nothing to be stale against.
+    ///
+    /// # Errors
+    ///
+    /// When `writes` is empty. There would be nowhere for a write to go, and
+    /// answering reads from a replica while silently dropping writes is the
+    /// failure this crate's configuration layer refuses at every turn.
+    pub fn with_endpoints(
+        writes: Vec<Arc<dyn Connection>>,
+        reads: Vec<Arc<dyn Connection>>,
+        sticky: bool,
+    ) -> Result<Self> {
+        let Some(first) = writes.first().cloned() else {
+            return Err(Error::internal(
+                "a database handle needs at least one endpoint to write to; one with only read \
+                 endpoints would answer every query and persist nothing",
+            ));
+        };
+
+        if reads.is_empty() && writes.len() == 1 {
+            return Ok(Self::from_arc(first));
+        }
+
+        Ok(Self {
+            connection: first,
+            split: Some(Arc::new(Split {
+                id: sticky::next_connection_id(),
+                sticky,
+                writes,
+                reads,
+                next_write: AtomicUsize::new(0),
+                next_read: AtomicUsize::new(0),
+                unscoped: Once::new(),
+            })),
+            to_the_writer: false,
+        })
+    }
+
+    /// The same handle, with its **reads** sent to the write endpoint too.
+    ///
+    /// For SQL this type cannot classify. Routing is by the method that was
+    /// called, so a statement that writes and returns rows —
+    /// `DELETE … RETURNING`, `WITH … INSERT`, an advisory lock, `SELECT …
+    /// FOR UPDATE` — reaches a replica if it is fetched, and a replica is
+    /// either read-only or a server whose copy of that change nothing else
+    /// will ever see.
+    ///
+    /// Free: no connection is opened and nothing is cloned but the handle.
+    ///
+    /// Does nothing on a connection that was never split, which is the right
+    /// answer rather than a no-op worth warning about — the writer is the only
+    /// endpoint there is.
+    #[must_use = "this returns a new handle rather than changing this one"]
+    pub fn writer(&self) -> Self {
+        Self { to_the_writer: true, ..self.clone() }
     }
 
     /// The underlying connection.
+    ///
+    /// The write endpoint on a split connection: the one every statement can
+    /// run against, and the one an ordinary handle has always returned.
     pub fn connection(&self) -> &Arc<dyn Connection> {
         &self.connection
+    }
+
+    /// Whether this connection reads and writes through separate endpoints.
+    pub fn is_split(&self) -> bool {
+        self.split.is_some()
+    }
+
+    /// Whether a write pins this connection's reads for the rest of the
+    /// [scope](crate::sticky).
+    pub fn is_sticky(&self) -> bool {
+        self.split.as_ref().is_some_and(|split| split.sticky)
+    }
+
+    /// The endpoint a write goes to.
+    ///
+    /// Not `dialect`'s or `allocate_id`'s business: those ask the connection a
+    /// question rather than running a statement, and routing them through here
+    /// would let a dialect lookup take a scope's write pin.
+    fn write_connection(&self) -> &Arc<dyn Connection> {
+        match &self.split {
+            None => &self.connection,
+            Some(split) => split.write_connection(),
+        }
+    }
+
+    /// The endpoint a read goes to.
+    fn read_connection(&self) -> &Arc<dyn Connection> {
+        match &self.split {
+            None => &self.connection,
+            Some(_) if self.to_the_writer => self.write_connection(),
+            Some(split) => split.read_connection(),
+        }
     }
 
     /// The dialect the backend speaks.
@@ -266,7 +406,7 @@ impl Database {
         prepared: Prepared,
         columns: Vec<ColumnRequest>,
     ) -> Result<Vec<OwnedRow>> {
-        self.connection.fetch(prepared.route, &prepared.sql, prepared.params, columns).await
+        self.read_connection().fetch(prepared.route, &prepared.sql, prepared.params, columns).await
     }
 
     /// Run a prepared query and decode every row into `E`.
@@ -300,23 +440,124 @@ impl Database {
     /// Run a prepared write.
     pub async fn execute(&self, prepared: Prepared) -> Result<ExecOutcome> {
         let outcomes =
-            self.connection.execute(prepared.route, &prepared.sql, prepared.params).await?;
+            self.write_connection().execute(prepared.route, &prepared.sql, prepared.params).await?;
         Ok(outcomes.into_iter().next().unwrap_or_default())
     }
 
     /// Run a raw statement with no bindings — for DDL.
     pub async fn statement(&self, sql: &str) -> Result<ExecOutcome> {
-        let outcomes = self.connection.execute(ShardRoute::Global, sql, Vec::new()).await?;
+        let outcomes = self.write_connection().execute(ShardRoute::Global, sql, Vec::new()).await?;
         Ok(outcomes.into_iter().next().unwrap_or_default())
+    }
+}
+
+/// The endpoints of a connection that separates reads from writes.
+///
+/// Every one of them is a pool that was opened at boot, so choosing between
+/// them is arithmetic rather than a connection attempt.
+struct Split {
+    /// This connection's identity to a [scope](crate::sticky).
+    id: usize,
+
+    /// Whether a write pins this connection's reads for the rest of a scope.
+    sticky: bool,
+
+    /// Where writes go. Never empty; `writes[0]` is [`Database::connection`].
+    writes: Vec<Arc<dyn Connection>>,
+
+    /// Where reads go. Empty means they go to the writer.
+    reads: Vec<Arc<dyn Connection>>,
+
+    next_write: AtomicUsize,
+    next_read: AtomicUsize,
+
+    /// Guards the one warning a sticky connection outside a scope emits.
+    unscoped: Once,
+}
+
+impl Split {
+    fn write_connection(&self) -> &Arc<dyn Connection> {
+        if !self.sticky {
+            return &self.writes[self.turn(&self.next_write, self.writes.len())];
+        }
+
+        let chosen =
+            sticky::write_endpoint(self.id, || self.turn(&self.next_write, self.writes.len()))
+                .unwrap_or_else(|| self.turn(&self.next_write, self.writes.len()));
+        &self.writes[chosen]
+    }
+
+    fn read_connection(&self) -> &Arc<dyn Connection> {
+        if self.reads.is_empty() {
+            return self.write_connection();
+        }
+        if !self.sticky {
+            return &self.reads[self.turn(&self.next_read, self.reads.len())];
+        }
+
+        match sticky::read_endpoint(self.id, || self.turn(&self.next_read, self.reads.len())) {
+            Some(sticky::Read::Replica(replica)) => &self.reads[replica],
+            Some(sticky::Read::Writer) => self.write_connection(),
+            // No scope, so nothing can be pinned — and an unpinned read from a
+            // connection that asked for read-your-own-writes is the stale row
+            // `sticky` was declared to rule out. The writer is the answer that
+            // is never wrong; see `sticky` for why it is preferred to the one
+            // that is merely faster.
+            None => {
+                self.warn_about_the_missing_scope();
+                self.write_connection()
+            }
+        }
+    }
+
+    /// The next endpoint of a role, round the ring.
+    ///
+    /// Round-robin rather than the random pick Laravel makes, because the
+    /// endpoints were opened at boot and are therefore known: a counter spreads
+    /// queries evenly, where a random choice is even only in expectation and
+    /// will happily send a burst of six at one replica.
+    ///
+    /// `Relaxed` because nothing is ordered against this. Two threads racing
+    /// may take the same turn or skip one, and the cost of either is that a
+    /// replica serves one query more than its neighbour.
+    fn turn(&self, counter: &AtomicUsize, len: usize) -> usize {
+        counter.fetch_add(1, Ordering::Relaxed) % len
+    }
+
+    /// Say once, per connection per process, that the read hosts are idle and
+    /// why.
+    ///
+    /// Once rather than per query: a console command or a worker that never
+    /// enters a scope would otherwise write this line for every row it reads,
+    /// and a warning that repeats is a warning that gets filtered.
+    fn warn_about_the_missing_scope(&self) {
+        self.unscoped.call_once(|| {
+            tracing::warn!(
+                "this connection declares `sticky`, and a read reached it outside a sticky \
+                 scope — so it was served by the write endpoint rather than by a read host. \
+                 A read that no scope is tracking cannot be known to be reading its own \
+                 write, and a replica would answer it with whatever it has replicated so \
+                 far. Wrap the unit of work in `rainier_database::with_sticky_scope`, or \
+                 drop `sticky` if these reads tolerate replication lag"
+            );
+        });
     }
 }
 
 impl std::fmt::Debug for Database {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Database")
-            .field("dialect", &self.connection.dialect())
-            .field("shard_family", &self.connection.shard_family())
-            .finish()
+        let mut out = f.debug_struct("Database");
+        out.field("dialect", &self.connection.dialect())
+            .field("shard_family", &self.connection.shard_family());
+
+        // Named only when there is something to say, so the dump of an
+        // ordinary connection reads exactly as it did.
+        if let Some(split) = &self.split {
+            out.field("write_endpoints", &split.writes.len())
+                .field("read_endpoints", &split.reads.len())
+                .field("sticky", &split.sticky);
+        }
+        out.finish()
     }
 }
 
@@ -353,12 +594,15 @@ impl Executor for Database {
         sql: &str,
         params: Vec<Value>,
     ) -> rainier_orm::Result<Vec<Box<dyn Row>>> {
-        self.connection.fetch_raw(ShardRoute::Global, sql, params).await.map_err(into_anyhow)
+        self.read_connection().fetch_raw(ShardRoute::Global, sql, params).await.map_err(into_anyhow)
     }
 
     async fn execute(&self, sql: &str, params: Vec<Value>) -> rainier_orm::Result<ExecOutcome> {
-        let outcomes =
-            self.connection.execute(ShardRoute::Global, sql, params).await.map_err(into_anyhow)?;
+        let outcomes = self
+            .write_connection()
+            .execute(ShardRoute::Global, sql, params)
+            .await
+            .map_err(into_anyhow)?;
         Ok(outcomes.into_iter().next().unwrap_or_default())
     }
 
@@ -368,7 +612,7 @@ impl Executor for Database {
         sql: &str,
         params: Vec<Value>,
     ) -> rainier_orm::Result<Vec<Box<dyn Row>>> {
-        self.connection.fetch_raw(route, sql, params).await.map_err(into_anyhow)
+        self.read_connection().fetch_raw(route, sql, params).await.map_err(into_anyhow)
     }
 
     async fn execute_routed(
@@ -377,7 +621,8 @@ impl Executor for Database {
         sql: &str,
         params: Vec<Value>,
     ) -> rainier_orm::Result<ExecOutcome> {
-        let outcomes = self.connection.execute(route, sql, params).await.map_err(into_anyhow)?;
+        let outcomes =
+            self.write_connection().execute(route, sql, params).await.map_err(into_anyhow)?;
         Ok(outcomes.into_iter().next().unwrap_or_default())
     }
 }
@@ -391,6 +636,7 @@ fn into_anyhow(error: Error) -> rainier_orm::Error {
 mod tests {
     use super::*;
     use crate::statement;
+    use crate::sticky::with_sticky_scope;
     use crate::testing::{fake_database, MemoryConnection};
 
     #[derive(rainier_orm::Entity, Clone, Debug, PartialEq)]
@@ -511,5 +757,260 @@ mod tests {
     fn cloning_shares_one_connection() {
         let db = Database::new(MemoryConnection::new(Dialect::MySql));
         assert!(Arc::ptr_eq(db.connection(), db.clone().connection()));
+    }
+
+    // --- reads here, writes there -------------------------------------------
+
+    /// `n` endpoints, plus the handles to assert what reached each of them.
+    fn endpoints(n: usize) -> (Vec<Arc<dyn Connection>>, Vec<Arc<MemoryConnection>>) {
+        let handles: Vec<Arc<MemoryConnection>> =
+            (0..n).map(|_| Arc::new(MemoryConnection::new(Dialect::Sqlite))).collect();
+        let connections =
+            handles.iter().map(|handle| Arc::clone(handle) as Arc<dyn Connection>).collect();
+        (connections, handles)
+    }
+
+    fn select() -> Prepared {
+        statement::select_all::<Post>(Dialect::Sqlite)
+    }
+
+    fn delete() -> Prepared {
+        statement::delete_by_pk::<Post>(Dialect::Sqlite, 1_i64.into())
+    }
+
+    #[tokio::test]
+    async fn a_connection_with_no_split_is_the_connection_it_always_was() {
+        // The property every existing deployment depends on: declaring nothing
+        // leaves every query on one endpoint, through the same code path.
+        let (connections, handles) = endpoints(1);
+        let db = Database::with_endpoints(connections, Vec::new(), false).expect("one endpoint");
+
+        assert!(!db.is_split());
+        assert!(!db.is_sticky());
+
+        let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+        db.execute(delete()).await.unwrap();
+        db.statement("CREATE TABLE posts (id INTEGER)").await.unwrap();
+
+        assert_eq!(handles[0].statement_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn reads_go_to_a_read_endpoint_and_writes_to_a_write_endpoint() {
+        let (writes, writers) = endpoints(1);
+        let (reads, readers) = endpoints(1);
+        let db = Database::with_endpoints(writes, reads, false).expect("built");
+
+        assert!(db.is_split());
+
+        let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+        assert_eq!(readers[0].statement_count(), 1);
+        assert_eq!(writers[0].statement_count(), 0);
+
+        db.execute(delete()).await.unwrap();
+        db.statement("CREATE TABLE posts (id INTEGER)").await.unwrap();
+        assert_eq!(writers[0].statement_count(), 2, "a write reached a replica");
+        assert_eq!(readers[0].statement_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_read_host_takes_its_turn() {
+        // Declaring three replicas and using one is a configuration that looks
+        // right in the file and does nothing in the fleet.
+        let (writes, _) = endpoints(1);
+        let (reads, readers) = endpoints(3);
+        let db = Database::with_endpoints(writes, reads, false).expect("built");
+
+        for _ in 0..6 {
+            let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+        }
+
+        for (at, reader) in readers.iter().enumerate() {
+            assert_eq!(reader.statement_count(), 2, "replica {at} was skipped");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_write_host_takes_its_turn() {
+        let (writes, writers) = endpoints(2);
+        let db = Database::with_endpoints(writes, Vec::new(), false).expect("built");
+
+        for _ in 0..4 {
+            db.execute(delete()).await.unwrap();
+        }
+
+        for (at, writer) in writers.iter().enumerate() {
+            assert_eq!(writer.statement_count(), 2, "primary {at} was skipped");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_sends_the_reads_after_it_in_the_same_scope_to_the_writer() {
+        // The whole point of `sticky`: the row the write just made is on the
+        // writer, and the replica would answer without it and without an error.
+        let (writes, writers) = endpoints(1);
+        let (reads, readers) = endpoints(1);
+        let db = Database::with_endpoints(writes, reads, true).expect("built");
+        assert!(db.is_sticky());
+
+        with_sticky_scope(async {
+            let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+            assert_eq!(
+                readers[0].statement_count(),
+                1,
+                "a read before any write is a replica read"
+            );
+
+            db.execute(delete()).await.unwrap();
+
+            let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+            let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+
+            // One write plus two reads, all on the endpoint that has the row.
+            assert_eq!(writers[0].statement_count(), 3);
+            assert_eq!(readers[0].statement_count(), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_write_in_one_scope_leaves_another_scopes_reads_on_the_replicas() {
+        let (writes, writers) = endpoints(1);
+        let (reads, readers) = endpoints(1);
+        let db = Database::with_endpoints(writes, reads, true).expect("built");
+
+        let writing = db.clone();
+        with_sticky_scope(async move {
+            writing.execute(delete()).await.unwrap();
+            let _: Vec<Post> = writing.fetch_all(select()).await.unwrap();
+        })
+        .await;
+
+        // A second unit of work through the *same handle*. A flag on the
+        // connection would still be set here.
+        with_sticky_scope(async {
+            let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+        })
+        .await;
+
+        assert_eq!(writers[0].statement_count(), 2, "the write and its own read");
+        assert_eq!(readers[0].statement_count(), 1, "the next scope was pinned by the last one");
+    }
+
+    #[tokio::test]
+    async fn a_sticky_connection_outside_a_scope_reads_from_the_writer() {
+        // Documented, and the safe direction: nothing is tracking this read, so
+        // nothing can say it is not reading its own write.
+        let (writes, writers) = endpoints(1);
+        let (reads, readers) = endpoints(1);
+        let db = Database::with_endpoints(writes, reads, true).expect("built");
+
+        let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+
+        assert_eq!(writers[0].statement_count(), 1);
+        assert_eq!(readers[0].statement_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_did_not_ask_for_sticky_reads_the_replica_either_way() {
+        // The other half of the same rule: a declaration that did not ask for
+        // read-your-own-writes gets the split it did ask for, scope or no
+        // scope.
+        let (writes, writers) = endpoints(1);
+        let (reads, readers) = endpoints(1);
+        let db = Database::with_endpoints(writes, reads, false).expect("built");
+
+        db.execute(delete()).await.unwrap();
+        let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+
+        assert_eq!(writers[0].statement_count(), 1);
+        assert_eq!(readers[0].statement_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_writer_handle_sends_a_fetch_to_the_write_endpoint() {
+        // For SQL this type cannot classify — `DELETE … RETURNING` and its
+        // relatives, which are writes that come back as rows.
+        let (writes, writers) = endpoints(1);
+        let (reads, readers) = endpoints(1);
+        let db = Database::with_endpoints(writes, reads, false).expect("built");
+
+        let _: Vec<Post> = db.writer().fetch_all(select()).await.unwrap();
+
+        assert_eq!(writers[0].statement_count(), 1);
+        assert_eq!(readers[0].statement_count(), 0);
+
+        // …and the handle it came from is unchanged.
+        let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+        assert_eq!(readers[0].statement_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_orm_surface_splits_the_same_way_the_prepared_one_does() {
+        // `Database` is an `Executor`, so `repo::` renders and runs its own
+        // SQL. If that path did not split, half the framework's queries would
+        // ignore the declaration.
+        let (writes, writers) = endpoints(1);
+        let (reads, readers) = endpoints(1);
+        let db = Database::with_endpoints(writes, reads, false).expect("built");
+
+        Executor::fetch_all(&db, "SELECT 1", vec![]).await.unwrap();
+        assert_eq!(readers[0].statement_count(), 1);
+        assert_eq!(writers[0].statement_count(), 0);
+
+        Executor::execute(&db, "DELETE FROM posts", vec![]).await.unwrap();
+        assert_eq!(writers[0].statement_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn asking_a_split_connection_a_question_does_not_pin_it() {
+        // `dialect` and `allocate_id` are questions rather than statements. If
+        // they went through the routing they would take a scope's write pin,
+        // and a repository that reads the dialect before every query would pin
+        // every scope on its first read.
+        let (writes, _) = endpoints(1);
+        let (reads, readers) = endpoints(1);
+        let db = Database::with_endpoints(writes, reads, true).expect("built");
+
+        with_sticky_scope(async {
+            assert_eq!(db.dialect(), Dialect::Sqlite);
+            assert!(!db.is_sharded());
+
+            let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+            assert_eq!(readers[0].statement_count(), 1, "a dialect lookup pinned the connection");
+        })
+        .await;
+    }
+
+    #[test]
+    fn a_handle_with_nowhere_to_write_is_refused() {
+        let (reads, _) = endpoints(2);
+        let err = Database::with_endpoints(Vec::new(), reads, false).unwrap_err();
+        assert!(err.message().contains("write"), "{}", err.message());
+    }
+
+    #[test]
+    fn one_endpoint_and_no_replicas_is_not_a_split() {
+        let (writes, _) = endpoints(1);
+        let db = Database::with_endpoints(writes, Vec::new(), true).expect("built");
+
+        // Not even with `sticky` asked for: there is one endpoint, so there is
+        // nothing to be stale against and nothing to pin.
+        assert!(!db.is_split());
+        assert!(!db.is_sticky());
+    }
+
+    #[tokio::test]
+    async fn a_role_with_no_replicas_sends_its_reads_to_the_writers() {
+        // `write` declared and `read` left out: two write hosts, and reads that
+        // have nowhere else to go.
+        let (writes, writers) = endpoints(2);
+        let db = Database::with_endpoints(writes, Vec::new(), false).expect("built");
+
+        assert!(db.is_split());
+        let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+        let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+
+        assert_eq!(writers[0].statement_count() + writers[1].statement_count(), 2);
     }
 }

@@ -77,6 +77,7 @@ pub mod relation;
 pub mod repository;
 pub mod row;
 pub mod statement;
+pub mod sticky;
 pub mod testing;
 
 pub use connection::{Connection, Database};
@@ -85,8 +86,8 @@ pub use criteria::{
     SubqueryDraft, SubqueryPredicate,
 };
 pub use databases::{
-    DatabaseConfig, DatabaseCredentials, DatabaseDriver, Databases, DsnDatabase, ServerDatabase,
-    SqliteDatabase,
+    DatabaseConfig, DatabaseCredentials, DatabaseDriver, DatabaseRole, Databases, DsnDatabase,
+    PoolSettings, ServerDatabase, SqliteDatabase,
 };
 pub use factory::{Factory, HasFactory};
 pub use manager::DatabaseManager;
@@ -101,6 +102,7 @@ pub use relation::{
 pub use repository::{EntityRepository, Repository};
 pub use row::{Cell, ColumnRequest, OwnedRow};
 pub use statement::Prepared;
+pub use sticky::{in_sticky_scope, with_sticky_scope};
 
 // The ORM, re-exported so an application depends on one Rainier ORM version and
 // gets the derive, the query builder and the migrator without naming it twice.

@@ -35,6 +35,22 @@
 //! placeholders. Reach for [`raw_placeholders`](RawQuery::raw_placeholders)
 //! there and write `$1` yourself.
 //!
+//! # On a connection that splits its reads, the terminal method chooses the
+//! # endpoint
+//!
+//! [`execute`](RawQuery::execute) writes and everything else reads, and nothing
+//! here looks at the SQL to check. That is right for the statements this door is
+//! usually opened for and wrong for one family of them: a `DELETE … RETURNING`,
+//! a `WITH … INSERT`, a `SELECT … FOR UPDATE`, an advisory lock — writes that
+//! come back as rows, and so are fetched. On a split connection they would be
+//! sent to a replica, which either refuses them or applies them somewhere
+//! nothing else reads.
+//!
+//! [`Database::writer`](crate::Database::writer) is the handle for those:
+//! `database.writer().query(…)` is the same connection with its reads sent to
+//! the endpoint that accepts writes. It costs nothing on a connection that was
+//! never split.
+//!
 //! # This is the unsafe door, and it is unsafe in one specific way
 //!
 //! **Values** are always bound — that is what [`bind`](RawQuery::bind) is for,
