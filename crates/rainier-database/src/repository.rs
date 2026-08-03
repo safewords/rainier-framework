@@ -92,7 +92,85 @@ pub trait Repository<M: Model>: Send + Sync + 'static {
     async fn create(&self, model: M) -> Result<M>;
 
     /// Update every non-key column of a row, matched by its primary key.
+    ///
+    /// **Every** non-key column, from the struct as the caller holds it — see
+    /// [`update_matching`](Self::update_matching) for when that is the wrong
+    /// write and what to reach for instead.
     async fn update(&self, model: &M) -> Result<u64>;
+
+    /// `UPDATE table SET <set> WHERE <criteria>` — write **only the named
+    /// columns**, to every matching row. Returns rows affected.
+    ///
+    /// # Why this exists, when [`update`](Self::update) is right there
+    ///
+    /// Because `update` is the more obvious call and it is the wrong one
+    /// whenever a caller means to change a subset of a row. It writes every
+    /// non-key column, from a struct that was read at some earlier moment, so
+    /// the columns nobody meant to touch are written back as they were *then*:
+    ///
+    /// ```text
+    /// t0  A reads the row              (seen_at = NULL, email_sent_at = NULL)
+    /// t1  B writes seen_at = now       (seen_at = 12:01)
+    /// t2  A sets email_sent_at on its copy and calls `update`
+    ///       → UPDATE … SET seen_at = NULL, email_sent_at = 12:02 WHERE id = 7
+    /// ```
+    ///
+    /// `seen_at` is now `NULL` again. Nothing errored, one row was affected,
+    /// and the return value is the same `1` a correct write produces — the
+    /// damage is only visible in the stored data, later, to somebody who does
+    /// not know to look. That is the failure this method exists to make
+    /// unnecessary: naming `email_sent_at` writes `email_sent_at`.
+    ///
+    /// The second half is the same shape. A guarded write — "stamp it, but only
+    /// if it is still unstamped" — is a predicate over more than the key, and
+    /// `update` has no room for one: its `WHERE` *is* the primary key. Under
+    /// `update` the check has to happen in the process, between the read and
+    /// the write, which is where the race lives.
+    ///
+    /// ```ignore
+    /// // Stamp only the rows that are still unstamped, in one statement.
+    /// let stamped = statuses
+    ///     .update_column(
+    ///         Criteria::new().where_in("id", ids).where_null("email_sent_at"),
+    ///         "email_sent_at",
+    ///         now,
+    ///     )
+    ///     .await?;
+    /// ```
+    ///
+    /// # No lifecycle hooks
+    ///
+    /// Like [`delete_matching`](Self::delete_matching) and unlike
+    /// [`update`](Self::update), this fires no `Updating`/`Updated`. There is no
+    /// model to hand a hook — the statement names rows by predicate and may
+    /// match none or a million — and reading them first to build one would
+    /// restore the table scan the bulk form exists to avoid. A caller that needs
+    /// per-row hooks wants [`matching`](Self::matching) and a loop, and should
+    /// know it is asking for N statements.
+    ///
+    /// # No soft-delete scoping
+    ///
+    /// Also like every other write here: `deleted_at IS NULL` is **not**
+    /// appended, so a tombstoned row matching `criteria` is written. That is
+    /// deliberate and it is what makes this the way to tombstone or restore more
+    /// than one row at a time — `set` a soft-delete column to a timestamp to
+    /// trash them, to `NULL` to restore them. A scope here would make the
+    /// restore match nothing, silently and forever. See
+    /// [`rainier_orm::trash`], which sets the reads-only policy out in full.
+    ///
+    /// # Notes
+    ///
+    /// - An empty `set` writes nothing and runs no statement, returning `Ok(0)`
+    ///   — "these zero columns changed" is a real answer for a caller building
+    ///   the list from a diff, and `SET` with no assignments is not valid SQL.
+    /// - For a column that must *accumulate* rather than be assigned — a
+    ///   counter — the value is not known until the stored one is, so no
+    ///   `Vec<(String, Value)>` can express it. That is
+    ///   [`statement::update_matching_with`] and its [`Assignment`], which also
+    ///   covers assigning a correlated subquery.
+    ///
+    /// [`Assignment`]: crate::Assignment
+    async fn update_matching(&self, criteria: Criteria, set: Vec<(String, Value)>) -> Result<u64>;
 
     /// Insert, or update on a conflict with `conflict_columns`. An empty
     /// `update_columns` makes it insert-or-ignore.
@@ -218,6 +296,26 @@ pub trait Repository<M: Model>: Send + Sync + 'static {
         Self: Sized,
     {
         Ok(self.count_matching(criteria).await? > 0)
+    }
+
+    /// [`update_matching`](Self::update_matching) writing one column — the
+    /// stamp.
+    ///
+    /// The overwhelmingly common partial write is a single column over a set of
+    /// rows: mark these as emailed, mark those as seen, tombstone that lot. This
+    /// spells it without the `vec![(…​.to_string(), …​.into())]` ceremony, so the
+    /// safe call is also the short one — which is the point, given that the
+    /// unsafe call ([`update`](Self::update)) is already the obvious one.
+    async fn update_column(
+        &self,
+        criteria: Criteria,
+        column: &str,
+        value: impl Into<Value> + Send,
+    ) -> Result<u64>
+    where
+        Self: Sized,
+    {
+        self.update_matching(criteria, vec![(column.to_string(), value.into())]).await
     }
 }
 
@@ -460,6 +558,18 @@ impl<M: Model> Repository<M> for EntityRepository<M> {
 
         self.fire(|| Updated { model: model.clone(), rows_affected }).await?;
         Ok(rows_affected)
+    }
+
+    async fn update_matching(&self, criteria: Criteria, set: Vec<(String, Value)>) -> Result<u64> {
+        // `SET` with nothing after it does not parse in any dialect, so the
+        // empty list is answered here rather than rendered. See the trait docs:
+        // zero columns changed is a real answer, not a caller error.
+        if set.is_empty() {
+            return Ok(0);
+        }
+
+        let prepared = statement::update_matching::<M>(self.db.dialect(), &criteria, set);
+        Ok(self.db.execute(prepared).await?.rows_affected)
     }
 
     async fn upsert(
@@ -892,6 +1002,113 @@ mod tests {
         posts.delete(1_i64.into()).await.unwrap();
 
         assert_eq!(seen.load(Ordering::SeqCst), 1111);
+    }
+
+    #[tokio::test]
+    async fn update_matching_fires_no_hooks() {
+        // Deliberate, and the counterpart of the test above: a bulk write has no
+        // model to hand a hook, and building one would mean reading every
+        // matching row first. `delete_matching` has always behaved this way;
+        // this pins that the new sibling matches it rather than quietly
+        // dispatching an `Updating` carrying some invented model.
+        let (posts, events, _) = with_hooks();
+        let seen = Arc::new(AtomicUsize::new(0));
+
+        let counter = Arc::clone(&seen);
+        events.listen(move |_: Arc<Updating<Post>>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        let counter = Arc::clone(&seen);
+        events.listen(move |_: Arc<Updated<Post>>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+
+        posts
+            .update_matching(
+                Criteria::new().where_eq("id", 1_u64),
+                vec![("published".into(), true.into())],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn update_matching_writes_only_the_named_column() {
+        // The whole point. `update(&model)` would put `title` in this statement
+        // too, carrying whatever the caller's struct happened to hold.
+        let (posts, connection) = repository(MemoryConnection::new(Dialect::Sqlite));
+
+        posts
+            .update_matching(
+                Criteria::new().where_eq("id", 1_u64),
+                vec![("published".into(), true.into())],
+            )
+            .await
+            .unwrap();
+
+        let sql = connection.last_statement().unwrap();
+        assert!(sql.starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("published"), "{sql}");
+        assert!(!sql.contains("title"), "the column nobody named must not be written: {sql}");
+    }
+
+    #[tokio::test]
+    async fn the_criteria_becomes_the_where_and_can_guard_on_more_than_the_key() {
+        // The second half of what `update` cannot do: its `WHERE` is the primary
+        // key and has no room for "only if still unstamped".
+        let (posts, connection) = repository(MemoryConnection::new(Dialect::Sqlite));
+
+        posts
+            .update_matching(
+                Criteria::new().where_in("id", vec![1_u64, 2, 3]).where_eq("published", false),
+                vec![("published".into(), true.into())],
+            )
+            .await
+            .unwrap();
+
+        let sql = connection.last_statement().unwrap();
+        assert!(sql.contains("IN"), "{sql}");
+        assert!(sql.contains("WHERE"), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_set_runs_no_statement() {
+        // `SET` with nothing after it is a syntax error, and "no columns
+        // changed" is a real answer for a caller assembling the list from a
+        // diff. Neither a panic nor an invalid statement.
+        let (posts, connection) = repository(MemoryConnection::new(Dialect::Sqlite));
+
+        let affected =
+            posts.update_matching(Criteria::new().where_eq("id", 1_u64), vec![]).await.unwrap();
+
+        assert_eq!(affected, 0);
+        assert_eq!(connection.statement_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn update_column_is_the_one_column_spelling() {
+        let (posts, connection) =
+            repository(MemoryConnection::new(Dialect::Sqlite).with_outcome(4, 0));
+
+        let affected = posts
+            .update_column(Criteria::new().where_eq("published", false), "published", true)
+            .await
+            .unwrap();
+
+        assert_eq!(affected, 4, "rows affected comes back, so a guarded stamp can count itself");
+        let sql = connection.last_statement().unwrap();
+        assert!(sql.starts_with("UPDATE"), "{sql}");
+        assert!(!sql.contains("title"), "{sql}");
     }
 
     #[tokio::test]
