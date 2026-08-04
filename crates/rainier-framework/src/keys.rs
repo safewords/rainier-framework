@@ -538,6 +538,13 @@ config_keys! {
     pub MAIL_SENDGRID_KEY: String = "mail.sendgrid.key";
 
     /// The Resend API key. Required by the `resend` driver.
+    /// The Cloudflare API token for Email Service — `MAIL_CLOUDFLARE_TOKEN`.
+    ///
+    /// Needs the **Email Sending: Edit** permission. It is the SMTP
+    /// *password*; the username is always the literal string `api_token`, which
+    /// the driver supplies so nobody has to know it.
+    pub MAIL_CLOUDFLARE_TOKEN: String = "mail.cloudflare_token";
+
     pub MAIL_RESEND_KEY: String = "mail.resend.key";
 
     // The `ses` driver has no keys here on purpose: region and credentials
@@ -611,6 +618,7 @@ mod tests {
             ("MAIL", MAIL_MAILGUN_ENDPOINT.path()),
             ("MAIL", MAIL_SENDGRID_KEY.path()),
             ("MAIL", MAIL_RESEND_KEY.path()),
+            ("MAIL", MAIL_CLOUDFLARE_TOKEN.path()),
         ];
 
         for (section, path) in pairs {

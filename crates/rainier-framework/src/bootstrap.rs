@@ -750,6 +750,12 @@ impl Rainier {
             global.insert(0, Arc::new(rainier_middleware::Timeout::seconds(timeout_secs)));
         }
 
+        // Before the kernel takes ownership of the stack, because this is the
+        // one place both halves are in scope: a CORS policy is only reachable
+        // by a preflight from `global`, and only *visible* as a mistake next to
+        // the route table that carries it instead.
+        crate::cors::warn_if_cors_cannot_answer_a_preflight(&global, &compiled);
+
         let kernel = Kernel::from_shared(Arc::clone(&compiled), global)
             .with_debug(app.resolve::<Config>()?.get_or(keys::APP_DEBUG, false));
 

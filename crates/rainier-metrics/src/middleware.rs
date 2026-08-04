@@ -34,8 +34,8 @@ pub const UNMATCHED: &str = "<unmatched>";
 /// ```ignore
 /// pub fn api() -> MiddlewareStack {
 ///     MiddlewareStack::new()
-///         .push(RecordMetrics::new(Arc::clone(&metrics)))
-///         .push(HandleCors::permissive())
+///         .with(RecordMetrics::new(Arc::clone(&metrics)))
+///         .with(ThrottleRequests::per_minute(60))
 /// }
 /// ```
 ///

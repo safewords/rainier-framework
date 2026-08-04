@@ -89,7 +89,7 @@ pub fn api(metrics: Option<Arc<Metrics>>) -> MiddlewareStack {
         Some(metrics) => stack.with(RecordMetrics::new(metrics)),
         None => stack,
     };
-    stack.with(HandleCors::any_origin()).with(ThrottleRequests::per_minute(60))
+    stack.with(ThrottleRequests::per_minute(60))
 }
 ```
 

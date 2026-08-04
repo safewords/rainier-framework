@@ -59,12 +59,14 @@ crate name.
 METHOD    URI                        NAME               MIDDLEWARE
 GET|HEAD  /                          home
 POST      /login                     login              AddHeaders, ThrottleRequests
-GET|HEAD  /api/posts                 api.posts.index    HandleCors, ThrottleRequests
+GET|HEAD  /api/posts                 api.posts.index    ThrottleRequests
 ```
 
 The middleware column is what is **actually compiled into each route's
 pipeline**, every group flattened — because the command reads the
-same `CompiledRouter` the kernel serves. See
+same `CompiledRouter` the kernel serves. Global middleware is not in it:
+`HandleCors`, `TrimStrings` and the rest wrap the router rather than living
+inside it, so they run for every row and for requests that match no row at all. See
 [Routing](routing.md#inspecting-the-table).
 
 ### `serve`

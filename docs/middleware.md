@@ -37,22 +37,22 @@ impl MiddlewareContract for RequireApiKey {
 
 ```mermaid
 flowchart TD
-    subgraph global [Global — every request]
+    subgraph global [Global — every request, matched or not]
         direction TB
+        G0[HandleCors]
         G1[TrimStrings]
         G2[ConvertEmptyStringsToNull]
     end
 
     subgraph route [Route — this route only]
         direction TB
-        R1[HandleCors]
         R2[ThrottleRequests]
         R3[Authenticate]
     end
 
-    REQ[Request] --> G1 --> G2 --> R1 --> R2 --> R3 --> H[Handler]
-    H --> R3b[Authenticate] --> R2b[ThrottleRequests] --> R1b[HandleCors]
-    R1b --> G2b[ConvertEmptyStringsToNull] --> G1b[TrimStrings] --> RES[Response]
+    REQ[Request] --> G0 --> G1 --> G2 --> R2 --> R3 --> H[Handler]
+    H --> R3b[Authenticate] --> R2b[ThrottleRequests]
+    R2b --> G2b[ConvertEmptyStringsToNull] --> G1b[TrimStrings] --> G0b[HandleCors] --> RES[Response]
 
     style H fill:#353,stroke:#6a6,color:#fff
 ```
@@ -166,15 +166,16 @@ whatever the route adds.
 
 ```rust
 pub fn api(per_minute: u32) -> MiddlewareStack {
-    MiddlewareStack::new()
-        .with(HandleCors::any_origin())
-        .with(ThrottleRequests::per_minute(per_minute))
+    MiddlewareStack::new().with(ThrottleRequests::per_minute(per_minute))
 }
 
 pub fn api_authenticated() -> MiddlewareStack {
     api(60).with_stack(auth("api"))
 }
 ```
+
+Note what is *not* in there. CORS belongs on the global stack, and a group is
+the one place it cannot work — see [`HandleCors`](#handlecors).
 
 Nesting is `with_stack`. There is no cycle check because a cycle is not
 expressible: a function that calls itself into a value recurses forever, and
@@ -276,7 +277,7 @@ so a group's session still wraps the controller's authorisation check.
 | `TrimStrings` | `TrimStrings::new()` | trims whitespace from every string input |
 | `ConvertEmptyStringsToNull` | `ConvertEmptyStringsToNull` | `""` becomes `null` |
 | `AddHeaders` | `AddHeaders::security_defaults()` | adds fixed response headers |
-| `HandleCors` | `HandleCors::any_origin()` | CORS, including preflight |
+| `HandleCors` | `HandleCors::for_origins([…])` | CORS, including preflight — **global only** |
 | `ThrottleRequests` | `ThrottleRequests::per_minute(60)` | rate limiting |
 | `TrustProxies` | `groups::trust_local_proxies()` | believe `X-Forwarded-For`, from proxies you name |
 | `StartSession` | `groups::session()` | load and persist the [session](sessions.md) |
@@ -286,10 +287,14 @@ so a group's session still wraps the controller's authorisation check.
 | `Compress` | `Compress::new()` | gzip a text response the client asked for |
 | `MethodOverride` | `MethodOverride::new()` | let an HTML form spell `PUT`/`PATCH`/`DELETE` |
 
-The two input normalisers are **global by default**; CORS, throttling and
+The two input normalisers are **global by default**; throttling and
 authentication are opt-in per route, because applying them everywhere by
 default is nearly always wrong. `Timeout` and `Compress` are global when
 [configured on](configuration.md#what-the-framework-sets-for-you) and absent otherwise.
+
+CORS is opt-in but **not** per route: an application registers it globally or
+not at all. There is no default policy because there is no origin list the
+framework could guess.
 
 ### `TrimStrings` and `ConvertEmptyStringsToNull`
 
@@ -314,20 +319,56 @@ AddHeaders::new().with("x-frame-options", "DENY")
 ### `HandleCors`
 
 ```rust
-HandleCors::any_origin()
-
-HandleCors::default()
-    .allow_origins(["https://app.example.com"])
-    .allow_methods(["GET", "POST"])
-    .allow_headers(["content-type", "authorization"])
-    .expose_headers(["x-request-id"])
-    .allow_credentials(true)
-    .max_age(600)
+// app/http/kernel.rs — global, never on a route or a group.
+registry.global(
+    HandleCors::for_origins(["https://app.example.com", "http://localhost:5173"])
+        .allow_methods(["GET", "POST"])
+        .allow_headers(["content-type", "authorization"])
+        .expose_headers(["x-request-id"])
+        .allow_credentials(true)
+        .max_age(600),
+);
 ```
 
-Answers preflight `OPTIONS` itself rather than passing it through.
-`any_origin()` plus `allow_credentials(true)` is a combination browsers reject,
-and so does this.
+**Register it globally.** This is the one placement that decides whether the
+policy works at all, and the wrong one fails silently.
+
+A browser asks permission before sending anything that is not a "simple"
+request — everything carrying `Authorization`, and every `POST` of JSON — and
+it asks with `OPTIONS` against the same path. No route declares `OPTIONS`, so
+the router matches the path, rejects the method and answers `405` *before*
+entering the route's pipeline. Middleware on a route or a group is that
+pipeline, so it never runs and the preflight is refused with no CORS headers on
+the refusal.
+
+What still works is exactly the requests that needed no preflight, which is why
+a group-mounted policy looks fine: a plain `GET` is decorated correctly and the
+entire authenticated surface is unreachable from a browser. Global middleware
+wraps the router rather than sitting inside it, so it answers the preflight —
+and puts the headers on `404`s and `405`s, without which a browser reports a
+mistyped URL as a CORS failure.
+
+The bootstrap warns at boot if it finds a policy on a route pipeline and none
+globally.
+
+#### `*` is not the permissive end of this
+
+| Built as | Answers | Means |
+|---|---|---|
+| `any_origin()` | `Access-Control-Allow-Origin: *` | public reads from anywhere; **no browser client can authenticate** |
+| `any_origin().allow_credentials(true)` | the caller's origin, reflected | **every** page on the internet may call this as whoever is logged in |
+| `for_origins([…]).allow_credentials(true)` | the caller's origin if listed | what an application usually means |
+
+A browser will not attach a cookie to a cross-origin request whose response
+omits `Access-Control-Allow-Credentials`, and will not accept that header beside
+`Access-Control-Allow-Origin: *`. The origin list and the credentials flag are
+therefore one decision: naming origins is what makes credentials possible, and
+credentials are what make the cookie arrive.
+
+Row two does **not** fail. `allowed_origin_for` reflects the caller's origin
+rather than answering `*`, so the browser is satisfied and the policy works —
+for everybody, which is the problem. `reflects_every_origin()` is how a test
+asserts you are not in that row.
 
 ### `ThrottleRequests`
 

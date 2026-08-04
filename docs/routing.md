@@ -254,7 +254,7 @@ METHOD    URI                        NAME               MIDDLEWARE
 GET|HEAD  /                          home
 GET|HEAD  /health                    health
 POST      /login                     login              AddHeaders, ThrottleRequests
-GET|HEAD  /api/posts                 api.posts.index    HandleCors, ThrottleRequests
+GET|HEAD  /api/posts                 api.posts.index    ThrottleRequests
 ```
 
 The middleware column shows what is **actually compiled into each route's

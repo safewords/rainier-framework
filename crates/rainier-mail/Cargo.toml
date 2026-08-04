@@ -9,6 +9,9 @@ repository.workspace = true
 
 [dependencies]
 rainier-support = { workspace = true }
+# The Cloudflare Email endpoint lives with the other connectors; this crate
+# turns one into an SMTP transport rather than restating where it is.
+rainier-drivers = { workspace = true }
 rainier-view = { workspace = true }
 rainier-events = { workspace = true }
 # The HTTP transport port and its fake — NOT the reqwest socket, which the

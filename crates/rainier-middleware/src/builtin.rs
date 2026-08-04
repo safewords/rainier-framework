@@ -166,6 +166,55 @@ pub enum AllowedOrigins {
 /// Answers preflight `OPTIONS` requests itself (short-circuiting the pipeline,
 /// which is why a preflight never reaches a route) and adds the response
 /// headers to everything else.
+///
+/// # Register it **globally**, not on a route group
+///
+/// This is the one placement decision that decides whether the policy works at
+/// all, and getting it wrong fails silently:
+///
+/// ```ignore
+/// registry.global(HandleCors::for_origins(["https://app.example"]).allow_credentials(true));
+/// ```
+///
+/// A browser asks permission before sending a cross-origin request that is not
+/// "simple" — anything carrying `Authorization`, and any `POST` of JSON — and it
+/// asks with `OPTIONS` against the same path. No route declares `OPTIONS`, so a
+/// router matches the path, rejects the method and answers `405` **before**
+/// entering the route's pipeline. Middleware attached to a route or a group
+/// lives in that pipeline, so it never runs, and the preflight is refused with
+/// no CORS headers on the refusal.
+///
+/// The requests that survive are exactly the ones needing no preflight — a
+/// plain `GET` — which is why a group-mounted policy looks like it works while
+/// the entire authenticated surface is unreachable from a browser.
+///
+/// Global middleware wraps the router rather than living inside it, so it sees
+/// the preflight first and answers it. It also puts the headers on `404`s and
+/// `405`s, which matters: without them a browser reports a mistyped URL as a
+/// CORS failure.
+///
+/// The bootstrap says so at boot when it finds this on a route pipeline and not
+/// in the global stack.
+///
+/// # `*` is not the permissive end of this setting
+///
+/// There are three reachable policies, and two of them look like settings:
+///
+/// | Built as | Answers | Means |
+/// |---|---|---|
+/// | [`any_origin`](Self::any_origin) | `Access-Control-Allow-Origin: *` | public reads work from anywhere; **no browser client can authenticate** |
+/// | `any_origin().allow_credentials(true)` | the caller's own origin, reflected | **every** page on the internet may make authenticated calls and read the answers |
+/// | [`for_origins`](Self::for_origins)`.allow_credentials(true)` | the caller's origin if it is listed | what an application usually means |
+///
+/// A browser will not attach a cookie to a cross-origin request whose response
+/// omits `Access-Control-Allow-Credentials`, and will not accept that header
+/// beside `Access-Control-Allow-Origin: *`. So the origin list and the
+/// credentials flag are one decision: naming origins is what makes credentials
+/// possible, and credentials are what make the cookie arrive.
+///
+/// Row two is what discovering row one invites, and it does not fail — see
+/// [`allowed_origin_for`](Self::allowed_origin_for), which reflects rather than
+/// answering `*`. It works for everybody, which is the problem.
 #[derive(Debug, Clone)]
 pub struct HandleCors {
     origins: AllowedOrigins,
@@ -196,9 +245,28 @@ impl Default for HandleCors {
 }
 
 impl HandleCors {
-    /// A permissive policy: any origin, no credentials.
+    /// A public policy: any origin, and therefore **no credentials**.
+    ///
+    /// Right for an API that serves the same public data to anyone and
+    /// authenticates nobody from a browser. Wrong for anything a browser logs
+    /// in to — see the table on [`HandleCors`], and reach for
+    /// [`for_origins`](Self::for_origins) instead.
     pub fn any_origin() -> Self {
         Self::default()
+    }
+
+    /// A policy for named origins — the constructor to start from when a
+    /// browser authenticates against this application.
+    ///
+    /// ```ignore
+    /// HandleCors::for_origins(["https://app.example", "http://localhost:5173"])
+    ///     .allow_credentials(true)
+    /// ```
+    ///
+    /// The same policy as `any_origin().allow_origins(..)`, spelled so the
+    /// starting point is not the one it is narrowing away from.
+    pub fn for_origins(origins: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::default().allow_origins(origins)
     }
 
     /// Restrict to an explicit origin list.
@@ -225,16 +293,35 @@ impl HandleCors {
         self
     }
 
-    /// Allow credentialed requests.
+    /// Allow credentialed requests — cookies, and `Authorization` on a
+    /// same-site cookie flow.
     ///
     /// Browsers reject `Access-Control-Allow-Credentials: true` alongside
     /// `Access-Control-Allow-Origin: *`, so enabling this with
     /// [`AllowedOrigins::Any`] would produce a policy that silently never
-    /// works. [`allowed_origin_for`](Self::allowed_origin_for) therefore echoes
-    /// the request's origin instead of `*` when credentials are on.
+    /// works. [`allowed_origin_for`](Self::allowed_origin_for) therefore
+    /// reflects the request's origin instead of `*` when credentials are on.
+    ///
+    /// **That reflection is a fallback, not a feature.** It keeps the pair
+    /// working rather than making it correct: a policy that reflects every
+    /// origin *and* allows credentials tells every page on the internet it may
+    /// call this application as whoever is logged in, and read the reply. Name
+    /// the origins with [`for_origins`](Self::for_origins) and the reflection
+    /// never applies — [`reflects_every_origin`](Self::reflects_every_origin)
+    /// is how a test asserts it does not.
     pub fn allow_credentials(mut self, allow: bool) -> Self {
         self.credentials = allow;
         self
+    }
+
+    /// Whether this policy hands a credentialed answer to **any** origin that
+    /// asks.
+    ///
+    /// True only for `any_origin().allow_credentials(true)` — the middle row of
+    /// the table on [`HandleCors`], and the one worth an assertion in an
+    /// application's own tests, because nothing about it fails at runtime.
+    pub fn reflects_every_origin(&self) -> bool {
+        self.credentials && matches!(self.origins, AllowedOrigins::Any)
     }
 
     /// How long a browser may cache the preflight result.

@@ -131,6 +131,9 @@
 
 #[cfg(feature = "aws")]
 pub mod aws;
+// No feature: constants, a validated token, and a `Debug` that redacts it.
+// Nothing to link, so nothing to gate.
+pub mod cloudflare_email;
 #[cfg(feature = "aws-dynamodb")]
 pub mod dynamodb;
 #[cfg(feature = "kafka")]
@@ -150,6 +153,7 @@ pub mod sqs;
 
 #[cfg(feature = "aws")]
 pub use aws::{sdk_error, AwsConnector};
+pub use cloudflare_email::CloudflareEmailConnector;
 #[cfg(feature = "aws-dynamodb")]
 pub use dynamodb::{DynamoDbClient, DynamoItem};
 #[cfg(feature = "kafka")]

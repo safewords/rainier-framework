@@ -53,6 +53,7 @@ pub fn transport(config: &Config) -> Result<Arc<dyn Transport>> {
             Ok(Arc::new(FileTransport::new(directory)?))
         }
         MailDriver::Smtp => smtp(config),
+        MailDriver::Cloudflare => cloudflare(config),
         MailDriver::Ses => ses(),
         MailDriver::Postmark => postmark(config),
         MailDriver::Mailgun => mailgun(config),
@@ -154,6 +155,23 @@ fn smtp(config: &Config) -> Result<Arc<dyn Transport>> {
 #[cfg(not(feature = "mail-smtp"))]
 fn smtp(_: &Config) -> Result<Arc<dyn Transport>> {
     Err(feature_missing("smtp", "mail-smtp"))
+}
+
+#[cfg(feature = "mail-smtp")]
+fn cloudflare(config: &Config) -> Result<Arc<dyn Transport>> {
+    // The one setting an application supplies. Host, port, implicit TLS and
+    // the `api_token` username are the service's, not a deployment's, so the
+    // driver holds them rather than asking four times for the same answer.
+    let token = require(config, keys::MAIL_CLOUDFLARE_TOKEN, "MAIL_CLOUDFLARE_TOKEN")?;
+    Ok(Arc::new(rainier_mail::cloudflare::cloudflare_smtp(token)?))
+}
+
+#[cfg(not(feature = "mail-smtp"))]
+fn cloudflare(_: &Config) -> Result<Arc<dyn Transport>> {
+    // The same feature as `smtp`, because it *is* the SMTP transport with
+    // settings applied — naming `mail-smtp` here rather than inventing a
+    // `mail-cloudflare` keeps the fix one flag rather than a guess.
+    Err(feature_missing("cloudflare", "mail-smtp"))
 }
 
 #[cfg(feature = "mail-ses")]

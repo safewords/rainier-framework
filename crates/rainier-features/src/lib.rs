@@ -162,10 +162,16 @@ pub fn compute(env: &[(String, String)], sources: &str) -> Report {
         _ => {}
     }
 
-    if let Some(sender @ ("smtp" | "ses" | "postmark" | "mailgun" | "sendgrid" | "resend")) =
-        get("MAIL_DRIVER")
+    if let Some(
+        sender @ ("smtp" | "cloudflare" | "ses" | "postmark" | "mailgun" | "sendgrid" | "resend"),
+    ) = get("MAIL_DRIVER")
     {
-        let feature = format!("mail-{sender}");
+        // `cloudflare` is the SMTP transport with the service's settings
+        // applied, so it needs that feature rather than one of its own.
+        // Naming a `mail-cloudflare` here would tell somebody to enable a flag
+        // that does not exist.
+        let feature =
+            if sender == "cloudflare" { "mail-smtp".to_string() } else { format!("mail-{sender}") };
         want(&mut report, &feature, format!("MAIL_DRIVER={sender}"));
     }
 

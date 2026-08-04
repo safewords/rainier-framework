@@ -43,6 +43,26 @@ pub trait Mailable: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Which named mailer this goes through, when it is particular about it.
+    ///
+    /// `None` — the default — means "whichever the application configured",
+    /// which is right for almost every message.
+    ///
+    /// Name one when the *message* is what decides, not the call site. A
+    /// password reset that must not queue behind a marketing blast belongs on
+    /// a different connection wherever it is sent from, and saying so here
+    /// means no caller can forget. A caller that needs to override this for
+    /// one send uses [`Mailer::via`](crate::Mailer::via), which wins — the
+    /// explicit instruction at the call site beats the standing preference.
+    ///
+    /// An unknown name is refused at send time rather than falling back to the
+    /// default: silently sending on the wrong connection is how a transactional
+    /// message ends up rate-limited behind bulk mail, and nothing about the
+    /// result would say so.
+    fn mailer(&self) -> Option<&str> {
+        None
+    }
+
     /// Extra headers.
     fn headers(&self) -> Vec<(String, String)> {
         Vec::new()

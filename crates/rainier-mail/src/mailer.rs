@@ -29,6 +29,13 @@ pub struct MessageSent {
 pub struct Mailer {
     views: Arc<dyn ViewEngine>,
     transport: Arc<dyn Transport>,
+    /// Transports beyond the default, by the name a caller or a mailable asks
+    /// for. Empty in the common case — one connection needs no names.
+    named: std::collections::HashMap<String, Arc<dyn Transport>>,
+    /// Set by [`Mailer::via`] for one send, and it outranks a mailable's own
+    /// [`Mailable::mailer`]: an instruction at the call site is more specific
+    /// than a standing preference on the type.
+    forced: Option<String>,
     events: Option<Arc<Dispatcher>>,
     /// The sender applied to any message that does not name one.
     default_from: Option<Address>,
@@ -44,7 +51,75 @@ pub const ORIGINAL_TO: &str = "X-Rainier-Original-To";
 impl Mailer {
     /// A mailer rendering through `views` and delivering through `transport`.
     pub fn new(views: Arc<dyn ViewEngine>, transport: Arc<dyn Transport>) -> Self {
-        Self { views, transport, events: None, default_from: None, always_to: None, recorded: None }
+        Self {
+            views,
+            transport,
+            named: std::collections::HashMap::new(),
+            forced: None,
+            events: None,
+            default_from: None,
+            always_to: None,
+            recorded: None,
+        }
+    }
+
+    /// Register a transport under a name a mailable or a caller can ask for.
+    ///
+    /// The mailer built without any of these has one connection and needs no
+    /// names, which is the common case and stays the simplest one.
+    pub fn with_named(mut self, name: impl Into<String>, transport: Arc<dyn Transport>) -> Self {
+        self.named.insert(name.into(), transport);
+        self
+    }
+
+    /// Send the next message through a named transport, whatever the mailable
+    /// would have chosen.
+    ///
+    /// ```ignore
+    /// mailer.via("transactional").send(&reset).await?;
+    /// ```
+    ///
+    /// Outranks [`Mailable::mailer`] deliberately: the mailable states a
+    /// standing preference, this is an instruction about one send, and the
+    /// more specific of the two should win. It is also the escape hatch that
+    /// makes a preference safe to state at all — a caller is never stuck with
+    /// one.
+    pub fn via(&self, name: impl Into<String>) -> Self {
+        Self {
+            views: Arc::clone(&self.views),
+            transport: Arc::clone(&self.transport),
+            named: self.named.clone(),
+            forced: Some(name.into()),
+            events: self.events.clone(),
+            default_from: self.default_from.clone(),
+            always_to: self.always_to.clone(),
+            // A `via` view never records: the fake's vector lives on the
+            // mailer a test holds, and copying it here would collect sends
+            // nobody can read back.
+            recorded: None,
+        }
+    }
+
+    /// The transport a message should go through, and why.
+    ///
+    /// Refuses an unknown name rather than falling back. Falling back would
+    /// mean a transactional message quietly leaving on the bulk connection,
+    /// arriving late or rate-limited, with nothing in the result saying it took
+    /// the wrong road — the failure would surface as "our password resets are
+    /// slow" weeks later.
+    fn transport_for(&self, mailable: &dyn Mailable) -> Result<&Arc<dyn Transport>> {
+        let requested = self.forced.as_deref().or_else(|| mailable.mailer());
+
+        let Some(name) = requested else { return Ok(&self.transport) };
+
+        self.named.get(name).ok_or_else(|| {
+            let mut known: Vec<&str> = self.named.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            Error::internal(format!(
+                "no mailer named `{name}`; registered: {}",
+                if known.is_empty() { "none".to_string() } else { known.join(", ") }
+            ))
+        })
     }
 
     /// A mailer that **records** messages instead of sending them.
@@ -52,6 +127,8 @@ impl Mailer {
         Self {
             views,
             transport: Arc::new(crate::transport::MemoryTransport::new()),
+            named: std::collections::HashMap::new(),
+            forced: None,
             events: None,
             default_from: None,
             always_to: None,
@@ -93,8 +170,12 @@ impl Mailer {
 
     /// Render and deliver a mailable.
     pub async fn send(&self, mailable: &dyn Mailable) -> Result<Message> {
+        // Resolved here, before the mailable is turned into a `Message` and
+        // its own preference is no longer reachable. An unknown name fails
+        // now, without a partial send.
+        let transport = Arc::clone(self.transport_for(mailable)?);
         let message = self.prepare(mailable)?;
-        self.deliver(message).await
+        self.deliver_over(message, transport).await
     }
 
     /// Render a mailable without sending it — for previewing, and for
@@ -153,6 +234,19 @@ impl Mailer {
     /// built its own `Message` gets the same treatment as one that went through
     /// a [`Mailable`].
     pub async fn deliver(&self, message: Message) -> Result<Message> {
+        // The default, or whatever `via` forced. A caller holding only a
+        // `Message` has no mailable left to ask, which is why `send` resolves
+        // the choice while it still can.
+        let transport = Arc::clone(&self.transport);
+        self.deliver_over(message, transport).await
+    }
+
+    /// [`deliver`](Self::deliver), over a transport already chosen.
+    async fn deliver_over(
+        &self,
+        message: Message,
+        transport: Arc<dyn Transport>,
+    ) -> Result<Message> {
         let message = self.apply_defaults(message);
         message.validate()?;
 
@@ -171,7 +265,7 @@ impl Mailer {
             return Ok(message);
         }
 
-        self.transport.send(&message).await?;
+        transport.send(&message).await?;
 
         if let Some(events) = &self.events {
             // Sent is past tense: the message has gone, so a failing listener
@@ -526,5 +620,87 @@ mod tests {
         let mailer = Mailer::new(views(), Arc::new(MemoryTransport::new()));
         mailer.send(&Welcome::to("ada@example.com")).await.unwrap();
         mailer.assert_nothing_sent();
+    }
+
+    /// A mailable that insists on a named connection.
+    struct Receipt {
+        mailer: Option<&'static str>,
+    }
+
+    impl Mailable for Receipt {
+        fn envelope(&self) -> Envelope {
+            Envelope::new("Receipt").from("shop@example.test").to("buyer@example.test")
+        }
+
+        fn content(&self) -> Result<Content> {
+            Ok(Content::text("thanks"))
+        }
+
+        fn mailer(&self) -> Option<&str> {
+            self.mailer
+        }
+    }
+
+    fn mailer_with_named() -> (Mailer, Arc<MemoryTransport>, Arc<MemoryTransport>) {
+        let default = Arc::new(MemoryTransport::new());
+        let bulk = Arc::new(MemoryTransport::new());
+        let mailer = Mailer::new(Arc::new(MemoryEngine::new()), default.clone())
+            .with_named("bulk", bulk.clone());
+        (mailer, default, bulk)
+    }
+
+    #[tokio::test]
+    async fn a_mailable_that_names_no_mailer_takes_the_default() {
+        let (mailer, default, bulk) = mailer_with_named();
+
+        mailer.send(&Receipt { mailer: None }).await.unwrap();
+
+        assert_eq!(default.sent().len(), 1);
+        assert_eq!(bulk.sent().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_mailable_can_choose_its_own_connection() {
+        let (mailer, default, bulk) = mailer_with_named();
+
+        mailer.send(&Receipt { mailer: Some("bulk") }).await.unwrap();
+
+        assert_eq!(bulk.sent().len(), 1);
+        assert_eq!(default.sent().len(), 0, "the default must not also receive it");
+    }
+
+    #[tokio::test]
+    async fn via_outranks_the_mailables_own_choice() {
+        // The mailable states a standing preference; `via` is an instruction
+        // about this send. The more specific one wins, and this is also what
+        // makes stating a preference safe — a caller is never stuck with it.
+        let (mailer, default, bulk) = mailer_with_named();
+
+        mailer.via("bulk").send(&Receipt { mailer: None }).await.unwrap();
+        assert_eq!(bulk.sent().len(), 1);
+
+        let (mailer, default2, bulk2) = mailer_with_named();
+        mailer.via("bulk").send(&Receipt { mailer: Some("bulk") }).await.unwrap();
+        assert_eq!(bulk2.sent().len(), 1);
+        assert_eq!(default2.sent().len(), 0);
+        assert_eq!(default.sent().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_mailer_is_refused_rather_than_falling_back() {
+        // The property worth having. A fallback would put a transactional
+        // message on the bulk connection — late, possibly rate-limited, and
+        // with nothing in the result saying it took the wrong road. The
+        // failure would surface weeks later as "our password resets are slow".
+        let (mailer, default, _bulk) = mailer_with_named();
+
+        let error = mailer
+            .send(&Receipt { mailer: Some("typo") })
+            .await
+            .expect_err("an unknown mailer name cannot be guessed at");
+
+        assert!(error.message().contains("typo"), "{}", error.message());
+        assert!(error.message().contains("bulk"), "it should list what is registered");
+        assert_eq!(default.sent().len(), 0, "nothing may go out on the wrong connection");
     }
 }

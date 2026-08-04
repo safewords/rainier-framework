@@ -3446,6 +3446,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "lettre",
+ "rainier-drivers",
  "rainier-events",
  "rainier-http-client",
  "rainier-support",

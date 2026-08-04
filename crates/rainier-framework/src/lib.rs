@@ -114,6 +114,7 @@ pub mod binding;
 pub mod bootstrap;
 pub mod broadcasting;
 pub mod commands;
+pub mod cors;
 pub mod facades;
 pub mod groups;
 pub mod health;

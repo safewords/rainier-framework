@@ -74,6 +74,10 @@
 
 #[cfg(any(feature = "postmark", feature = "mailgun", feature = "sendgrid", feature = "resend"))]
 mod api;
+// The same gate as `smtp`, because this builds that transport. A module that
+// only exists to configure another cannot outlive it.
+#[cfg(feature = "smtp")]
+pub mod cloudflare;
 pub mod driver;
 pub mod mailable;
 pub mod mailer;

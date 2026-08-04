@@ -32,8 +32,8 @@
 use std::sync::Arc;
 
 use rainier_middleware::{
-    AddHeaders, ConvertEmptyStringsToNull, HandleCors, MiddlewareStack, ThrottleRequests,
-    TrimStrings, TrustProxies,
+    AddHeaders, ConvertEmptyStringsToNull, MiddlewareStack, ThrottleRequests, TrimStrings,
+    TrustProxies,
 };
 use rainier_session::{SessionManager, StartSession};
 
@@ -47,10 +47,35 @@ pub fn web() -> MiddlewareStack {
     MiddlewareStack::new().with(AddHeaders::security_defaults()).with_stack(session())
 }
 
-/// CORS plus a rate limit — what a JSON API wants.
+/// A rate limit — what a JSON API wants.
 ///
 /// No session on purpose: an API authenticates per request with a token, so a
 /// session row and a `Set-Cookie` per call would be pure overhead.
+///
+/// # CORS is **not** in here, and used to be
+///
+/// It was `HandleCors::any_origin()` at the front of this list, and that could
+/// not work from a route group. A browser asks permission before sending
+/// anything that carries `Authorization` or `POST`s JSON, and it asks with
+/// `OPTIONS` against the same path — which no route declares, so the router
+/// answers `405` before entering any route pipeline. A group's middleware is
+/// that pipeline. The preflight was refused with no CORS headers on the
+/// refusal, so the request it asked about was never sent.
+///
+/// Only requests needing no preflight got through, which is why this looked
+/// like it worked: a plain `GET` is decorated correctly and everything
+/// authenticated is unreachable from a browser.
+///
+/// Register the policy on the global stack instead, where it wraps the router
+/// rather than sitting inside it:
+///
+/// ```ignore
+/// // app/http/kernel.rs
+/// registry.global(HandleCors::for_origins(["https://app.example"]).allow_credentials(true));
+/// ```
+///
+/// The bootstrap says so at boot if it finds one on a route pipeline and not in
+/// the global stack — see [`cors`](crate::cors).
 pub fn api() -> MiddlewareStack {
     api_throttled(60)
 }
@@ -61,9 +86,7 @@ pub fn api() -> MiddlewareStack {
 /// A string-keyed registry spells this `'throttle:60,1'` and parses the limit
 /// back out of the name.
 pub fn api_throttled(per_minute: u32) -> MiddlewareStack {
-    MiddlewareStack::new()
-        .with(HandleCors::any_origin())
-        .with(ThrottleRequests::per_minute(per_minute))
+    MiddlewareStack::new().with(ThrottleRequests::per_minute(per_minute))
 }
 
 /// Start a session, using whichever store the application bound.
@@ -114,14 +137,24 @@ mod tests {
         // The property worth pinning: a group that quietly started sessions
         // would put a row and a `Set-Cookie` on every API call.
         assert!(!api().labels().contains(&"StartSession"));
-        assert_eq!(api().labels(), vec!["HandleCors", "ThrottleRequests"]);
+        assert_eq!(api().labels(), vec!["ThrottleRequests"]);
+    }
+
+    #[test]
+    fn api_carries_no_cors_policy() {
+        // Deliberate, and it is the whole of a bug this group used to ship. A
+        // preflight is `OPTIONS` against a path no route accepts `OPTIONS`
+        // for, so the router answers 405 without entering a route pipeline —
+        // and a group *is* a route pipeline. CORS mounted here answers the
+        // requests that never needed it and none of the ones that did.
+        assert!(!api().labels().contains(&"HandleCors"), "{:?}", api().labels());
     }
 
     #[test]
     fn a_group_can_take_an_argument() {
         // What a name in a registry cannot do without parsing itself back out
         // of a string.
-        assert_eq!(api_throttled(10).len(), 2);
+        assert_eq!(api_throttled(10).len(), 1);
     }
 
     #[test]

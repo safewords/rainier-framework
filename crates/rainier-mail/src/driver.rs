@@ -38,6 +38,16 @@ setting_enum! {
         /// behind the `smtp` feature.
         Smtp = "smtp",
 
+        /// Cloudflare Email Service — the same SMTP transport with the four
+        /// settings that service requires already applied, behind the `smtp`
+        /// feature.
+        ///
+        /// Distinct from [`Smtp`](Self::Smtp) because three of those four fail
+        /// as a hang or as "bad token" rather than as a wrong setting — most
+        /// of all the username, which is the literal string `api_token` and
+        /// not an address. See [`cloudflare`](crate::cloudflare).
+        Cloudflare = "cloudflare",
+
         /// Amazon SES — [`SesTransport`](crate::SesTransport), behind the
         /// `ses` feature.
         Ses = "ses",
@@ -72,7 +82,13 @@ impl MailDriver {
     pub fn delivers(&self) -> bool {
         matches!(
             self,
-            Self::Smtp | Self::Ses | Self::Postmark | Self::Mailgun | Self::Sendgrid | Self::Resend
+            Self::Smtp
+                | Self::Cloudflare
+                | Self::Ses
+                | Self::Postmark
+                | Self::Mailgun
+                | Self::Sendgrid
+                | Self::Resend
         )
     }
 
@@ -132,6 +148,7 @@ mod tests {
         // one of these two lists.
         let senders = [
             MailDriver::Smtp,
+            MailDriver::Cloudflare,
             MailDriver::Ses,
             MailDriver::Postmark,
             MailDriver::Mailgun,
