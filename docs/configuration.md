@@ -353,6 +353,31 @@ would review cleanly, deploy cleanly and change nothing. Then the query runs
 against the other one and **answers**: rows come back, the types match, the page
 renders. There is no failure to notice.
 
+### Handing one over skips the check entirely
+
+`with_cache`, `with_queue`, `with_database` and `with_storage` each win over
+both the variable and the section — that is the point, since they are the escape
+hatch for a backend no configuration file can describe. What is easy to miss is
+that the refusal above lives in the branch they replace, so **an application
+that hands one over never sees it**.
+
+That is a trap rather than a nuance, and it has caught a real application. Hand
+over a `CacheManager` and `CACHE_DRIVER` is then read by nothing, so setting it
+to `redis` boots cleanly on whatever store was passed in — which is the
+unshared-cache failure the refusal exists to prevent, arriving through the
+wiring that suppressed the refusal.
+
+If your application hands a backend over *and* still reads the variable for its
+own purposes, restate the refusal in your own `configure`:
+
+```rust
+if env.get("CACHE_DRIVER").is_some_and(|d| !d.trim().is_empty()) {
+    return Err(Error::internal(
+        "this application declares its cache stores; CACHE_DRIVER is not read — set CACHE_STORE",
+    ));
+}
+```
+
 That failure gets quieter as you go down the list, which is why all four refuse
 rather than only the loud ones:
 

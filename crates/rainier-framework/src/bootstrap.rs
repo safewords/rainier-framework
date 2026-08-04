@@ -323,6 +323,28 @@ impl Rainier {
     ///
     /// Defaults to an in-process one, which is right for development and wrong
     /// the moment a second instance exists — see [`CacheManager`].
+    ///
+    /// # It takes the conflict check with it
+    ///
+    /// This wins over both `CACHE_DRIVER` and a `cache.stores` section, which
+    /// is the point — it is the escape hatch for a store no configuration can
+    /// describe, like a `kv` binding. What is easy to miss is that nothing else
+    /// is consulted **at all**: the check that refuses `CACHE_DRIVER` beside a
+    /// declared section lives in the branch this one replaces, so an
+    /// application calling this never sees it.
+    ///
+    /// That is a real trap and it has caught a real application. `CACHE_DRIVER`
+    /// is then read by nothing, so setting it to `redis` boots cleanly on
+    /// whatever store was handed over here — the unshared-cache failure the
+    /// refusal exists to prevent, arriving through the wiring that suppressed
+    /// the refusal.
+    ///
+    /// An application that hands a store over and *also* reads `CACHE_DRIVER`
+    /// for its own purposes should restate the refusal in its own `configure`.
+    /// The same applies to [`with_queue`](Self::with_queue),
+    /// [`with_database`](Self::with_database) and
+    /// [`with_storage`](Self::with_storage), each of which replaces its own
+    /// section's branch and its own checks.
     pub fn with_cache(mut self, cache: CacheManager) -> Self {
         self.cache = Some(cache);
         self
