@@ -241,6 +241,29 @@ pub struct QueuedJob {
     /// later. `None` for the ordinary case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique_key: Option<String>,
+
+    /// A driver's handle on **this delivery**, set when the job is reserved.
+    ///
+    /// Not the job's id: a job redelivered after a worker died is the same job
+    /// with a new handle. Only the driver that set it knows what it means —
+    /// for Redis it is the stream entry id that `XACK` needs.
+    ///
+    /// `#[serde(skip)]` on purpose, twice over. It does not belong in the
+    /// stored job, because it does not exist until something reserves it; and
+    /// a stored one would be stale the moment it was redelivered.
+    ///
+    /// It exists because the alternative was writing it into
+    /// [`payload`](Self::payload), which corrupted the job. `payload` is
+    /// `Value::Null` for a unit-struct job — 17 of them in the first
+    /// application to run this — and `payload[key] = value` on a `Null`
+    /// silently promotes it to an object. Round-tripping then yielded `{}`,
+    /// and `serde_json::from_value::<UnitStruct>({})` fails with "invalid
+    /// type: map, expected unit struct". The job retried to its limit and went
+    /// to the failed table, having never run. Nothing could fix that from the
+    /// other end either: `{}` is also what an empty named struct serialises
+    /// to, so a driver stripping the key cannot know whether to restore `Null`.
+    #[serde(skip)]
+    pub delivery_handle: Option<String>,
 }
 
 impl QueuedJob {
@@ -257,6 +280,7 @@ impl QueuedJob {
             attempts: 0,
             max_attempts: J::TRIES,
             unique_key: None,
+            delivery_handle: None,
             available_at: now,
             created_at: now,
         })

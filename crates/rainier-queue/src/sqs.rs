@@ -4,13 +4,9 @@ use std::time::Duration;
 
 use rainier_drivers::{AwsConnector, SqsClient};
 use rainier_support::{BoxFuture, Error, Result};
-use serde_json::json;
 
 use crate::job::QueuedJob;
 use crate::queue::Queue;
-
-/// Where `reserve` stashes the receipt handle so `acknowledge` can find it.
-const RECEIPT_HANDLE: &str = "__sqs_receipt_handle";
 
 /// Jobs on Amazon SQS.
 ///
@@ -161,7 +157,12 @@ impl Queue for SqsQueue {
             };
 
             // The handle is valid only for this receive, so it rides on the job.
-            job.payload[RECEIPT_HANDLE] = json!(message.receipt_handle);
+            // On the job, not in its payload. Writing it into the payload
+            // rewrote the job: `payload[key] = value` promotes a `Value::Null`
+            // — what a unit-struct job serialises to — into an object, and the
+            // job then failed to deserialise into its own type on every
+            // attempt. Same fault the Redis driver had; same fix.
+            job.delivery_handle = Some(message.receipt_handle.clone());
 
             // SQS's delivery count is authoritative: it counts deliveries to
             // workers that died without recording anything.
@@ -219,9 +220,9 @@ impl std::fmt::Debug for SqsQueue {
     }
 }
 
-/// The receipt handle [`reserve`](Queue::reserve) stashed on the job.
+/// The receipt handle [`reserve`](Queue::reserve) put on the job.
 fn receipt_handle(job: &QueuedJob) -> Result<&str> {
-    job.payload.get(RECEIPT_HANDLE).and_then(|value| value.as_str()).ok_or_else(|| {
+    job.delivery_handle.as_deref().ok_or_else(|| {
         // Reachable only if a job was constructed rather than reserved, which is
         // a programming error rather than an SQS one.
         Error::internal("this job carries no SQS receipt handle, so it was not reserved from SQS")
@@ -231,6 +232,7 @@ fn receipt_handle(job: &QueuedJob) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const URL: &str = "https://sqs.eu-west-2.amazonaws.com/123456789012/jobs";
 
@@ -249,6 +251,7 @@ mod tests {
             available_at: chrono::Utc::now(),
             created_at: chrono::Utc::now(),
             unique_key: None,
+            delivery_handle: None,
         }
     }
 
@@ -281,7 +284,7 @@ mod tests {
     #[test]
     fn a_reserved_job_carries_its_handle() {
         let mut reserved = job();
-        reserved.payload[RECEIPT_HANDLE] = json!("AQEB-handle");
+        reserved.delivery_handle = Some("AQEB-handle".to_string());
 
         assert_eq!(receipt_handle(&reserved).unwrap(), "AQEB-handle");
     }

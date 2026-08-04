@@ -118,6 +118,9 @@ impl JobRow {
             available_at: self.available_at,
             created_at: self.created_at,
             unique_key: self.unique_key,
+            // The row *is* the reservation here — this driver marks it
+            // reserved in place — so there is no separate handle to carry.
+            delivery_handle: None,
         })
     }
 }

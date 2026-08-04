@@ -70,13 +70,6 @@ use serde_json::json;
 use crate::job::QueuedJob;
 use crate::queue::{FailedJob, Queue};
 
-/// Where `reserve` stashes the stream entry id so `acknowledge` can find it.
-///
-/// The same trick [`SqsQueue`](crate::SqsQueue) plays with a receipt handle,
-/// and for the same reason: the id that identifies a *delivery* is not the id
-/// that identifies the job, and only the transport knows it.
-const ENTRY_ID: &str = "__redis_entry_id";
-
 /// The consumer group every worker joins.
 ///
 /// One group, so the workers share the queue rather than each getting a copy —
@@ -226,9 +219,9 @@ impl RedisQueue {
             .await
     }
 
-    /// The stream entry id `reserve` stashed on this job.
+    /// The stream entry id `reserve` put on this job.
     fn entry_id(job: &QueuedJob) -> Result<&str> {
-        job.payload.get(ENTRY_ID).and_then(|id| id.as_str()).ok_or_else(|| {
+        job.delivery_handle.as_deref().ok_or_else(|| {
             Error::internal(format!(
                 "job `{}` has no Redis entry id — it was not reserved from this queue",
                 job.id
@@ -237,12 +230,12 @@ impl RedisQueue {
     }
 
     /// The job, without the transport's bookkeeping on it.
+    ///
+    /// The handle is `#[serde(skip)]`, so clearing it here is belt and braces
+    /// — but a job put back on the stream must not claim a delivery that has
+    /// been acknowledged.
     fn without_entry_id(job: &QueuedJob) -> QueuedJob {
-        let mut job = job.clone();
-        if let Some(payload) = job.payload.as_object_mut() {
-            payload.remove(ENTRY_ID);
-        }
-        job
+        QueuedJob { delivery_handle: None, ..job.clone() }
     }
 
     fn encode(job: &QueuedJob) -> Result<Vec<u8>> {
@@ -315,7 +308,13 @@ impl Queue for RedisQueue {
             };
 
             // The id identifying this *delivery*, which is not the job's id.
-            job.payload[ENTRY_ID] = json!(entry.id);
+            //
+            // On the job, not in its payload. Writing it into the payload
+            // rewrote the job: `payload[key] = value` promotes a `Value::Null`
+            // — which is what a unit-struct job serialises to — into an
+            // object, and the job then failed to deserialise into its own type
+            // for the whole of its retry budget.
+            job.delivery_handle = Some(entry.id.clone());
             job.attempts += 1;
 
             Ok(Some(job))
@@ -448,6 +447,7 @@ mod tests {
             available_at: Utc::now(),
             created_at: Utc::now(),
             unique_key: None,
+            delivery_handle: None,
         }
     }
 
@@ -474,17 +474,47 @@ mod tests {
     }
 
     #[test]
-    fn the_entry_id_rides_on_the_payload_and_comes_off_again() {
+    fn the_entry_id_rides_on_the_job_and_comes_off_again() {
         let mut reserved = job();
-        reserved.payload[ENTRY_ID] = json!("1700000000000-0");
+        reserved.delivery_handle = Some("1700000000000-0".to_string());
 
         assert_eq!(RedisQueue::entry_id(&reserved).unwrap(), "1700000000000-0");
 
         // A retry must not carry the *previous* delivery's id, or the next
         // acknowledgement would target an entry that is already gone.
         let retry = RedisQueue::without_entry_id(&reserved);
-        assert!(retry.payload.get(ENTRY_ID).is_none());
+        assert!(retry.delivery_handle.is_none());
         assert_eq!(retry.payload["a"], 1, "the job's own payload survives");
+    }
+
+    #[test]
+    fn reserving_does_not_rewrite_a_unit_struct_jobs_payload() {
+        // The bug this field exists for. A unit-struct job serialises to
+        // `null`, and the entry id used to be written into the payload —
+        // where `payload[key] = value` promotes `null` to an object. The job
+        // then failed to deserialise into its own type on every attempt and
+        // went to the failed table having never run.
+        let mut reserved = QueuedJob { payload: serde_json::Value::Null, ..job() };
+        reserved.delivery_handle = Some("1700000000000-0".to_string());
+
+        assert_eq!(reserved.payload, serde_json::Value::Null, "the payload must be untouched");
+
+        let retry = RedisQueue::without_entry_id(&reserved);
+        assert_eq!(retry.payload, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_delivery_handle_is_never_serialised_with_the_job() {
+        // It describes a delivery that does not exist until something reserves
+        // the job, so a stored one would be stale on redelivery — and the
+        // stream body is what redelivery is built from.
+        let mut reserved = job();
+        reserved.delivery_handle = Some("1700000000000-0".to_string());
+
+        let encoded = RedisQueue::encode(&reserved).unwrap();
+        let decoded: QueuedJob = serde_json::from_slice(&encoded).unwrap();
+
+        assert!(decoded.delivery_handle.is_none());
     }
 
     #[test]

@@ -74,6 +74,7 @@ fn job(id: &str) -> QueuedJob {
         available_at: Utc::now(),
         created_at: Utc::now(),
         unique_key: None,
+        delivery_handle: None,
     }
 }
 
