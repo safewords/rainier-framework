@@ -174,6 +174,17 @@ impl PusherServer {
     /// sockets received it, which is zero whenever no browser on *this* replica
     /// is subscribed and is the ordinary case rather than a fault.
     pub fn deliver_published(&self, channel: &str, body: &str) -> usize {
+        let name = channel.strip_prefix(&self.prefix).unwrap_or(channel);
+
+        // Nothing here is listening to it. Checked before parsing, because a
+        // subscription wide enough to catch every channel this application
+        // publishes also catches whatever else shares the Redis — and warning
+        // about the shape of somebody else's messages would fill the log with
+        // a problem that is not one.
+        if self.rooms.count(name) == 0 {
+            return 0;
+        }
+
         let Ok(published) = serde_json::from_str::<Value>(body) else {
             tracing::warn!(channel, "discarding an unreadable published message");
             return 0;
@@ -184,7 +195,6 @@ impl PusherServer {
             return 0;
         };
 
-        let name = channel.strip_prefix(&self.prefix).unwrap_or(channel);
         let data = published.get("data").cloned().unwrap_or(Value::Null);
         let frame = Self::frame(event, Some(name), &data);
 
@@ -541,6 +551,15 @@ mod tests {
         let server = PusherServer::new(auth());
         assert_eq!(server.deliver_published("chan", "not json"), 0);
         assert_eq!(server.deliver_published("chan", &json!({ "data": {} }).to_string()), 0);
+    }
+
+    #[test]
+    fn a_channel_nothing_here_listens_to_costs_nothing() {
+        // The subscription is wide enough to catch everything this application
+        // publishes, which on a shared Redis means catching other things too.
+        // Those must not be parsed, warned about, or counted.
+        let server = PusherServer::new(auth());
+        assert_eq!(server.deliver_published("someone-elses-channel", "{\"not\": \"ours\"}"), 0);
     }
 
     #[test]
