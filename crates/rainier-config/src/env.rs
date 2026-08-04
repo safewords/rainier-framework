@@ -223,11 +223,34 @@ impl Env {
     /// missing quote. A driver name selects *code*, and substituting different
     /// code than the deployment asked for is not a recovery — it is the bug,
     /// arriving later and somewhere else.
+    ///
+    /// # An empty value is not an unset one
+    ///
+    /// `CACHE_DRIVER=` is an error, not the default. Blanking a line is a
+    /// common way to mean "disable this", so the message says which it is and
+    /// what to do — but the behaviour does not bend, because the other way this
+    /// arises is `CACHE_DRIVER=$SOMETHING_UNSET` in a compose file or a shell
+    /// wrapper, where the expansion is empty and nobody wrote it down. Treating
+    /// that as unset would hand the deployment an in-process cache, which is
+    /// the failure a driver name being a closed set exists to prevent.
+    ///
+    /// ```
+    /// # use rainier_config::Env;
+    /// # use rainier_support::setting_enum;
+    /// # setting_enum! {
+    /// #     pub enum CacheDriver: "cache driver" {
+    /// #         #[default]
+    /// #         Memory = "memory",
+    /// #         Redis = "redis",
+    /// #     }
+    /// # }
+    /// let err = Env::parse("CACHE_DRIVER=").setting::<CacheDriver>("CACHE_DRIVER").unwrap_err();
+    ///
+    /// assert!(err.message().contains("remove the line"), "{}", err.message());
+    /// ```
     pub fn setting<T: rainier_support::Setting + Default>(&self, key: &str) -> Result<T> {
         match self.get(key) {
-            Some(raw) => {
-                T::parse(&raw).map_err(|e| Error::internal(format!("`{key}`: {}", e.message())))
-            }
+            Some(raw) => self.parse_setting(key, &raw),
             None => Ok(T::default()),
         }
     }
@@ -236,14 +259,35 @@ impl Env {
     ///
     /// For the case where one application wants a different default from the
     /// one the enum declares — a test harness pinning `sync`, say. Still an
-    /// error on an unrecognised value.
+    /// error on an unrecognised value, and on an empty one — see
+    /// [`setting`](Self::setting) for why an empty value is not an unset one.
     pub fn setting_or<T: rainier_support::Setting>(&self, key: &str, default: T) -> Result<T> {
         match self.get(key) {
-            Some(raw) => {
-                T::parse(&raw).map_err(|e| Error::internal(format!("`{key}`: {}", e.message())))
-            }
+            Some(raw) => self.parse_setting(key, &raw),
             None => Ok(default),
         }
+    }
+
+    /// Parse one setting, naming the variable — and telling an empty value
+    /// apart from an unrecognised one.
+    ///
+    /// Both are errors and both stay errors. They get different messages
+    /// because they have different fixes: an unrecognised value is a typo to
+    /// correct, and an empty one is a line to delete. Without the split the
+    /// message reads ``  `` is not a valid cache driver``, whose most visible
+    /// feature is an empty pair of backticks and which suggests spelling
+    /// something rather than removing something.
+    fn parse_setting<T: rainier_support::Setting>(&self, key: &str, raw: &str) -> Result<T> {
+        if raw.trim().is_empty() {
+            return Err(Error::internal(format!(
+                "`{key}` is set to an empty value, which is not the same as leaving it unset: \
+                 remove the line to take the default {}, or name one of {}",
+                T::SETTING,
+                T::options()
+            )));
+        }
+
+        T::parse(raw).map_err(|e| Error::internal(format!("`{key}`: {}", e.message())))
     }
 
     /// Copy every parsed variable into the process environment, skipping any
@@ -499,5 +543,69 @@ HUGE=inf",
         assert_eq!(env.int("COUNT", 0), 7);
         assert_eq!(env.float("RATIO", 0.0), 0.5);
         assert_eq!(env.string("ABSENT", "fallback"), "fallback");
+    }
+
+    rainier_support::setting_enum! {
+        /// A stand-in driver, so this crate can test `setting` without
+        /// depending on a crate that owns a real one.
+        pub enum TestDriver: "test driver" {
+            #[default]
+            Memory = "memory",
+            Redis = "redis",
+        }
+    }
+
+    #[test]
+    fn an_absent_setting_takes_its_default() {
+        let env = Env::parse("").isolated();
+
+        assert_eq!(env.setting::<TestDriver>("TEST_DRIVER").unwrap(), TestDriver::Memory);
+    }
+
+    #[test]
+    fn an_empty_setting_is_refused_and_says_which_kind_of_wrong_it_is() {
+        // Reported by a consuming application: blanking a line is a common way
+        // to mean "disable this", and the message it used to get was
+        // "`` is not a valid test driver", whose most visible feature is an
+        // empty pair of backticks. It reads as a spelling problem and the fix
+        // is a deletion.
+        for source in ["TEST_DRIVER=", "TEST_DRIVER=   "] {
+            let err =
+                Env::parse(source).isolated().setting::<TestDriver>("TEST_DRIVER").unwrap_err();
+
+            assert!(err.message().contains("TEST_DRIVER"), "{}", err.message());
+            assert!(err.message().contains("empty value"), "{}", err.message());
+            assert!(err.message().contains("remove the line"), "{}", err.message());
+            assert!(err.message().contains("`memory`, `redis`"), "{}", err.message());
+        }
+    }
+
+    #[test]
+    fn an_empty_setting_does_not_become_the_default() {
+        // The behaviour deliberately does not bend to match the friendlier
+        // message. `CACHE_DRIVER=$SOMETHING_UNSET` in a compose file expands to
+        // empty with nobody having written it down, and reading that as "unset"
+        // hands the deployment an in-process cache — the failure a closed set
+        // exists to prevent.
+        assert!(Env::parse("TEST_DRIVER=")
+            .isolated()
+            .setting::<TestDriver>("TEST_DRIVER")
+            .is_err());
+        assert!(Env::parse("TEST_DRIVER=")
+            .isolated()
+            .setting_or("TEST_DRIVER", TestDriver::Redis)
+            .is_err());
+    }
+
+    #[test]
+    fn an_unrecognised_setting_keeps_its_own_message() {
+        // The two errors have different fixes, so they stay distinguishable.
+        let err = Env::parse("TEST_DRIVER=redys")
+            .isolated()
+            .setting::<TestDriver>("TEST_DRIVER")
+            .unwrap_err();
+
+        assert!(err.message().contains("not a valid test driver"), "{}", err.message());
+        assert!(!err.message().contains("remove the line"), "{}", err.message());
     }
 }

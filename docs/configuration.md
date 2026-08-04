@@ -94,6 +94,23 @@ back because their whole range is obvious from the type and a bad one is
 usually a stray quote; a driver name selects **code**, and running different
 code than was asked for is not a recovery.
 
+#### An empty value is not an unset one
+
+`CACHE_DRIVER=` is an error, not the default. Blanking a line is a common way
+to mean "disable this", so the message says which mistake it is:
+
+```
+Error: `CACHE_DRIVER` is set to an empty value, which is not the same as leaving
+it unset: remove the line to take the default cache driver, or name one of
+`memory`, `redis`, `redis-cluster`, `memcached`, `dynamodb`, `kv`
+```
+
+**The behaviour does not bend to match the friendlier message**, and the reason
+is the other way an empty value arises: `CACHE_DRIVER=$SOMETHING_UNSET` in a
+compose file or a shell wrapper expands to empty with nobody having written it
+down. Reading that as "unset" hands the deployment an in-process cache — the
+failure a closed set exists to prevent. **Delete the line; do not blank it.**
+
 ## The config repository
 
 ```rust
