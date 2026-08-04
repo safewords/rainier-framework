@@ -62,15 +62,24 @@
 //!
 //! | | [Broadcasting](../rainier_broadcast/index.html) | This |
 //! |---|---|---|
-//! | Who holds the socket | a separate process (soketi, Pusher) | your process |
+//! | Protocol | Pusher's | whatever you write |
+//! | Who holds the socket | a relay, **or** your process with `pusher-server` | your process |
 //! | Direction | out only | both ways |
 //! | Scales across instances | yes, through Redis | one instance per socket |
-//! | Client | a Pusher-protocol client | anything that speaks WebSocket |
+//! | Client | `pusher-js`, Laravel Echo | anything that speaks WebSocket |
 //!
-//! Broadcast when the browser only needs to hear. Use a socket when it needs
-//! to talk back, or when you would rather not run a second process. Note the
-//! third row before choosing: a `Rooms` registry lives in one process's
-//! memory, so two instances behind a load balancer have two sets of rooms.
+//! The deciding question is **who writes the client**. A browser already
+//! running Laravel Echo speaks one protocol and will not be talked out of it,
+//! so that is broadcasting whether or not the sockets end up in your process —
+//! `rainier-broadcast`'s `pusher-server` feature holds them here and still fans
+//! out over Redis. Reach for this crate when both ends are yours: a bespoke
+//! message shape, or a client that needs to talk back.
+//!
+//! Note the fourth row before choosing this one. A [`Rooms`] registry lives in
+//! one process's memory, so two instances behind a load balancer have two sets
+//! of rooms and neither sees the other's — where broadcasting shares
+//! subscriptions through Redis and does not care which instance a browser
+//! reached.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

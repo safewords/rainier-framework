@@ -37,18 +37,30 @@
 //! use a [notification](rainier_support) or a job for those, and broadcast in
 //! addition if the screen should also move.
 //!
-//! # What this crate is not
+//! # Publishing and delivering are separate, and only the first is required
 //!
-//! **It is not a WebSocket server.** Broadcasting publishes; a separate
-//! process — soketi, Pusher, any Pusher-protocol server — holds the sockets and
-//! relays. That split is what lets the thing holding
-//! ten thousand idle connections be neither your web server nor your language.
+//! This crate is the **publish** side: an event happened, on a channel. What
+//! turns that into bytes on a browser's socket is a deployment choice, and
+//! there are two:
 //!
-//! What Rainier provides is the two halves an application owns: publishing
-//! (over Redis with the `redis` feature, over Kafka with `kafka`, or a driver
-//! you write) and
-//! [authorising](ChannelRegistry) subscriptions, including the Pusher
-//! protocol's [HMAC](PusherAuth).
+//! | | Where the sockets live | When |
+//! |---|---|---|
+//! | A relay | another process — soketi, Pusher, Laravel Reverb | the connections should not be held by your web server, or something else already runs one |
+//! | [`PusherServer`](pusher_server::PusherServer) | this process, behind the `pusher-server` feature | one less deployment, and the connection count is one your process can carry |
+//!
+//! Both consume the same publish, so moving between them changes no
+//! application code — a publish goes to Redis either way, and whoever is
+//! subscribed delivers it. The application's own half is the same in both
+//! cases: publishing (over Redis with `redis`, Kafka with `kafka`, or a driver
+//! you write) and [authorising](ChannelRegistry) subscriptions, including the
+//! Pusher protocol's [HMAC](PusherAuth).
+//!
+//! # Not the same thing as `rainier-websocket`
+//!
+//! That crate is for a socket **you write both ends of** — your own message
+//! shapes, two-way, no protocol to conform to. This one speaks the Pusher
+//! protocol because the client is `pusher-js` or Laravel Echo and will not be
+//! talked out of it. See its docs for the comparison in full.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
