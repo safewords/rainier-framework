@@ -90,6 +90,10 @@ mail-sendgrid = ["rainier-mail/sendgrid", "http-client"]
 mail-resend = ["rainier-mail/resend", "http-client"]
 # Amazon SQS, for a queue somebody else operates.
 sqs = ["rainier-queue/sqs"]
+# Hold the browsers' Pusher-protocol sockets in this process, instead of running
+# soketi or Laravel Reverb beside it. Implies `redis`: replicas share
+# subscriptions through the same Redis the publish side already writes to.
+pusher-server = ["redis", "rainier-broadcast/pusher-server"]
 # Kafka: broadcasting over a topic, the relay that fans it back out to this
 # process's sockets, and jobs on a partitioned log. One feature, for the same
 # reason `redis` is one: "we have a Kafka" is a single fact about a deployment.

@@ -19,6 +19,9 @@ aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 aws-sdk-sqs = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
+# For `RedisSubscription`: the pub/sub connection is a `Stream`, and reading one
+# needs `StreamExt`.
+futures-util = { workspace = true, optional = true }
 rskafka = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
@@ -43,7 +46,7 @@ tokio = { workspace = true, optional = true }
 [features]
 default = []
 # A single Redis server, or a Sentinel-fronted primary.
-redis-driver = ["dep:redis", "dep:tokio"]
+redis-driver = ["dep:redis", "dep:tokio", "dep:futures-util"]
 # A sharded Redis Cluster. Implies `redis-driver`.
 redis-cluster = ["redis-driver", "redis/cluster-async"]
 # Memcached over its text protocol.

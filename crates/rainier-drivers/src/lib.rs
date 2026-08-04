@@ -167,7 +167,10 @@ pub use memcached::{
     MAX_RELATIVE_TTL,
 };
 #[cfg(feature = "redis-driver")]
-pub use redis::{Reconnect, RedisClient, RedisConnection, RedisConnector, RedisSettings};
+pub use redis::{
+    PublishedMessage, Reconnect, RedisClient, RedisConnection, RedisConnector, RedisSettings,
+    RedisSubscription,
+};
 #[cfg(feature = "redis-driver")]
 pub use redis_streams::StreamEntry;
 #[cfg(feature = "aws-s3")]

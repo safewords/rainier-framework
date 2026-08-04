@@ -59,6 +59,8 @@ pub mod channel;
 pub mod event;
 pub mod manager;
 pub mod pusher;
+#[cfg(feature = "pusher-server")]
+pub mod pusher_server;
 
 #[cfg(feature = "kafka")]
 pub mod kafka;

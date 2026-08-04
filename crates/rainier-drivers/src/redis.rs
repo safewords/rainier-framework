@@ -435,6 +435,18 @@ pub struct RedisConnector {
     backend: Backend,
     description: String,
     settings: RedisSettings,
+    /// Where [`subscribe`](Self::subscribe) opens its own connection.
+    ///
+    /// A subscriber cannot share the multiplexed connection: once a Redis
+    /// connection subscribes it accepts nothing but more subscribe and
+    /// unsubscribe commands, so a shared one would take the cache and the
+    /// queue down with it.
+    ///
+    /// One node's address even on a cluster. Ordinary `PUBLISH` is propagated
+    /// across the whole cluster — it is not slot-routed, which is why cluster
+    /// mode has a separate `SPUBLISH` for the sharded kind — so a subscriber
+    /// on any single node sees everything published anywhere.
+    pubsub_url: String,
 }
 
 impl RedisConnector {
@@ -477,7 +489,12 @@ impl RedisConnector {
             Error::internal(format!("could not open a Redis client: {e}"))
         })?;
 
-        Ok(Self { backend: Backend::Single(client), description: "redis".to_string(), settings })
+        Ok(Self {
+            backend: Backend::Single(client),
+            description: "redis".to_string(),
+            settings,
+            pubsub_url: url.to_string(),
+        })
     }
 
     /// Open a connector to a sharded cluster.
@@ -527,6 +544,7 @@ impl RedisConnector {
             return Err(Error::internal("a Redis cluster needs at least one seed node"));
         }
         let count = seeds.len();
+        let first_seed = seeds[0].clone();
 
         // The builder even when nothing is declared: `ClusterClient::new` is
         // this with no options set, so an application that declares nothing
@@ -553,7 +571,59 @@ impl RedisConnector {
             backend: Backend::Cluster(client),
             description: format!("redis-cluster({count} seeds)"),
             settings,
+            // The first seed, because a subscriber wants one node and any node
+            // will do — see `pubsub_url`. `seeds` is non-empty, checked above.
+            pubsub_url: first_seed,
         })
+    }
+
+    /// Listen for everything published to channels matching `pattern`.
+    ///
+    /// `PSUBSCRIBE`, on a **new connection of its own** — see
+    /// [`pubsub_url`](Self::pubsub_url). A pattern rather than a channel list
+    /// because the interesting subscribers do not know their channels up
+    /// front: a socket server learns them as clients arrive and forgets them as
+    /// they leave, and re-issuing `SUBSCRIBE` on every one of those would race
+    /// the events it exists to deliver.
+    ///
+    /// Glob syntax is Redis's own, so a prefix pattern ends in `*`:
+    /// `"lewd-production:*"`.
+    ///
+    /// # Cluster
+    ///
+    /// One node is enough. `PUBLISH` is broadcast across the cluster rather
+    /// than routed to a slot — the sharded variant is a separate command,
+    /// `SPUBLISH` — so a subscriber attached to any single node receives what
+    /// every node publishes.
+    ///
+    /// # Errors
+    ///
+    /// When the connection cannot be opened or the subscribe is refused.
+    pub async fn subscribe(&self, pattern: &str) -> Result<RedisSubscription> {
+        // Built here rather than reusing `backend`: a cluster client cannot
+        // hand out a plain pub/sub connection, and this needs a plain one.
+        let client = redis::Client::open(self.pubsub_url.as_str()).map_err(|e| {
+            // Never echoed — a Redis URL routinely carries a password.
+            Error::internal(format!("could not open a Redis subscriber: {e}"))
+        })?;
+
+        let mut pubsub = client.get_async_pubsub().await.map_err(|e| {
+            Error::service_unavailable(format!("could not reach Redis to subscribe: {e}"))
+        })?;
+
+        pubsub.psubscribe(pattern).await.map_err(|e| {
+            Error::service_unavailable(format!("could not subscribe to `{pattern}`: {e}"))
+        })?;
+
+        Ok(RedisSubscription { stream: pubsub.into_on_message() })
+    }
+
+    /// Where [`subscribe`](Self::subscribe) connects.
+    ///
+    /// The connector's own URL for a single server, and the first seed for a
+    /// cluster.
+    pub fn pubsub_url(&self) -> &str {
+        &self.pubsub_url
     }
 
     /// A label for diagnostics.
@@ -1289,5 +1359,56 @@ mod client_tests {
         assert_eq!(client.incr_by("hits", 1).await.unwrap(), 1);
         assert_eq!(client.incr_by("hits", 4).await.unwrap(), 5);
         assert_eq!(client.incr_by("hits", -2).await.unwrap(), 3);
+    }
+}
+
+/// A live `PSUBSCRIBE`, as a stream of published messages.
+///
+/// Holds its own connection for as long as it exists. Dropping it unsubscribes
+/// and closes that connection, which is the only way to stop: there is no
+/// cancel token, because the useful lifetime of a subscriber is the lifetime of
+/// whatever is reading from it.
+pub struct RedisSubscription {
+    stream: redis::aio::PubSubStream,
+}
+
+impl RedisSubscription {
+    /// The next message, or `None` when the connection has ended.
+    ///
+    /// `None` is not "nothing has been published" — this waits for that. It
+    /// means the socket is gone, and a long-lived reader should treat it as the
+    /// signal to resubscribe rather than as the end of the work.
+    pub async fn next_message(&mut self) -> Option<PublishedMessage> {
+        use futures_util::StreamExt;
+
+        let message = self.stream.next().await?;
+        Some(PublishedMessage {
+            channel: message.get_channel_name().to_string(),
+            payload: message.get_payload_bytes().to_vec(),
+        })
+    }
+}
+
+impl std::fmt::Debug for RedisSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The stream has no useful rendering and the URL behind it carries a
+        // password, so neither appears.
+        f.debug_struct("RedisSubscription").finish_non_exhaustive()
+    }
+}
+
+/// One message off a [`RedisSubscription`].
+#[derive(Clone, Debug)]
+pub struct PublishedMessage {
+    /// The channel it was published to — the concrete one, not the pattern.
+    pub channel: String,
+    /// The body, exactly as published.
+    pub payload: Vec<u8>,
+}
+
+impl PublishedMessage {
+    /// The body as UTF-8, when it is.
+    pub fn text(&self) -> Option<&str> {
+        std::str::from_utf8(&self.payload).ok()
     }
 }

@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 rainier-support = { workspace = true }
 rainier-drivers = { workspace = true, optional = true }
+rainier-websocket = { workspace = true, optional = true }
 
 async-trait = { workspace = true }
 futures-util = { workspace = true, optional = true }
@@ -23,6 +24,10 @@ tracing = { workspace = true }
 default = []
 # Publish over Redis pub/sub — what soketi and other Pusher-protocol servers consume.
 redis = ["dep:rainier-drivers", "rainier-drivers/redis-driver"]
+# Hold the browsers' sockets in this process and speak the Pusher protocol to
+# them, instead of running soketi/Reverb alongside. Implies `redis`, because the
+# fan-in between replicas is the same Redis the publish side writes to.
+pusher-server = ["redis", "dep:rainier-websocket"]
 # Publish to a Kafka topic, and relay it back to whoever holds the sockets.
 kafka = ["dep:rainier-drivers", "rainier-drivers/kafka", "dep:futures-util"]
 
