@@ -407,10 +407,19 @@ pub fn warn_if_locks_are_not_shared(app: &Application) {
     }
 }
 
-/// What to do about it. One sentence, in one place, so the two messages above
+/// What to do about it. One sentence, in one place, so the four messages above
 /// cannot drift.
-const ADVICE: &str = "set CACHE_DRIVER to a shared store (redis, redis-cluster, memcached, \
-                      dynamodb) and hand the built store to `Rainier::with_cache`";
+///
+/// Three routes rather than one, and the section is named first because it is
+/// the one an application with more than a single store is already using. The
+/// version of this that named only `CACHE_DRIVER` was advice a section-declaring
+/// application could not follow: setting that variable *and* declaring
+/// `cache.stores` is refused at boot, so the fix for one warning was the cause
+/// of a different failure. `with_cache` is the third because it wins over both
+/// — it is the escape hatch for a store no configuration can describe.
+const ADVICE: &str = "point the cache at a shared store — declare one (redis, redis-cluster, \
+                      memcached, dynamodb) in the `cache.stores` section, or set CACHE_DRIVER to \
+                      one, but not both; or hand a built store to `Rainier::with_cache`";
 
 /// The complaint, or `None` when there is nothing to complain about.
 fn lock_complaint(app: &Application) -> Result<Option<String>> {

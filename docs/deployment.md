@@ -401,6 +401,47 @@ Two more worth having:
   changes your build with no commit of yours to trigger CI. Weekly is enough to
   find out before a deploy does.
 
+## Sizing the image
+
+Cargo features are resolved before anything compiles, and a well-built
+application's driver `match`es are exhaustive — so every compiled driver is
+referenced and the linker keeps it. Features are the sizing mechanism, and
+`cargo rainier features` computes the set a deployment needs:
+
+```sh
+cargo rainier features --env .env.production
+```
+
+It reads two things: the conventional driver **variables** (`CACHE_DRIVER`,
+`QUEUE_DRIVER`, `MAIL_DRIVER`, `HASH_DRIVER`, `STORAGE_DRIVER`, `KAFKA_TLS`) and
+your **source tree**, for the compile-time choices no variable selects.
+
+### It cannot see a configuration section
+
+`filesystems`, `queues`, `databases` and `cache.stores` each name a driver per
+entry, and none of them is visible to it. Those sections are declared in Rust by
+your own `configure`, so reading one would mean running the application — which
+is what a tool deciding how to *build* it cannot do.
+
+**So a section-declaring application states its drivers twice**: once in the
+section that runs, and once as a variable in whatever environment file the build
+reads. Get it wrong and the image is built without the feature the entry needs;
+the failure lands at boot, naming the missing feature, which is at least loud.
+
+Two of those variables are not free to leave lying around:
+
+| Variable | At build time | At runtime |
+|---|---|---|
+| `CACHE_DRIVER`, `QUEUE_DRIVER` | needed, if the section declares that driver | **a boot failure** alongside their section — [never both](configuration.md#one-or-the-other-never-both) |
+| `STORAGE_DRIVER` | needed for an `s3` disk | read by **nothing** — the default disk comes from `FILESYSTEM_DISK` and every driver from the disk's own declaration |
+
+The first row is the one to get right: keep those two in the build's environment
+file and out of the running container.
+
+`STORAGE_DRIVER` is inert at runtime and safe to set anywhere — and it is the
+one that silently under-builds, because an `s3` disk declared in a
+[section](filesystem.md#declaring-disks) has nothing else to announce it.
+
 [ci]: https://github.com/safewords/rainier-sample-project/blob/main/.github/workflows/ci.yml
 
 ## What to run

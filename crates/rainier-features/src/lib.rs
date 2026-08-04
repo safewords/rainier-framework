@@ -28,6 +28,39 @@
 //!    code either reaches for `Jwt` or the `Http` facade's real transport, or
 //!    it does not.
 //!
+//! # It does not read a configuration section
+//!
+//! `filesystems`, `queues`, `databases` and `cache.stores` each name a driver
+//! per entry, and **none of them is visible here**. That is a limitation with a
+//! cause rather than a gap to fill: those sections are declared in *Rust*, by an
+//! application's own `configure`, so reading one means running the application
+//! — which is precisely what a tool that decides how to *build* it cannot do.
+//!
+//! The consequence is sharp enough to state plainly, because nothing warns
+//! about it:
+//!
+//! - An application that declares an `s3` disk, a `redis` queue connection or a
+//!   `redis` cache store **in a section** computes a feature set without them,
+//!   and the image it sizes is missing the feature that entry needs. The failure
+//!   lands at boot — "this store uses the `redis` driver, but rainier-cache was
+//!   built without the `redis-driver` feature" — which is at least loud, and is
+//!   why those build errors name the feature.
+//! - So a section-declaring application has to state its drivers **twice**: once
+//!   in the section that runs, and once as a variable in whatever environment
+//!   file the build reads.
+//!
+//! Two of those variables are not free to leave lying around. `CACHE_DRIVER`
+//! and `QUEUE_DRIVER` are read at runtime, and setting either *alongside* its
+//! section is a boot failure by design — so the build-time copy belongs in the
+//! build's environment file and must not reach the running container.
+//!
+//! `STORAGE_DRIVER` is the opposite and worth knowing: **nothing reads it at
+//! runtime.** The framework takes its default disk from `FILESYSTEM_DISK` and
+//! every driver from the disk's own declaration, so `STORAGE_DRIVER` exists
+//! only to answer this crate. It is inert in a running process and safe to set
+//! anywhere; it is also the one that silently under-builds, since an `s3` disk
+//! declared in a section has nothing else to announce it.
+//!
 //! # What it answers, and what it cannot
 //!
 //! The report says what a **build must carry** for those selections to be
