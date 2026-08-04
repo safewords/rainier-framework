@@ -44,6 +44,25 @@ setting_enum! {
         /// [driver's docs](crate::redis). Needs the `redis` feature.
         Redis = "redis",
 
+        /// Redis streams on a sharded cluster.
+        ///
+        /// Same durability caveat as [`Redis`](Self::Redis), and a routing
+        /// difference that is not optional: a cluster owns each key on the
+        /// shard that owns its slot, and a single-server client connected to
+        /// one node answers `MOVED` for every key that lives on another.
+        ///
+        /// Which is not a connection error, and does not look like one. A
+        /// worker draining several queues finds the ones that happen to hash to
+        /// the node it reached and silently drains nothing from the rest —
+        /// those jobs are pushed, accepted, and never worked. Queue names
+        /// written with hash tags (`{orders}`) pin each queue to one slot, so
+        /// which shard a queue lands on is stable and the failure is
+        /// reproducible rather than intermittent, which is the only kind thing
+        /// about it.
+        ///
+        /// Needs the `redis-cluster` feature.
+        RedisCluster = "redis-cluster",
+
         /// Amazon SQS.
         ///
         /// Durable and managed, with the visibility timeout doing the
@@ -79,12 +98,12 @@ impl QueueDriver {
     /// [`may_lose_an_accepted_job`](Self::may_lose_an_accepted_job), which is
     /// the one that catches Redis.
     pub fn survives_a_restart(&self) -> bool {
-        matches!(self, Self::Database | Self::Redis | Self::Sqs | Self::Kafka)
+        matches!(self, Self::Database | Self::Redis | Self::RedisCluster | Self::Sqs | Self::Kafka)
     }
 
     /// Whether a dispatch this driver **accepted** can still be lost.
     ///
-    /// True only for [`Redis`](Self::Redis), and it is the distinction the
+    /// True for both Redis drivers, and it is the distinction the
     /// obvious question misses: a Redis job survives your process restarting,
     /// because it lives in another one — and can still vanish, because Redis
     /// acknowledges a write before it is on disk (`appendfsync everysec`
@@ -105,8 +124,13 @@ impl QueueDriver {
     ///
     /// So this is the predicate a deploy check should look at when the work is
     /// a payment rather than a cache warm.
+    ///
+    /// A cluster does not change the answer. Sharding spreads the keys over
+    /// more servers; it does not make any one of them acknowledge a write later
+    /// than it did before, and a failover on the shard that owns a queue drops
+    /// that queue's confirmed writes exactly as a single-server failover would.
     pub fn may_lose_an_accepted_job(&self) -> bool {
-        matches!(self, Self::Redis)
+        matches!(self, Self::Redis | Self::RedisCluster)
     }
 
     /// Whether this driver needs a `queue:work` process to make progress.

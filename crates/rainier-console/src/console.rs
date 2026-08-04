@@ -337,9 +337,41 @@ mod tests {
 
     #[tokio::test]
     async fn a_help_flag_shows_help_instead_of_running() {
-        let before = CALLS.load(Ordering::SeqCst);
-        assert_eq!(run("greet --help").await, exit::SUCCESS);
-        assert_eq!(CALLS.load(Ordering::SeqCst), before, "the command must not have run");
+        // Its own counter and its own command, because `CALLS` is process-wide
+        // and every other test that runs `greet` increments it. Reading it
+        // before and after only proves this command did not run when nothing
+        // else runs concurrently — and the test harness runs these in parallel,
+        // so the assertion failed whenever another test's increment landed
+        // between the two reads. Passing under `--test-threads=1` and failing
+        // otherwise is the tell.
+        static SOLO_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        struct Solo;
+
+        #[async_trait::async_trait]
+        impl Command for Solo {
+            fn name(&self) -> &str {
+                "solo"
+            }
+            fn description(&self) -> &str {
+                "Only this test runs it"
+            }
+            async fn handle(&self, _: &Arguments, _: &Application) -> Result<i32> {
+                SOLO_CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(exit::SUCCESS)
+            }
+        }
+
+        let console = Console::new("rainier").register(Solo);
+
+        assert_eq!(console.run_argv(&app(), ["solo", "--help"]).await, exit::SUCCESS);
+        assert_eq!(SOLO_CALLS.load(Ordering::SeqCst), 0, "the command must not have run");
+
+        // The other half of the claim: without the flag it does run, so the
+        // assertion above is about `--help` and not about a command that never
+        // runs at all.
+        assert_eq!(console.run_argv(&app(), ["solo"]).await, exit::SUCCESS);
+        assert_eq!(SOLO_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]

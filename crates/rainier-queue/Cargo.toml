@@ -28,6 +28,10 @@ default = []
 sqs = ["dep:rainier-drivers", "rainier-drivers/aws-sqs"]
 # Jobs on Redis streams. Read the `redis` module docs before choosing it.
 redis = ["dep:rainier-drivers", "rainier-drivers/redis-driver"]
+# Jobs on a sharded Redis cluster. Needed whenever the server is a cluster:
+# a single-server client reaches one node and answers `MOVED` for every queue
+# whose slot is held by another, draining only part of what it was given.
+redis-cluster = ["redis", "rainier-drivers/redis-cluster"]
 # Jobs on a Kafka topic. Read the `kafka` module docs first — a log is not a
 # queue, and the differences are the kind that cost money.
 kafka = ["dep:rainier-drivers", "rainier-drivers/kafka"]

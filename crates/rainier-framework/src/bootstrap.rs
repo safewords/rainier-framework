@@ -1170,6 +1170,20 @@ fn queues_from_env(env: &Env) -> Result<QueueConnections> {
             RedisConnection::new(env.string("REDIS_URL", "redis://127.0.0.1:6379/")).into()
         }
 
+        // Comma-separated seeds in the same variable, exactly as the cache
+        // reads them above — "we have a Redis at these addresses" is one fact
+        // about a deployment, and splitting it across two variable names is how
+        // the cache and the queue end up pointed at different servers.
+        QueueDriver::RedisCluster => RedisConnection::cluster(
+            env.string("REDIS_URL", "redis://127.0.0.1:6379/")
+                .split(',')
+                .map(str::trim)
+                .filter(|seed| !seed.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )?
+        .into(),
+
         // No fallback: an SQS queue *is* a URL, so there is nothing to guess
         // that would not be a queue in somebody else's account.
         QueueDriver::Sqs => SqsConnection::new(env.require("SQS_QUEUE_URL")?).into(),

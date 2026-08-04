@@ -196,7 +196,9 @@ use crate::worker::WorkerOptions;
 fn reservation_setting(driver: QueueDriver) -> Option<&'static str> {
     match driver {
         QueueDriver::Sync | QueueDriver::Memory => None,
-        QueueDriver::Database | QueueDriver::Redis => Some("reservation"),
+        QueueDriver::Database | QueueDriver::Redis | QueueDriver::RedisCluster => {
+            Some("reservation")
+        }
         QueueDriver::Sqs => Some("visibility_timeout"),
         QueueDriver::Kafka => Some("lease"),
     }
@@ -966,6 +968,17 @@ impl DatabaseConnection {
 #[derive(Clone)]
 pub struct RedisConnection {
     url: String,
+    /// The other seeds, when this names a cluster.
+    ///
+    /// A cluster and a single server differ in exactly one way here — how the
+    /// connector is opened — so they are one type rather than two. Every
+    /// setting below (prefix, reservation, both timeouts, reconnection) means
+    /// the same thing and is honoured the same way either way, and a second
+    /// type would have been those two hundred lines again to vary one call.
+    ///
+    /// `None` is a single server. `Some` is a cluster, and `url` is its first
+    /// seed — so the field is never empty when it is set.
+    cluster_seeds: Option<Vec<String>>,
     prefix: Option<String>,
     reservation: Option<Duration>,
     connect_timeout: Option<Duration>,
@@ -981,6 +994,7 @@ impl RedisConnection {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            cluster_seeds: None,
             prefix: None,
             reservation: None,
             connect_timeout: None,
@@ -989,6 +1003,36 @@ impl RedisConnection {
             reconnect_attempts: None,
             reconnect_max_backoff: None,
         }
+    }
+
+    /// A connection to a sharded cluster, across `seeds`.
+    ///
+    /// Every URL is a **seed**: the client asks one of them for the cluster's
+    /// shape and then routes each key to the shard that owns its slot. Give it
+    /// more than one where you can — a single dead seed makes the whole cluster
+    /// unreachable, even though every other node is up.
+    ///
+    /// Reach for this whenever the server is a cluster, not only when the
+    /// queues look spread out. A single-server client pointed at one node of a
+    /// cluster answers `MOVED` for every key that lives elsewhere, and a worker
+    /// draining several queues then works the ones that happen to hash to that
+    /// node and silently ignores the rest.
+    ///
+    /// # Errors
+    ///
+    /// When `seeds` is empty. A cluster connection with nothing to ask for the
+    /// topology cannot be built, and the useful moment to say so is here rather
+    /// than at the first push.
+    pub fn cluster(seeds: impl IntoIterator<Item = impl Into<String>>) -> Result<Self> {
+        let seeds: Vec<String> = seeds.into_iter().map(Into::into).collect();
+        let Some(first) = seeds.first().cloned() else {
+            return Err(Error::internal(
+                "a `redis-cluster` queue connection needs at least one seed URL to ask for the \
+                 cluster's shape; it was given none",
+            ));
+        };
+
+        Ok(Self { cluster_seeds: Some(seeds), ..Self::new(first) })
     }
 
     /// Prefix every key this connection writes.
@@ -1184,8 +1228,21 @@ impl RedisConnection {
     /// — and the driver underneath deliberately never echoes one either. Enough
     /// to tell two connections apart in a log, and not enough to authenticate
     /// with.
+    /// Every seed carries its own userinfo, so redacting only the first would
+    /// print the rest of the cluster's passwords — the one case where showing
+    /// the whole list matters more than showing one name.
     pub fn url_without_credentials(&self) -> String {
-        without_credentials(&self.url)
+        match &self.cluster_seeds {
+            Some(seeds) => {
+                seeds.iter().map(|seed| without_credentials(seed)).collect::<Vec<_>>().join(",")
+            }
+            None => without_credentials(&self.url),
+        }
+    }
+
+    /// Whether this connection routes across a sharded cluster.
+    pub fn is_cluster(&self) -> bool {
+        self.cluster_seeds.is_some()
     }
 
     /// Connect, and build the connection as its concrete driver.
@@ -1208,7 +1265,27 @@ impl RedisConnection {
         // waits in a store the worker that was supposed to drain it is not
         // watching. Its settings travel with it for the same reason: two
         // connections that share a server do not share a timeout.
-        let connector = RedisConnector::open_with(&self.url, self.settings())?;
+        let connector = match &self.cluster_seeds {
+            #[cfg(feature = "redis-cluster")]
+            Some(seeds) => RedisConnector::open_cluster_with(seeds.clone(), self.settings())?,
+
+            // Declared as a cluster, built without the feature that can route
+            // to one. Refused rather than opened against the first seed: that
+            // would connect, boot, serve, and lose every queue whose slot is on
+            // another shard — with nothing in the logs naming the cause.
+            #[cfg(not(feature = "redis-cluster"))]
+            Some(_) => {
+                return Err(Error::internal(format!(
+                    "the queue connection for `{}` names a Redis cluster, but this binary was \
+                     built without the `redis-cluster` feature. Enable it — connecting to the \
+                     first seed as a single server would answer `MOVED` for every queue held on \
+                     another shard, and drain only the ones that happen to live on that node",
+                    self.url_without_credentials()
+                )))
+            }
+
+            None => RedisConnector::open_with(&self.url, self.settings())?,
+        };
         let queue = crate::redis::RedisQueue::connect(&connector).await?;
 
         let queue = match &self.prefix {
@@ -1232,6 +1309,7 @@ impl std::fmt::Debug for RedisConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedisConnection")
             .field("url", &self.url_without_credentials())
+            .field("cluster", &self.is_cluster())
             .field("prefix", &self.prefix)
             .field("reservation", &self.reservation)
             .field("connect_timeout", &self.connect_timeout)
@@ -2012,7 +2090,12 @@ impl TryFrom<RawConnection> for ConnectionConfig {
                 }))
             }
 
-            QueueDriver::Redis => {
+            // One arm, because the two differ only in how the connector opens.
+            // `redis-cluster` says so outright; `redis` with more than one seed
+            // in its `url` says the same thing implicitly, and honouring only
+            // the explicit spelling would leave a seed list silently opened
+            // against its first entry.
+            QueueDriver::Redis | QueueDriver::RedisCluster => {
                 raw.reject_settings_it_ignores(&[
                     "url",
                     "prefix",
@@ -2031,8 +2114,22 @@ impl TryFrom<RawConnection> for ConnectionConfig {
                     )
                 })?;
 
+                // A comma-separated `url` is a cluster's seed list, the same
+                // rule `REDIS_URL` follows — one convention, so a deployment
+                // that moves a value from the environment into a config file
+                // does not have to learn a second spelling for it.
+                let seeds: Vec<String> = url
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+
+                let clustered = raw.driver == QueueDriver::RedisCluster || seeds.len() > 1;
+
                 let connection = RedisConnection {
-                    url,
+                    cluster_seeds: clustered.then(|| seeds.clone()),
+                    url: seeds.first().cloned().unwrap_or(url),
                     prefix: raw.prefix,
                     reservation: raw.reservation.map(Duration::from_secs),
                     connect_timeout: raw.connect_timeout_ms.map(Duration::from_millis),
@@ -2784,6 +2881,71 @@ mod tests {
             assert!(err.contains("response_timeout_ms"), "{err}");
             assert!(err.contains("reconnect"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_cluster_needs_at_least_one_seed() {
+        let err = RedisConnection::cluster(Vec::<String>::new()).unwrap_err().message().to_string();
+        assert!(err.contains("at least one seed"), "{err}");
+    }
+
+    #[test]
+    fn every_seed_is_redacted_and_not_just_the_first() {
+        // The whole point of the list form: redacting only `url` would print
+        // the second and third nodes' passwords into whatever logged it.
+        let connection = RedisConnection::cluster([
+            "redis://default:hunter2@a.internal:6379",
+            "redis://default:hunter3@b.internal:6379",
+        ])
+        .unwrap();
+
+        let shown = connection.url_without_credentials();
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(!shown.contains("hunter3"), "{shown}");
+        assert!(shown.contains("a.internal"), "{shown}");
+        assert!(shown.contains("b.internal"), "{shown}");
+        assert!(!format!("{connection:?}").contains("hunter"), "{connection:?}");
+    }
+
+    #[test]
+    fn a_seed_list_in_the_url_is_a_cluster_however_the_driver_is_spelled() {
+        // A comma-separated `url` means a seed list. Opening that against its
+        // first entry as a single server is the silent half-drain this exists
+        // to prevent, so `redis` with several seeds is a cluster too.
+        let config = serde_json::from_value::<ConnectionConfig>(json!({
+            "driver": "redis",
+            "url": "redis://a:6379,redis://b:6379",
+        }))
+        .unwrap();
+
+        let ConnectionConfig::Redis(connection) = config else { panic!("expected redis") };
+        assert!(connection.is_cluster());
+    }
+
+    #[test]
+    fn one_seed_is_still_a_cluster_when_the_driver_says_so() {
+        // A cluster reached through a single Service DNS name is one seed, and
+        // is still a cluster — the client discovers the other shards from it.
+        let config = serde_json::from_value::<ConnectionConfig>(json!({
+            "driver": "redis-cluster",
+            "url": "redis://redis-leader:6379",
+        }))
+        .unwrap();
+
+        let ConnectionConfig::Redis(connection) = config else { panic!("expected redis") };
+        assert!(connection.is_cluster());
+    }
+
+    #[test]
+    fn a_single_url_on_the_plain_driver_is_not_a_cluster() {
+        let config = serde_json::from_value::<ConnectionConfig>(json!({
+            "driver": "redis",
+            "url": "redis://localhost:6379",
+        }))
+        .unwrap();
+
+        let ConnectionConfig::Redis(connection) = config else { panic!("expected redis") };
+        assert!(!connection.is_cluster());
     }
 
     #[test]

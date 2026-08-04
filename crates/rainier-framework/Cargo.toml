@@ -62,7 +62,7 @@ sea-orm-executor = ["rainier-database/sea-orm-executor"]
 # about a deployment — and because a `redis` feature that gave you a cache and
 # not a queue is the kind of surprise nobody debugs quickly.
 redis = ["rainier-cache/redis-driver", "rainier-queue/redis", "rainier-broadcast/redis"]
-redis-cluster = ["redis", "rainier-cache/redis-cluster"]
+redis-cluster = ["redis", "rainier-cache/redis-cluster", "rainier-queue/redis-cluster"]
 memcached = ["rainier-cache/memcached"]
 # Read `$2y$` password hashes written by a PHP or Rails application, so a
 # ported users table logs everybody in while it converts.

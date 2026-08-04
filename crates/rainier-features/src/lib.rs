@@ -152,6 +152,9 @@ pub fn compute(env: &[(String, String)], sources: &str) -> Report {
 
     match get("QUEUE_DRIVER") {
         Some("redis") => want(&mut report, "redis", "QUEUE_DRIVER=redis".into()),
+        Some("redis-cluster") => {
+            want(&mut report, "redis-cluster", "QUEUE_DRIVER=redis-cluster".into())
+        }
         Some("sqs") => want(&mut report, "sqs", "QUEUE_DRIVER=sqs".into()),
         Some("kafka") => {
             want(&mut report, "kafka", "QUEUE_DRIVER=kafka".into());
