@@ -24,6 +24,14 @@
 //! not go through the scoping helper. An inconsistent scope is worse than no
 //! scope, because it is invisible — one builder honouring it and its neighbour
 //! not is a difference nobody can see from a call site.
+//!
+//! **It covers this crate only, and that is not the whole framework.**
+//! `rainier-database` builds the `Criteria`-driven reads — which is most of what
+//! an application actually calls — in its own `statement` module, outside this
+//! test's loop. That module was unscoped for a while precisely because this test
+//! read as coverage of something it could not see. Its counterpart now lives in
+//! `rainier-database/tests/soft_deletes.rs`; the two are a pair, and neither is
+//! evidence about the other.
 
 use core::cell::RefCell;
 

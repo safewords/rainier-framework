@@ -20,10 +20,15 @@
 //! ```
 //!
 //! One filter a criteria does **not** have to record is the soft-delete one: if
-//! the model marks a tombstone column, every statement built from a criteria
-//! appends `deleted_at IS NULL` by itself. [`with_trashed`](Criteria::with_trashed)
-//! and [`only_trashed`](Criteria::only_trashed) are how a query that means to
-//! see deleted rows says so.
+//! the model marks a tombstone column, every read built from a criteria appends
+//! `deleted_at IS NULL` by itself. [`with_trashed`](Criteria::with_trashed) and
+//! [`only_trashed`](Criteria::only_trashed) are how a query that means to see
+//! deleted rows says so, and [`trash_scope`](Criteria::trash_scope) reads back
+//! which of the three it is.
+//!
+//! Reads only. The `UPDATE` and `DELETE` builders share this module's `WHERE`
+//! construction and are deliberately left unscoped, which is what makes a bulk
+//! tombstone or restore expressible at all — see [`rainier_orm::trash`].
 
 use rainier_orm::sea_query::{ColumnRef, Expr, Func, SimpleExpr, Value};
 use rainier_orm::TrashScope;

@@ -128,8 +128,24 @@ fn select_columns<E: Entity>() -> rainier_orm::sea_query::SelectStatement {
 /// point rather than a tidiness: a `SELECT` and its `COUNT` disagreeing about
 /// which rows exist is a paginator reporting a total it cannot produce, and one
 /// builder honouring the scope while its neighbour does not is a difference no
-/// call site can see. `no_select_builder_is_left_unscoped` in
-/// `tests/soft_deletes.rs` fails if a new builder here skips it.
+/// call site can see.
+///
+/// The builders that name no [`Criteria`] pass [`TrashScope::Active`], because
+/// there is nowhere for a caller to have said otherwise. The ones that take a
+/// criteria pass **its** scope, which is where `with_trashed` and
+/// `only_trashed` take effect — `apply_criteria` is the single seam, so it
+/// cannot be honoured by `select_matching` and skipped by `count_matching`.
+///
+/// The write builders deliberately do not call this. A scoped `DELETE` leaves a
+/// purge unable to purge, and a scoped `UPDATE` makes a bulk restore match
+/// nothing — see [`rainier_orm::trash`], which sets the reads-only policy out
+/// in full.
+///
+/// `no_select_builder_is_left_unscoped` in this crate's `tests/soft_deletes.rs`
+/// fails if a `SELECT` is built here without going through this helper. Its
+/// sibling in `rainier-orm` guards that crate's own two query modules; the
+/// missing half of that pair is how this module came to be unscoped while
+/// reading as covered.
 ///
 /// The column is qualified to `E`'s table, like everything else this module
 /// writes. That is load-bearing rather than stylistic: a criteria may join, and
@@ -545,6 +561,15 @@ fn apply_criteria<E: Entity>(
 
     let (condition, route) = criteria_condition::<E>(dialect, criteria);
     stmt.cond_where(condition);
+
+    // The criteria's own scope, not `Active`: a caller that said `with_trashed`
+    // or `only_trashed` said it here, and this is the only place that reading
+    // is consumed. Applied after the filters rather than inside
+    // `criteria_condition`, because that function is shared with the `UPDATE`
+    // and `DELETE` builders — and scoping a write is what would leave a purge
+    // unable to purge and a bulk restore matching nothing. See
+    // [`rainier_orm::trash`] for why the policy is reads-only.
+    scope_select::<E>(stmt, criteria.trash_scope());
 
     for (column, descending) in criteria.orders() {
         let order = if *descending { Order::Desc } else { Order::Asc };
