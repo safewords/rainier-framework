@@ -62,8 +62,9 @@ let pool = if url.starts_with("sqlite::memory:") {
 };
 ```
 
-`Databases` below picks that pool for you — see
-[what the section does not carry](#what-the-section-does-not-carry).
+`Databases` below picks that pool for you when you declare no `pool`, and
+[refuses one](#sizing-the-pool) that would open a second connection to a
+database that only exists inside the first.
 
 ## More than one database
 
@@ -164,12 +165,198 @@ connection, a server connection with no `host` or no `database`, a `password`
 with no `username`, a `default` naming an entry nobody declared. Each is a case
 where the connection would work and read the wrong rows.
 
+### What a connection carries besides an address
+
+Four of these decide what the connection *reaches*; two decide what happens to a
+value once it gets there, and those two fail by **storing something other than
+what was sent**.
+
+```rust
+ServerDatabase::mysql("app")
+    .host("db.internal")
+    .credentials("app", secret)
+    .charset("utf8mb4")
+    .collation("utf8mb4_unicode_ci")
+    .strict(true)
+    .tls_ca("/etc/ssl/rds-combined-ca-bundle.pem")
+```
+
+| Setting | What it is for |
+|---|---|
+| `charset` / `collation` | the character set the connection negotiates, and how it orders |
+| `strict` | whether MySQL errors on an out-of-range value or truncates it |
+| `unix_socket` | a socket on this machine instead of a host and port |
+| `tls_ca` | a CA certificate to verify the server against; one setting both engines read |
+| `option(k, v)` | a driver parameter this list has no field for — an allow-list, see [below](#what-the-section-does-not-carry) |
+
+**`charset` is a data setting.** MySQL's `utf8` is three bytes wide. A
+connection negotiating it does not reject an emoji, or a good deal of CJK text
+— it truncates the value at the first four-byte character and stores the row.
+The write succeeds and the text is short. `utf8mb4` is the one that holds all of
+Unicode. Rainier still declares no default, because an assumed character set is
+an assumption about every existing row in a database this connection did not
+create; undeclared leaves the driver and the server to settle it exactly as they
+did before.
+
+**`strict` is the other one.** Non-strict MySQL truncates a value too long or
+out of range for its column instead of erroring — the `INSERT` returns success
+and the stored value is not the one that was sent. Left undeclared the server's
+own `sql_mode` decides, which is not a safe default so much as an unknown one: a
+managed database's parameter group is a place strict mode routinely gets turned
+off. Declaring it settles it for every connection in the pool rather than for
+whichever one happened to be checked out.
+
+A setting the driver cannot honour is **refused when the connection is
+declared** rather than accepted and dropped — `charset` on a driver with no such
+setting, `collation` with no `charset` to order, `unix_socket` beside a `host`
+nothing will dial.
+
+### Splitting reads from writes
+
+A connection may name a `read` role and a `write` role, each with its own hosts
+and, if it needs them, its own credentials. Everything a role does not name it
+takes from the connection around it, so the common case is short:
+
+```json
+{
+  "primary": {
+    "driver": "mysql", "host": "writer.internal", "database": "app",
+    "username": "app", "password": "…",
+    "read": { "host": ["replica-a.internal", "replica-b.internal"] },
+    "sticky": true
+  }
+}
+```
+
+A connection naming neither role is one connection and behaves exactly as it did
+before any of this existed — same endpoint, same pool, same connection string.
+
+**Which endpoint a statement reaches is decided by the method that ran it**, not
+by reading the SQL: a fetch reads and an execute writes. Every host of a role is
+opened at boot and they are used in turn, round-robin.
+
+#### `sticky`, and what it does outside a scope
+
+Splitting reads onto a replica introduces exactly one failure, and it is the
+quiet kind: a read issued straight after a write can land on a replica that has
+not caught up and **answer**. Not an error — the row is simply not there yet.
+The record that was just created 404s; the balance that was just debited reads
+its old total. Nothing raises, so nothing is logged, and it arrives as "it saved
+but it did not save" from somebody who could not reproduce it, because by the
+second attempt the replica had caught up.
+
+`sticky` closes it, and what it needs is a **scope**: a unit of work inside
+which *this scope has already written* is worth remembering. Inside one, a write
+pins the connection and every read after it goes to the endpoint that put the
+row there.
+
+```rust
+use rainier_framework::database::with_sticky_scope;
+
+with_sticky_scope(async move {
+    let post = posts.create(post).await?;
+    posts.find_or_fail(post.id).await          // the writer, because this scope wrote
+}).await?;
+```
+
+Two things to know before declaring it, because both surprise people:
+
+- **Outside a scope, a sticky connection reads from the writer.** There are only
+  two things it could do, and sending the read to a replica is precisely the
+  staleness `sticky` was declared to rule out. A read split that is not being
+  used shows up as load on the primary and idle replicas — visible, measurable,
+  fixable. The other answer shows up as a row that is not there. The first such
+  read logs a warning naming this, once per connection per process.
+- **Nothing enters a scope on your behalf yet.** `with_sticky_scope` is called
+  by the caller; the framework does not wrap a request or a job in one. A
+  `sticky` connection today therefore reads from its writer everywhere until you
+  wrap your own units of work.
+
+A connection is free to declare the split **without** `sticky`, which is a
+deliberate statement that its reads tolerate lag. What is not on offer is the
+promise plus the staleness.
+
+### Sizing the pool
+
+A connection may declare a `pool`, and so may either of its roles. Every field
+is optional and an absent one keeps the value the connection would have had, so
+a declaration says only what it is changing:
+
+```json
+{
+  "primary": {
+    "driver": "postgres", "host": "writer.internal", "database": "app",
+    "pool": { "max_connections": 8, "acquire_timeout": 5 },
+    "read": { "host": "replica.internal", "pool": { "max_connections": 20 } }
+  }
+}
+```
+
+Durations are whole seconds. `0` means *never* for the two that can be disabled
+— `idle_timeout` and `max_lifetime` — and is refused for the two where it would
+mean "give up instantly".
+
+**The roles are sized separately because they are sized differently.** A primary
+takes writes from every process and its connection budget is the scarce one;
+replicas take the read traffic and there are usually several. A role that
+declares no `pool` takes the connection's.
+
+Three fail in a way that does not look like a pool problem:
+
+- **`max_connections` is a share of a budget, not a limit on this process.** The
+  database accepts some total number of connections and every app process opens
+  up to its own maximum, so the number to write down is the database's budget
+  divided by the process count — and on a split connection, divided again by the
+  hosts in the role, because each host is its own pool. Too high does not show
+  up as slowness: the processes that started first keep working and the next one
+  to start is refused outright, which reads as a partial outage rather than as a
+  setting.
+- **`acquire_timeout` chooses which failure saturation produces.** Too short and
+  requests fail while the database is healthy and merely busy. Too long and they
+  queue past the point the caller gave up, so the pool spends its capacity on
+  work nobody is waiting for — which keeps the queue full, and is how a brief
+  spike becomes a sustained one.
+- **`max_lifetime` is the guard against a connection that is not there.** A load
+  balancer or a database that drops long-lived connections leaves the pool
+  holding sockets that look open and fail on first use, so the failures land on
+  whichever query happened to draw a dead one. Recycling on an age is what stops
+  that presenting as intermittent errors nobody can reproduce.
+
+There is deliberately **no preset to name**. `PoolConfig::serverless()` is
+expressible field by field, and a preset *name* in a configuration file is a
+value whose meaning moves when the library changes underneath it — where six
+numbers are six things a review can check against the database in front of it.
+
+The [in-memory SQLite](#the-in-memory-sqlite-trap) case is the one a pool
+declaration cannot get wrong: the database *is* the connection, so a pool that
+is not exactly one connection kept forever is refused. A second connection is a
+second, empty database, and reaping the first drops the schema.
+
 ### What the section does not carry
 
-**Pool settings.** The one case where getting it wrong is silent — an in-memory
-SQLite database with more than one connection is more than one *database* — has
-exactly one right answer, and `Databases` uses it. Sizing a pool is a tuning
-decision with no wrong-data failure mode.
+**A table prefix.** Refused rather than accepted, because it cannot be applied
+*everywhere* a table name is rendered. `Entity::table()` is a `&'static str`
+with no connection in scope, a foreign key names its parent as a string, and a
+migration step takes SQL already written. A prefix reaching the first of those
+and not the rest is the worst outcome available: some statements hit prefixed
+tables and some hit unprefixed ones, and a query against a table that exists but
+is not the one holding the rows comes back **empty** rather than failing. If it
+is wanted it belongs in the ORM, where every table name is rendered — a
+`Database` *is* an `Executor`, so `repo::query::<E>()` renders `E::table()`
+inside a crate that has never heard of this section.
+
+**`engine`.** MySQL's table engine is a `CREATE TABLE` clause, and nothing
+between a declaration and the schema builder carries it. Accepting it would put
+a value in the file the database never hears, which is strictly worse than
+refusing it.
+
+**Anything `options` names that the driver would not read.** `options` is an
+allow-list, not a passthrough, because of what a driver does with a parameter it
+does not recognise: sqlx's MySQL URL parser ignores it outright and its
+PostgreSQL one logs and moves on. Neither fails. A passthrough would let a file
+say `sslmode=verify-full` under a spelling the driver does not read, and the
+connection would be established unverified — with the setting sitting in the
+file, reviewed, and doing nothing.
 
 **The `d1` and `libsql` drivers.** Their executors take a caller-supplied
 transport (a `fetch` binding in a Worker, an HTTP client on a server), which is

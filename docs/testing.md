@@ -475,7 +475,7 @@ Argon2Hasher::insecure_for_tests()
 
 19 MiB and two iterations per hash is the point of Argon2, and it is also what
 turns a suite that creates fifty users into a suite that takes a minute. See
-[Hashing](hashing.md#tests-must-not-use-the-real-one).
+[Hashing](hashing.md#tests-must-not-use-the-real-parameters).
 
 ## Building requests
 

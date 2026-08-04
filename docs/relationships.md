@@ -53,6 +53,19 @@ for the same reason.
 [`Criteria::join`](repositories.md#joins) is still there for when both sides
 genuinely are in one place and you want the database to do the work.
 
+Because a load resolves through the far side's repository, it inherits that
+side's scopes. A related model marking a [soft-delete](models.md#soft-deletes)
+column has `deleted_at IS NULL` appended to its load *and* to its
+[count](#counting-without-loading), so a parent's tombstoned children neither
+appear nor are counted — with nothing to remember at the call site.
+
+`matching` narrows the far side further when you want it to, and is where a
+`with_trashed()` goes on the rare load that means to see them:
+
+```rust
+Post::comments().matching(Criteria::new().with_trashed())
+```
+
 ---
 
 ## The four kinds
@@ -238,9 +251,27 @@ Three queries for a page of twenty. Four for a page of a thousand.
 loads and a `where_in`; neither has earned a type yet. Say if you want one.
 
 **No `attach`/`detach`/`sync` on a pivot.** Writing to a pivot is an `INSERT`
-into a two-column table, and the repository's escape hatch —
-`repository.database()` — is the honest way to do it until there is a reason
-for more.
+into a two-column table, and since a pivot's two key columns are exactly a
+[composite primary key](models.md#composite-primary-keys), the honest way to do
+it is to give the pivot an `Entity` of its own and use the ORM:
+
+```rust
+#[derive(Entity, Clone)]
+#[orm(table = "post_tag")]
+struct PostTag {
+    #[orm(pk)]
+    post_id: u64,
+    #[orm(pk)]
+    tag_id: u64,
+}
+
+repo::insert(&db, &PostTag { post_id, tag_id }).await?;
+repo::delete_by_keys::<PostTag, _>(&db, vec![post_id.into(), tag_id.into()]).await?;
+```
+
+The composite key is what makes a double-click harmless — attaching the same tag
+twice collides rather than duplicating. `repository.database()` is still there
+for a pivot carrying extra columns you would rather not model.
 
 **No cascading saves.** Saving a parent does not save its children. Rust makes
 "which of these are dirty?" a question you cannot answer without tracking every

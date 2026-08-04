@@ -303,8 +303,29 @@ flowchart TD
 ```
 
 The **transports live in `rainier-drivers`**, not in the cache crate. Redis is
-wanted by the queue too, and an application should configure it once — one
-client, one set of connections, one place where a URL is parsed.
+wanted by the queue and the broadcaster too, so the client, the URL parsing and
+the timeout handling are written once and each of them builds on it.
+
+What is deliberately *not* shared is the connection. A cache store and a queue
+connection each declare their own URL, their own timeouts and their own
+reconnection, even on the same server — and a `redis` queue connection naming
+the cache's store is refused rather than resolved. Sharing is what makes one of
+them quietly inherit the other's settings, and in this particular pair it is
+worse than that: they would share a database index, so flushing the cache would
+empty the whole index and take every job waiting in it. Give the queue its own
+index in its own URL.
+
+```rust
+use rainier_framework::drivers::{RedisConnector, RedisSettings};
+
+// The settings a store or a connection declares end up here.
+let connector = RedisConnector::open_with(
+    "redis://127.0.0.1:6379/0",
+    RedisSettings::new()
+        .connect_timeout(Duration::from_millis(2000))
+        .response_timeout(Duration::from_millis(250)),
+)?;
+```
 
 ## Cloudflare Workers KV
 
@@ -481,10 +502,113 @@ REDIS_URL=redis://127.0.0.1:6379/
 MEMCACHED_URL=127.0.0.1:11211
 ```
 
-A driver whose cargo feature is not enabled falls back to memory **with a
-warning** rather than failing the boot. A cache is the one dependency an
-application should be able to lose, and a missing feature is a build-time
-mistake worth a loud line rather than an outage.
+That declares **one** store, named after its driver, and the framework builds it
+at boot. Leave `CACHE_DRIVER` unset and the in-process store is what you get,
+which is right for a test and for single-process development.
+
+A driver whose cargo feature is not enabled **fails the boot**, naming the
+feature to add. It used to warn and use memory anyway, and that was the failure
+it was warning about: `CACHE_DRIVER=redis` produced an unshared cache, so locks
+were not locks and a rate limit counted to `N ×` its limit across `N` replicas —
+with one line in a log nobody reads at boot. A cache is the one dependency an
+application should be able to *lose*; silently getting a different one is not
+the same thing.
+
+### More than one store
+
+One `CACHE_DRIVER` is one backend. Two — a shared Redis and a per-process
+scratch store — are a **section**: a `default` naming one entry, and each entry
+naming its own driver and settings.
+
+```rust
+use rainier_framework::cache::{StoreConfig, Stores};
+
+let stores = Stores::new("shared")
+    .with("shared", StoreConfig::redis("redis://cache.internal:6379/1"))
+    .with("scratch", StoreConfig::memory());
+```
+
+which is the same shape from the configuration tree, under `cache.stores`:
+
+```json
+{
+  "cache": {
+    "stores": {
+      "default": "shared",
+      "stores": {
+        "shared":  { "driver": "redis", "url": "redis://cache.internal:6379/1",
+                     "response_timeout_ms": 250, "reconnect": true },
+        "scratch": { "driver": "memory" }
+      }
+    }
+  }
+}
+```
+
+Each store is built from **its own** declaration. There is no shared connector
+to inherit: the version of this that built them from one produced a second store
+with the right *name* pointed at the wrong server, and that failure is quiet in
+the way a cache's failures always are. Everything downstream of a cache treats
+absence as normal — a miss is not an error — so a store on the wrong server is
+not an outage, it is a permanent miss that reads as a slow application. When
+what was cached was a rate-limit counter or a lock, it is not slow, it is wrong.
+
+`CACHE_DRIVER` and a `cache.stores` section each name the default store, so
+setting both fails the boot rather than resolving by precedence — the same rule
+as [`DATABASE_URL` and a `databases` section](database.md#never-both).
+
+### What a `redis` store waits for, and why it has no pool
+
+**The Redis connection multiplexes.** One socket carries every concurrent
+command and the client matches each reply to the request that asked for it, so a
+pool on top would open more sockets without moving more commands. There is
+nothing to size, and `max_connections` on a `redis` store is refused by name
+rather than accepted and ignored.
+
+What that shape of connection honours instead is three settings, and on a cache
+they matter more than anywhere else, because the cache is on the hot path of
+nearly every request:
+
+| Setting | What it bounds | What goes wrong without it |
+|---|---|---|
+| `connect_timeout_ms` | opening the socket, handshake included | a process booting against a route that goes nowhere waits minutes before saying anything |
+| `response_timeout_ms` | one command waiting for its reply | a server that accepted the command and went quiet stalls every request that touches a session, a cached value or a rate limit — all at once, and the symptom names nothing |
+| `reconnect` | nothing — it *recovers* | **the important one**: a multiplexed connection does not re-open itself, so one socket dropped by an idle proxy breaks the cache for the life of the process |
+
+Milliseconds, and named so: a command's budget on the hot path cannot be written
+in whole seconds, where the only values available are `0` — which would fail
+everything — and `1`, already longer than a request can afford to wait for a
+cache read.
+
+All three are **off unless declared**, so a section that says nothing behaves as
+it did before they existed, including the store that does not reconnect. That is
+why `reconnect` is the one to reach for first.
+
+**Memcached does pool, and says so.** The contrast is what makes the Redis
+answer a design rather than a gap: a Memcached connection has no request ids, so
+replies are matched to requests by order and one connection serves one command
+at a time. A `memcached` store therefore takes a `pool_size` and a `redis` store
+does not — the difference is in the protocols, not in how finished the two are.
+
+### What a declaration refuses
+
+Each of these would give a working-looking store reading or writing somewhere
+other than the one intended, so each is a boot failure:
+
+| Declaration | Why |
+|---|---|
+| no `driver` | an assumed driver is a store pointed at whatever the default happens to be |
+| `url` on a `memory` store | somebody believes this cache is shared between processes; it is not |
+| `max_connections` and the rest of the pool fields | no store here has a pool of that shape — see above |
+| `pool_size` on anything but `memcached` | only Memcached has a pool to size |
+| `key` without `secret` | falls back to the ambient chain, and reads a **different account's** table |
+| `key` and `secret` with no `region` | a signed request has to name one, and a guess is a wrong one |
+| `reconnect_attempts` without `reconnect` | reads as reconnection being on and behaves as it being off |
+| `default` naming an undeclared store | the fallback would be silent, and the wrong store |
+
+One driver is built from something no configuration file can hold: `kv` needs a
+`KvTransport`, which is a binding inside a Worker and an API client outside one.
+It arrives through `CacheResources` rather than through the config tree.
 
 ## Testing
 

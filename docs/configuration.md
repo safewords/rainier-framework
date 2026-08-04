@@ -242,6 +242,14 @@ worth asking about it:
 | `FilesystemDriver` | `local` `memory` `s3` | `is_shared()`, `is_durable()` |
 | `AppEnv` | `production` `staging` `local` `testing` | `is_developing()`, `is_serving_users()` |
 
+`FilesystemDriver` is the one whose set a *declaration* may exceed: an
+application can [register a driver](filesystem.md#a-driver-the-framework-does-not-ship)
+the framework does not ship, and a disk may then name it. The enum stays closed
+because it is the set the framework knows how to *build* — which is what lets a
+caller match on `FilesystemDriver::S3` without handling an open-ended string to
+do it. A name that is neither built in nor registered is still a boot failure,
+never a silent `local`.
+
 The predicates are the point. `driver.is_revocable()` is a question with one
 answer; `driver == "cookie"` is the same question, spelled so that adding a
 second non-revocable store silently gets it wrong.
@@ -265,6 +273,97 @@ let store: Arc<dyn SessionStore> = match env.setting::<SessionDriver>("SESSION_D
 No `_ =>` arm, and that is deliberate. Adding a store to the framework makes
 this a compile error — which is exactly the list of places that need to learn
 about it.
+
+## Sections: when one of something is not enough
+
+A driver name is one setting, and for a single backend that is the whole
+configuration. It stops being enough the moment there are **two**, because the
+second one shares nothing with the first: its own driver, its own host, its own
+credentials, its own timeouts.
+
+Four things come in more than one, and all four are declared the same way — a
+`default` naming one entry, and each entry naming its own driver and settings:
+
+| Section | Entries are called | Also declarable as one, by | Type |
+|---|---|---|---|
+| `filesystems` | `disks` | `FILESYSTEM_DISK` naming a declared disk | [`Disks`](filesystem.md#declaring-disks) |
+| `databases` | `connections` | `DATABASE_URL` | [`Databases`](database.md#more-than-one-database) |
+| `queues` | `connections` | `QUEUE_DRIVER` | [`Connections`](queues.md#more-than-one-connection) |
+| `cache.stores` | `stores` | `CACHE_DRIVER` | [`Stores`](cache.md#more-than-one-store) |
+
+The `disks` / `connections` / `stores` inconsistency is inherited rather than
+invented. The wire shapes mirror the framework these are ported from, including
+its own asymmetry, so a section carried across from an existing application does
+not have to be re-learned to be brought over.
+
+```json
+{
+  "queues": {
+    "default": "primary",
+    "connections": {
+      "primary": { "driver": "database", "reservation": 90 },
+      "bulk": { "driver": "sqs", "queue_url": "https://sqs…/bulk", "region": "us-east-1" }
+    }
+  }
+}
+```
+
+Each is also a typed key, so a section can be built in code and handed to the
+builder rather than assembled as JSON:
+
+```rust
+Rainier::new(".")
+    .with_disks(Disks::new("uploads").with("uploads", DiskConfig::local("storage/app")))
+    .with_databases(Databases::from_url(&url)?.with("replica", replica))
+    .with_queues(Connections::new("primary").with("primary", ConnectionConfig::database()))
+```
+
+### One or the other, never both
+
+Each section's scalar counterpart names the **default entry**, so declaring both
+is two answers to one question — and that is a boot failure rather than a
+precedence rule:
+
+```
+Error: `DATABASE_URL` is set and a `databases` section is declared, and both name
+the default database connection. Rainier will not choose between them: …
+```
+
+The reason precedence is the wrong answer is what happens *after* it resolves.
+Whichever declaration lost would still be sitting in the configuration, read by
+whoever changes it next — so repointing the database by editing the visible one
+would review cleanly, deploy cleanly and change nothing. Then the query runs
+against the other one and **answers**: rows come back, the types match, the page
+renders. There is no failure to notice.
+
+That failure gets quieter as you go down the list, which is why all four refuse
+rather than only the loud ones:
+
+- a **disk** on the wrong bucket reads back empty, and somebody notices a
+  missing file;
+- a **job** pushed to the wrong backend is accepted, returns an id, and then
+  waits in a store no worker drains — no error, no retry, no failed-job row,
+  because it never failed;
+- a **cache store** on the wrong server is not an outage at all, because
+  everything downstream of a cache treats a miss as normal. It reads as a slow
+  application — and when what was cached was a lock or a rate-limit counter, it
+  is not slow, it is wrong;
+- a **database** query against the wrong connection simply answers.
+
+### An entry declares its own settings, and is built from those alone
+
+This is the property all four share and the reason they are sections at all. The
+version of each that built every entry from one shared client produced a second
+entry with the right *name* pointed at the wrong place.
+
+A setting an entry's driver cannot honour is **refused when the section is
+read**, not accepted and dropped. That includes settings a section ported from
+elsewhere carries that Rainier has no equivalent for — `after_commit` on a queue
+connection is refused because there is no transaction API for it to wait on, and
+the refusal names what to do instead. An ignored setting is worse than a
+rejected one: a rejected `after_commit` is a boot failure and a five-minute
+conversation, while an accepted one is a configuration file that states, in
+writing, that jobs wait for their transaction — while they do not.
 
 ## Where it is set
 
@@ -347,6 +446,7 @@ differ:
 | `keys::SERVER_COMPRESSION` | `bool` | `SERVER_COMPRESSION` | `false` |
 | `keys::LOG_FORMAT` | `LogFormat` | `LOG_FORMAT` | `auto` |
 | `keys::DATABASE_URL` | `String` | `DATABASE_URL` | `sqlite::memory:` |
+| `keys::FILESYSTEMS` | `Disks` | `FILESYSTEM_DISK` names the default | one `local` disk at `storage/app` |
 | `keys::CACHE_DRIVER` | `CacheDriver` | `CACHE_DRIVER` | `memory` |
 | `keys::CACHE_REDIS_URL` | `String` | `REDIS_URL` | `redis://127.0.0.1:6379/` |
 | `keys::CACHE_MEMCACHED_URL` | `String` | `MEMCACHED_URL` | `127.0.0.1:11211` |
@@ -382,6 +482,14 @@ differ:
 | `keys::MAIL_MAILGUN_ENDPOINT` | `String` | `MAIL_MAILGUN_ENDPOINT` | *(empty)* — the US endpoint |
 | `keys::MAIL_SENDGRID_KEY` | `String` | `MAIL_SENDGRID_KEY` | *(empty)* |
 | `keys::MAIL_RESEND_KEY` | `String` | `MAIL_RESEND_KEY` | *(empty)* |
+
+`filesystems` is the only [section](#sections-when-one-of-something-is-not-enough)
+the framework seeds, and it seeds it because a seeded disk costs a directory
+nobody writes to. `databases`, `queues` and `cache.stores` are seeded with
+**nothing**: a seeded connection opens a pool at boot against a database the
+application never asked for, and a seeded queue accepts jobs no worker drains.
+Declare nothing and you get no database and no queue at all, which is what an
+application that has neither should get.
 
 The three new in 1.0.1 are worth a word each:
 

@@ -229,7 +229,9 @@ Queue::instance().dispatch(NotifyAuthor { post_id }).await?;
 
 Drivers: `SyncQueue` (inline), `MemoryQueue` (tests), `DatabaseQueue` (on the
 database you already have, with an optimistic claim so two workers cannot take
-the same job).
+the same job), plus Redis, SQS and Kafka behind their features. One connection
+is a `QUEUE_DRIVER`; more than one is a `queues` section where each connection
+carries its own driver, endpoint, credentials and timeouts.
 
 ### Mailables
 
@@ -375,7 +377,10 @@ router.get("/dashboard", dashboard).middleware(["session"]);
 
 Every payload records which key wrote it, so key rotation is a deploy. Sessions
 have four drivers — memory, database, cache (Redis, sharded cluster, Memcached),
-cookie — behind one port; storage has local, memory and S3/R2.
+cookie — behind one port; storage has local, memory and S3/R2, plus any driver
+an application registers with `FilesystemDriver::extend`. A disk that cannot
+sign a temporary URL **fails** rather than handing back the permanent public one,
+because that fallback is a paywall bypass that reads like a graceful degradation.
 
 ### Console
 
@@ -411,6 +416,16 @@ The reasoning lives next to the code.
   the first two, so `[Rule::Email]` means "if supplied, must be an email".
 - **`5xx` messages never reach the client** unless debug is on — they contain
   connection strings and queries. `4xx` always does; it describes what the client did.
+- **A setting the framework cannot honour is refused, not ignored.** An ignored
+  setting is a configuration file that states something untrue and is believed;
+  a rejected one is a boot failure and a five-minute conversation.
+- **Two declarations of the same default are a boot failure, not a precedence
+  rule.** The one that loses stays in the file being read by whoever changes it
+  next, and the query that then runs against the winner comes back with rows
+  rather than an error.
+- **A correlated subquery cannot be built without its correlation.** An `EXISTS`
+  that forgot to correlate matches every row and returns the whole table without
+  erroring, so the mistake is made unwritable rather than caught.
 
 ## Building an application
 

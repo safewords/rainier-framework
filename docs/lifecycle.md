@@ -89,6 +89,9 @@ the config with framework defaults. Everything after it is a builder method:
 | `.with_queue(manager)` | bind a `QueueManager` you built |
 | `.with_queues(conns)` | declare the connections and let the framework build them |
 | `.with_jobs(registry)` | declare the jobs a worker can run |
+| `.with_storage(storage)` | bind a `Storage` you built |
+| `.with_disks(disks)` | declare the disks and let the framework build them |
+| `.with_cache(manager)` | bind a `CacheManager` you built |
 | `.with_mailer(mailer)` | bind a `Mailer` |
 | `.with_provider(provider)` | register a service provider |
 | `.without_facades()` | do not install the process-global facade app |

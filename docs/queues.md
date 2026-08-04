@@ -294,6 +294,89 @@ it.** That is fine in development and wrong in production — it is exactly the
 coupling the queue exists to remove. Switch before you deploy; see
 [Deployment](deployment.md).
 
+### What a connection carries
+
+Each entry names its own driver and that driver's own settings. Nothing is
+shared between two connections, including two on the same server — sharing is
+what makes one of them quietly inherit the other's settings.
+
+| Driver | Its settings |
+|---|---|
+| `database` | `reservation` |
+| `redis` | `url`, `prefix`, `reservation`, `connect_timeout_ms`, `response_timeout_ms`, `reconnect`, `reconnect_attempts`, `reconnect_max_backoff_ms` |
+| `sqs` | `queue_url`, `region`, `endpoint`, `visibility_timeout`, `wait_time`, `key`/`secret` |
+| `kafka` | `brokers`, `group`, `topic_prefix`, `lease` |
+
+`reservation` is the one with teeth — it is the only setting here whose
+*plausible* values include one that breaks the queue silently, so it gets a
+check of its own (`Connections::check_reservations`) rather than a warning in
+prose. A reservation shorter than the work takes means a second worker claims a
+job the first is still running.
+
+Three drivers need something no configuration file can hold: `sync` needs the
+job registry and the container it resolves dependencies from, `database` needs
+the application's `Database`, and `kafka` needs a shared lock store. Those
+arrive through `QueueResources`. A driver that needs one and was not given it is
+a boot failure naming the missing piece, not a connection that quietly becomes
+something else.
+
+#### What a `redis` connection waits for
+
+The same three settings the [cache](cache.md#what-a-redis-store-waits-for-and-why-it-has-no-pool)
+has, for the same reason — the connection multiplexes, so there is nothing to
+pool and everything to time out:
+
+```json
+{
+  "primary": {
+    "driver": "redis",
+    "url": "redis://localhost:6379/1",
+    "connect_timeout_ms": 2000,
+    "response_timeout_ms": 250,
+    "reconnect": true
+  }
+}
+```
+
+`reconnect` is the one to reach for first: a socket a proxy dropped while the
+queue was idle otherwise takes every push with it, permanently, until the
+process restarts. All three are off unless declared.
+
+Milliseconds here, unlike `reservation` and `lease` beside them, which are whole
+seconds because they are periods a *job* waits. A command's budget is not: in
+seconds the only values available are `0`, which would fail everything, and `1`,
+already longer than a request can afford to spend pushing.
+
+### Settings this framework cannot honour
+
+A section written against another framework's queue config carries several more.
+Every one is **refused by name**, with what to write instead, because the
+alternative is the failure this whole section is built to avoid wearing a
+different hat: a setting that is read, understood by the person who wrote it,
+and then dropped.
+
+An ignored setting is worse than a rejected one. A rejected `after_commit` is a
+boot failure and a five-minute conversation. An accepted one is a configuration
+file that states, in writing, that jobs wait for their transaction — while they
+do not, and the person reading it has no reason to doubt it.
+
+| Declaration | Why it cannot be honoured | Write instead |
+|---|---|---|
+| `retry_after` | the same setting under another name | `reservation` — or `visibility_timeout` on `sqs`, `lease` on `kafka` |
+| `after_commit` | Rainier has **no transaction API** at all, so there is no commit to wait for | nothing; dispatch after the write returns |
+| `block_for` | no driver here blocks; `reserve` returns immediately and the **worker** does the waiting | nothing; a worker's own `sleep` |
+| `table` | the queue's tables are named on their entities at compile time, not per connection | nothing; run the driver's own migrations |
+| `prefix`, `suffix` on `sqs` | they compose a queue *URL* out of parts, and an `sqs` connection is given the whole URL | `queue_url` |
+| `connection` on `redis` | it would point at the cache's named stores — the queue sharing the cache's database index, which is the failure it existed to prevent | `url`, with its own index |
+| `max_connections`, `min_connections`, `pool_size` | no driver here pools, and the Redis one **multiplexes** | `response_timeout_ms` and `reconnect` |
+
+A declaration is refused on the same principle whenever accepting it would give
+a working-looking connection storing jobs somewhere other than intended: no
+`driver`, a `queue` on any connection (the queue is the job's to name, and one
+here would be a decoy), a `url` on an `sqs` connection, `key` without `secret`,
+`key` and `secret` with no `region`, an empty `brokers`, or a `default` naming a
+connection nobody declared.
+
 ### `RedisQueue`, and what it costs
 
 Redis is the reflex answer to "we need a queue". It is available here, and it

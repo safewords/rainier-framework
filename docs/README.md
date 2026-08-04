@@ -70,6 +70,7 @@ rights in their names or marks.
 | [Scenarios](scenarios.md) | Worked designs composing the pages above — starting with a Twitter-shaped feed |
 | [Queues](queues.md) | Jobs, drivers, the worker, retries, and the reservation protocol |
 | [Cache](cache.md) | The cache port, Redis, Redis Cluster, Memcached, Workers KV, atomic locks |
+| [Filesystem](filesystem.md) | The storage port, declaring disks, signed URLs, and registering a driver |
 | [Task Scheduling](scheduling.md) | Cron expressions, `without_overlapping`, `on_one_server` |
 | [Observability](observability.md) | Prometheus metrics, an OpenAPI document, OpenTelemetry, log format, health checks |
 | [Helpers](helpers.md) | `Str` inflection, type-maps, the error type, and `build_info!()` |
@@ -128,6 +129,19 @@ concept as you know it, and where it lives here.
 | an active-record model | [`#[derive(Entity)]` + `Model`](models.md) |
 | creating / created model hooks | [typed hook events](models.md#lifecycle-hooks) |
 | the query builder, paginated | [`Criteria` + a repository](repositories.md) |
+| `orWhere` / a nested where group | [`or_where(\|group\| …)`](repositories.md#or-groups) |
+| `whereExists` / a correlated subquery | [`Subquery::count(..).correlate(..)`](repositories.md#correlated-subqueries) |
+| `increment` on a column | [`Assignment::Increment`](repositories.md#counters-and-correlated-writes) |
+| updating some columns by a filter | [`update_matching` / `update_column`](repositories.md#update-writes-every-column-and-that-is-usually-not-what-you-meant) |
+| `upsert` with a conflict target | [`Upsert::on(..)`](repositories.md#the-conflict-target-must-be-a-column-the-insert-supplies) |
+| soft deletes, `withTrashed` | [`#[orm(soft_delete)]`](models.md#soft-deletes) |
+| a composite primary key | [two `#[orm(pk)]` fields](models.md#composite-primary-keys) |
+| `filesystems.php` and `Storage::disk` | [declaring disks](filesystem.md#declaring-disks) |
+| `Storage::extend` | [`FilesystemDriver::extend`](filesystem.md#a-driver-the-framework-does-not-ship) |
+| a temporary signed URL | [`temporary_url`](filesystem.md#signed-urls) |
+| a read/write connection split | [`read` and `write` roles, plus `sticky`](database.md#splitting-reads-from-writes) |
+| pool sizing in `database.php` | [a connection's `pool`](database.md#sizing-the-pool) |
+| more than one cache store | [`cache.stores`](cache.md#more-than-one-store) |
 | has-many / belongs-to | [`HasMany` / `BelongsTo`](relationships.md), loaded for a slice |
 | many-to-many, with a pivot | [`BelongsToMany`](relationships.md#many-to-many) |
 | eager loading | `Post::author().load(&posts, &*users)` — [one query](relationships.md) |
@@ -232,3 +246,9 @@ produced worse Rust. Each links to the page that explains the trade.
 - **A migration's `down` is derived from its `up`, not written twice.** [Why](migrations.md#the-rollback-is-derived)
 - **An OpenAPI request body is the validator's own rules.** [Why](observability.md#the-request-body-comes-from-the-validator)
 - **Nothing is autoloaded and nothing is discovered by name.** [Why](directory-structure.md#two-things-rust-does-differently)
+- **A setting the framework cannot honour is refused, never ignored.** [Why](configuration.md#an-entry-declares-its-own-settings-and-is-built-from-those-alone)
+- **Two declarations of one default fail the boot rather than resolving by precedence.** [Why](configuration.md#one-or-the-other-never-both)
+- **A correlated subquery cannot be constructed without its correlation.** [Why](repositories.md#a-subquery-carries-its-correlation-from-construction)
+- **A soft-delete column is declared, never inferred from its name.** [Why](models.md#the-marker-is-declared-never-inferred)
+- **An upsert refuses a conflict target the insert does not supply.** [Why](repositories.md#the-conflict-target-must-be-a-column-the-insert-supplies)
+- **A disk that cannot sign a temporary URL fails instead of returning a public one.** [Why](filesystem.md#a-public-url-is-never-a-substitute-for-a-signed-one)
