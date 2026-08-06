@@ -83,13 +83,35 @@ impl JwtAlgorithm {
             Self::Es256 => "ES256",
         }
     }
+
+    /// Read an `alg` from a JWKS entry.
+    ///
+    /// An unknown one is refused rather than defaulted. A default here would
+    /// decide, on a verifier's behalf, which algorithm somebody else's key
+    /// uses — and being wrong about that is either a rejection storm or a
+    /// forgery, depending on which way it is wrong.
+    pub fn parse(name: &str) -> Result<Self> {
+        match name {
+            "RS256" => Ok(Self::Rs256),
+            "ES256" => Ok(Self::Es256),
+            other => Err(Error::internal(format!(
+                "`{other}` is not an algorithm this service verifies; only RS256 and ES256"
+            ))),
+        }
+    }
 }
 
 /// One signing key, with the public half a JWKS needs.
 pub struct JwtKey {
     kid: String,
     algorithm: JwtAlgorithm,
-    encoding: EncodingKey,
+    /// Absent for a key rebuilt from somebody else's JWKS.
+    ///
+    /// A relying party has the public half and nothing else, which is the
+    /// whole point of publishing a JWKS. Modelling that as `None` rather than
+    /// as a second type keeps one `JwtKeyRing` for both sides — the verifier
+    /// in a service that also signs its own tokens is the same ring.
+    encoding: Option<EncodingKey>,
     decoding: DecodingKey,
     /// The public JWK, minus the fields the ring fills in.
     jwk: Value,
@@ -124,8 +146,10 @@ impl JwtKey {
         Ok(Self {
             kid: kid.into(),
             algorithm: JwtAlgorithm::Rs256,
-            encoding: EncodingKey::from_rsa_pem(pem.as_bytes())
-                .map_err(|e| Error::internal(format!("could not load the RSA key: {e}")))?,
+            encoding: Some(
+                EncodingKey::from_rsa_pem(pem.as_bytes())
+                    .map_err(|e| Error::internal(format!("could not load the RSA key: {e}")))?,
+            ),
             decoding: DecodingKey::from_rsa_pem(public_pem(&public)?.as_bytes())
                 .map_err(|e| Error::internal(format!("could not load the RSA key: {e}")))?,
             jwk,
@@ -160,8 +184,10 @@ impl JwtKey {
         Ok(Self {
             kid: kid.into(),
             algorithm: JwtAlgorithm::Es256,
-            encoding: EncodingKey::from_ec_pem(pem.as_bytes())
-                .map_err(|e| Error::internal(format!("could not load the P-256 key: {e}")))?,
+            encoding: Some(
+                EncodingKey::from_ec_pem(pem.as_bytes())
+                    .map_err(|e| Error::internal(format!("could not load the P-256 key: {e}")))?,
+            ),
             decoding: DecodingKey::from_ec_pem(public_pem.as_bytes())
                 .map_err(|e| Error::internal(format!("could not load the P-256 key: {e}")))?,
             jwk,
@@ -207,6 +233,105 @@ impl JwtKey {
     /// The algorithm.
     pub fn algorithm(&self) -> JwtAlgorithm {
         self.algorithm
+    }
+
+    /// A verify-only key, rebuilt from a JWKS entry.
+    ///
+    /// The inverse of [`to_jwk`](Self::to_jwk), and what a relying party needs:
+    /// it has the published document and no private half. Without this, every
+    /// service verifying somebody else's tokens hand-decodes `n` and `e` into
+    /// a public key, which is a piece of bignum-and-base64 handling that has
+    /// no business being written more than once.
+    ///
+    /// **The algorithm comes from the JWK's `alg`, never from a token's
+    /// header.** That is the same rule [`Jwt::verify`] follows, for the same
+    /// reason: a header saying `none`, or saying `HS256` over a public key
+    /// everybody can read, is the classic JWT forgery.
+    ///
+    /// Requires `kid`. A JWKS entry without one cannot be selected by a
+    /// token's header, so accepting it would put a key in the ring that
+    /// nothing can ever match.
+    pub fn from_jwk(jwk: &Value) -> Result<Self> {
+        let field = |name: &str| -> Result<String> {
+            jwk.get(name)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| Error::internal(format!("this JWKS entry has no `{name}`")))
+        };
+
+        let decode = |name: &str| -> Result<Vec<u8>> {
+            B64URL
+                .decode(field(name)?)
+                .map_err(|e| Error::internal(format!("`{name}` is not base64url: {e}")))
+        };
+
+        let kid = field("kid")?;
+        let algorithm = JwtAlgorithm::parse(&field("alg")?)?;
+
+        let decoding = match field("kty")?.as_str() {
+            "RSA" => {
+                use rsa::{BigUint, RsaPublicKey};
+
+                // Big-endian, unsigned, as RFC 7518 §6.3.1 specifies. Reading
+                // these little-endian produces a key that is structurally
+                // valid and verifies nothing, which is the failure this is
+                // most likely to be broken into.
+                let public = RsaPublicKey::new(
+                    BigUint::from_bytes_be(&decode("n")?),
+                    BigUint::from_bytes_be(&decode("e")?),
+                )
+                .map_err(|e| Error::internal(format!("this JWKS entry is not an RSA key: {e}")))?;
+
+                DecodingKey::from_rsa_pem(public_pem(&public)?.as_bytes())
+                    .map_err(|e| Error::internal(format!("could not load the RSA key: {e}")))?
+            }
+            "EC" => {
+                use p256::elliptic_curve::sec1::FromEncodedPoint;
+                use p256::pkcs8::EncodePublicKey;
+                use p256::{AffinePoint, EncodedPoint};
+
+                let curve = field("crv")?;
+                if curve != "P-256" {
+                    return Err(Error::internal(format!(
+                        "`{curve}` is not a curve this service verifies; only P-256"
+                    )));
+                }
+
+                let point = EncodedPoint::from_affine_coordinates(
+                    decode("x")?.as_slice().into(),
+                    decode("y")?.as_slice().into(),
+                    false,
+                );
+
+                let affine = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&point))
+                    .ok_or_else(|| {
+                    Error::internal("this JWKS entry is not a point on P-256")
+                })?;
+
+                let public = p256::PublicKey::from_affine(affine).map_err(|e| {
+                    Error::internal(format!("this JWKS entry is not a P-256 key: {e}"))
+                })?;
+
+                let pem = public
+                    .to_public_key_pem(Default::default())
+                    .map_err(|e| Error::internal(format!("could not encode the key: {e}")))?;
+
+                DecodingKey::from_ec_pem(pem.as_bytes())
+                    .map_err(|e| Error::internal(format!("could not load the P-256 key: {e}")))?
+            }
+            other => {
+                return Err(Error::internal(format!(
+                    "`{other}` is not a key type this service verifies; only RSA and EC"
+                )))
+            }
+        };
+
+        Ok(Self { kid, algorithm, encoding: None, decoding, jwk: jwk.clone() })
+    }
+
+    /// Whether this key can sign, or only verify.
+    pub fn can_sign(&self) -> bool {
+        self.encoding.is_some()
     }
 
     /// The public JWK, as a JWKS entry.
@@ -266,6 +391,41 @@ impl JwtKeyRing {
     /// Every key id, current first.
     pub fn ids(&self) -> Vec<&str> {
         self.keys.iter().map(|key| key.kid.as_str()).collect()
+    }
+
+    /// A verify-only ring, rebuilt from a published JWKS document.
+    ///
+    /// What a relying party holds: every key the issuer says can still verify,
+    /// and no private half. Order is the document's, which for a well-behaved
+    /// issuer puts the current signing key first — but nothing here depends on
+    /// that, since [`Jwt::verify`] selects by `kid`.
+    ///
+    /// Entries this build cannot verify with — an unknown `kty`, an `alg` that
+    /// is not RS256 or ES256, a missing `kid` — are **skipped rather than
+    /// fatal**. An issuer that adds a key type before its relying parties
+    /// understand it should not take them all down; the tokens naming that key
+    /// are rejected individually, which is the correct blast radius.
+    ///
+    /// A document that yields no usable key at all *is* an error, because
+    /// there is nothing to distinguish it from a successful fetch of an empty
+    /// or wrong document — and a silently empty ring rejects every token with
+    /// "names a key this service does not hold".
+    pub fn from_jwks(document: &Value) -> Result<Self> {
+        let entries = document
+            .get("keys")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::internal("this JWKS document has no `keys` array"))?;
+
+        let keys: Vec<Arc<JwtKey>> =
+            entries.iter().filter_map(|jwk| JwtKey::from_jwk(jwk).ok()).map(Arc::new).collect();
+
+        if keys.is_empty() {
+            return Err(Error::internal(
+                "this JWKS document holds no key this service can verify with",
+            ));
+        }
+
+        Ok(Self { keys })
     }
 
     /// The JWKS document.
@@ -354,10 +514,19 @@ impl Jwt {
             Error::internal("the JWT key ring is empty, so nothing can be signed")
         })?;
 
+        // A ring built from somebody else's JWKS can verify and nothing else.
+        // Saying so beats a signature failure deeper in, which reads like a
+        // key problem rather than like asking a verifier to sign.
+        let encoding = key.encoding.as_ref().ok_or_else(|| {
+            Error::internal(
+                "this key was rebuilt from a JWKS and holds no private half, so it can verify but not sign",
+            )
+        })?;
+
         let mut header = Header::new(key.algorithm.as_jsonwebtoken());
         header.kid = Some(key.kid.clone());
 
-        jsonwebtoken::encode(&header, claims, &key.encoding)
+        jsonwebtoken::encode(&header, claims, encoding)
             .map_err(|e| Error::internal(format!("could not sign the token: {e}")))
     }
 

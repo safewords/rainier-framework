@@ -106,3 +106,107 @@ fn a_jwks_carries_no_private_material() {
     }
     assert!(!published.contains("PRIVATE"));
 }
+
+/// The framework's own JWKS reader agrees with the hand-rolled one above.
+///
+/// The test above rebuilds the key from `n` and `e` by hand, which is what a
+/// relying party used to have to do. `JwtKeyRing::from_jwks` exists so nobody
+/// writes that twice — and this asserts the two reach the same verdict on the
+/// same document, so a change to the reader cannot quietly stop matching the
+/// interop check that guards the wire format.
+#[test]
+fn a_ring_rebuilt_from_the_published_jwks_verifies_the_token() {
+    let signer = Jwt::new(JwtKeyRing::new(JwtKey::generate_rs256("k1", 2048).unwrap()))
+        .issued_by("https://issuer.test")
+        .for_audience("interop");
+
+    #[derive(Serialize, serde::Deserialize)]
+    struct Claims {
+        iss: String,
+        aud: String,
+        sub: String,
+        exp: i64,
+    }
+
+    let token = signer
+        .sign(&Claims {
+            iss: "https://issuer.test".into(),
+            aud: "interop".into(),
+            sub: "client:4".into(),
+            exp: 9_999_999_999,
+        })
+        .unwrap();
+
+    // Only the published document crosses this line — no help from the
+    // signing side, which is the whole point.
+    let verifier = Jwt::new(JwtKeyRing::from_jwks(&signer.jwks()).unwrap())
+        .issued_by("https://issuer.test")
+        .for_audience("interop");
+
+    let claims: Claims = verifier.verify(&token).expect("the published key verifies the token");
+    assert_eq!(claims.sub, "client:4");
+}
+
+#[test]
+fn a_ring_rebuilt_from_a_jwks_cannot_sign() {
+    // The failure this guards is a service that verifies somebody else's
+    // tokens and then tries to mint one, getting an error about the key rather
+    // than about what it asked for.
+    let signer = Jwt::new(JwtKeyRing::new(JwtKey::generate_rs256("k1", 2048).unwrap()));
+    let verifier = Jwt::new(JwtKeyRing::from_jwks(&signer.jwks()).unwrap());
+
+    #[derive(Serialize)]
+    struct Claims {
+        sub: String,
+    }
+
+    let error = verifier.sign(&Claims { sub: "nope".into() }).expect_err("cannot sign");
+    assert!(error.message().contains("verify but not sign"), "{}", error.message());
+}
+
+#[test]
+fn an_es256_key_survives_the_same_round_trip() {
+    // The EC branch decodes an affine point rather than two bignums, so it
+    // fails differently from RSA and is worth its own pass.
+    let signer = Jwt::new(JwtKeyRing::new(JwtKey::generate_es256("ec1").unwrap()));
+
+    #[derive(Serialize, serde::Deserialize)]
+    struct Claims {
+        sub: String,
+        exp: i64,
+    }
+
+    let token = signer.sign(&Claims { sub: "client:4".into(), exp: 9_999_999_999 }).unwrap();
+    let verifier = Jwt::new(JwtKeyRing::from_jwks(&signer.jwks()).unwrap());
+
+    let claims: Claims = verifier.verify(&token).expect("the published EC key verifies");
+    assert_eq!(claims.sub, "client:4");
+}
+
+#[test]
+fn a_key_type_the_verifier_does_not_know_is_skipped_and_not_fatal() {
+    // An issuer adding a key type before its relying parties understand it
+    // must not take them all down. The unknown entry is dropped; the one that
+    // can verify still does.
+    let signer = Jwt::new(JwtKeyRing::new(JwtKey::generate_rs256("k1", 2048).unwrap()));
+
+    let mut document = signer.jwks();
+    document["keys"].as_array_mut().unwrap().push(serde_json::json!({
+        "kty": "OKP", "crv": "Ed25519", "kid": "future", "alg": "EdDSA", "x": "AAAA",
+    }));
+
+    let ring = JwtKeyRing::from_jwks(&document).expect("the usable key is still read");
+
+    assert_eq!(ring.ids(), vec!["k1"]);
+}
+
+#[test]
+fn a_document_with_nothing_usable_is_an_error() {
+    // Distinguishable from a successful fetch. A silently empty ring rejects
+    // every token with "names a key this service does not hold", which sends
+    // whoever debugs it looking at the issuer's signing key.
+    let empty = serde_json::json!({"keys": []});
+
+    assert!(JwtKeyRing::from_jwks(&empty).is_err());
+    assert!(JwtKeyRing::from_jwks(&serde_json::json!({})).is_err());
+}
