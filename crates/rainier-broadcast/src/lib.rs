@@ -73,6 +73,7 @@ pub mod manager;
 pub mod pusher;
 #[cfg(feature = "pusher-server")]
 pub mod pusher_server;
+pub mod sessions;
 
 #[cfg(feature = "kafka")]
 pub mod kafka;
@@ -85,6 +86,7 @@ pub use channel::Channel;
 pub use event::{Broadcast, Broadcastable};
 pub use manager::Broadcasting;
 pub use pusher::PusherAuth;
+pub use sessions::{SessionChannels, SessionRoster};
 
 #[cfg(feature = "kafka")]
 pub use kafka::{KafkaBroadcaster, KafkaRelay, RelayCursor, RelayedBroadcast};

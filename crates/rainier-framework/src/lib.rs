@@ -129,6 +129,7 @@ pub mod queued_listeners;
 #[cfg(feature = "kafka")]
 pub mod relay;
 pub mod scheduling;
+pub mod session_delivery;
 pub mod signed;
 pub mod testing;
 
