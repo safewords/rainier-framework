@@ -133,6 +133,9 @@ pub struct Column {
     primary: bool,
     unique: bool,
     indexed: bool,
+    /// Set by `if_not_exists()`. See that method for why an add-column
+    /// migration needs it at all.
+    if_not_exists: bool,
     /// Set by `foreign_id().constrained_on(..)`, so the common case is one
     /// call rather than a column and a matching constraint.
     references: Option<(String, String, Option<Action>, Option<Action>)>,
@@ -149,6 +152,7 @@ impl Column {
             primary: false,
             unique: false,
             indexed: false,
+            if_not_exists: false,
             references: None,
         }
     }
@@ -195,6 +199,40 @@ impl Column {
     }
 
     /// A single-column index.
+    /// Tolerate the column already existing.
+    ///
+    /// # The problem this exists for
+    ///
+    /// `Step::create_table::<E>` renders the **current** model, so a fresh
+    /// install gets today's schema in one statement. Every add-column
+    /// migration written afterwards then replays against a table that already
+    /// has the column, and fails:
+    ///
+    /// ```text
+    /// duplicate column name: internal
+    /// ```
+    ///
+    /// So the same migration is required against a database that predates the
+    /// column and impossible against one created after it. This makes it a
+    /// no-op in the second case, which is the only way both can hold.
+    ///
+    /// # Not free on every dialect
+    ///
+    /// MySQL/MariaDB and Postgres have `ADD COLUMN IF NOT EXISTS` and it is
+    /// rendered. SQLite has no such guard and no conditional DDL, so the
+    /// statement is **skipped entirely** there.
+    ///
+    /// That is correct for the case SQLite is used in here — a database
+    /// created from the model, which therefore already has the column — and
+    /// wrong for a long-lived SQLite database that predates it. Say so out
+    /// loud rather than let it be discovered: if you need to add a column to
+    /// an existing SQLite database, write the `ALTER` as a raw step for that
+    /// dialect.
+    pub fn if_not_exists(&mut self) -> &mut Self {
+        self.if_not_exists = true;
+        self
+    }
+
     pub fn index(&mut self) -> &mut Self {
         self.indexed = true;
         self
@@ -878,9 +916,31 @@ impl TableChanges {
         for change in &self.changes {
             match change {
                 Change::AddColumn(column) => {
+                    // SQLite has no `ADD COLUMN IF NOT EXISTS` and no
+                    // conditional DDL, so a tolerant add cannot be expressed
+                    // and is skipped. See `Column::if_not_exists`: the case
+                    // that reaches SQLite here is a database created from the
+                    // model, which already has the column.
+                    if column.if_not_exists && dialect == Dialect::Sqlite {
+                        continue;
+                    }
+
                     let mut stmt = Table::alter();
                     stmt.table(Alias::new(self.table.clone())).add_column(column.to_def());
-                    statements.push(dialect.build_schema(&stmt));
+
+                    let mut sql = dialect.build_schema(&stmt);
+
+                    // Rendered as text because `sea-query` has no builder for
+                    // it. Anchored on `ADD COLUMN ` so a change in how that
+                    // clause is built fails loudly here rather than silently
+                    // dropping the guard.
+                    if column.if_not_exists {
+                        let anchor = "ADD COLUMN ";
+                        debug_assert!(sql.contains(anchor), "no `{anchor}` to guard in: {sql}");
+                        sql = sql.replacen(anchor, "ADD COLUMN IF NOT EXISTS ", 1);
+                    }
+
+                    statements.push(sql);
 
                     // `foreign_id("x").index()` in an alter has to become a
                     // real index here, the same as it does in a create.
@@ -952,6 +1012,11 @@ impl TableChanges {
         for change in self.changes.iter().rev() {
             match change {
                 Change::AddColumn(column) => {
+                    // Mirrors the forward pass: nothing was added on SQLite,
+                    // so there is nothing to drop.
+                    if column.if_not_exists && dialect == Dialect::Sqlite {
+                        continue;
+                    }
                     if column.indexed {
                         statements.push(dialect.build_schema(&drop_index_stmt(
                             &self.table,
@@ -1024,6 +1089,58 @@ fn strip_inline_primary(def: &mut ColumnDef, column: &Column) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tolerant_add_guards_the_statement_where_the_dialect_can() {
+        // `Step::create_table::<E>` renders the current model, so a fresh
+        // install already has the column and the migration that adds it fails
+        // with `duplicate column name`. This is what lets the same migration
+        // run against both.
+        let changes = TableChanges::to("api_clients", |table| {
+            table.boolean("internal").default(false).if_not_exists();
+        });
+
+        for dialect in [Dialect::MySql, Dialect::Postgres] {
+            let sql = changes.to_sql(dialect).join(
+                "
+",
+            );
+            assert!(sql.contains("ADD COLUMN IF NOT EXISTS"), "{dialect:?}: {sql}");
+        }
+    }
+
+    #[test]
+    fn a_tolerant_add_is_skipped_on_sqlite() {
+        // SQLite has no guard and no conditional DDL. Skipping is right for
+        // the case it is used in here — a database created from the model —
+        // and is documented on `Column::if_not_exists` as wrong for a
+        // long-lived SQLite database that predates the column.
+        let changes = TableChanges::to("api_clients", |table| {
+            table.boolean("internal").default(false).if_not_exists();
+        });
+
+        assert!(changes.to_sql(Dialect::Sqlite).is_empty());
+        assert!(changes.to_reverse_sql(Dialect::Sqlite).is_empty());
+    }
+
+    #[test]
+    fn an_ordinary_add_is_left_alone() {
+        // The guard is opt-in. A plain add must still fail loudly on a column
+        // that is already there, because that is a migration written against
+        // the wrong table.
+        let changes = TableChanges::to("api_clients", |table| {
+            table.boolean("internal").default(false);
+        });
+
+        let sql = changes.to_sql(Dialect::MySql).join(
+            "
+",
+        );
+
+        assert!(sql.contains("ADD COLUMN"), "{sql}");
+        assert!(!sql.contains("IF NOT EXISTS"), "{sql}");
+        assert!(!changes.to_sql(Dialect::Sqlite).is_empty());
+    }
 
     fn posts() -> Blueprint {
         Blueprint::create("posts", |table| {
