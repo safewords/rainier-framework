@@ -240,6 +240,9 @@ fn guess_content_type(key: &str) -> &'static str {
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
+        // AVIF, which browsers will not render as `application/octet-stream`
+        // — the object stores fine, downloads fine, and does not display.
+        Some("avif") => "image/avif",
         Some("zip") => "application/zip",
         Some("mp4") => "video/mp4",
         // `svg` is deliberately absent: an SVG is a document that can carry
@@ -425,6 +428,19 @@ mod tests {
 
         // An SVG can carry script, so it stays out of the list too.
         assert_eq!(guess_content_type("logo.svg"), "application/octet-stream");
+    }
+
+    #[test]
+    fn every_still_image_format_renders() {
+        // AVIF was missing, and the failure is quiet: the object stores, it
+        // downloads, and a browser will not display it — which reads as a
+        // broken image rather than a missing header.
+        assert_eq!(guess_content_type("map.png"), "image/png");
+        assert_eq!(guess_content_type("map.jpg"), "image/jpeg");
+        assert_eq!(guess_content_type("map.jpeg"), "image/jpeg");
+        assert_eq!(guess_content_type("map.webp"), "image/webp");
+        assert_eq!(guess_content_type("map.avif"), "image/avif");
+        assert_eq!(guess_content_type("map.gif"), "image/gif");
 
         assert_eq!(guess_content_type("photo.PNG"), "image/png", "case-insensitive");
         assert_eq!(guess_content_type("a/b/report.pdf"), "application/pdf");
