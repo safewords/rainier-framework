@@ -24,6 +24,73 @@ use rainier_notify::{Channel as NotificationChannel, Delivery};
 use rainier_routing::Req;
 use rainier_support::{BoxFuture, Error, Result};
 
+/// Sign a subscription to a **session's own** delivery channel, or refuse it.
+///
+/// The counterpart to [`authorize`], for channels named after a key held in
+/// the caller's session rather than after who they are signed in as. See
+/// [`rainier_broadcast::sessions`] for why per-session delivery exists at all.
+///
+/// # Mount it without a guard
+///
+/// It authorises on the caller's session holding the key, which is a stronger
+/// check than being signed in — and it is the same check for a visitor who is
+/// not. Putting it behind an auth guard would refuse every anonymous visitor a
+/// channel they legitimately own.
+///
+/// That is also why it is a **separate route** from [`authorize`]: serving both
+/// from one path means taking the guard off that path, and then no ordinary
+/// private channel authorises at all.
+///
+/// ```ignore
+/// router
+///     .post("/broadcasting/auth/session", move |request| {
+///         authorize_session(request, SessionChannels::new("feed-session."), "feed_delivery_key")
+///     })
+///     .name("broadcasting.auth.session");
+/// ```
+///
+/// # What it answers
+///
+/// * `200` with the signature, for a channel this session holds the key to.
+/// * `403` for one it does not, and for any channel that is not a session
+///   channel of the given shape — the latter belongs to whatever route owns
+///   it, and answering here would authorise it without that route's guard.
+/// * `400` when `socket_id` is missing, which is the client not having sent
+///   what the signature is computed over.
+///
+/// `403` rather than `404` for a refusal: the caller already knows the channel
+/// name, having just sent it, so there is nothing left to conceal — and a
+/// Pusher client shows "denied" for a 403 and hangs on a 404.
+pub async fn authorize_session(
+    request: Req,
+    channels: rainier_broadcast::sessions::SessionChannels,
+    session_key: &str,
+) -> Result<Response> {
+    use rainier_broadcast::sessions;
+    use rainier_session::SessionRequestExt;
+
+    let channel = request.input("channel_name").unwrap_or_default();
+
+    // Read, never create. Minting a key here would sign whatever was asked
+    // for, which is the whole thing this prevents.
+    let held = request.session().and_then(|session| session.string(session_key));
+
+    if sessions::authorize(&channels, &channel, held.as_deref()).is_err() {
+        return Ok(Response::new(StatusCode::FORBIDDEN));
+    }
+
+    let socket = request.input("socket_id").unwrap_or_default();
+    if socket.is_empty() {
+        return Err(Error::bad_request("`socket_id` is required."));
+    }
+
+    let broadcasting = rainier_container::facade_application().resolve::<Broadcasting>()?;
+    let body =
+        broadcasting.driver().auth_response(&socket, &Channel::from_wire_name(&channel), None)?;
+
+    Ok(Response::json(&body))
+}
+
 /// The header a Pusher client sends its socket id in.
 ///
 /// It is what makes `to_others` possible: the
