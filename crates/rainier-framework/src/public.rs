@@ -35,6 +35,31 @@
 //!   because a directory that quietly serves something is how a listing turns
 //!   into a disclosure.
 //!
+//! # An application that already has a fallback
+//!
+//! The install is skipped — a fallback somebody declared is one they meant,
+//! and replacing it would be the framework arguing. Chain the two by hand
+//! instead, file-last, so a 404 the application shapes deliberately keeps its
+//! shape:
+//!
+//! ```ignore
+//! pub async fn fallback(request: Req) -> Result<Response> {
+//!     if request.path().starts_with("/api/") {
+//!         return Ok(my_json_404(&request));
+//!     }
+//!
+//!     let served = PublicFiles::at("public").serve(&request).await;
+//!     if served.status() != StatusCode::NOT_FOUND {
+//!         return Ok(served);
+//!     }
+//!
+//!     Ok(Error::not_found("Not Found").into_response())
+//! }
+//! ```
+//!
+//! Worth knowing because the symptom of forgetting is that files ship, sit on
+//! disk in the running container, and 404 anyway.
+//!
 //! # Caching
 //!
 //! `ETag` and `Last-Modified` from the file's length and modification time, and
