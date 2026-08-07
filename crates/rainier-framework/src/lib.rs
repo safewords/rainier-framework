@@ -125,6 +125,7 @@ pub mod limits;
 pub mod mail;
 pub mod notifications;
 pub mod observability;
+pub mod public;
 pub mod queued_listeners;
 #[cfg(feature = "kafka")]
 pub mod relay;

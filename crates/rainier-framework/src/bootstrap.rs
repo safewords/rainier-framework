@@ -521,7 +521,7 @@ impl Rainier {
     /// Compiling the router here is what makes an unknown middleware alias or
     /// a duplicate route name a **boot** failure rather than a surprise on the
     /// first request that hits it.
-    pub async fn boot(self) -> Result<Arc<Application>> {
+    pub async fn boot(mut self) -> Result<Arc<Application>> {
         // Before anything is installed, and before tracing: a `.env` the
         // process cannot read is not a state to start serving in.
         if let Some(error) = self.deferred {
@@ -711,6 +711,29 @@ impl Rainier {
         // resolves a service gets one a provider bound.
         for provider in self.providers {
             app.register_arc(provider)?;
+        }
+
+        // The `public/` directory, if this application has one.
+        //
+        // Installed as the router's fallback, so a route always wins and a
+        // file is only tried when nothing matched — see `crate::public` for
+        // why that is the opposite of Laravel's `try_files` and why it does
+        // not matter in practice.
+        //
+        // Only when the directory exists, and only when the application has
+        // not set a fallback of its own: an application that declared one
+        // meant it, and quietly replacing it would be the framework arguing.
+        //
+        // Not configurable by a path in `.env`, deliberately. A document root
+        // that moves at run time is a document root somebody can be talked
+        // into moving.
+        let public = self.base_path.join("public");
+        if !self.router.has_fallback() && public.is_dir() {
+            let files = crate::public::PublicFiles::at(public);
+            self.router.fallback(move |request: rainier_routing::Req| {
+                let files = files.clone();
+                async move { files.serve(&request).await }
+            });
         }
 
         // Compiled once and shared: the kernel serves it, and the container

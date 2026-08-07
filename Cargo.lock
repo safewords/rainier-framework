@@ -3371,6 +3371,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures-util",
+ "percent-encoding",
  "rainier-auth",
  "rainier-broadcast",
  "rainier-cache",

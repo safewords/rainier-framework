@@ -234,6 +234,14 @@ impl Router {
         })
     }
 
+    /// Whether a fallback has been declared.
+    ///
+    /// For a caller wanting to install a default without overriding one an
+    /// application chose — `bootstrap` installs `public/` this way.
+    pub fn has_fallback(&self) -> bool {
+        self.fallback.is_some()
+    }
+
     /// The handler for requests that match nothing.
     ///
     /// Without one, an unmatched request is a plain `404`.
