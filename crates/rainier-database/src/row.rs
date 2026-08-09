@@ -277,6 +277,9 @@ impl Row for OwnedRow {
         match self.value(col) {
             None => Ok(None),
             Some(Cell::Text(value)) => Ok(Some(value.clone())),
+            // Aggregates that select `DateOf` store a calendar day; callers
+            // that `get_string` the alias still expect `YYYY-MM-DD`.
+            Some(Cell::Date(value)) => Ok(Some(value.format("%Y-%m-%d").to_string())),
             Some(other) => wrong_type(col, other, "text"),
         }
     }

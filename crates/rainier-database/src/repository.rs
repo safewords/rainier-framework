@@ -663,8 +663,11 @@ fn column_type_of<E: rainier_orm::Entity>(projection: &Projection) -> rainier_or
             ColumnType::BigInt
         }
         Projection::DatePart(..) => ColumnType::Int,
-        // A calendar date, which every dialect renders as text here.
-        Projection::DateOf(_) => ColumnType::Text,
+        // MySQL/Postgres `CAST(… AS DATE)` returns a DATE value; SQLite's
+        // `date(…)` returns text that `get_naive_date` still parses. Asking
+        // for Text here made sqlx try a string/blob decode against DATE and
+        // fail dashboard aggregates that group by calendar day.
+        Projection::DateOf(_) => ColumnType::Date,
 
         // `AVG` is fractional even over integers.
         Projection::Avg(_) => ColumnType::Double,
