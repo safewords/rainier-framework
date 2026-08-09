@@ -24,9 +24,9 @@ use sea_query::{
 
 /// The type a column is actually declared as.
 ///
-/// Identical to the declared one except for an **auto-increment** key, where
-/// an unsigned type is downgraded to its signed equivalent. Three reasons, and
-/// the first is decisive:
+/// Identical to the declared one except for a PostgreSQL **auto-increment**
+/// key, where an unsigned type is downgraded to its signed equivalent. Three
+/// reasons, and the first is decisive:
 ///
 /// 1. Postgres has no unsigned integers, and sea-query *panics* rather than
 ///    rendering `BIGSERIAL` for a `BigUnsigned` marked auto-increment. A `u64`
@@ -36,10 +36,11 @@ use sea_query::{
 /// 3. `BIGINT` still holds 9.2 × 10^18 rows. The lost half of the `u64` range
 ///    is not a range anyone reaches.
 ///
-/// The entity's field stays `u64`; only the column is narrower. Decoding a
-/// positive `i64` into it is lossless.
-fn effective_type(col: &crate::column::ColumnSpec) -> ColumnType {
-    if !col.auto_increment {
+/// The entity's field stays `u64`; only PostgreSQL's column is narrower.
+/// MySQL must retain the unsigned declaration both so `u64` decoding agrees
+/// with the column metadata and so unsigned foreign keys can reference it.
+fn effective_type(col: &crate::column::ColumnSpec, dialect: Dialect) -> ColumnType {
+    if !col.auto_increment || dialect != Dialect::Postgres {
         return col.ty;
     }
 
@@ -54,6 +55,17 @@ fn effective_type(col: &crate::column::ColumnSpec) -> ColumnType {
 /// single-column uniques, and inline foreign keys. Secondary indexes are
 /// separate; see [`create_index_ddls`].
 pub fn create_table_stmt<E: Entity>() -> TableCreateStatement {
+    create_table_stmt_for::<E>(Dialect::Postgres)
+}
+
+/// Build the `CREATE TABLE` statement for `E` using `dialect`'s concrete
+/// generated-key representation.
+///
+/// Prefer this over [`create_table_stmt`] when rendering the statement for a
+/// known backend. The argument-free form retains its historical portable,
+/// PostgreSQL-safe signed representation for callers that only inspect the
+/// statement tree.
+pub fn create_table_stmt_for<E: Entity>(dialect: Dialect) -> TableCreateStatement {
     let mut stmt = Table::create();
     stmt.table(Alias::new(E::table())).if_not_exists();
 
@@ -71,7 +83,7 @@ pub fn create_table_stmt<E: Entity>() -> TableCreateStatement {
         let keyed =
             col.pk || col.unique || E::indexes().iter().any(|ix| ix.columns.contains(&col.name));
         let mut def = ColumnDef::new(Alias::new(col.name));
-        apply_type(&mut def, effective_type(col), keyed);
+        apply_type(&mut def, effective_type(col, dialect), keyed);
 
         if col.pk {
             if !composite_key {
@@ -112,7 +124,7 @@ pub fn create_table_stmt<E: Entity>() -> TableCreateStatement {
 /// Render `E`'s `CREATE TABLE` (without secondary indexes) as SQL for
 /// `dialect`.
 pub fn create_table_ddl<E: Entity>(dialect: Dialect) -> String {
-    dialect.build_schema(&create_table_stmt::<E>())
+    dialect.build_schema(&create_table_stmt_for::<E>(dialect))
 }
 
 /// Render `E`'s secondary indexes as `CREATE [UNIQUE] INDEX` statements for
@@ -237,6 +249,12 @@ mod auto_increment_tests {
     fn postgres_gets_a_sequence_backed_key() {
         let ddl = create_table_ddl::<Widget>(Dialect::Postgres);
         assert!(ddl.contains("serial"), "{ddl}");
+    }
+
+    #[test]
+    fn mysql_keeps_an_auto_increment_u64_key_unsigned() {
+        let ddl = create_table_ddl::<Widget>(Dialect::MySql);
+        assert!(ddl.to_lowercase().contains("unsigned"), "{ddl}");
     }
 
     #[test]
