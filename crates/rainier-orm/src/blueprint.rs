@@ -281,17 +281,38 @@ impl Column {
     }
 
     /// The column definition, ready for a `CREATE` or an `ALTER`.
-    fn to_def(&self) -> ColumnDef {
+    fn to_def(&self, dialect: Dialect) -> ColumnDef {
         let mut def = ColumnDef::new(Alias::new(self.name.clone()));
 
         // An auto-increment `BIGINT UNSIGNED` is not a thing Postgres will
         // create, and the key it generates is a positive `i64` on every
         // backend anyway — so the unsigned types narrow when they are keys.
-        // The same rule the entity path applies, for the same reason.
-        let kind = match (self.auto_increment, self.kind) {
-            (true, ColumnKind::Basic(ColumnType::BigUint)) => ColumnKind::Basic(ColumnType::BigInt),
-            (true, ColumnKind::Basic(ColumnType::Uint)) => ColumnKind::Basic(ColumnType::Int),
-            (_, kind) => kind,
+        //
+        // On Postgres ONLY. This narrowed on every dialect, and the entity
+        // path in `schema::effective_type` has always been conditional, with a
+        // comment saying exactly why: MySQL has to keep the unsigned
+        // declaration so that `u64` decoding agrees with the column metadata,
+        // and so that an unsigned foreign key can reference the key at all.
+        //
+        // MySQL compares the two sides of a foreign key including signedness.
+        // So `increments("id")` emitting a signed `int` made every
+        // `unsigned_integer(…).constrained_on(…)` pointing at it fail with
+        //
+        //     errno 150 "Foreign key constraint is incorrectly formed"
+        //
+        // which names neither column and reads as a malformed constraint
+        // rather than a type mismatch. Caught by lewd.net's
+        // `0001_create_help_questions` refusing to apply to a fresh MySQL
+        // database — the pairing was correct in the Laravel schema it was
+        // transcribed from, because `$table->increments()` is UNSIGNED there.
+        let kind = match (self.auto_increment, dialect, self.kind) {
+            (true, Dialect::Postgres, ColumnKind::Basic(ColumnType::BigUint)) => {
+                ColumnKind::Basic(ColumnType::BigInt)
+            }
+            (true, Dialect::Postgres, ColumnKind::Basic(ColumnType::Uint)) => {
+                ColumnKind::Basic(ColumnType::Int)
+            }
+            (_, _, kind) => kind,
         };
         kind.apply(&mut def);
 
@@ -597,7 +618,7 @@ impl Blueprint {
     // --- rendering ---------------------------------------------------------
 
     /// The `CREATE TABLE` statement, before rendering.
-    pub fn to_statement(&self) -> TableCreateStatement {
+    pub fn to_statement(&self, dialect: Dialect) -> TableCreateStatement {
         let mut stmt = Table::create();
         stmt.table(Alias::new(self.table.clone()));
         if self.if_not_exists {
@@ -608,9 +629,9 @@ impl Blueprint {
             // An inline `PRIMARY KEY` on a column *and* a composite one is two
             // primary keys, which no engine accepts. The composite wins,
             // because it is the more specific thing to have asked for.
-            let mut def = column.to_def();
+            let mut def = column.to_def(dialect);
             if self.primary.is_some() {
-                strip_inline_primary(&mut def, column);
+                strip_inline_primary(&mut def, column, dialect);
             }
             stmt.col(&mut def);
         }
@@ -649,7 +670,7 @@ impl Blueprint {
     /// Every statement that creates this table on `dialect`, in order: the
     /// table, then its indexes.
     pub fn to_sql(&self, dialect: Dialect) -> Vec<String> {
-        let mut statements = vec![dialect.build_schema(&self.to_statement())];
+        let mut statements = vec![dialect.build_schema(&self.to_statement(dialect))];
 
         // Single-column `index()` modifiers become real indexes here rather
         // than at declaration time, so `table.string("slug").index()` and
@@ -926,7 +947,7 @@ impl TableChanges {
                     }
 
                     let mut stmt = Table::alter();
-                    stmt.table(Alias::new(self.table.clone())).add_column(column.to_def());
+                    stmt.table(Alias::new(self.table.clone())).add_column(column.to_def(dialect));
 
                     let mut sql = dialect.build_schema(&stmt);
 
@@ -1079,16 +1100,67 @@ fn drop_index_stmt(table: &str, index: &IndexDef) -> sea_query::IndexDropStateme
 ///
 /// `ColumnDef` has no "unset" for this, so the definition is rebuilt from the
 /// column with `primary` cleared.
-fn strip_inline_primary(def: &mut ColumnDef, column: &Column) {
+fn strip_inline_primary(def: &mut ColumnDef, column: &Column, dialect: Dialect) {
     let mut without = column.clone();
     without.primary = false;
     without.auto_increment = false;
-    *def = without.to_def();
+    *def = without.to_def(dialect);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MySQL compares both sides of a foreign key including signedness, so an
+    /// auto-increment key it references has to stay `UNSIGNED`. Postgres has no
+    /// unsigned integers at all and must narrow.
+    ///
+    /// This narrowed on every dialect, which made `increments("id")` emit a
+    /// signed `int` on MySQL and every `unsigned_integer(…).constrained_on(…)`
+    /// pointing at it fail with errno 150 — a message that names neither column
+    /// and reads as a malformed constraint rather than a type mismatch.
+    #[test]
+    fn an_auto_increment_key_keeps_unsigned_on_mysql_and_narrows_on_postgres() {
+        let blueprint = Blueprint::create("help_categories", |table| {
+            table.increments("id");
+        });
+
+        let mysql = blueprint.to_sql(Dialect::MySql).join("\n");
+        assert!(
+            mysql.to_lowercase().contains("unsigned"),
+            "MySQL dropped UNSIGNED from an auto-increment key, so an unsigned \
+             foreign key cannot reference it: {mysql}"
+        );
+
+        let postgres = blueprint.to_sql(Dialect::Postgres).join("\n");
+        assert!(
+            !postgres.to_lowercase().contains("unsigned"),
+            "Postgres has no unsigned integers: {postgres}"
+        );
+    }
+
+    /// The pairing the bug actually broke, end to end: the referencing column
+    /// and the key it points at have to render as the same type.
+    #[test]
+    fn an_unsigned_foreign_key_matches_the_key_it_references_on_mysql() {
+        let parent = Blueprint::create("help_categories", |table| {
+            table.increments("id");
+        })
+        .to_sql(Dialect::MySql)
+        .join("\n")
+        .to_lowercase();
+
+        let child = Blueprint::create("help_questions", |table| {
+            table.increments("id");
+            table.unsigned_integer("help_category_id").constrained_on("help_categories");
+        })
+        .to_sql(Dialect::MySql)
+        .join("\n")
+        .to_lowercase();
+
+        assert!(parent.contains("int unsigned"), "parent key: {parent}");
+        assert!(child.contains("int unsigned"), "child column: {child}");
+    }
 
     #[test]
     fn a_tolerant_add_guards_the_statement_where_the_dialect_can() {
@@ -1179,9 +1251,14 @@ mod tests {
     }
 
     #[test]
-    fn a_key_never_renders_as_unsigned() {
+    fn a_key_never_renders_as_unsigned_on_postgres() {
         // Postgres has no unsigned serial, and the key a database generates is
         // a positive i64 on every backend anyway.
+        //
+        // Postgres only — the name used to say "never", which read as a rule
+        // for every dialect and is the assumption that made MySQL drop the
+        // UNSIGNED its foreign keys need. See
+        // `an_auto_increment_key_keeps_unsigned_on_mysql_and_narrows_on_postgres`.
         let postgres = posts().to_sql(Dialect::Postgres).join("\n");
         assert!(!postgres.to_lowercase().contains("unsigned"), "{postgres}");
     }
