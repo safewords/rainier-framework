@@ -69,7 +69,7 @@ pub mod retry;
 pub mod transport;
 
 pub use fake::{FakeTransport, RecordedRequest};
-pub use request::{Http, PendingRequest};
+pub use request::{Http, MultipartField, PendingRequest};
 pub use response::HttpResponse;
 pub use retry::Backoff;
 pub use transport::Transport;

@@ -204,6 +204,33 @@ impl Http {
     }
 }
 
+/// One field of a `multipart/form-data` body.
+#[derive(Debug, Clone)]
+pub struct MultipartField {
+    /// The field name.
+    pub name: String,
+    /// Its bytes.
+    pub value: Vec<u8>,
+    /// A filename, which makes this a file part rather than a plain field.
+    pub filename: Option<String>,
+}
+
+impl MultipartField {
+    /// A plain text field.
+    pub fn text(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self { name: name.into(), value: value.into().into_bytes(), filename: None }
+    }
+
+    /// A file part. Put it **last**: S3 ignores fields that follow it.
+    pub fn file(
+        name: impl Into<String>,
+        filename: impl Into<String>,
+        value: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self { name: name.into(), value: value.into(), filename: Some(filename.into()) }
+    }
+}
+
 /// A request being built.
 pub struct PendingRequest {
     method: String,
@@ -278,6 +305,99 @@ impl PendingRequest {
 
         self.body = Some(encoded.into_bytes());
         self.header("content-type", "application/x-www-form-urlencoded")
+    }
+
+    /// Send a `multipart/form-data` body.
+    ///
+    /// Needed wherever the other end takes a browser-style form upload rather
+    /// than JSON — an S3 POST policy is the case this was written for, and it
+    /// will not accept the urlencoded body [`form`](Self::form) produces.
+    ///
+    /// # Field order is preserved, and matters
+    ///
+    /// S3 ignores every field that appears *after* the file part, so a policy
+    /// or signature placed after it is silently not applied and the upload
+    /// fails as an unexplained 403. Fields are written in the order given;
+    /// put the file last.
+    ///
+    /// # The boundary
+    ///
+    /// Derived from the parts rather than randomly, so a request is
+    /// reproducible in a test, and long enough that it cannot occur inside
+    /// ordinary payload bytes. A boundary that appears in the body truncates
+    /// the upload at that point, which presents as a corrupt file rather than
+    /// as an error.
+    #[must_use = "this returns the request rather than sending it"]
+    pub fn multipart(mut self, parts: &[MultipartField]) -> Self {
+        let boundary = Self::boundary_for(parts);
+        let mut body: Vec<u8> = Vec::new();
+
+        for part in parts {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}
+"
+                )
+                .as_bytes(),
+            );
+            match &part.filename {
+                Some(filename) => body.extend_from_slice(
+                    format!(
+                        "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"
+                         Content-Type: application/octet-stream
+
+",
+                        part.name, filename
+                    )
+                    .as_bytes(),
+                ),
+                None => body.extend_from_slice(
+                    format!(
+                        "Content-Disposition: form-data; name=\"{}\"
+
+",
+                        part.name
+                    )
+                    .as_bytes(),
+                ),
+            }
+            body.extend_from_slice(&part.value);
+            body.extend_from_slice(
+                b"
+",
+            );
+        }
+        body.extend_from_slice(
+            format!(
+                "--{boundary}--
+"
+            )
+            .as_bytes(),
+        );
+
+        self.body = Some(body);
+        self.header("content-type", format!("multipart/form-data; boundary={boundary}"))
+    }
+
+    /// A boundary that cannot appear in the parts.
+    ///
+    /// Checked rather than assumed: a boundary occurring inside a payload
+    /// truncates the body there, and the result is a file that uploaded
+    /// "successfully" and is corrupt.
+    fn boundary_for(parts: &[MultipartField]) -> String {
+        let mut boundary = "----rainier-boundary-0000000000".to_string();
+
+        for n in 0.. {
+            boundary = format!("----rainier-boundary-{n:010}");
+            let needle = boundary.as_bytes();
+            let clashes =
+                parts.iter().any(|part| part.value.windows(needle.len()).any(|w| w == needle));
+            if !clashes {
+                break;
+            }
+        }
+
+        boundary
     }
 
     /// How long to wait before giving up.
@@ -410,6 +530,85 @@ fn encode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    use super::MultipartField;
+
+    /// The body a request would send.
+    fn body_of(request: PendingRequest) -> String {
+        String::from_utf8(request.body.clone().expect("a body")).expect("utf-8 in these tests")
+    }
+
+    #[test]
+    fn multipart_keeps_the_order_it_was_given() {
+        // S3 ignores every field after the file part, so a signature placed
+        // after it is silently not applied and the upload fails as an
+        // unexplained 403. Order is the contract, not a convenience.
+        let body = body_of(Http::post("https://example.test").multipart(&[
+            MultipartField::text("policy", "abc"),
+            MultipartField::text("x-amz-signature", "def"),
+            MultipartField::file("file", "probe.txt", b"hello".to_vec()),
+        ]));
+
+        let policy = body.find("policy").expect("policy present");
+        let signature = body.find("x-amz-signature").expect("signature present");
+        let file = body.find("filename=").expect("file present");
+
+        assert!(policy < signature, "{body}");
+        assert!(signature < file, "the file part must come last");
+    }
+
+    #[test]
+    fn a_file_part_carries_a_filename_and_a_plain_field_does_not() {
+        // The presence of `filename=` is what makes S3 treat a part as the
+        // body rather than as another condition.
+        let body = body_of(Http::post("https://example.test").multipart(&[
+            MultipartField::text("key", "abc.txt"),
+            MultipartField::file("file", "abc.txt", b"x".to_vec()),
+        ]));
+
+        assert!(body.contains(r#"name="key""#), "{body}");
+        assert_eq!(body.matches("filename=").count(), 1, "{body}");
+    }
+
+    #[test]
+    fn the_boundary_never_occurs_inside_the_payload() {
+        // A boundary appearing in the body truncates the upload there, and the
+        // result is a file that uploaded "successfully" and is corrupt. So it
+        // is checked against the parts rather than assumed unique.
+        let hostile = b"----rainier-boundary-0000000000".to_vec();
+        let request = Http::post("https://example.test").multipart(&[MultipartField::file(
+            "file",
+            "evil.bin",
+            hostile.clone(),
+        )]);
+
+        let boundary = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.rsplit("boundary=").next().unwrap().to_string())
+            .expect("a content-type with a boundary");
+
+        assert_ne!(boundary.as_bytes(), hostile.as_slice());
+        assert!(!hostile.windows(boundary.len()).any(|w| w == boundary.as_bytes()));
+    }
+
+    #[test]
+    fn multipart_sets_its_own_content_type() {
+        // Not urlencoded. `form` produces a body S3 will not accept, and the
+        // only visible difference at the call site is which method was used.
+        let request =
+            Http::post("https://example.test").multipart(&[MultipartField::text("a", "b")]);
+
+        let content_type = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.clone())
+            .expect("a content-type");
+
+        assert!(content_type.starts_with("multipart/form-data; boundary="), "{content_type}");
+    }
     use super::*;
     use serde_json::json;
 
