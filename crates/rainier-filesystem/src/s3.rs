@@ -96,6 +96,17 @@ impl Filesystem for S3Filesystem {
         })
     }
 
+    fn read_chunks<'a>(
+        &'a self,
+        path: &'a str,
+        on_chunk: &'a mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            let key = normalise_path(path)?;
+            self.client.get_streaming(&key, on_chunk).await
+        })
+    }
+
     fn put<'a>(&'a self, path: &'a str, contents: Bytes) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let key = normalise_path(path)?;

@@ -84,6 +84,39 @@ impl S3Client {
         Ok(Some(bytes.to_vec()))
     }
 
+    /// Read an object a chunk at a time, calling `on_chunk` with each.
+    ///
+    /// `Ok(false)` if there is no such key.
+    ///
+    /// The chunks are whatever the transport hands over — the SDK's frames, not
+    /// a size chosen here. A caller that needs fixed-size blocks has to buffer;
+    /// re-chunking for everyone would copy every byte an extra time to serve the
+    /// callers that do not care.
+    pub async fn get_streaming(
+        &self,
+        key: &str,
+        on_chunk: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+    ) -> Result<bool> {
+        let mut output = match self.client.get_object().bucket(&self.bucket).key(key).send().await {
+            Ok(output) => output,
+            Err(e) if is_not_found(&e) => return Ok(false),
+            Err(e) => return Err(sdk_error(&format!("S3 get_object `{key}`"), e)),
+        };
+
+        // `try_next` rather than `collect`: `collect` is what makes the whole
+        // object resident, which is the entire thing this avoids.
+        while let Some(chunk) = output
+            .body
+            .try_next()
+            .await
+            .map_err(|e| Error::internal(format!("could not read `{key}`: {e}")))?
+        {
+            on_chunk(&chunk)?;
+        }
+
+        Ok(true)
+    }
+
     /// Write an object.
     pub async fn put(&self, key: &str, body: Vec<u8>, content_type: &str) -> Result<()> {
         self.client

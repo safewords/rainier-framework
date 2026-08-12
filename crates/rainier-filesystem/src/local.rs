@@ -120,6 +120,42 @@ impl Filesystem for LocalFilesystem {
         })
     }
 
+    fn read_chunks<'a>(
+        &'a self,
+        path: &'a str,
+        on_chunk: &'a mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            use tokio::io::AsyncReadExt;
+
+            let resolved = self.resolve(path)?;
+
+            let mut file = match tokio::fs::File::open(&resolved).await {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                // A directory, on Unix. Windows reports opening one as
+                // `PermissionDenied`, which is indistinguishable from a real
+                // permission failure, so that case falls through to the error —
+                // the same asymmetry `get` documents above.
+                Err(e) if e.kind() == std::io::ErrorKind::IsADirectory => return Ok(false),
+                Err(e) => return Err(io_error("open", path, e)),
+            };
+
+            // 64 KiB: large enough that the syscall overhead disappears against
+            // the work done per chunk, small enough to stay in cache.
+            let mut buffer = vec![0u8; 64 * 1024];
+
+            loop {
+                match file.read(&mut buffer).await {
+                    Ok(0) => return Ok(true),
+                    Ok(n) => on_chunk(&buffer[..n])?,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(io_error("read", path, e)),
+                }
+            }
+        })
+    }
+
     fn put<'a>(&'a self, path: &'a str, contents: Bytes) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let resolved = self.resolve(path)?;
@@ -629,5 +665,73 @@ mod tests {
 
         fs.put_string("uploads/my file 🎉.txt", "x").await.unwrap();
         assert!(fs.exists("uploads/my file 🎉.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_chunked_read_sees_every_byte_in_order() {
+        let temp = Temp::new("chunks");
+        let fs = temp.filesystem();
+
+        // Larger than the read buffer, so this genuinely crosses chunks rather
+        // than passing by fitting in one.
+        let written: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        fs.put("big.bin", Bytes::from(written.clone())).await.unwrap();
+
+        let mut seen = Vec::new();
+        let mut chunks = 0usize;
+        let found = fs
+            .read_chunks("big.bin", &mut |chunk| {
+                chunks += 1;
+                seen.extend_from_slice(chunk);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(found);
+        assert_eq!(seen, written, "the bytes came back different");
+
+        // The point of the method. One chunk would mean it quietly fell back to
+        // reading the whole object, which is the memory profile it exists to
+        // avoid — and every assertion above would still pass.
+        assert!(chunks > 1, "read in a single chunk; it is not streaming");
+    }
+
+    #[tokio::test]
+    async fn a_chunked_read_of_a_missing_file_is_not_an_error() {
+        let temp = Temp::new("chunks-missing");
+
+        let mut called = false;
+        let found = temp
+            .filesystem()
+            .read_chunks("nope.bin", &mut |_| {
+                called = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(!found);
+        assert!(!called, "the callback ran for a file that does not exist");
+    }
+
+    #[tokio::test]
+    async fn a_chunked_read_stops_when_the_callback_fails() {
+        let temp = Temp::new("chunks-abort");
+        let fs = temp.filesystem();
+
+        fs.put("big.bin", Bytes::from(vec![7u8; 300_000])).await.unwrap();
+
+        // A caller that has seen enough should stop paying for the rest.
+        let mut chunks = 0usize;
+        let result = fs
+            .read_chunks("big.bin", &mut |_| {
+                chunks += 1;
+                Err(Error::internal("seen enough"))
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(chunks, 1, "the read carried on after the callback refused");
     }
 }

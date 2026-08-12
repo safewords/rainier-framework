@@ -58,7 +58,63 @@ pub trait Filesystem: Send + Sync + 'static {
     /// A missing file is **not an error**: "read it if it exists" is the common
     /// case, and making the caller distinguish absence from failure by parsing a
     /// message is how absence ends up being treated as an outage.
+    ///
+    /// This reads the whole file into memory. For anything user-supplied, whose
+    /// size you did not choose, prefer [`read_chunks`](Filesystem::read_chunks).
     fn get<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<Option<Bytes>>>;
+
+    /// Read a file in chunks, calling `on_chunk` with each.
+    ///
+    /// `Ok(false)` if the file is not there, matching [`get`](Filesystem::get)'s
+    /// treatment of absence as an ordinary answer.
+    ///
+    /// # Why not just `get`
+    ///
+    /// `get` is fine for a config file and wrong for an upload. Hashing a video
+    /// through `get` means holding the whole video in memory, so the peak
+    /// footprint of a request is whatever the client chose to send — and the
+    /// process that dies from it is the one serving every other request too.
+    /// This keeps one chunk live at a time regardless of object size.
+    ///
+    /// # A callback, not a `Stream`
+    ///
+    /// A `Stream` would be the more composable shape and would put a generic in
+    /// the signature of a trait that is used as `dyn Filesystem` everywhere.
+    /// Every caller so far folds the bytes into an accumulator — a hash, a
+    /// length, a parser — which a callback expresses without making the port
+    /// harder to hold.
+    ///
+    /// The callback is synchronous on purpose: it runs between reads, and an
+    /// `await` in there would stall the read for something unrelated to it.
+    ///
+    /// # Errors
+    ///
+    /// Returning `Err` from `on_chunk` aborts the read and surfaces that error
+    /// unchanged, so a caller that finds what it needs partway can stop paying
+    /// for the rest.
+    ///
+    /// # Default
+    ///
+    /// Defaults to one `get` and a single chunk. That is correct but has the
+    /// memory profile this exists to avoid, so a driver that can genuinely
+    /// stream — anything over HTTP, anything on a real disk — should override
+    /// it. Left as a default rather than required so that adding this did not
+    /// break every driver outside this repo.
+    fn read_chunks<'a>(
+        &'a self,
+        path: &'a str,
+        on_chunk: &'a mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            match self.get(path).await? {
+                Some(bytes) => {
+                    on_chunk(&bytes)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        })
+    }
 
     /// Write a file, creating any directories it needs and replacing what was
     /// there.
