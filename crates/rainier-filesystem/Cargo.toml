@@ -14,6 +14,8 @@ rainier-drivers = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 serde = { workspace = true }
 # A disk on a driver the framework does not ship carries that driver's own
 # settings, which have to survive from the configuration tree to the factory

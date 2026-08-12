@@ -175,6 +175,11 @@ pub mod memory;
 
 #[cfg(feature = "s3")]
 pub mod s3;
+pub mod upload_policy;
+
+pub use upload_policy::{
+    sign as sign_upload_form, SignedUploadForm, SigningContext, UploadConditions,
+};
 
 pub use disks::{CustomDisk, DiskConfig, Disks, LocalDisk, S3Credentials, S3Disk};
 pub use driver::{DiskDriver, FilesystemDriver};

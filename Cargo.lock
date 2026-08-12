@@ -3355,10 +3355,12 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "hmac 0.12.1",
  "rainier-drivers",
  "rainier-support",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
 ]
