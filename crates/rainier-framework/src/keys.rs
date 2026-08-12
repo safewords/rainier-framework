@@ -442,12 +442,16 @@ config_keys! {
     /// is the job's ([`Job::QUEUE`](crate::queue::Job::QUEUE)); this is which
     /// queues a worker takes *from*.
     ///
-    /// Unset is the ordinary case, and safe: a worker then drains exactly the
-    /// queues its registered jobs declare, which cannot drift from what the
-    /// binary can run. Set it when an application's queue names are computed
-    /// at runtime — a per-environment prefix, say — because then the
-    /// registered constants are not the names anything is actually dispatched
-    /// to, and deriving would point workers at queues nobody writes to.
+    /// Unset is the ordinary case: a worker then drains
+    /// [`QUEUE_DEFAULT`] alone — the queue an unqualified dispatch goes to.
+    /// A job that names its own queue is *not* picked up, which is
+    /// deliberate: naming a queue is asking for a worker dedicated to it,
+    /// usually because the job is slow and would block the queue it was taken
+    /// out of.
+    ///
+    /// Set this to give one worker several queues, in priority order — the
+    /// equivalent of listing them on `queue:work --queue`, but stated once
+    /// where the application is configured rather than on every command line.
     ///
     /// `--queue` on the command line still wins, for one invocation.
     pub QUEUE_WORK_QUEUES: String = "queue.queues";

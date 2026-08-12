@@ -1142,8 +1142,20 @@ fn prefixed(store: StoreConfig, prefix: String) -> StoreConfig {
 /// registered constants are not the names anything is dispatched to, and
 /// deriving would point workers at queues nobody writes to.
 fn with_worker_queues(config: &Config, manager: QueueManager) -> QueueManager {
-    match config.string(keys::QUEUE_WORK_QUEUES) {
-        Some(declared) => manager.with_default_queues(declared.split(',')),
+    // An explicit list first, then the application's configured default queue.
+    //
+    // The second is the one that matters for correctness. `queue.default` is
+    // the queue an unqualified dispatch goes to, and an application that
+    // renames it — a per-environment prefix, say — would otherwise have its
+    // workers drain a queue called literally `default` that nothing is
+    // dispatched to. The worker starts, reports itself healthy, and processes
+    // nothing.
+    if let Some(declared) = config.string(keys::QUEUE_WORK_QUEUES) {
+        return manager.with_default_queues(declared.split(','));
+    }
+
+    match config.string(keys::QUEUE_DEFAULT) {
+        Some(default) => manager.with_default_queues([default]),
         None => manager,
     }
 }

@@ -294,19 +294,23 @@ impl QueueManager {
 
     /// The queues a worker drains when it is told nothing else.
     ///
-    /// The explicit declaration if there is one, otherwise every queue the
-    /// registered jobs use. Falls back to `default` only for a registry with
-    /// no jobs at all, which is a binary with nothing to drain anyway.
+    /// The declaration if there is one, and otherwise a single queue: the
+    /// application's configured default.
+    ///
+    /// Deliberately **not** every queue the registered jobs use. A job that
+    /// names a queue is asking to be drained by a worker dedicated to it, and
+    /// a plain `queue:work` picking it up anyway would defeat the reason it
+    /// was moved off the default — usually that it is slow, and would block
+    /// the queue it was taken out of. So a job on a named queue does not run
+    /// until something is told to drain that queue, which is the same
+    /// arrangement Laravel has.
+    ///
+    /// The cost is that a named queue nobody drains is silent, and the
+    /// framework cannot tell that from a queue that is merely idle. That is
+    /// what [`queues`](JobRegistry::queues) is for: it reports what the binary
+    /// has registered, so a deployment check can compare the two.
     pub fn default_queues(&self) -> Vec<String> {
-        if let Some(declared) = &self.default_queues {
-            return declared.clone();
-        }
-
-        let derived = self.registry.queues();
-        if derived.is_empty() {
-            return vec!["default".to_string()];
-        }
-        derived.to_vec()
+        self.default_queues.clone().unwrap_or_else(|| vec!["default".to_string()])
     }
 
     /// Declare a connection reachable as `name`.
@@ -873,7 +877,51 @@ mod tests {
     }
 
     #[test]
-    fn the_queues_come_from_the_registered_jobs_by_default() {
+    fn a_job_on_a_named_queue_is_not_drained_by_a_plain_worker() {
+        // The rule, and the reason for it: a job that names a queue is asking
+        // for a worker dedicated to it, usually because it is slow and would
+        // block the queue it was taken out of. A plain `queue:work` picking it
+        // up anyway would defeat the move.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Slow;
+        #[async_trait::async_trait]
+        impl Job for Slow {
+            const NAME: &'static str = "stats.rebuild";
+            const QUEUE: &'static str = "intense-workloads";
+            async fn handle(&self, _: &JobContext) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let registry = Arc::new(JobRegistry::new().with::<Slow>());
+        let manager = QueueManager::new(Arc::new(MemoryQueue::new()), registry);
+
+        assert_eq!(manager.default_queues(), ["default"]);
+    }
+
+    #[test]
+    fn the_registry_still_reports_what_it_knows_for_a_deploy_check() {
+        // The cost of the rule above is that a named queue nobody drains is
+        // silent, and indistinguishable from one that is merely idle. This is
+        // what lets a deployment compare the two.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Slow;
+        #[async_trait::async_trait]
+        impl Job for Slow {
+            const NAME: &'static str = "stats.rebuild";
+            const QUEUE: &'static str = "intense-workloads";
+            async fn handle(&self, _: &JobContext) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let registry = JobRegistry::new().with::<Slow>();
+
+        assert_eq!(registry.queues(), ["intense-workloads"]);
+    }
+
+    #[test]
+    fn a_declaration_still_wins_over_the_default() {
         // The point of deriving rather than configuring: this cannot be
         // pointed at a queue the binary has nothing to run, and cannot miss
         // one it does.
@@ -900,10 +948,11 @@ mod tests {
         }
 
         let registry = Arc::new(JobRegistry::new().with::<Encode>().with::<Thumbnail>());
-        let manager = QueueManager::new(Arc::new(MemoryQueue::new()), registry);
+        let manager = QueueManager::new(Arc::new(MemoryQueue::new()), registry)
+            .with_default_queues(["transcode-video", "transcode-image"]);
 
-        // Registration order, because that is the only ordering carrying
-        // intent — sorting would silently reprioritise.
+        // Order is kept: earlier queues are drained first, and sorting would
+        // silently reprioritise what the application asked for.
         assert_eq!(manager.default_queues(), ["transcode-video", "transcode-image"]);
     }
 
