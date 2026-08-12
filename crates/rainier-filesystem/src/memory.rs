@@ -104,6 +104,8 @@ impl Filesystem for MemoryFilesystem {
                 path: normalised.clone(),
                 size: entry.contents.len() as u64,
                 last_modified: Some(entry.last_modified),
+                // Neither driver records one.
+                content_type: None,
             }))
         })
     }
@@ -125,6 +127,8 @@ impl Filesystem for MemoryFilesystem {
                     path: path.clone(),
                     size: entry.contents.len() as u64,
                     last_modified: Some(entry.last_modified),
+                    // Neither driver records one.
+                    content_type: None,
                 })
                 .collect();
 

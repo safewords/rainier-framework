@@ -15,6 +15,15 @@ pub struct Metadata {
     pub size: u64,
     /// When it was last written, if the driver records that.
     pub last_modified: Option<DateTime<Utc>>,
+    /// The content type the driver has recorded, if it records one.
+    ///
+    /// `None` covers two different situations that only object stores
+    /// distinguish: the driver does not track content types at all (the local
+    /// disk), and the object was stored without one. Neither is a mismatch,
+    /// which is why this is not defaulted to `application/octet-stream` —
+    /// a caller comparing it against a declared type would then reject every
+    /// object stored by something that did not set it.
+    pub content_type: Option<String>,
 }
 
 /// Where a driver keeps bytes.

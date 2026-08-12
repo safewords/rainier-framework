@@ -32,6 +32,13 @@ pub struct S3Head {
     pub size: u64,
     /// When it was last written, as seconds since the epoch.
     pub last_modified: Option<i64>,
+    /// The `Content-Type` recorded against the object.
+    ///
+    /// `None` when the object was stored without one. Not defaulted to
+    /// `application/octet-stream`: a caller comparing this against what a
+    /// client declared needs to tell "the bucket says octet-stream" apart from
+    /// "the bucket says nothing", and only one of those is a mismatch.
+    pub content_type: Option<String>,
 }
 
 /// Talks to one S3 bucket.
@@ -160,6 +167,7 @@ impl S3Client {
         Ok(Some(S3Head {
             size: output.content_length().unwrap_or(0).max(0) as u64,
             last_modified: output.last_modified().map(|time| time.secs()),
+            content_type: output.content_type().map(str::to_string),
         }))
     }
 

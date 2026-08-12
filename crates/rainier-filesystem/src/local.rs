@@ -79,6 +79,8 @@ impl LocalFilesystem {
                 path: normalise_path(path)?,
                 size: meta.len(),
                 last_modified: meta.modified().ok().map(system_time_to_utc),
+                // Neither driver records one.
+                content_type: None,
             })),
             // A directory is not a file, and reporting it as one would make
             // `exists` true for something `get` cannot read.
@@ -257,6 +259,8 @@ impl Filesystem for LocalFilesystem {
                     path: if normalised.is_empty() { name } else { format!("{normalised}/{name}") },
                     size: meta.len(),
                     last_modified: meta.modified().ok().map(system_time_to_utc),
+                    // Neither driver records one.
+                    content_type: None,
                 });
             }
 

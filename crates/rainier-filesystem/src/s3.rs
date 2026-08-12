@@ -142,6 +142,7 @@ impl Filesystem for S3Filesystem {
                 last_modified: head
                     .last_modified
                     .and_then(|secs| DateTime::from_timestamp(secs, 0)),
+                content_type: head.content_type,
             }))
         })
     }
@@ -162,6 +163,12 @@ impl Filesystem for S3Filesystem {
                     last_modified: object
                         .last_modified
                         .and_then(|secs| DateTime::from_timestamp(secs, 0)),
+                    // `ListObjectsV2` does not return one. A caller that needs
+                    // the content type of a listed object has to `metadata` it
+                    // — reporting `None` is the honest answer, and inventing
+                    // one from the extension would be a guess wearing the
+                    // clothes of a fact the bucket reported.
+                    content_type: None,
                 })
                 .collect();
 
