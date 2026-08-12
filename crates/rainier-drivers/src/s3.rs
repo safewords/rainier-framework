@@ -331,6 +331,59 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    /// A presigned PUT, against real storage.
+    ///
+    /// Ignored: needs credentials and a network. Run it when the presigning
+    /// changes, or against a new provider:
+    ///
+    /// ```sh
+    /// AWS_ENDPOINT_URL=… AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…     ///   AWS_DEFAULT_REGION=auto S3_TEST_BUCKET=…     ///   cargo test -p rainier-drivers --lib a_presigned_put_is_accepted -- --ignored --nocapture
+    /// ```
+    ///
+    /// It exists because the sibling POST-policy path is signed correctly and
+    /// still refused by Cloudflare R2 with a bare `501 NotImplemented`. Whether
+    /// a provider *implements* a signing mode is not something the signature
+    /// can tell you — only bytes landing can.
+    #[tokio::test]
+    #[ignore = "needs S3 credentials and a network"]
+    async fn a_presigned_put_is_accepted() {
+        let Ok(bucket) = std::env::var("S3_TEST_BUCKET") else {
+            panic!("set S3_TEST_BUCKET to a bucket these credentials may write to");
+        };
+
+        let connector = crate::aws::AwsConnector::from_env().await;
+        let client = S3Client::new(&connector, bucket);
+
+        let key = format!("presign-probe-{}.txt", std::process::id());
+        let url = client
+            .presigned_put_url(&key, Duration::from_secs(300))
+            .await
+            .expect("signing a PUT url");
+
+        // Plain HTTP, no SDK: the point is that the URL alone carries the
+        // authorisation, which is what a browser will rely on.
+        let status = std::process::Command::new("curl")
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-X",
+                "PUT",
+                "--data",
+                "probe",
+                &url,
+            ])
+            .output()
+            .expect("curl is available")
+            .stdout;
+        let status = String::from_utf8_lossy(&status).trim().to_string();
+
+        assert!(status.starts_with('2'), "the bucket refused a presigned PUT: HTTP {status}");
+        println!("presigned PUT accepted: {key} -> {status}");
+    }
     use super::*;
 
     async fn client() -> S3Client {
