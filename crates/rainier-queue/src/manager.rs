@@ -231,15 +231,16 @@ pub struct QueueManager {
     /// than silently deduplicated by nothing — see
     /// [`with_locks`](QueueManager::with_locks).
     locks: Option<LockManager>,
-    /// Which queues `queue:work` drains when nobody passes `--queue`.
+    /// Which queues `queue:work` drains, when the answer is not simply "the
+    /// ones this binary has jobs for".
     ///
-    /// An application that puts its jobs on named queues has to say so
-    /// somewhere, and the alternative to saying it here is saying it on every
-    /// worker's command line — in a Dockerfile, in a chart, in a systemd unit
-    /// and in whatever an operator types at three in the morning. Those drift,
-    /// and the failure when they do is silent: a worker starts, drains a queue
-    /// nothing is dispatched to, reports itself healthy and processes nothing.
-    default_queues: Vec<String>,
+    /// `None` is the ordinary case and the better one: the registry already
+    /// knows every registered job's `Job::QUEUE`, and deriving the list from
+    /// that cannot drift from what the worker can actually run. This exists
+    /// for the genuine exceptions — a deployment that deliberately splits one
+    /// binary's queues across pools, or drains a queue whose producer lives in
+    /// another application entirely.
+    default_queues: Option<Vec<String>>,
 }
 
 impl QueueManager {
@@ -255,26 +256,25 @@ impl QueueManager {
             registry,
             recorded: None,
             locks: None,
-            // The queue `Job::QUEUE` defaults to, so an application that has
-            // never thought about queue names behaves exactly as before.
-            default_queues: vec!["default".to_string()],
+            // Nothing declared: the registry's queues are used instead.
+            default_queues: None,
         }
     }
 
-    /// Drain these queues when `queue:work` is given no `--queue`.
+    /// Drain these queues instead of the ones the registry implies.
+    ///
+    /// **Usually unnecessary.** A worker's queues are already knowable — they
+    /// are exactly the queues its registered jobs declare — and deriving them
+    /// cannot drift from what the binary can run. Reach for this only when the
+    /// answer genuinely differs from that: one binary split across pools, or a
+    /// queue whose producer is another application.
     ///
     /// In priority order, like the flag: earlier queues are emptied first,
     /// which is how a `high` queue gets ahead of `default`.
     ///
-    /// State it once, here, rather than on every worker's command line. The
-    /// two are not equivalent — a flag that is right in the Dockerfile and
-    /// missing from the chart produces a worker that starts cleanly, drains a
-    /// queue nothing is dispatched to, and reports itself healthy while
-    /// processing nothing.
-    ///
     /// An empty list is ignored rather than obeyed: a worker draining no
-    /// queues at all is never what was meant, and the failure it produces is
-    /// the same silent one.
+    /// queues at all is never what was meant, and it fails silently — the
+    /// worker starts, reports itself healthy, and processes nothing.
     pub fn with_default_queues(
         mut self,
         queues: impl IntoIterator<Item = impl Into<String>>,
@@ -287,14 +287,26 @@ impl QueueManager {
             .collect();
 
         if !queues.is_empty() {
-            self.default_queues = queues;
+            self.default_queues = Some(queues);
         }
         self
     }
 
     /// The queues a worker drains when it is told nothing else.
-    pub fn default_queues(&self) -> &[String] {
-        &self.default_queues
+    ///
+    /// The explicit declaration if there is one, otherwise every queue the
+    /// registered jobs use. Falls back to `default` only for a registry with
+    /// no jobs at all, which is a binary with nothing to drain anyway.
+    pub fn default_queues(&self) -> Vec<String> {
+        if let Some(declared) = &self.default_queues {
+            return declared.clone();
+        }
+
+        let derived = self.registry.queues();
+        if derived.is_empty() {
+            return vec!["default".to_string()];
+        }
+        derived.to_vec()
     }
 
     /// Declare a connection reachable as `name`.
@@ -389,7 +401,7 @@ impl QueueManager {
             )),
             connections: BTreeMap::new(),
             registry: Arc::new(JobRegistry::new()),
-            default_queues: vec!["default".to_string()],
+            default_queues: None,
             recorded: Some(Mutex::new(Vec::new())),
             locks: None,
         }
@@ -852,12 +864,47 @@ mod unique_tests {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn an_application_that_says_nothing_drains_default_exactly_as_before() {
-        // The whole point of a default: adding this must not change what any
-        // existing application does.
+    fn a_registry_with_no_jobs_still_drains_default() {
+        // A binary with nothing registered has nothing to drain anyway, but it
+        // must not end up draining *no* queues, which fails silently.
         let manager = QueueManager::fake();
 
         assert_eq!(manager.default_queues(), ["default"]);
+    }
+
+    #[test]
+    fn the_queues_come_from_the_registered_jobs_by_default() {
+        // The point of deriving rather than configuring: this cannot be
+        // pointed at a queue the binary has nothing to run, and cannot miss
+        // one it does.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Encode;
+        #[async_trait::async_trait]
+        impl Job for Encode {
+            const NAME: &'static str = "transcode.video";
+            const QUEUE: &'static str = "transcode-video";
+            async fn handle(&self, _: &JobContext) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Thumbnail;
+        #[async_trait::async_trait]
+        impl Job for Thumbnail {
+            const NAME: &'static str = "transcode.image";
+            const QUEUE: &'static str = "transcode-image";
+            async fn handle(&self, _: &JobContext) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let registry = Arc::new(JobRegistry::new().with::<Encode>().with::<Thumbnail>());
+        let manager = QueueManager::new(Arc::new(MemoryQueue::new()), registry);
+
+        // Registration order, because that is the only ordering carrying
+        // intent — sorting would silently reprioritise.
+        assert_eq!(manager.default_queues(), ["transcode-video", "transcode-image"]);
     }
 
     #[test]

@@ -342,6 +342,18 @@ type Runner =
 #[derive(Default, Clone)]
 pub struct JobRegistry {
     runners: HashMap<String, Runner>,
+    /// The queues the registered jobs declare, in registration order.
+    ///
+    /// Kept because a worker draining a queue no registered job uses is doing
+    /// nothing, and a queue a registered job uses that no worker drains is
+    /// work that never runs. Both are silent. Recording what was registered
+    /// means `queue:work` can answer "which queues" from the binary itself
+    /// rather than from a flag somebody has to keep in step with it.
+    ///
+    /// Registration order, not sorted: it is the order the application listed
+    /// its jobs, which is the only ordering that carries intent. Sorting would
+    /// silently reprioritise.
+    queues: Vec<String>,
 }
 
 impl JobRegistry {
@@ -373,6 +385,14 @@ impl JobRegistry {
         });
 
         self.runners.insert(J::NAME.to_string(), runner);
+
+        // `J::QUEUE` is a compile-time constant, so this cannot disagree with
+        // where the job is actually dispatched. Two jobs sharing a queue
+        // record it once.
+        if !self.queues.iter().any(|queue| queue == J::QUEUE) {
+            self.queues.push(J::QUEUE.to_string());
+        }
+
         self
     }
 
@@ -385,6 +405,18 @@ impl JobRegistry {
     /// Whether `name` is registered.
     pub fn knows(&self, name: &str) -> bool {
         self.runners.contains_key(name)
+    }
+
+    /// Every queue the registered jobs declare, in registration order.
+    ///
+    /// What a worker should drain if nobody says otherwise: exactly the queues
+    /// this binary has something to run. A list that came from configuration
+    /// instead can drift from the binary in both directions, and both are
+    /// silent — a queue nothing is registered for looks like an idle worker,
+    /// and a registered job whose queue nobody drains looks like a queue that
+    /// is merely slow.
+    pub fn queues(&self) -> &[String] {
+        &self.queues
     }
 
     /// Every registered job name, sorted.

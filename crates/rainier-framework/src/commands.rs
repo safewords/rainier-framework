@@ -309,20 +309,21 @@ impl Command for QueueWorkCommand {
     async fn handle(&self, args: &Arguments, app: &Application) -> Result<i32> {
         let manager = app.resolve::<QueueManager>()?;
 
-        // The flag wins; without it, what the application declared through
-        // `QueueManager::with_default_queues`. An application that puts its
-        // jobs on named queues would otherwise have to repeat them on every
-        // worker's command line — a Dockerfile, a chart, a systemd unit — and
-        // the failure when one of those drifts is silent: the worker starts,
-        // drains a queue nothing is dispatched to, and reports itself healthy
-        // while processing nothing.
+        // The flag wins; without it, the queues this binary actually has jobs
+        // for — see `QueueManager::default_queues`. Deriving it means the
+        // worker cannot be pointed at a queue it has nothing to run, and
+        // cannot miss one it does, which is what happens when the list is
+        // repeated on a command line in a Dockerfile, a chart and a systemd
+        // unit. That failure is silent: the worker starts, drains a queue
+        // nothing is dispatched to, and reports itself healthy while
+        // processing nothing.
         let queues: Vec<String> = match args.option("queue") {
             Some(flag) => flag
                 .split(',')
                 .map(|name| name.trim().to_string())
                 .filter(|name| !name.is_empty())
                 .collect(),
-            None => manager.default_queues().to_vec(),
+            None => manager.default_queues(),
         };
 
         // Only reachable from `--queue=` or `--queue=,,`: the declared default
