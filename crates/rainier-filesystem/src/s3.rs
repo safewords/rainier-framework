@@ -202,6 +202,17 @@ impl Filesystem for S3Filesystem {
             self.client.presigned_get_url(&key, expires_in).await
         })
     }
+
+    fn temporary_upload_url<'a>(
+        &'a self,
+        path: &'a str,
+        expires_in: std::time::Duration,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let key = normalise_path(path)?;
+            self.client.presigned_put_url(&key, expires_in).await
+        })
+    }
 }
 
 impl std::fmt::Debug for S3Filesystem {

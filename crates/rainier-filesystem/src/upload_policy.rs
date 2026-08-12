@@ -27,6 +27,26 @@
 //! checked for running — an almost-right chain still produces 32 plausible
 //! bytes.
 //!
+//! # Cloudflare R2 does not implement this at all
+//!
+//! Verified against a live bucket on 2026-08-12:
+//!
+//! ```text
+//! 501 NotImplemented
+//! Presigned post requests are not yet implemented
+//! ```
+//!
+//! The signature is correct; R2 simply does not serve POST policies. So on R2
+//! use [`Filesystem::temporary_upload_url`](crate::Filesystem::temporary_upload_url),
+//! which is a presigned PUT and which R2 does implement — accepting that it
+//! signs a URL rather than conditions, and compensating with a short expiry, a
+//! key the client did not choose, and a size checked after the fact.
+//!
+//! This module stays for real S3 and for anything else that implements the
+//! POST form. It is left here rather than deleted because the next person will
+//! reach for POST policies for exactly the right reasons, and should find this
+//! note instead of spending a day on a 501.
+//!
 //! # R2 is stricter than S3 in one way that matters
 //!
 //! R2 requires the region in the credential scope to be `auto`. Signing with

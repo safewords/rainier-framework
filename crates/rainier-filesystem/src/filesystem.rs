@@ -207,6 +207,38 @@ pub trait Filesystem: Send + Sync + 'static {
             ))
         })
     }
+
+    /// A URL a client may **upload** to, for `expires_in`.
+    ///
+    /// # Weaker than a signed POST form, and usually unavoidable
+    ///
+    /// An S3 POST policy signs *conditions* — a size range, a content type —
+    /// so the bucket itself refuses an upload that breaks them. A presigned
+    /// PUT signs a URL and nothing more: whoever holds it may write any bytes,
+    /// of any size, to that one key until it expires.
+    ///
+    /// Reach for a POST policy where the backend implements it. Cloudflare R2
+    /// does not — it answers `501 NotImplemented` — so on R2 this is the only
+    /// way to let a browser upload directly, and the missing conditions have
+    /// to be compensated for by the caller: a short expiry, a key the client
+    /// did not choose, and a size checked after the bytes land.
+    fn temporary_upload_url<'a>(
+        &'a self,
+        path: &'a str,
+        expires_in: Duration,
+    ) -> BoxFuture<'a, Result<String>> {
+        let _ = expires_in;
+        Box::pin(async move {
+            let _ = path;
+            Err(Error::new(
+                ErrorKind::Status(501),
+                format!(
+                    "the `{}` disk cannot sign an upload URL; letting a client upload directly                      needs a driver that signs",
+                    self.name()
+                ),
+            ))
+        })
+    }
 }
 
 /// The typed conveniences every [`Filesystem`] gets.

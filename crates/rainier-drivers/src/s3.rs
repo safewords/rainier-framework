@@ -247,6 +247,43 @@ impl S3Client {
         Ok(request.uri().to_string())
     }
 
+    /// A presigned **PUT** URL: a client may upload to this key, once, until it
+    /// expires.
+    ///
+    /// # It is weaker than a POST policy, and that is forced
+    ///
+    /// An S3 POST policy signs *conditions* — a size range, a content type —
+    /// so the bucket refuses an oversized or wrong-typed upload itself. A
+    /// presigned PUT signs a URL and nothing else: whoever holds it may write
+    /// any bytes, of any size, to that one key until it expires.
+    ///
+    /// Cloudflare R2 answers `501 NotImplemented` to a POST policy, so on R2
+    /// this is the only option. Compensate where the URL cannot:
+    ///
+    /// - keep `expires_in` short, because the URL *is* the capability;
+    /// - check the size after the fact, since nothing enforced it during;
+    /// - never derive the key from client input, because the URL fixes the key
+    ///   and that is the one condition it does carry.
+    pub async fn presigned_put_url(&self, key: &str, expires_in: Duration) -> Result<String> {
+        let config = PresigningConfig::expires_in(expires_in).map_err(|_| {
+            Error::bad_request(format!(
+                "a presigned URL cannot last {} seconds; SigV4 caps a signed URL at 7 days",
+                expires_in.as_secs()
+            ))
+        })?;
+
+        let request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .presigned(config)
+            .await
+            .map_err(|e| sdk_error(&format!("S3 presign put_object `{key}`"), e))?;
+
+        Ok(request.uri().to_string())
+    }
+
     /// Copy an object **server-side**.
     ///
     /// `false` if the source did not exist. Server-side matters: the alternative
