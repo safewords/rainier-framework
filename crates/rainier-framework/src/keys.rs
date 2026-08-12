@@ -434,6 +434,24 @@ config_keys! {
     /// since a queue nobody drains reports nothing at all.
     pub QUEUES: QueueConnections = "queues";
 
+    /// Which queues a `queue:work` process drains, comma-separated and in
+    /// priority order — `queue.queues`.
+    ///
+    /// The counterpart of `config/horizon.php`'s `supervisor-*.queue`, not of
+    /// `config/queue.php`'s `connections.*.queue`. Which queue a job goes *to*
+    /// is the job's ([`Job::QUEUE`](crate::queue::Job::QUEUE)); this is which
+    /// queues a worker takes *from*.
+    ///
+    /// Unset is the ordinary case, and safe: a worker then drains exactly the
+    /// queues its registered jobs declare, which cannot drift from what the
+    /// binary can run. Set it when an application's queue names are computed
+    /// at runtime — a per-environment prefix, say — because then the
+    /// registered constants are not the names anything is actually dispatched
+    /// to, and deriving would point workers at queues nobody writes to.
+    ///
+    /// `--queue` on the command line still wins, for one invocation.
+    pub QUEUE_WORK_QUEUES: String = "queue.queues";
+
     /// Which declared connection a dispatch naming none goes to.
     ///
     /// Not [`QUEUE_DEFAULT`], which names a queue inside a connection. A

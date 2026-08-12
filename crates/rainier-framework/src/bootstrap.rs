@@ -1134,6 +1134,20 @@ fn prefixed(store: StoreConfig, prefix: String) -> StoreConfig {
 /// returns an id and then waits in a store no worker drains. Nothing fails, so
 /// nothing is logged, and there is no failed-job row — the job never failed. It
 /// was never run.
+/// Apply `queue.queues` to a manager built from configuration.
+///
+/// Left alone when unset, so the manager falls back to the queues its
+/// registered jobs declare. An application only needs this when its queue
+/// names are computed at runtime — a per-environment prefix, say — where the
+/// registered constants are not the names anything is dispatched to, and
+/// deriving would point workers at queues nobody writes to.
+fn with_worker_queues(config: &Config, manager: QueueManager) -> QueueManager {
+    match config.string(keys::QUEUE_WORK_QUEUES) {
+        Some(declared) => manager.with_default_queues(declared.split(',')),
+        None => manager,
+    }
+}
+
 async fn build_queues(
     env: &Env,
     config: &Config,
@@ -1152,12 +1166,15 @@ async fn build_queues(
              unset `QUEUE_DRIVER` and declare every connection in the section",
         )),
 
-        (true, None) => Ok(Some(config.require(keys::QUEUES)?.build(resources).await?)),
+        (true, None) => Ok(Some(with_worker_queues(
+            config,
+            config.require(keys::QUEUES)?.build(resources).await?,
+        ))),
 
         (false, Some(_)) => {
             let queues = queues_from_env(env)?;
             config.set(keys::QUEUES, queues.clone())?;
-            Ok(Some(queues.build(resources).await?))
+            Ok(Some(with_worker_queues(config, queues.build(resources).await?)))
         }
 
         (false, None) => Ok(None),
