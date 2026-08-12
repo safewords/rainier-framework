@@ -231,6 +231,15 @@ pub struct QueueManager {
     /// than silently deduplicated by nothing — see
     /// [`with_locks`](QueueManager::with_locks).
     locks: Option<LockManager>,
+    /// Which queues `queue:work` drains when nobody passes `--queue`.
+    ///
+    /// An application that puts its jobs on named queues has to say so
+    /// somewhere, and the alternative to saying it here is saying it on every
+    /// worker's command line — in a Dockerfile, in a chart, in a systemd unit
+    /// and in whatever an operator types at three in the morning. Those drift,
+    /// and the failure when they do is silent: a worker starts, drains a queue
+    /// nothing is dispatched to, reports itself healthy and processes nothing.
+    default_queues: Vec<String>,
 }
 
 impl QueueManager {
@@ -240,7 +249,52 @@ impl QueueManager {
     /// not ask for one goes there. Names come from
     /// [`with_connection`](Self::with_connection).
     pub fn new(queue: Arc<dyn Queue>, registry: Arc<JobRegistry>) -> Self {
-        Self { queue, connections: BTreeMap::new(), registry, recorded: None, locks: None }
+        Self {
+            queue,
+            connections: BTreeMap::new(),
+            registry,
+            recorded: None,
+            locks: None,
+            // The queue `Job::QUEUE` defaults to, so an application that has
+            // never thought about queue names behaves exactly as before.
+            default_queues: vec!["default".to_string()],
+        }
+    }
+
+    /// Drain these queues when `queue:work` is given no `--queue`.
+    ///
+    /// In priority order, like the flag: earlier queues are emptied first,
+    /// which is how a `high` queue gets ahead of `default`.
+    ///
+    /// State it once, here, rather than on every worker's command line. The
+    /// two are not equivalent — a flag that is right in the Dockerfile and
+    /// missing from the chart produces a worker that starts cleanly, drains a
+    /// queue nothing is dispatched to, and reports itself healthy while
+    /// processing nothing.
+    ///
+    /// An empty list is ignored rather than obeyed: a worker draining no
+    /// queues at all is never what was meant, and the failure it produces is
+    /// the same silent one.
+    pub fn with_default_queues(
+        mut self,
+        queues: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        let queues: Vec<String> = queues
+            .into_iter()
+            .map(Into::into)
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect();
+
+        if !queues.is_empty() {
+            self.default_queues = queues;
+        }
+        self
+    }
+
+    /// The queues a worker drains when it is told nothing else.
+    pub fn default_queues(&self) -> &[String] {
+        &self.default_queues
     }
 
     /// Declare a connection reachable as `name`.
@@ -335,6 +389,7 @@ impl QueueManager {
             )),
             connections: BTreeMap::new(),
             registry: Arc::new(JobRegistry::new()),
+            default_queues: vec!["default".to_string()],
             recorded: Some(Mutex::new(Vec::new())),
             locks: None,
         }
@@ -796,6 +851,52 @@ mod unique_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_application_that_says_nothing_drains_default_exactly_as_before() {
+        // The whole point of a default: adding this must not change what any
+        // existing application does.
+        let manager = QueueManager::fake();
+
+        assert_eq!(manager.default_queues(), ["default"]);
+    }
+
+    #[test]
+    fn declared_queues_are_kept_in_priority_order() {
+        // Earlier first, like the flag — that ordering is how a `high` queue
+        // gets ahead of `default`, and sorting or deduplicating would silently
+        // change the priority the application asked for.
+        let manager =
+            QueueManager::fake().with_default_queues(["transcode-video", "transcode-image"]);
+
+        assert_eq!(manager.default_queues(), ["transcode-video", "transcode-image"]);
+    }
+
+    #[test]
+    fn blank_names_are_dropped_rather_than_drained() {
+        // A trailing comma in a chart value is the realistic source, and a
+        // queue named "" is one nothing is ever dispatched to.
+        let manager = QueueManager::fake().with_default_queues(["high", "  ", "", " low "]);
+
+        assert_eq!(manager.default_queues(), ["high", "low"]);
+    }
+
+    #[test]
+    fn declaring_nothing_leaves_the_previous_default_standing() {
+        // A worker draining no queues at all is never what was meant, and it
+        // fails the same silent way the flag does: it starts, reports itself
+        // healthy, and processes nothing.
+        let manager = QueueManager::fake().with_default_queues(Vec::<String>::new());
+        assert_eq!(manager.default_queues(), ["default"]);
+
+        let manager =
+            QueueManager::fake().with_default_queues(["high"]).with_default_queues(["", "   "]);
+        assert_eq!(
+            manager.default_queues(),
+            ["high"],
+            "a bad later call must not erase a good one"
+        );
+    }
+
     use super::*;
     use crate::queue::MemoryQueue;
     use rainier_support::Error;

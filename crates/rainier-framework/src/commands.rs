@@ -299,7 +299,7 @@ impl Command for QueueWorkCommand {
         Some(
             "Usage:\n  queue:work [--queue=default,high] [--once] [--max-jobs=N] [--sleep=1]\n\n\
              Options:\n  \
-             --queue     Comma-separated queues, in priority order\n  \
+             --queue     Comma-separated queues, in priority order.\n              Defaults to the queues the application declared.\n  \
              --once      Process what is waiting, then stop\n  \
              --max-jobs  Stop after N jobs (a worker that recycles)\n  \
              --sleep     Seconds to wait when the queue is empty",
@@ -309,12 +309,29 @@ impl Command for QueueWorkCommand {
     async fn handle(&self, args: &Arguments, app: &Application) -> Result<i32> {
         let manager = app.resolve::<QueueManager>()?;
 
-        let queues: Vec<String> = args
-            .option_or("queue", "default")
-            .split(',')
-            .map(|name| name.trim().to_string())
-            .filter(|name| !name.is_empty())
-            .collect();
+        // The flag wins; without it, what the application declared through
+        // `QueueManager::with_default_queues`. An application that puts its
+        // jobs on named queues would otherwise have to repeat them on every
+        // worker's command line — a Dockerfile, a chart, a systemd unit — and
+        // the failure when one of those drifts is silent: the worker starts,
+        // drains a queue nothing is dispatched to, and reports itself healthy
+        // while processing nothing.
+        let queues: Vec<String> = match args.option("queue") {
+            Some(flag) => flag
+                .split(',')
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect(),
+            None => manager.default_queues().to_vec(),
+        };
+
+        // Only reachable from `--queue=` or `--queue=,,`: the declared default
+        // cannot be empty. A flag that is present and names nothing is a typo,
+        // and draining no queues at all is never what it meant.
+        if queues.is_empty() {
+            eprintln!("--queue named no queues; there would be nothing to drain");
+            return Ok(1);
+        }
 
         let mut options = WorkerOptions::default()
             .queues(queues.clone())
