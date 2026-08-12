@@ -286,6 +286,47 @@ impl QueuedJob {
         })
     }
 
+    /// An envelope around a payload this framework did not serialise.
+    ///
+    /// For work handed to a consumer that is not this application's worker —
+    /// another service, another language — but which still travels as a
+    /// `QueuedJob` because something in between reserves it through
+    /// [`Queue::reserve`](crate::Queue::reserve) and forwards the envelope
+    /// whole.
+    ///
+    /// # Not the same as [`push_raw`](crate::Queue::push_raw)
+    ///
+    /// `push_raw` is for a consumer reading the queue **directly**, where an
+    /// envelope it has never heard of is indistinguishable from corruption.
+    /// This is the opposite case: the consumer never sees the queue, and
+    /// something reserving on its behalf can only reserve a `QueuedJob`. Using
+    /// `push_raw` there fails at the driver — a stream entry that is not an
+    /// envelope cannot be reserved as one.
+    ///
+    /// `max_attempts` is 1. Redelivery is the forwarder's business — it is the
+    /// only party that knows whether the far end ever received the work — and
+    /// a second attempt minted here would race whatever it does about the
+    /// first.
+    pub fn foreign(
+        queue: impl Into<String>,
+        name: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: generate_id(),
+            name: name.into(),
+            payload,
+            queue: queue.into(),
+            attempts: 0,
+            max_attempts: 1,
+            unique_key: None,
+            delivery_handle: None,
+            available_at: now,
+            created_at: now,
+        }
+    }
+
     /// Put it on a different queue.
     pub fn on_queue(mut self, queue: impl Into<String>) -> Self {
         self.queue = queue.into();
