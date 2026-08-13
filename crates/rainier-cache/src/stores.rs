@@ -619,6 +619,15 @@ impl RedisStore {
         self
     }
 
+    /// Whether this store's connection re-opens itself after losing its socket.
+    ///
+    /// Exposed so a deployment can assert what it believes it configured. A
+    /// store that does not reconnect works until its first dropped socket and
+    /// then fails every command for the life of the process.
+    pub fn reconnects(&self) -> bool {
+        self.connection.reconnects()
+    }
+
     /// How many times to retry re-establishing the connection. Turns
     /// reconnection on.
     pub fn reconnect_attempts(mut self, attempts: u32) -> Self {
@@ -718,6 +727,19 @@ impl RedisClusterStore {
         self
     }
 
+    /// Re-open connections when their sockets are lost.
+    ///
+    /// **The most important setting here, and more so than on a single node.**
+    /// A cluster client holds a connection per shard, so it has several
+    /// sockets to lose and several ways to end up half-working: the shards
+    /// whose sockets survived keep answering, which is exactly what makes the
+    /// failure hard to see. A single-key health check reads one shard and
+    /// reports the cache healthy while the others hang.
+    pub fn reconnect(mut self) -> Self {
+        self.connection.reconnect = true;
+        self
+    }
+
     /// How long opening a connection may take before it fails.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connection.connect_timeout = Some(timeout);
@@ -748,6 +770,15 @@ impl RedisClusterStore {
         self.connection.reconnect = true;
         self.connection.reconnect_max_backoff = Some(ceiling);
         self
+    }
+
+    /// Whether this store's connection re-opens itself after losing its socket.
+    ///
+    /// Exposed so a deployment can assert what it believes it configured. A
+    /// store that does not reconnect works until its first dropped socket and
+    /// then fails every command for the life of the process.
+    pub fn reconnects(&self) -> bool {
+        self.connection.reconnects()
     }
 
     /// How many seeds were declared.

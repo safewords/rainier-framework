@@ -113,6 +113,104 @@ impl RedisCache {
         self.client.reconnects()
     }
 
+    /// How many spread probes [`health`](Self::health) sends on a cluster.
+    ///
+    /// Sixteen distinct hash tags, so the reads land in sixteen different
+    /// slots. The number is not about coverage of the 16384 slots — nothing
+    /// short of thousands of reads covers those — it is about touching every
+    /// *shard*. Sixteen well-spread slots hit all three masters of a typical
+    /// cluster essentially always, and a bigger cluster gets proportionally
+    /// more chances rather than fewer.
+    const HEALTH_PROBES: usize = 16;
+
+    /// Whether the whole cache is actually reachable.
+    ///
+    /// Prefer this to a single `get` for a readiness check, and on a cluster
+    /// the difference is the entire point.
+    ///
+    /// # Why one key is not a health check
+    ///
+    /// A cluster shards by key, so reading one key exercises **one shard**. A
+    /// probe that reads `__readiness__` proves the node owning that slot is
+    /// alive and proves nothing about the others — so a cluster with two of
+    /// three masters unreachable reports itself healthy, and every request
+    /// whose keys happen to land on the other two hangs.
+    ///
+    /// That is not hypothetical. It is how a cache outage stayed invisible
+    /// through a readiness endpoint that answered `ok` in 0ms while sign-ins
+    /// timed out at thirty seconds, twice in one day, on two different
+    /// applications.
+    ///
+    /// # What it checks
+    ///
+    /// On a cluster:
+    ///
+    /// 1. **Slot coverage.** `CLUSTER INFO` must report `cluster_state:ok` and
+    ///    all 16384 slots assigned. A slot left unassigned by an interrupted
+    ///    resharding takes the client's whole slot map with it, and the
+    ///    symptom is every command failing rather than the one key.
+    /// 2. **Reachability of each shard**, by reading
+    ///    [`HEALTH_PROBES`](Self::HEALTH_PROBES) keys in different slots. A
+    ///    node whose socket died — a pod restarted underneath a client with no
+    ///    reconnection — fails here and nowhere else.
+    ///
+    /// On a single node it is a `PING`, because there is one shard and one
+    /// socket and nothing else to learn.
+    ///
+    /// # It does not impose a timeout
+    ///
+    /// A caller that needs one wraps this, the same as any other await. The
+    /// health registry already bounds its checks, and inventing a second
+    /// deadline here would race it.
+    pub async fn health(&self) -> Result<()> {
+        if !self.is_cluster() {
+            self.client.ping().await?;
+            return Ok(());
+        }
+
+        let info = self.client.cluster_info().await?;
+
+        let field = |name: &str| {
+            info.lines()
+                .find_map(|line| line.trim().strip_prefix(name)?.strip_prefix(':'))
+                .map(str::trim)
+                .map(str::to_string)
+        };
+
+        match field("cluster_state").as_deref() {
+            Some("ok") => {}
+            other => {
+                return Err(rainier_support::Error::internal(format!(
+                    "the cluster reports state `{}`; it is not serving",
+                    other.unwrap_or("unknown")
+                )));
+            }
+        }
+
+        // 16384, always — the constant is the protocol's, not a setting. One
+        // short means a slot belongs to nobody, which is a repair
+        // (`CLUSTER SETSLOT <slot> NODE <id>`) and not something to wait out.
+        let assigned = field("cluster_slots_assigned")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        if assigned != 16384 {
+            return Err(rainier_support::Error::internal(format!(
+                "the cluster has {assigned} of 16384 slots assigned; the missing ones answer \
+                 nothing and the client cannot build a slot map"
+            )));
+        }
+
+        // Spread across shards. `{n}` is a hash tag: Redis hashes only what is
+        // inside the braces, so these land in sixteen known-distinct slots
+        // rather than sixteen keys that might share one.
+        for probe in 0..Self::HEALTH_PROBES {
+            self.get(&format!("{{{probe}}}:__readiness__")).await?;
+        }
+
+        Ok(())
+    }
+
     /// Store only if the key is absent, atomically.
     ///
     /// **Not the same as [`Cache::add`]**, whose default

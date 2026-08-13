@@ -1043,64 +1043,78 @@ async fn build_cache(
 /// what the store is.
 ///
 /// Each driver reads the settings it needs from the environment beside it. No
-/// **connection** settings are read from anywhere — no timeouts, no
-/// reconnection — because this is the shorthand for a deployment that has one
-/// store and says so, and a framework that invented a timeout on its behalf
-/// would be choosing when its application fails. A deployment that wants them
-/// declares the section, where they belong to a store rather than to a process.
+/// **timeouts** are read from anywhere, because a framework that invented one
+/// on an application's behalf would be choosing when that application fails. A
+/// deployment that wants them declares the section, where they belong to a
+/// store rather than to a process.
+///
+/// **Reconnection is not in that category, and is on.** It does not decide
+/// when to fail; it decides whether to recover, and the answer without it is
+/// never. A multiplexed connection does not re-open itself, so one dropped
+/// socket — a restarted Redis pod, a proxy reaping an idle connection — breaks
+/// the cache for the life of the process, and every clone of it: the cache's,
+/// the rate limiter's, the session store's.
+///
+/// That is not a hypothetical cost of a tidy default. Two applications ran for
+/// hours answering readiness `ok` while every cache command hung to its
+/// request timeout, because their Redis pods had restarted underneath a client
+/// that could not re-open a socket. Both recovered the moment they were
+/// restarted by hand, which is the tell.
 fn stores_from_env(env: &Env) -> Result<CacheStores> {
     let driver: CacheDriver = env.setting("CACHE_DRIVER")?;
 
-    let store: StoreConfig =
-        match driver {
-            CacheDriver::Memory => StoreConfig::memory(),
+    let store: StoreConfig = match driver {
+        CacheDriver::Memory => StoreConfig::memory(),
 
-            // The same variable and the same fallback the queue reads, because "we
-            // have a Redis at this URL" is one fact about a deployment. Give the
-            // queue a different database index in its own URL: flushing this cache
-            // empties the whole index, and every job waiting in it goes too.
-            CacheDriver::Redis => {
-                RedisStore::new(env.string("REDIS_URL", "redis://127.0.0.1:6379/")).into()
+        // The same variable and the same fallback the queue reads, because "we
+        // have a Redis at this URL" is one fact about a deployment. Give the
+        // queue a different database index in its own URL: flushing this cache
+        // empties the whole index, and every job waiting in it goes too.
+        CacheDriver::Redis => {
+            RedisStore::new(env.string("REDIS_URL", "redis://127.0.0.1:6379/")).reconnect().into()
+        }
+
+        // Comma-separated, because a cluster is a seed list and one variable
+        // holding all of them is how a deployment writes that down. Empties
+        // dropped, so a stray trailing comma is not a seed whose host is the
+        // empty string.
+        CacheDriver::RedisCluster => RedisClusterStore::new(
+            env.string("REDIS_URL", "redis://127.0.0.1:6379/")
+                .split(',')
+                .map(str::trim)
+                .filter(|seed| !seed.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .reconnect()
+        .into(),
+
+        CacheDriver::Memcached => {
+            MemcachedStore::new(env.string("MEMCACHED_URL", "127.0.0.1:11211")).into()
+        }
+
+        // No fallback: a table name cannot be guessed into anything but
+        // somebody else's table, or one that is not there.
+        CacheDriver::DynamoDb => {
+            let mut store = DynamoDbStore::new(env.require("DYNAMODB_CACHE_TABLE")?);
+            if let Some(region) = env.get("AWS_REGION").filter(|r| !r.trim().is_empty()) {
+                store = store.region(region);
             }
+            store.into()
+        }
 
-            // Comma-separated, because a cluster is a seed list and one variable
-            // holding all of them is how a deployment writes that down. Empties
-            // dropped, so a stray trailing comma is not a seed whose host is the
-            // empty string.
-            CacheDriver::RedisCluster => RedisClusterStore::new(
-                env.string("REDIS_URL", "redis://127.0.0.1:6379/")
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|seed| !seed.is_empty())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>(),
-            )
-            .into(),
-
-            CacheDriver::Memcached => {
-                MemcachedStore::new(env.string("MEMCACHED_URL", "127.0.0.1:11211")).into()
-            }
-
-            // No fallback: a table name cannot be guessed into anything but
-            // somebody else's table, or one that is not there.
-            CacheDriver::DynamoDb => {
-                let mut store = DynamoDbStore::new(env.require("DYNAMODB_CACHE_TABLE")?);
-                if let Some(region) = env.get("AWS_REGION").filter(|r| !r.trim().is_empty()) {
-                    store = store.region(region);
-                }
-                store.into()
-            }
-
-            // Its transport is a binding inside a Worker and an API client outside
-            // one, and neither is a value a variable can hold. This is the one
-            // store an application has to build and hand over.
-            CacheDriver::Kv => return Err(Error::internal(
+        // Its transport is a binding inside a Worker and an API client outside
+        // one, and neither is a value a variable can hold. This is the one
+        // store an application has to build and hand over.
+        CacheDriver::Kv => {
+            return Err(Error::internal(
                 "`CACHE_DRIVER=kv` cannot be built from the environment: Workers KV is reached \
                  through a binding inside a Worker and an API client outside one, and neither \
                  is a value a variable can hold. Build the store and pass it to \
                  `Rainier::with_cache`",
-            )),
-        };
+            ))
+        }
+    };
 
     let name = driver.as_str();
     let store = match env.get("CACHE_PREFIX").filter(|prefix| !prefix.trim().is_empty()) {
@@ -2193,6 +2207,35 @@ mod database_and_queue_tests {
             let stores = stores_from_env(&env(&pairs)).expect(driver);
             assert_eq!(stores.default_name(), driver);
             assert_eq!(stores.get(driver).unwrap().driver().as_str(), driver);
+        }
+    }
+
+    #[test]
+    fn a_redis_store_declared_by_env_reconnects() {
+        // The incident this pins: a multiplexed connection does not re-open
+        // itself, so when the Redis pods restarted underneath two running
+        // applications every cache command hung to its request timeout, and
+        // both stayed broken until somebody restarted them by hand.
+        //
+        // Timeouts are still not invented here -- those decide when an
+        // application fails, and that is its own call. Reconnection decides
+        // whether it recovers, and the answer without it is never.
+        for (driver, pairs) in [
+            ("redis", vec![("REDIS_URL", "redis://127.0.0.1:6379/2")]),
+            ("redis-cluster", vec![("REDIS_URL", "redis://10.0.0.1:6379")]),
+        ] {
+            let mut pairs = pairs;
+            pairs.push(("CACHE_DRIVER", driver));
+
+            let stores = stores_from_env(&env(&pairs)).expect(driver);
+
+            let reconnects = match stores.get(driver).unwrap() {
+                StoreConfig::Redis(store) => store.reconnects(),
+                StoreConfig::RedisCluster(store) => store.reconnects(),
+                _ => panic!("{driver} declared as a redis store"),
+            };
+
+            assert!(reconnects, "`{driver}` from the env shorthand must reconnect");
         }
     }
 

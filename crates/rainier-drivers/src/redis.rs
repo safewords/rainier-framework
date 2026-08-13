@@ -1294,6 +1294,19 @@ impl RedisClient {
         let reply: String = self.connection.clone().query(&redis::cmd("PING")).await?;
         Ok(reply.eq_ignore_ascii_case("pong"))
     }
+
+    /// `CLUSTER INFO`, as the server prints it.
+    ///
+    /// Raw text rather than a parsed struct: the fields a caller wants differ
+    /// (a health check reads `cluster_state` and `cluster_slots_assigned`, an
+    /// operator tool reads the epochs), and parsing all of them here would be
+    /// inventing a shape nobody asked for.
+    ///
+    /// Routed to whichever node answers, which is the right scope: every node
+    /// in a cluster reports the same view of state and slot coverage.
+    pub async fn cluster_info(&self) -> Result<String> {
+        self.connection.clone().query(&redis::cmd("CLUSTER").arg("INFO").clone()).await
+    }
 }
 
 impl std::fmt::Debug for RedisClient {
