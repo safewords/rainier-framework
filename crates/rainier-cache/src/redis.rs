@@ -162,7 +162,7 @@ impl RedisCache {
     /// A caller that needs one wraps this, the same as any other await. The
     /// health registry already bounds its checks, and inventing a second
     /// deadline here would race it.
-    pub async fn health(&self) -> Result<()> {
+    pub async fn health_check(&self) -> Result<()> {
         if !self.is_cluster() {
             self.client.ping().await?;
             return Ok(());
@@ -222,6 +222,11 @@ impl RedisCache {
 }
 
 impl Cache for RedisCache {
+    /// The cluster-aware probe — see [`RedisCache::health_check`].
+    fn health<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
+        Box::pin(self.health_check())
+    }
+
     fn name(&self) -> &str {
         &self.label
     }

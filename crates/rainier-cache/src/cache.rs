@@ -23,6 +23,17 @@ pub trait Cache: Send + Sync + 'static {
     /// The value at `key`, or `None` if it is absent or expired.
     fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>>>;
 
+    /// Whether this store is actually reachable — for a readiness check.
+    ///
+    /// Defaults to one read, which is the whole story for a store with one
+    /// endpoint. A **sharded** store must override it: reading one key there
+    /// exercises one shard and proves nothing about the rest, and a store that
+    /// answers `ok` while most of it is unreachable is worse than no check at
+    /// all. See [`RedisCache::health`](crate::RedisCache::health).
+    fn health<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.get("__readiness__").await.map(|_| ()) })
+    }
+
     /// Store `value`, expiring after `ttl`. `None` means no expiry.
     fn put<'a>(
         &'a self,
