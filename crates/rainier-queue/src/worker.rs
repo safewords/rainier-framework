@@ -314,7 +314,14 @@ impl Worker {
         ));
 
         let started = std::time::Instant::now();
-        let outcome = match self.options.timeout {
+        // The job's own limit wins.
+        //
+        // The worker's is a backstop for jobs that never said how long they
+        // need; one that did know is the better authority, and overriding it
+        // from the command line would make the declaration a decoy.
+        let timeout = self.registry.timeout_for(&job.name).or(self.options.timeout);
+
+        let outcome = match timeout {
             Some(timeout) => {
                 match tokio::time::timeout(timeout, self.registry.run(&job, Arc::clone(&context)))
                     .await
@@ -506,6 +513,22 @@ mod tests {
         }
     }
 
+    /// Takes longer than the worker's limit and says so.
+    #[derive(Serialize, Deserialize)]
+    struct Patient;
+
+    #[async_trait::async_trait]
+    impl Job for Patient {
+        const NAME: &'static str = "test.patient";
+        const TRIES: u32 = 1;
+        const TIMEOUT: Option<Duration> = Some(Duration::from_secs(5));
+
+        async fn handle(&self, _: &JobContext) -> Result<()> {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(())
+        }
+    }
+
     fn registry() -> Arc<JobRegistry> {
         Arc::new(JobRegistry::new().with::<Flaky>().with::<Slow>())
     }
@@ -664,6 +687,35 @@ mod tests {
         worker.run_next().await.unwrap();
         assert_eq!(queue.size("high").await.unwrap(), 0, "the high queue drains first");
         assert_eq!(queue.size("low").await.unwrap(), 1);
+    }
+
+    /// A job that states its own limit is not held to the worker's.
+    ///
+    /// The worker's is the fallback for jobs that never said how long they
+    /// need. Letting a command-line flag overrule a declaration would make
+    /// the declaration a decoy — which is how a transcode ladder whose honest
+    /// duration is minutes got killed at the web default of sixty seconds.
+    #[tokio::test]
+    async fn a_jobs_own_timeout_wins_over_the_workers() {
+        let _serial = reset(1);
+        let queue = Arc::new(MemoryQueue::new());
+        queue.push(QueuedJob::from_job(&Patient).unwrap()).await.unwrap();
+
+        let worker = Worker::new(
+            Arc::clone(&queue) as Arc<dyn Queue>,
+            Arc::new(JobRegistry::new().with::<Patient>()),
+            Arc::new(Container::new()),
+        )
+        // Far below what `Patient` takes. `Patient` declares its own, so this
+        // must not be what applies.
+        .with_options(
+            WorkerOptions::default().stop_when_empty().timeout(Some(Duration::from_millis(1))),
+        );
+
+        let stats = worker.run().await.unwrap();
+
+        assert_eq!(stats.failed, 0, "the job's own timeout should have applied");
+        assert_eq!(stats.processed, 1);
     }
 
     #[tokio::test]

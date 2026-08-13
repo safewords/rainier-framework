@@ -348,6 +348,12 @@ impl Command for QueueWorkCommand {
         // A job that runs forever holds its worker forever, so a timeout is on
         // by default; `--timeout=0` is how a caller says "no limit" rather
         // than having to mean it by omission.
+        //
+        // This sets the *fallback*, not an override. A job that declares
+        // `Job::TIMEOUT` is answering for itself and wins over this — how long
+        // the work legitimately takes belongs to the work, and a flag that
+        // could overrule it would make the declaration a decoy that a
+        // deployment silently disagrees with.
         if let Some(seconds) = args.option("timeout").and_then(|value| value.parse::<u64>().ok()) {
             options = options.timeout(match seconds {
                 0 => None,

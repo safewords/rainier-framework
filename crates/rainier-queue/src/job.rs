@@ -151,6 +151,21 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
         Self::QUEUE.to_string()
     }
 
+    /// How long this job may run before it is abandoned.
+    ///
+    /// `None` defers to the worker's own limit, which is where every job's
+    /// timeout used to come from. That default is chosen for the shortest
+    /// work in the application, so a job whose honest duration is minutes had
+    /// no way to say so and was killed partway through — the transcoder's
+    /// ladder published its smallest rendition and lost the rest, reported
+    /// only as "the job exceeded its 60s timeout" on the worker.
+    ///
+    /// State it on the job rather than on the deployment. How long the work
+    /// legitimately takes is a property of the work, and a flag on the worker
+    /// command has to be kept in step with every job that worker might drain
+    /// — including ones added later, by someone who will not think to look.
+    const TIMEOUT: Option<Duration> = None;
+
     /// How long to wait before retrying after `attempt` failures.
     ///
     /// Exponential by default — 1s, 2s, 4s, … — because the usual reason a job
@@ -383,6 +398,12 @@ type Runner =
 #[derive(Default, Clone)]
 pub struct JobRegistry {
     runners: HashMap<String, Runner>,
+    /// Each job's own timeout, for the ones that declare one.
+    ///
+    /// Held here because the worker deserialises a job by name and never has
+    /// the type: without this the trait's constant would be unreachable from
+    /// the only place that could act on it.
+    timeouts: HashMap<String, Duration>,
     /// The queues the registered jobs declare, in registration order.
     ///
     /// Kept because a worker draining a queue no registered job uses is doing
@@ -427,6 +448,10 @@ impl JobRegistry {
 
         self.runners.insert(J::NAME.to_string(), runner);
 
+        if let Some(timeout) = J::TIMEOUT {
+            self.timeouts.insert(J::NAME.to_string(), timeout);
+        }
+
         // `J::QUEUE` is a compile-time constant, so this cannot disagree with
         // where the job is actually dispatched. Two jobs sharing a queue
         // record it once.
@@ -441,6 +466,13 @@ impl JobRegistry {
     pub fn with<J: Job>(mut self) -> Self {
         self.register::<J>();
         self
+    }
+
+    /// What `name` declared as its own timeout, if anything.
+    ///
+    /// `None` means the job did not state one and the worker's limit applies.
+    pub fn timeout_for(&self, name: &str) -> Option<Duration> {
+        self.timeouts.get(name).copied()
     }
 
     /// Whether `name` is registered.
