@@ -168,38 +168,7 @@ impl RedisCache {
             return Ok(());
         }
 
-        let info = self.client.cluster_info().await?;
-
-        let field = |name: &str| {
-            info.lines()
-                .find_map(|line| line.trim().strip_prefix(name)?.strip_prefix(':'))
-                .map(str::trim)
-                .map(str::to_string)
-        };
-
-        match field("cluster_state").as_deref() {
-            Some("ok") => {}
-            other => {
-                return Err(rainier_support::Error::internal(format!(
-                    "the cluster reports state `{}`; it is not serving",
-                    other.unwrap_or("unknown")
-                )));
-            }
-        }
-
-        // 16384, always — the constant is the protocol's, not a setting. One
-        // short means a slot belongs to nobody, which is a repair
-        // (`CLUSTER SETSLOT <slot> NODE <id>`) and not something to wait out.
-        let assigned = field("cluster_slots_assigned")
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(0);
-
-        if assigned != 16384 {
-            return Err(rainier_support::Error::internal(format!(
-                "the cluster has {assigned} of 16384 slots assigned; the missing ones answer \
-                 nothing and the client cannot build a slot map"
-            )));
-        }
+        serving(&self.client.cluster_info().await?)?;
 
         // Spread across shards. `{n}` is a hash tag: Redis hashes only what is
         // inside the braces, so these land in sixteen known-distinct slots
@@ -219,6 +188,49 @@ impl RedisCache {
     pub async fn add_atomic(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> Result<bool> {
         self.client.set_nx(key, value, ttl).await
     }
+}
+
+/// Every slot a Redis cluster has. The protocol's constant, not a setting.
+const CLUSTER_SLOTS: u32 = 16384;
+
+/// Whether `CLUSTER INFO` describes a cluster that can serve every key.
+///
+/// Split out from [`RedisCache::health_check`] so it can be tested without a
+/// cluster, which matters here: this is the half that decides whether a fault
+/// is reported at all, and it is otherwise only exercised during an outage.
+fn serving(info: &str) -> Result<()> {
+    let field = |name: &str| {
+        info.lines()
+            .find_map(|line| line.trim().strip_prefix(name)?.strip_prefix(':'))
+            .map(str::trim)
+    };
+
+    match field("cluster_state") {
+        Some("ok") => {}
+        other => {
+            return Err(rainier_support::Error::internal(format!(
+                "the cluster reports state `{}`; it is not serving",
+                other.unwrap_or("unknown")
+            )));
+        }
+    }
+
+    // One short means a slot belongs to nobody. That is a repair --
+    // `CLUSTER SETSLOT <slot> NODE <id>` -- rather than something to wait out,
+    // and its blast radius is the whole store: a client that cannot build a
+    // complete slot map fails every command, not the keys that would have
+    // lived in the missing slot.
+    let assigned =
+        field("cluster_slots_assigned").and_then(|value| value.parse::<u32>().ok()).unwrap_or(0);
+
+    if assigned != CLUSTER_SLOTS {
+        return Err(rainier_support::Error::internal(format!(
+            "the cluster has {assigned} of {CLUSTER_SLOTS} slots assigned; the missing ones \
+             answer nothing and the client cannot build a slot map"
+        )));
+    }
+
+    Ok(())
 }
 
 impl Cache for RedisCache {
@@ -289,6 +301,54 @@ impl std::fmt::Debug for RedisCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CLUSTER INFO` as a healthy three-master cluster prints it, trimmed to
+    /// the fields this reads.
+    fn cluster_info(state: &str, assigned: u32) -> String {
+        format!(
+            "cluster_state:{state}
+             cluster_slots_assigned:{assigned}
+             cluster_slots_ok:{assigned}
+             cluster_known_nodes:6
+"
+        )
+    }
+
+    #[test]
+    fn a_complete_cluster_is_serving() {
+        assert!(serving(&cluster_info("ok", 16384)).is_ok());
+    }
+
+    #[test]
+    fn one_orphaned_slot_is_not_serving() {
+        // The real number from the incident: an interrupted resharding left
+        // slot 6254 owned by nobody, and `cluster_state` still said `ok`. The
+        // client could not build a slot map from that, so every command
+        // failed -- not just the keys that hash to 6254.
+        let error = serving(&cluster_info("ok", 16383)).expect_err("16383 is not a whole cluster");
+
+        assert!(
+            error.to_string().contains("16383 of 16384"),
+            "the error should say how many are missing: {error}"
+        );
+    }
+
+    #[test]
+    fn a_cluster_that_says_it_is_down_is_not_serving() {
+        assert!(serving(&cluster_info("fail", 16384)).is_err());
+    }
+
+    #[test]
+    fn a_reply_that_says_nothing_is_not_taken_as_healthy() {
+        // Fails closed. A parse that quietly yields zero slots must not read
+        // as "no problem found" -- that is how a broken probe passes.
+        assert!(serving("").is_err());
+        assert!(serving(
+            "cluster_state:ok
+"
+        )
+        .is_err());
+    }
 
     /// Needs a live server. Run with
     /// `cargo test -p rainier-cache --features redis-driver -- --ignored`
