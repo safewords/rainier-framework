@@ -378,6 +378,33 @@ impl Command for QueueWorkCommand {
             worker = worker.with_events(events);
         }
 
+        // Stop taking work when asked to stop.
+        //
+        // Nothing called `Worker::stop`, so a `SIGTERM` did nothing at all: the
+        // worker kept reserving jobs and the process never exited. Under an
+        // orchestrator that means the full termination grace period every time
+        // — fifteen minutes of a pod sitting in `Terminating`, still claiming
+        // work it will be killed in the middle of — and a rollout that has to
+        // be forced through by hand.
+        //
+        // The flag is checked between jobs, never during one, so the job in
+        // flight is finished and acknowledged before the loop breaks. That is
+        // the behaviour a grace period is for: a worker that abandoned work
+        // halfway to exit promptly would trade a slow rollout for redelivered
+        // jobs.
+        let worker = Arc::new(worker);
+        let signalled = Arc::clone(&worker);
+
+        tokio::spawn(async move {
+            if let Some(signal) = stop_signal().await {
+                tracing::info!(
+                    signal,
+                    "shutting down: finishing the job in flight and taking no more"
+                );
+                signalled.stop();
+            }
+        });
+
         println!("Processing jobs from: {}", queues.join(", "));
         let stats = worker.run().await?;
 
@@ -387,6 +414,43 @@ impl Command for QueueWorkCommand {
         );
         Ok(if stats.failed > 0 { exit::FAILURE } else { exit::SUCCESS })
     }
+}
+
+/// Wait for a shutdown signal, and say which one arrived.
+///
+/// `SIGTERM` is the one that matters — it is what an orchestrator sends and
+/// what a `docker stop` sends — but `SIGINT` is what a person pressing Ctrl-C
+/// sends, and a worker that drains on one and not the other is confusing in
+/// exactly the situation where confusion is expensive.
+///
+/// `None` if no handler could be installed. That is not fatal: the worker
+/// carries on and shuts down the way it did before, which is the behaviour
+/// this replaces rather than a new failure.
+#[cfg(unix)]
+async fn stop_signal() -> Option<&'static str> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut term = signal(SignalKind::terminate())
+        .inspect_err(|e| tracing::warn!(error = %e, "no SIGTERM handler; shutdown will not drain"))
+        .ok()?;
+    let mut interrupt = signal(SignalKind::interrupt())
+        .inspect_err(|e| tracing::warn!(error = %e, "no SIGINT handler"))
+        .ok()?;
+
+    tokio::select! {
+        _ = term.recv() => Some("SIGTERM"),
+        _ = interrupt.recv() => Some("SIGINT"),
+    }
+}
+
+/// Ctrl-C, which is all a non-Unix host offers here.
+#[cfg(not(unix))]
+async fn stop_signal() -> Option<&'static str> {
+    tokio::signal::ctrl_c()
+        .await
+        .inspect_err(|e| tracing::warn!(error = %e, "no Ctrl-C handler; shutdown will not drain"))
+        .ok()
+        .map(|()| "Ctrl-C")
 }
 
 /// `key:generate` — mint an application key.

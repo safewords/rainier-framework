@@ -510,6 +510,31 @@ mod tests {
         Arc::new(JobRegistry::new().with::<Flaky>().with::<Slow>())
     }
 
+    #[tokio::test]
+    async fn a_stopped_worker_stops_reserving() {
+        // What a shutdown signal does. Nothing called `stop` before this, so a
+        // SIGTERM did nothing: the worker kept reserving and the process sat
+        // out its whole termination grace period before being killed, holding
+        // work it would be interrupted in the middle of.
+        let queue = Arc::new(MemoryQueue::new());
+        for _ in 0..3 {
+            queue.push(QueuedJob::from_job(&Slow).unwrap()).await.unwrap();
+        }
+
+        let worker = Worker::new(
+            Arc::clone(&queue) as Arc<dyn Queue>,
+            registry(),
+            Arc::new(Container::new()),
+        );
+
+        worker.stop();
+
+        let stats = worker.run().await.expect("the loop returns rather than hanging");
+
+        assert_eq!(stats.total(), 0, "a stopped worker takes nothing new");
+        assert_eq!(queue.size("default").await.unwrap(), 3, "the work is left for somebody");
+    }
+
     fn worker(queue: Arc<MemoryQueue>) -> Worker {
         Worker::new(queue, registry(), Arc::new(Container::new()))
             .with_options(WorkerOptions::default().stop_when_empty())
