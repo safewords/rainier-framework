@@ -371,6 +371,7 @@ impl PusherServer {
         tracing::debug!(
             channel = %name,
             rooms_now = self.rooms.count(&name),
+            socket = ?socket.id(),
             server = format!("{:p}", self),
             rooms_registry = format!("{:p}", Arc::as_ptr(&self.rooms)),
             "joined a room",
@@ -500,7 +501,21 @@ impl WebSocketHandler for PusherServer {
     }
 
     async fn on_close(&self, socket: &Socket) {
+        // Which connection is leaving, and what it takes with it.
+        //
+        // `leave_all` is the only thing that removes an *empty* room, so a
+        // server reporting no rooms at all has closed something — and if the
+        // client on the other end is still pinging happily, the id being
+        // closed is not the id anyone expected. Logging both sides of that is
+        // the difference between "the socket went away" and "the wrong socket
+        // was evicted".
+        tracing::debug!(
+            socket = ?socket.id(),
+            rooms_before = ?self.rooms.rooms(),
+            "pusher connection closing; leaving every room",
+        );
         self.rooms.leave_all(socket.id());
+        tracing::debug!(rooms_after = ?self.rooms.rooms(), "left");
         // Or the map grows for the life of the process, one entry per
         // connection ever made.
         self.issued
