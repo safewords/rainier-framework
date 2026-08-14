@@ -321,18 +321,25 @@ impl Worker {
         // from the command line would make the declaration a decoy.
         let timeout = self.registry.timeout_for(&job.name).or(self.options.timeout);
 
+        // Guarded, so a panic fails this job rather than the worker — see
+        // [`CatchPanic`].
+        let run = CatchPanic(self.registry.run(&job, Arc::clone(&context)));
+
         let outcome = match timeout {
-            Some(timeout) => {
-                match tokio::time::timeout(timeout, self.registry.run(&job, Arc::clone(&context)))
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        Err(Error::internal(format!("the job exceeded its {timeout:?} timeout")))
-                    }
+            Some(timeout) => match tokio::time::timeout(timeout, run).await {
+                Ok(result) => result,
+                Err(_) => {
+                    Ok(Err(Error::internal(format!("the job exceeded its {timeout:?} timeout"))))
                 }
+            },
+            None => run.await,
+        };
+
+        let outcome = match outcome {
+            Ok(result) => result,
+            Err(panic) => {
+                Err(Error::internal(format!("the job panicked: {}", panic_message(panic.as_ref()))))
             }
-            None => self.registry.run(&job, Arc::clone(&context)).await,
         };
 
         match outcome {
@@ -425,6 +432,66 @@ fn backoff_for(attempts: u32) -> Duration {
     Duration::from_secs(1u64 << attempts.clamp(1, 6))
 }
 
+/// A future that turns a panic in the inner future into an `Err` instead of
+/// unwinding into the caller.
+///
+/// # Why the queue needs this
+///
+/// A panic in one job kills the worker process, and with it every other job on
+/// every queue that worker drains. That is the wrong blast radius: the other
+/// jobs did nothing wrong, and the panicking one is usually a configuration
+/// fault that a retry or a failed-job record would surface just as loudly and
+/// far more cheaply.
+///
+/// It is not hypothetical. Facades panic by design when their service is not
+/// bound — the reasoning being that a facade whose service was never
+/// registered can never work, so it should say so rather than propagate an
+/// error into every caller. That reasoning holds in a request handler and
+/// inverts in a queue worker, where the "saying so" is the process dying. A
+/// deployment configured `MAIL_DRIVER=smtp` without the matching cargo
+/// feature, and the first job to send mail put the worker into
+/// CrashLoopBackOff, taking the whole default queue with it.
+///
+/// So a panicking job becomes a failing job: it retries on the normal
+/// schedule, lands in the failed-job table when its attempts run out, and the
+/// worker carries on. The panic itself is still printed by the default hook,
+/// so nothing is hidden.
+struct CatchPanic<F>(F);
+
+impl<F: std::future::Future> std::future::Future for CatchPanic<F> {
+    type Output = std::result::Result<F::Output, Box<dyn std::any::Any + Send>>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // SAFETY: a pin projection to the single field. The inner future is
+        // never moved out, and `CatchPanic` is only ever polled through this.
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
+
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    }
+}
+
+/// What a panic payload says, for the failed-job record.
+///
+/// `panic!` with a literal gives a `&str` and with a format gives a `String`;
+/// anything else is a payload type this cannot read, and saying so beats
+/// inventing a message.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "a panic with a payload this worker cannot render".to_string()
+    }
+}
+
 impl std::fmt::Debug for Worker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Worker")
@@ -513,6 +580,20 @@ mod tests {
         }
     }
 
+    /// Panics, the way a facade does when its service is not bound.
+    #[derive(Serialize, Deserialize)]
+    struct Exploding;
+
+    #[async_trait::async_trait]
+    impl Job for Exploding {
+        const NAME: &'static str = "test.exploding";
+        const TRIES: u32 = 1;
+
+        async fn handle(&self, _: &JobContext) -> Result<()> {
+            panic!("the `Mail` facade could not resolve `Mailer`");
+        }
+    }
+
     /// Takes longer than the worker's limit and says so.
     #[derive(Serialize, Deserialize)]
     struct Patient;
@@ -530,7 +611,7 @@ mod tests {
     }
 
     fn registry() -> Arc<JobRegistry> {
-        Arc::new(JobRegistry::new().with::<Flaky>().with::<Slow>())
+        Arc::new(JobRegistry::new().with::<Flaky>().with::<Slow>().with::<Exploding>())
     }
 
     #[tokio::test]
@@ -735,6 +816,38 @@ mod tests {
         // `Slow` gets one attempt, so a timeout is terminal.
         assert_eq!(worker.run_next().await.unwrap(), Outcome::Failed);
         assert!(queue.failed_jobs()[0].error.contains("timeout"));
+    }
+
+    /// A panicking job used to take the process with it, and every other job
+    /// on every queue that worker served. Facades panic when their service is
+    /// not bound, so one misconfigured driver was enough.
+    #[tokio::test]
+    async fn a_panicking_job_fails_rather_than_killing_the_worker() {
+        let queue = Arc::new(MemoryQueue::new());
+        queue.push(QueuedJob::from_job(&Exploding).unwrap()).await.unwrap();
+
+        let worker = Worker::new(
+            Arc::clone(&queue) as Arc<dyn Queue>,
+            registry(),
+            Arc::new(Container::new()),
+        )
+        .with_options(WorkerOptions::default().stop_when_empty());
+
+        // The worker is still here to answer, which is the point.
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Failed);
+
+        let failed = queue.failed_jobs();
+        assert_eq!(failed.len(), 1);
+        assert!(
+            failed[0].error.contains("panicked"),
+            "the record says what happened: {}",
+            failed[0].error
+        );
+        assert!(
+            failed[0].error.contains("could not resolve"),
+            "and carries the panic's own message: {}",
+            failed[0].error
+        );
     }
 
     #[tokio::test]
