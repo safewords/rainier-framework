@@ -182,6 +182,23 @@ impl PusherServer {
         // about the shape of somebody else's messages would fill the log with
         // a problem that is not one.
         if self.rooms.count(name) == 0 {
+            // Say which rooms *do* exist.
+            //
+            // "Nobody is listening" and "somebody is listening under a name
+            // this lookup did not produce" are the same silence, and telling
+            // them apart from outside is close to impossible: the browser is
+            // told its subscription succeeded either way. Naming the rooms the
+            // server actually holds turns that into a one-line diagnosis.
+            //
+            // `debug`, not `warn`: on a healthy deployment most published
+            // channels legitimately have no local subscriber, and warning per
+            // message would drown the log in the normal case.
+            tracing::debug!(
+                channel,
+                looked_up = name,
+                held = ?self.rooms.rooms(),
+                "published to a channel with no local subscriber",
+            );
             return 0;
         }
 
