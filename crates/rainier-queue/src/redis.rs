@@ -321,6 +321,28 @@ impl Queue for RedisQueue {
         })
     }
 
+    fn renew<'a>(&'a self, job: &'a QueuedJob) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // `XAUTOCLAIM` in `reserve` hands any entry idle longer than
+            // `self.reservation` to whoever asks next, without checking whether
+            // its holder is still working. For anything slower than the
+            // reservation window that means the same job runs on several
+            // workers at once -- observed in production with one upload leased
+            // three times over, each host encoding it from the start.
+            //
+            // Renewing says "still here", so the timer only ever expires on a
+            // worker that has actually stopped.
+            self.client
+                .xclaim_touch(
+                    &self.keys.stream(&job.queue),
+                    GROUP,
+                    &self.consumer,
+                    Self::entry_id(job)?,
+                )
+                .await
+        })
+    }
+
     fn acknowledge<'a>(&'a self, job: &'a QueuedJob) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.client

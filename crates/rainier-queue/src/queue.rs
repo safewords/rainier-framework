@@ -58,6 +58,21 @@ pub trait Queue: Send + Sync + 'static {
     /// Return a job to the queue for another attempt, available after `delay`.
     fn release<'a>(&'a self, job: &'a QueuedJob, delay: Duration) -> BoxFuture<'a, Result<()>>;
 
+    /// Say that `job` is still being worked, so its reservation does not lapse.
+    ///
+    /// A reservation answers "is the holder still alive", and without a way to
+    /// renew it the only lever is its length: long enough for the slowest job
+    /// imaginable, and therefore far too long to reclaim work whose worker
+    /// really did die. Drivers that reclaim on an idle timer should reset it
+    /// here.
+    ///
+    /// Defaults to doing nothing, which is right for drivers that hand a job
+    /// to exactly one consumer until it is acknowledged.
+    fn renew<'a>(&'a self, job: &'a QueuedJob) -> BoxFuture<'a, Result<()>> {
+        let _ = job;
+        Box::pin(async { Ok(()) })
+    }
+
     /// Move a job to the failed store after its last attempt.
     fn fail<'a>(&'a self, job: &'a QueuedJob, error: &'a str) -> BoxFuture<'a, Result<()>>;
 

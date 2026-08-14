@@ -151,6 +151,41 @@ impl RedisClient {
         self.connection().run(redis::cmd("XDEL").arg(stream).arg(id)).await
     }
 
+    /// `XCLAIM ... IDLE 0 JUSTID` — say the holder is still working.
+    ///
+    /// Resets the entry's idle time without moving it or re-delivering it, so
+    /// a consumer that is genuinely mid-job keeps its reservation.
+    ///
+    /// This is what stops `XAUTOCLAIM` taking live work. A reservation is a
+    /// claim about liveness, not a guess at how long the work takes: without a
+    /// way to say "still here", the only lever is a timeout long enough for the
+    /// slowest imaginable job, which is either far too long to reclaim genuinely
+    /// dead work or far too short to survive a real one.
+    pub async fn xclaim_touch(
+        &self,
+        stream: &str,
+        group: &str,
+        consumer: &str,
+        id: &str,
+    ) -> Result<()> {
+        self.connection()
+            .run(
+                redis::cmd("XCLAIM")
+                    .arg(stream)
+                    .arg(group)
+                    .arg(consumer)
+                    // Minimum idle time of 0: claim it regardless of how long
+                    // it has been pending, since it is already ours.
+                    .arg(0)
+                    .arg(id)
+                    .arg("IDLE")
+                    .arg(0)
+                    // No payload back; this is a keep-alive, not a delivery.
+                    .arg("JUSTID"),
+            )
+            .await
+    }
+
     /// `XLEN`.
     pub async fn xlen(&self, stream: &str) -> Result<u64> {
         self.connection().query(redis::cmd("XLEN").arg(stream)).await
