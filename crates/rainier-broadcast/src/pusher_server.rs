@@ -197,6 +197,13 @@ impl PusherServer {
                 channel,
                 looked_up = name,
                 held = ?self.rooms.rooms(),
+                // Which server object this is. A subscribe that joined and a
+                // publish that found nothing are only reconcilable if they ran
+                // against different instances, and comparing this against the
+                // `joined a room` line below is how that gets settled instead
+                // of argued.
+                server = format!("{:p}", self),
+                rooms_registry = format!("{:p}", Arc::as_ptr(&self.rooms)),
                 "published to a channel with no local subscriber",
             );
             return 0;
@@ -349,6 +356,18 @@ impl PusherServer {
         }
 
         self.rooms.join(name.clone(), socket.clone());
+
+        // The other half of the identity check in `deliver_published`. If a
+        // subscribe reports a room here and a publish reports none there, these
+        // two addresses say whether it is the same server disagreeing with
+        // itself or two servers that were never the same object.
+        tracing::debug!(
+            channel = %name,
+            rooms_now = self.rooms.count(&name),
+            server = format!("{:p}", self),
+            rooms_registry = format!("{:p}", Arc::as_ptr(&self.rooms)),
+            "joined a room",
+        );
 
         socket.send(Message::text(Self::frame(
             "pusher_internal:subscription_succeeded",
