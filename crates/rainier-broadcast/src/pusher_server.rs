@@ -69,6 +69,13 @@ use crate::pusher::PusherAuth;
 /// is the ceiling on how long a dead connection goes unnoticed by the client.
 const ACTIVITY_TIMEOUT_SECONDS: u64 = 120;
 
+/// How often the server pings an otherwise quiet connection.
+///
+/// Comfortably inside the window where idle connections were observed to stop
+/// receiving, and far inside the `ACTIVITY_TIMEOUT_SECONDS` the client is told
+/// to expect, so a browser never has to be the one to break the silence.
+const KEEPALIVE_SECONDS: u64 = 15;
+
 /// A Pusher-protocol server holding its own sockets.
 ///
 /// Mount it on the path `pusher-js` connects to — `/app/{key}` — and give it
@@ -426,14 +433,54 @@ impl WebSocketHandler for PusherServer {
             .expect("the socket registry is not poisoned")
             .insert(socket_id.clone(), socket.id());
 
-        socket.send(Message::text(Self::frame(
+        let established = socket.send(Message::text(Self::frame(
             "pusher:connection_established",
             None,
             &json!({
                 "socket_id": socket_id,
                 "activity_timeout": ACTIVITY_TIMEOUT_SECONDS,
             }),
-        )))
+        )));
+
+        // Keep the connection warm from this side.
+        //
+        // A connection that receives nothing stops receiving *anything* after
+        // about thirty seconds: it stays open as far as the client is
+        // concerned — no close frame, no error — but the publish that should
+        // reach it reports no local subscriber. Measured against production:
+        // a client whose first event arrived at +3s went on receiving out to
+        // +60s, while an otherwise identical client that simply waited got
+        // nothing at +30s. Any outbound traffic was the difference.
+        //
+        // Which is why this is a fix and not a workaround: the protocol says
+        // the server pings an idle connection — that is what the
+        // `activity_timeout` handed to the client above is *about* — and this
+        // server advertised the timeout while never sending the ping. Real
+        // pusher-js waits for the server to speak first and answers with
+        // `pusher:pong`, so nothing on either side was keeping a quiet channel
+        // alive.
+        //
+        // The interval is well inside the window where connections were seen
+        // to go quiet, and far inside the 120s the client is told to expect.
+        // The task ends the moment a send fails, which is the connection
+        // having gone for real.
+        let keepalive = socket.clone();
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(KEEPALIVE_SECONDS));
+            ticker.tick().await; // fires immediately; the first real tick is one interval in
+            loop {
+                ticker.tick().await;
+                if keepalive
+                    .send(Message::text(Self::frame("pusher:ping", None, &json!({}))))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        established
     }
 
     async fn on_message(&self, socket: &Socket, message: Message) -> Result<()> {

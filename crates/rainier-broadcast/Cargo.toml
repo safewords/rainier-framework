@@ -21,6 +21,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
+# Only for the Pusher server's keepalive timer — see `KEEPALIVE_SECONDS`.
+tokio = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -29,7 +31,7 @@ redis = ["dep:rainier-drivers", "rainier-drivers/redis-driver"]
 # Hold the browsers' sockets in this process and speak the Pusher protocol to
 # them, instead of running soketi/Reverb alongside. Implies `redis`, because the
 # fan-in between replicas is the same Redis the publish side writes to.
-pusher-server = ["redis", "dep:rainier-websocket"]
+pusher-server = ["redis", "dep:rainier-websocket", "dep:tokio"]
 # Publish to a Kafka topic, and relay it back to whoever holds the sockets.
 kafka = ["dep:rainier-drivers", "rainier-drivers/kafka", "dep:futures-util"]
 
