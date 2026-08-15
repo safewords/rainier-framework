@@ -31,8 +31,8 @@ use rainier_orm::sea_query::{
     Query as SqQuery, SelectStatement, SimpleExpr, SubQueryStatement, Value,
 };
 use rainier_orm::{
-    key_condition, key_route, row_key_condition, Dialect, Entity, Result, ShardRoute, SingleKey,
-    TrashScope, Upsert,
+    key_condition, key_route, row_key_condition, ColumnType, Dialect, Entity, Result, ShardRoute,
+    SingleKey, TrashScope, Upsert,
 };
 
 use crate::criteria::{
@@ -227,7 +227,25 @@ pub fn select_by_column<E: Entity>(
 /// `date_part('month', x)`. Application code that picks one works on one
 /// deployment and 500s on the others — including the SQLite its own tests run.
 fn projection_expr<E: Entity>(dialect: Dialect, projection: &Projection) -> SimpleExpr {
-    projection_expr_in(dialect, projection, &column_ref::<E>)
+    projection_expr_in(dialect, projection, &column_ref::<E>, &integral_column::<E>)
+}
+
+/// Whether one of the entity's own columns holds a whole number.
+///
+/// Only consulted to decide whether a `SUM` needs a cast — see the MySQL note
+/// in [`projection_expr_in`]. A column this entity does not declare, or a
+/// qualified one belonging to a joined table, answers `false`: not casting is
+/// the conservative choice, since a wrong cast truncates.
+fn integral_column<E: Entity>(name: &str) -> bool {
+    if name.contains('.') {
+        return false;
+    }
+    E::columns().iter().find(|c| c.name == name).is_some_and(|c| {
+        matches!(
+            c.ty,
+            ColumnType::Int | ColumnType::BigInt | ColumnType::Uint | ColumnType::BigUint
+        )
+    })
 }
 
 /// [`projection_expr`] with the scope its columns resolve against left open.
@@ -239,6 +257,7 @@ fn projection_expr_in(
     dialect: Dialect,
     projection: &Projection,
     resolve: &dyn Fn(&str) -> ColumnRef,
+    integral: &dyn Fn(&str) -> bool,
 ) -> SimpleExpr {
     let col = |name: &str| Expr::col(resolve(name));
 
@@ -246,6 +265,23 @@ fn projection_expr_in(
         Projection::Column(c) => col(c).into(),
         Projection::CountAll => Func::count(Expr::col(Asterisk)).into(),
         Projection::Count(c) => Func::count(col(c)).into(),
+        // `SUM` of an integer column, read back as an integer.
+        //
+        // MySQL types a `SUM` as `DECIMAL` whatever it summed, and the driver
+        // will not hand a `DECIMAL` to an `i64` — "Rust type `Option<i64>` (as
+        // SQL type `BIGINT`) is not compatible with SQL type `DECIMAL`". That
+        // is a 500 on the whole query, not a wrong number, and it fires the
+        // moment there is a single row to sum. Every application hitting it
+        // wrote `CAST(... AS SIGNED)` into raw SQL and stopped using the
+        // aggregate API, which is the wrong place for the fix to live.
+        //
+        // Only over a column declared as a whole number: casting a sum of
+        // decimals to an integer would truncate it, and a silently wrong total
+        // is worse than the error this avoids. Postgres and SQLite already
+        // return an integer for an integer sum and need nothing.
+        Projection::Sum(c) if dialect == Dialect::MySql && integral(c) => {
+            Func::cast_as(Func::sum(col(c)), Alias::new("SIGNED")).into()
+        }
         Projection::Sum(c) => Func::sum(col(c)).into(),
         Projection::Min(c) => Func::min(col(c)).into(),
         Projection::Max(c) => Func::max(col(c)).into(),
@@ -348,7 +384,10 @@ fn subquery_select<E: Entity>(
         // Nothing about it is caller-supplied, so nothing about it is injectable.
         stmt.expr(SimpleExpr::Constant(Value::Int(Some(1))));
     } else {
-        stmt.expr(projection_expr_in(dialect, subquery.projection(), &subquery_column));
+        // A subquery's projection is compared inside SQL rather than decoded,
+        // so nothing needs the integer cast above — and the entity whose
+        // columns would say whether to is the outer one, not this table's.
+        stmt.expr(projection_expr_in(dialect, subquery.projection(), &subquery_column, &|_| false));
     }
 
     let mut condition = Cond::all();
@@ -1880,5 +1919,41 @@ mod tests {
             r#"UPDATE "parents" SET "children_count" = ? WHERE "parents"."id" = ?"#
         );
         assert_eq!(prepared.params, vec![Value::from(9_i64), Value::from(3_u64)]);
+    }
+
+    #[test]
+    fn a_sum_over_an_integer_column_is_cast_on_mysql() {
+        // Without this the aggregate API is unusable on MySQL for the thing it
+        // is most often asked to do: MySQL types a SUM as DECIMAL whatever it
+        // summed, and the driver refuses to decode that into an i64. Every
+        // application that hit it dropped to raw SQL with a CAST, which is how
+        // a page ends up with eight hand-written queries.
+        let criteria = Criteria::new().select(Projection::Sum("id".into()), "total");
+        let sql = select_aggregate::<Post>(Dialect::MySql, &criteria).sql;
+
+        assert!(sql.contains("CAST"), "no cast on mysql: {sql}");
+        assert!(sql.to_uppercase().contains("SIGNED"), "cast is not to an integer: {sql}");
+    }
+
+    #[test]
+    fn other_dialects_sum_without_a_cast() {
+        // Postgres and SQLite already give an integer back for an integer sum,
+        // and a cast there is noise in every query plan and every log.
+        for dialect in [Dialect::Postgres, Dialect::Sqlite] {
+            let criteria = Criteria::new().select(Projection::Sum("id".into()), "total");
+            let sql = select_aggregate::<Post>(dialect, &criteria).sql;
+
+            assert!(!sql.contains("CAST"), "{dialect:?} cast a sum it did not need to: {sql}");
+        }
+    }
+
+    #[test]
+    fn a_sum_over_a_non_integer_column_is_never_cast() {
+        // Truncating a sum of decimals to a whole number is a silently wrong
+        // total, which is worse than the decode error the cast exists to avoid.
+        let criteria = Criteria::new().select(Projection::Sum("title".into()), "total");
+        let sql = select_aggregate::<Post>(Dialect::MySql, &criteria).sql;
+
+        assert!(!sql.contains("CAST"), "cast a sum over a non-integer column: {sql}");
     }
 }
