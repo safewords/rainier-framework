@@ -118,6 +118,8 @@ pub mod cors;
 pub mod facades;
 pub mod groups;
 pub mod health;
+#[cfg(feature = "jwt")]
+pub mod jwks;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod keys;
