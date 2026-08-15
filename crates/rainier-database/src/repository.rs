@@ -372,7 +372,12 @@ impl<E: Entity> EntityRepository<E> {
             .projections()
             .iter()
             .map(|(projection, name)| {
-                ColumnRequest::new(name.clone(), column_type_of::<E>(projection))
+                // What the caller asked for, if they said — they know about
+                // the joined columns this entity cannot type.
+                let ty = criteria
+                    .projection_type(name)
+                    .unwrap_or_else(|| column_type_of::<E>(projection));
+                ColumnRequest::new(name.clone(), ty)
             })
             .collect();
 

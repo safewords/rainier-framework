@@ -31,6 +31,7 @@
 //! tombstone or restore expressible at all — see [`rainier_orm::trash`].
 
 use rainier_orm::sea_query::{ColumnRef, Expr, Func, SimpleExpr, Value};
+use rainier_orm::ColumnType;
 use rainier_orm::TrashScope;
 
 /// One recorded predicate.
@@ -953,6 +954,7 @@ pub struct Criteria {
     /// callers and `joins()` keep working unchanged.
     typed_joins: Vec<(String, String, String, JoinKind)>,
     derived_joins: Vec<(Derived, String, String, JoinKind)>,
+    projection_types: Vec<(String, ColumnType)>,
     /// `(projection, alias)` — an empty list means "every column of the model".
     projections: Vec<(Projection, String)>,
     /// What to group by.
@@ -1197,6 +1199,42 @@ impl Criteria {
     ) -> Self {
         self.typed_joins.push((table.into(), local.into(), foreign.into(), JoinKind::Left));
         self
+    }
+
+    /// Select a projection under an alias, saying what type to read it back as.
+    ///
+    /// # When the entity cannot answer
+    ///
+    /// A projection's type is normally inferred from the column it reads. That
+    /// works right up to the first projection that reads a *joined* table's
+    /// column, or arithmetic over two of them — the entity does not declare
+    /// those, so there is nothing to infer from, and the fallback is a guess.
+    ///
+    /// A guess here is not a wrong number, it is a decode error at runtime on
+    /// a query that is otherwise correct. Saying it is better than inferring
+    /// it.
+    ///
+    /// # It is a request, not an annotation
+    ///
+    /// The type asked for is the type produced: on MySQL an aggregate is
+    /// `DECIMAL` whatever it aggregated, so asking for an integer emits the
+    /// `CAST` that makes it one. Otherwise this would document the mismatch
+    /// rather than fix it.
+    pub fn select_as(
+        mut self,
+        projection: Projection,
+        alias: impl Into<String>,
+        ty: ColumnType,
+    ) -> Self {
+        let alias = alias.into();
+        self.projection_types.push((alias.clone(), ty));
+        self.projections.push((projection, alias));
+        self
+    }
+
+    /// The type a caller asked for an alias to be read back as, if any.
+    pub fn projection_type(&self, alias: &str) -> Option<ColumnType> {
+        self.projection_types.iter().find(|(name, _)| name == alias).map(|(_, ty)| *ty)
     }
 
     /// Select a projection under an alias.

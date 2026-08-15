@@ -408,6 +408,26 @@ fn subquery_column(spec: &str) -> ColumnRef {
     }
 }
 
+/// Make `expr` produce `ty` on dialects that would not.
+///
+/// Only MySQL needs it, and only for numbers: every aggregate there is
+/// `DECIMAL` regardless of what it aggregated, and the driver will not decode a
+/// `DECIMAL` into an `i64` or an `f64`. Postgres and SQLite already return what
+/// was asked for.
+fn coerce_for(dialect: Dialect, expr: SimpleExpr, ty: ColumnType) -> SimpleExpr {
+    if dialect != Dialect::MySql {
+        return expr;
+    }
+    match ty {
+        ColumnType::Int | ColumnType::BigInt => Func::cast_as(expr, Alias::new("SIGNED")).into(),
+        ColumnType::Uint | ColumnType::BigUint => {
+            Func::cast_as(expr, Alias::new("UNSIGNED")).into()
+        }
+        ColumnType::Double => Func::cast_as(expr, Alias::new("DOUBLE")).into(),
+        _ => expr,
+    }
+}
+
 fn join_type(kind: JoinKind) -> JoinType {
     match kind {
         JoinKind::Inner => JoinType::InnerJoin,
@@ -589,7 +609,15 @@ pub fn select_aggregate<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Pre
     stmt.from(alias(E::table()));
 
     for (projection, name) in criteria.projections() {
-        stmt.expr_as(projection_expr::<E>(dialect, projection), alias(name));
+        let expr = projection_expr::<E>(dialect, projection);
+        // A requested type is a request: MySQL hands back `DECIMAL` for any
+        // aggregate, so asking for an integer has to *make* it one or the
+        // decode fails on a query that is otherwise right.
+        let expr = match criteria.projection_type(name) {
+            Some(ty) => coerce_for(dialect, expr, ty),
+            None => expr,
+        };
+        stmt.expr_as(expr, alias(name));
     }
 
     let route = apply_criteria::<E>(dialect, &mut stmt, criteria, true);
@@ -675,15 +703,18 @@ fn apply_criteria<E: Entity>(
         stmt.distinct();
     }
 
+    // The near side of a join reads like every other column spec in this
+    // module: `"name"` on the model's table, `"table.name"` on one already
+    // joined. Hardcoding the model's table meant a second join could only ever
+    // hang off the root, so a chain — renditions to uploads to view counts —
+    // was not sayable and became raw SQL.
     for (table, local, foreign) in criteria.joins() {
-        let on =
-            Expr::col((alias(E::table()), alias(local))).equals((alias(table), alias(foreign)));
+        let on = Expr::col(column_ref::<E>(local)).equals((alias(table), alias(foreign)));
         stmt.join(JoinType::InnerJoin, alias(table), on);
     }
 
     for (derived, local, foreign, kind) in criteria.derived_joins() {
-        let on = Expr::col((alias(E::table()), alias(local)))
-            .equals((alias(derived.alias()), alias(foreign)));
+        let on = Expr::col(column_ref::<E>(local)).equals((alias(derived.alias()), alias(foreign)));
         stmt.join_subquery(
             join_type(kind),
             derived_select(dialect, derived),
@@ -693,8 +724,7 @@ fn apply_criteria<E: Entity>(
     }
 
     for (table, local, foreign, kind) in criteria.typed_joins() {
-        let on =
-            Expr::col((alias(E::table()), alias(local))).equals((alias(table), alias(foreign)));
+        let on = Expr::col(column_ref::<E>(local)).equals((alias(table), alias(foreign)));
         stmt.join(join_type(kind), alias(table), on);
     }
 
@@ -2248,5 +2278,51 @@ mod tests {
         let closing = sql.find(r#") AS "per_post""#).expect("no derived table close");
         let filter = sql.find(r#"WHERE "comments"."approved""#).expect("the filter vanished");
         assert!(filter < closing, "the filter was hoisted out of the subquery: {sql}");
+    }
+
+    #[test]
+    fn a_requested_type_is_produced_not_merely_recorded() {
+        // The point of `select_as`: MySQL hands back DECIMAL for any aggregate,
+        // so asking for an integer has to emit the cast that makes it one.
+        // Recording the request and leaving the SQL alone would document the
+        // decode failure rather than prevent it.
+        let criteria = Criteria::new().select_as(
+            Projection::Aggregate(
+                AggregateFn::Sum,
+                Operand::column("joined.a").times(Operand::column("joined.b")),
+            ),
+            "total",
+            ColumnType::BigInt,
+        );
+
+        assert!(
+            select_aggregate::<Post>(Dialect::MySql, &criteria).sql.contains("SIGNED"),
+            "an integer was asked for and not cast to one",
+        );
+        assert!(
+            !select_aggregate::<Post>(Dialect::Sqlite, &criteria).sql.contains("CAST"),
+            "sqlite was made to cast something it already returns",
+        );
+    }
+
+    #[test]
+    fn a_join_can_hang_off_an_already_joined_table() {
+        // A chain — renditions to uploads to view counts — is three tables, and
+        // the second join's near side is the first join's table. Pinning every
+        // near side to the model's own table made that unsayable, which is
+        // exactly the query that stayed as a string.
+        let sql = select_aggregate::<Post>(
+            Dialect::Sqlite,
+            &Criteria::new()
+                .join("comments", "id", "post_id")
+                .join("authors", "comments.author_id", "id")
+                .select(Projection::CountAll, "n"),
+        )
+        .sql;
+
+        assert!(
+            sql.contains(r#""comments"."author_id" = "authors"."id""#),
+            "the second join did not start from the first join's table: {sql}",
+        );
     }
 }
