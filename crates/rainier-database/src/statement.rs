@@ -2325,4 +2325,53 @@ mod tests {
             "the second join did not start from the first join's table: {sql}",
         );
     }
+
+    #[test]
+    fn the_video_egress_shape_renders_as_one_statement() {
+        // The exact query the storage page builds, kept here because it is the
+        // shape that motivated `Derived` and the one a future change to any of
+        // this would silently break: two derived tables, an aggregate over a
+        // product of their columns, one statement.
+        let mean_rung = Derived::from("media_asset_renditions", "rungs")
+            .select(Projection::Column("media_asset_id".into()), "media_asset_id")
+            .select(Projection::Avg("filesize".into()), "mean")
+            .where_not_null("width")
+            .group_by(Projection::Column("media_asset_id".into()));
+        let views = Derived::from("post_view_count_statistics", "views")
+            .select(Projection::Column("post_id".into()), "post_id")
+            .select(Projection::Max("view_count".into()), "views")
+            .group_by(Projection::Column("post_id".into()));
+
+        let sql = select_aggregate::<Post>(
+            Dialect::MySql,
+            &Criteria::new()
+                .select_as(
+                    Projection::Aggregate(
+                        AggregateFn::Sum,
+                        Operand::column("rungs.mean").times(Operand::column("views.views")),
+                    ),
+                    "total",
+                    ColumnType::BigInt,
+                )
+                .join_derived(mean_rung, "id", "media_asset_id")
+                .join_derived(views, "id", "post_id")
+                .where_eq("published", true),
+        )
+        .sql;
+
+        // One statement, two subqueries, and the product of their columns.
+        assert_eq!(
+            sql.matches("SELECT").count(),
+            3,
+            "not one statement with two derived tables: {sql}"
+        );
+        assert!(sql.contains("AVG("), "the inner mean went missing: {sql}");
+        assert!(sql.contains("MAX("), "the inner latest-snapshot went missing: {sql}");
+        assert!(sql.contains("SUM("), "the outer total went missing: {sql}");
+        assert!(sql.contains("CAST"), "the caller asked for an integer and did not get one: {sql}");
+        assert!(
+            sql.contains("`rungs`.`mean` * `views`.`views`"),
+            "the product is not what was asked: {sql}"
+        );
+    }
 }
