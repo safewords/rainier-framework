@@ -170,6 +170,124 @@ pub enum Projection {
     /// rows in a group that match, which is the shape every "how many of these
     /// were resolved" report needs.
     CountWhenIn(String, Vec<Value>),
+    /// An aggregate over an [`Operand`] rather than a bare column, so a total
+    /// can be `SUM(size * views)` and not only `SUM(size)`.
+    ///
+    /// The single-column variants above stay: they are what most callers want
+    /// and they read better than `Aggregate(AggregateFn::Sum,
+    /// Operand::column("x"))` for the same thing.
+    Aggregate(AggregateFn, Operand),
+}
+
+/// An arithmetic operator between two [`Operand`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operator {
+    /// `a + b`.
+    Add,
+    /// `a - b`.
+    Subtract,
+    /// `a * b`.
+    Multiply,
+    /// `a / b`. Division by zero is the dialect's business, not this type's:
+    /// MySQL and Postgres answer `NULL`, SQLite answers `NULL`, and none of
+    /// them error — so guard the divisor if a zero would mean something.
+    Divide,
+}
+
+/// What an aggregate reads: a column, a bound value, or arithmetic over them.
+///
+/// # Why this exists
+///
+/// `SUM(column)` covers most reporting and then abruptly does not. "Bytes
+/// served" is `SUM(size * views)`, "revenue" is `SUM(price * quantity)`, and
+/// neither is expressible as an aggregate over one column. Every application
+/// that needed one dropped out of the query builder and wrote the whole
+/// statement as a string — losing the dialect handling, the shard routing and
+/// the soft-delete scope along with it, none of which the string knows about.
+///
+/// # What it does not try to be
+///
+/// A general SQL expression language. There are no function calls, no `CASE`,
+/// no casts: those are how a query builder turns into a second-rate dialect of
+/// SQL that only its author can read. This is arithmetic over columns and
+/// literals, because that is the shape that kept forcing the escape hatch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Operand {
+    /// A column — `"name"` on the query's own table, `"table.name"` on a joined
+    /// one, exactly as everywhere else in this module.
+    Column(String),
+    /// A bound literal. Bound, not interpolated, so it is never injectable.
+    Literal(Value),
+    /// `left <op> right`.
+    Arithmetic(Box<Operand>, Operator, Box<Operand>),
+}
+
+impl Operand {
+    /// A column operand.
+    pub fn column(name: impl Into<String>) -> Self {
+        Self::Column(name.into())
+    }
+
+    /// A literal operand, bound as a parameter.
+    pub fn literal(value: impl Into<Value>) -> Self {
+        Self::Literal(value.into())
+    }
+
+    /// `self * other`.
+    pub fn times(self, other: Operand) -> Self {
+        Self::Arithmetic(Box::new(self), Operator::Multiply, Box::new(other))
+    }
+
+    /// `self + other`.
+    pub fn plus(self, other: Operand) -> Self {
+        Self::Arithmetic(Box::new(self), Operator::Add, Box::new(other))
+    }
+
+    /// `self - other`.
+    pub fn minus(self, other: Operand) -> Self {
+        Self::Arithmetic(Box::new(self), Operator::Subtract, Box::new(other))
+    }
+
+    /// `self / other`. See [`Operator::Divide`] on what a zero divisor does.
+    pub fn divided_by(self, other: Operand) -> Self {
+        Self::Arithmetic(Box::new(self), Operator::Divide, Box::new(other))
+    }
+
+    /// Every column this operand reads, in the order they appear.
+    ///
+    /// Used to decide typing and qualification, both of which have to consider
+    /// the whole expression rather than one side of it.
+    pub fn columns(&self) -> Vec<&str> {
+        let mut found = Vec::new();
+        self.collect_columns(&mut found);
+        found
+    }
+
+    fn collect_columns<'a>(&'a self, into: &mut Vec<&'a str>) {
+        match self {
+            Self::Column(name) => into.push(name.as_str()),
+            Self::Literal(_) => {}
+            Self::Arithmetic(left, _, right) => {
+                left.collect_columns(into);
+                right.collect_columns(into);
+            }
+        }
+    }
+}
+
+/// Which aggregate [`Projection::Aggregate`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFn {
+    /// `COUNT(expr)` — nulls excluded, as SQL defines it.
+    Count,
+    /// `SUM(expr)`.
+    Sum,
+    /// `MIN(expr)`.
+    Min,
+    /// `MAX(expr)`.
+    Max,
+    /// `AVG(expr)`, which is fractional even over integers.
+    Avg,
 }
 
 impl Projection {
@@ -186,6 +304,13 @@ impl Projection {
             | Projection::Avg(c)
             | Projection::DateOf(c)
             | Projection::CountWhenIn(c, _) => Some(c),
+            // An aggregate over a bare column still has one.
+            Projection::Aggregate(_, Operand::Column(c)) => Some(c),
+            // An aggregate over an expression reads several columns or none,
+            // and "the column" has no answer then — returning either side of
+            // `a * b` would qualify half of it and leave the rest ambiguous.
+            // Callers wanting the set ask [`Operand::columns`].
+            Projection::Aggregate(..) => None,
         }
     }
 }
@@ -696,6 +821,124 @@ pub enum JoinKind {
     Left,
 }
 
+/// A subquery joined as though it were a table.
+///
+/// # Why a query builder needs these
+///
+/// SQL will not nest aggregates: `SUM(AVG(size) * views)` is not a query, it is
+/// a parse error. The answer is always the same shape — aggregate once in a
+/// derived table, join it, aggregate again outside — and without it the caller
+/// has two choices, both bad: write the statement as a string, or run the inner
+/// aggregate as its own query and multiply the rows together in application
+/// code. The second reads as "just one more query" and is a table scan moved
+/// somewhere it cannot be indexed.
+///
+/// It is also how a *latest* row per group gets joined: `MAX(snapshot)` grouped
+/// by owner, joined back. Joining the raw table instead multiplies every outer
+/// row by however many snapshots it has, which is the kind of wrong that grows
+/// quietly with the age of the data.
+///
+/// # Shape
+///
+/// A derived table selects from one table, filters, groups, and is joined on
+/// one column pair. It deliberately cannot join, nest another derived table, or
+/// order — each of those turns this into a second query language, and the
+/// escape hatch remains for anything that genuinely needs one.
+// No `PartialEq`: `Constraint` holds bound `Value`s and does not implement it,
+// and a derived table is built to be run rather than compared.
+#[derive(Debug, Clone)]
+pub struct Derived {
+    table: String,
+    alias: String,
+    projections: Vec<(Projection, String)>,
+    groups: Vec<Projection>,
+    constraints: Vec<Constraint>,
+}
+
+impl Derived {
+    /// `(SELECT … FROM table …) AS alias`.
+    ///
+    /// The alias is how the outer query names these columns —
+    /// `"alias.column"`, like any other joined table — so it has to be given
+    /// rather than generated.
+    pub fn from(table: impl Into<String>, alias: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            alias: alias.into(),
+            projections: Vec::new(),
+            groups: Vec::new(),
+            constraints: Vec::new(),
+        }
+    }
+
+    /// Select a projection under a name the outer query can read.
+    pub fn select(mut self, projection: Projection, alias: impl Into<String>) -> Self {
+        self.projections.push((projection, alias.into()));
+        self
+    }
+
+    /// `GROUP BY projection`.
+    pub fn group_by(mut self, projection: Projection) -> Self {
+        self.groups.push(projection);
+        self
+    }
+
+    /// `column = value`.
+    pub fn where_eq(mut self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.constraints.push(Constraint::Eq(column.into(), value.into()));
+        self
+    }
+
+    /// `column <> value`.
+    pub fn where_ne(mut self, column: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.constraints.push(Constraint::Ne(column.into(), value.into()));
+        self
+    }
+
+    /// `column IS NULL`.
+    pub fn where_null(mut self, column: impl Into<String>) -> Self {
+        self.constraints.push(Constraint::Null(column.into()));
+        self
+    }
+
+    /// `column IS NOT NULL`.
+    pub fn where_not_null(mut self, column: impl Into<String>) -> Self {
+        self.constraints.push(Constraint::NotNull(column.into()));
+        self
+    }
+
+    /// `column LIKE pattern`.
+    pub fn where_like(mut self, column: impl Into<String>, pattern: impl Into<String>) -> Self {
+        self.constraints.push(Constraint::Like(column.into(), pattern.into()));
+        self
+    }
+
+    /// The table this selects from.
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// The name the outer query refers to it by.
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// What it selects.
+    pub fn projections(&self) -> &[(Projection, String)] {
+        &self.projections
+    }
+
+    /// What it groups by.
+    pub fn groups(&self) -> &[Projection] {
+        &self.groups
+    }
+
+    /// Its own filters.
+    pub fn constraints(&self) -> &[Constraint] {
+        &self.constraints
+    }
+}
+
 /// A recorded, replayable set of query constraints.
 ///
 /// Predicates are AND-combined. A column is `"name"` (qualified to the model's
@@ -709,6 +952,7 @@ pub struct Criteria {
     /// outer join. Kept beside `joins` rather than replacing it so existing
     /// callers and `joins()` keep working unchanged.
     typed_joins: Vec<(String, String, String, JoinKind)>,
+    derived_joins: Vec<(Derived, String, String, JoinKind)>,
     /// `(projection, alias)` — an empty list means "every column of the model".
     projections: Vec<(Projection, String)>,
     /// What to group by.
@@ -915,6 +1159,35 @@ impl Criteria {
         self
     }
 
+    /// `INNER JOIN (subquery) AS alias ON model.local = alias.foreign`.
+    ///
+    /// See [`Derived`] for what this is for — chiefly aggregating twice, which
+    /// SQL will not let a single statement do, and joining the latest row per
+    /// group without multiplying by every row in it.
+    pub fn join_derived(
+        mut self,
+        derived: Derived,
+        local: impl Into<String>,
+        foreign: impl Into<String>,
+    ) -> Self {
+        self.derived_joins.push((derived, local.into(), foreign.into(), JoinKind::Inner));
+        self
+    }
+
+    /// `LEFT JOIN (subquery) AS alias ON model.local = alias.foreign`.
+    ///
+    /// Keeps the outer row when the derived table has nothing for it — which
+    /// for an aggregate means the joined columns come back `NULL`, not zero.
+    pub fn left_join_derived(
+        mut self,
+        derived: Derived,
+        local: impl Into<String>,
+        foreign: impl Into<String>,
+    ) -> Self {
+        self.derived_joins.push((derived, local.into(), foreign.into(), JoinKind::Left));
+        self
+    }
+
     /// `LEFT JOIN table ON model.local = table.foreign`.
     pub fn left_join(
         mut self,
@@ -1071,6 +1344,11 @@ impl Criteria {
     /// Ordering expressed against selected aliases.
     pub fn alias_orders(&self) -> &[(String, bool)] {
         &self.alias_orders
+    }
+
+    /// The derived tables joined in, with the column pair each is joined on.
+    pub fn derived_joins(&self) -> impl Iterator<Item = (&Derived, &str, &str, JoinKind)> {
+        self.derived_joins.iter().map(|(d, l, f, k)| (d, l.as_str(), f.as_str(), *k))
     }
 
     /// Joins that carry a kind, including outer ones.

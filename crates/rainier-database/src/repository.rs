@@ -28,7 +28,7 @@ use rainier_orm::{Entity, Upsert};
 use rainier_support::{Error, Result};
 
 use crate::connection::Database;
-use crate::criteria::{Criteria, Projection};
+use crate::criteria::{AggregateFn, Criteria, Projection};
 use crate::model::{Created, Creating, Deleted, Deleting, Model, Updated, Updating};
 use crate::pagination::Paginated;
 use crate::relation::{PivotQuery, RelationKey};
@@ -677,6 +677,22 @@ fn column_type_of<E: rainier_orm::Entity>(projection: &Projection) -> rainier_or
         // which every driver can produce and the caller can parse, rather than
         // to a numeric type that would misread a string.
         Projection::Sum(c) => declared::<E>(c).unwrap_or(ColumnType::BigInt),
+
+        // An aggregate over an expression. `COUNT` is always a count; `AVG` is
+        // always fractional; the rest carry through only when the expression
+        // reads exactly one column this entity declares. Arithmetic over two
+        // columns — the case this variant exists for — has no single declared
+        // type, and `BigInt` is the right guess for a `SUM`: the products this
+        // is used for are sizes times counts.
+        Projection::Aggregate(AggregateFn::Count, _) => ColumnType::BigInt,
+        Projection::Aggregate(AggregateFn::Avg, _) => ColumnType::Double,
+        Projection::Aggregate(func, expr) => match expr.columns().as_slice() {
+            [only] => declared::<E>(only).unwrap_or(match func {
+                AggregateFn::Sum => ColumnType::BigInt,
+                _ => ColumnType::Text,
+            }),
+            _ => ColumnType::BigInt,
+        },
         Projection::Column(c) | Projection::Min(c) | Projection::Max(c) => {
             declared::<E>(c).unwrap_or(ColumnType::Text)
         }

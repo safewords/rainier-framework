@@ -36,7 +36,8 @@ use rainier_orm::{
 };
 
 use crate::criteria::{
-    Assignment, Comparison, Criteria, DatePart, JoinKind, Projection, Subquery, SubqueryPredicate,
+    AggregateFn, Assignment, Comparison, Criteria, DatePart, Derived, JoinKind, Operand, Operator,
+    Projection, Subquery, SubqueryPredicate,
 };
 
 /// A rendered statement: SQL, its ordered bind values, and where to run it.
@@ -248,6 +249,30 @@ fn integral_column<E: Entity>(name: &str) -> bool {
     })
 }
 
+/// Render an [`Operand`] — a column, a bound literal, or arithmetic over them.
+///
+/// Recursive, and parenthesised by construction: sea-query builds a tree rather
+/// than a string, so `a * (b + c)` cannot lose its grouping the way a
+/// hand-concatenated expression can.
+fn operand_expr(operand: &Operand, resolve: &dyn Fn(&str) -> ColumnRef) -> SimpleExpr {
+    match operand {
+        Operand::Column(name) => Expr::col(resolve(name)).into(),
+        // `Expr::val`, so it is bound as a parameter rather than written into
+        // the SQL. A literal in a projection is still caller-supplied.
+        Operand::Literal(value) => Expr::val(value.clone()).into(),
+        Operand::Arithmetic(left, op, right) => {
+            let left = operand_expr(left, resolve);
+            let right = operand_expr(right, resolve);
+            match op {
+                Operator::Add => left.add(right),
+                Operator::Subtract => left.sub(right),
+                Operator::Multiply => left.mul(right),
+                Operator::Divide => left.div(right),
+            }
+        }
+    }
+}
+
 /// [`projection_expr`] with the scope its columns resolve against left open.
 ///
 /// A subquery's projection reads *its* table, not the outer one, so the two
@@ -286,6 +311,27 @@ fn projection_expr_in(
         Projection::Min(c) => Func::min(col(c)).into(),
         Projection::Max(c) => Func::max(col(c)).into(),
         Projection::Avg(c) => Func::avg(col(c)).into(),
+
+        // An aggregate over an expression. The MySQL cast above applies here
+        // too, and on the same condition: every column the expression reads
+        // has to be a whole number, or the sum being cast is not one.
+        Projection::Aggregate(AggregateFn::Sum, expr)
+            if dialect == Dialect::MySql
+                && !expr.columns().is_empty()
+                && expr.columns().iter().all(|c| integral(c)) =>
+        {
+            Func::cast_as(Func::sum(operand_expr(expr, resolve)), Alias::new("SIGNED")).into()
+        }
+        Projection::Aggregate(func, expr) => {
+            let inner = operand_expr(expr, resolve);
+            match func {
+                AggregateFn::Count => Func::count(inner).into(),
+                AggregateFn::Sum => Func::sum(inner).into(),
+                AggregateFn::Min => Func::min(inner).into(),
+                AggregateFn::Max => Func::max(inner).into(),
+                AggregateFn::Avg => Func::avg(inner).into(),
+            }
+        }
 
         // `SUM(CASE WHEN col IN (…) THEN 1 ELSE 0 END)`, which counts the
         // matching rows of each group in the same pass as the total.
@@ -360,6 +406,53 @@ fn subquery_column(spec: &str) -> ColumnRef {
         Some((table, column)) => (alias(table), alias(column)).into_column_ref(),
         None => (alias(SUBQUERY_ALIAS), alias(spec)).into_column_ref(),
     }
+}
+
+fn join_type(kind: JoinKind) -> JoinType {
+    match kind {
+        JoinKind::Inner => JoinType::InnerJoin,
+        JoinKind::Left => JoinType::LeftJoin,
+    }
+}
+
+/// The inner `SELECT` of a [`Derived`] table.
+///
+/// Its columns resolve against its own table, never the outer entity's — a
+/// derived table is not correlated, which is the whole reason it can be
+/// aggregated and then joined.
+///
+/// No integer cast on its projections: the value crosses back into the outer
+/// query as a column, so it is the *outer* projection that gets decoded and
+/// therefore the outer projection that needs the cast. Casting here as well
+/// would be a second cast on the same number and would truncate a `AVG` that
+/// the outer query legitimately wants fractional.
+fn derived_select(dialect: Dialect, derived: &Derived) -> SelectStatement {
+    let table = derived.table().to_string();
+    let resolve = move |name: &str| -> ColumnRef {
+        match name.split_once('.') {
+            Some((t, c)) => (alias(t), alias(c)).into_column_ref(),
+            None => (alias(table.as_str()), alias(name)).into_column_ref(),
+        }
+    };
+
+    let mut stmt = SqQuery::select();
+    stmt.from(alias(derived.table()));
+
+    for (projection, name) in derived.projections() {
+        stmt.expr_as(projection_expr_in(dialect, projection, &resolve, &|_| false), alias(name));
+    }
+
+    let mut condition = Cond::all();
+    for constraint in derived.constraints() {
+        condition = condition.add(constraint.to_expr(resolve(constraint.column())));
+    }
+    stmt.cond_where(condition);
+
+    for projection in derived.groups() {
+        stmt.add_group_by([projection_expr_in(dialect, projection, &resolve, &|_| false)]);
+    }
+
+    stmt
 }
 
 /// The inner `SELECT` of a [`Subquery`], correlated to `E`'s row.
@@ -588,14 +681,21 @@ fn apply_criteria<E: Entity>(
         stmt.join(JoinType::InnerJoin, alias(table), on);
     }
 
+    for (derived, local, foreign, kind) in criteria.derived_joins() {
+        let on = Expr::col((alias(E::table()), alias(local)))
+            .equals((alias(derived.alias()), alias(foreign)));
+        stmt.join_subquery(
+            join_type(kind),
+            derived_select(dialect, derived),
+            alias(derived.alias()),
+            on,
+        );
+    }
+
     for (table, local, foreign, kind) in criteria.typed_joins() {
         let on =
             Expr::col((alias(E::table()), alias(local))).equals((alias(table), alias(foreign)));
-        let join = match kind {
-            JoinKind::Inner => JoinType::InnerJoin,
-            JoinKind::Left => JoinType::LeftJoin,
-        };
-        stmt.join(join, alias(table), on);
+        stmt.join(join_type(kind), alias(table), on);
     }
 
     let (condition, route) = criteria_condition::<E>(dialect, criteria);
@@ -1955,5 +2055,198 @@ mod tests {
         let sql = select_aggregate::<Post>(Dialect::MySql, &criteria).sql;
 
         assert!(!sql.contains("CAST"), "cast a sum over a non-integer column: {sql}");
+    }
+
+    // ─── arithmetic inside an aggregate ──────────────────────────────────
+
+    #[test]
+    fn a_sum_can_multiply_two_columns() {
+        // The shape that kept forcing raw SQL: "bytes served" is size times
+        // views, and no aggregate over a single column says it.
+        let criteria = Criteria::new().select(
+            Projection::Aggregate(
+                AggregateFn::Sum,
+                Operand::column("id").times(Operand::column("views.n")),
+            ),
+            "total",
+        );
+        let sql = select_aggregate::<Post>(Dialect::Sqlite, &criteria).sql;
+
+        assert!(sql.contains("SUM"), "{sql}");
+        assert!(sql.contains('*'), "the product went missing: {sql}");
+        // Each side qualified to its own table — the unqualified one to the
+        // model's, the dotted one to the table it names.
+        assert!(sql.contains(r#""posts"."id""#), "{sql}");
+        assert!(sql.contains(r#""views"."n""#), "{sql}");
+    }
+
+    #[test]
+    fn a_literal_in_an_expression_is_bound_not_written() {
+        // A projection is as caller-supplied as a filter is. Interpolating a
+        // literal here would be the same injection with a different name.
+        let criteria = Criteria::new().select(
+            Projection::Aggregate(
+                AggregateFn::Sum,
+                Operand::column("id").times(Operand::literal(1024_i64)),
+            ),
+            "total",
+        );
+        let prepared = select_aggregate::<Post>(Dialect::Sqlite, &criteria);
+
+        assert!(
+            !prepared.sql.contains("1024"),
+            "the literal was written into the SQL: {}",
+            prepared.sql
+        );
+        assert_eq!(prepared.params.len(), 1, "the literal was not bound");
+    }
+
+    #[test]
+    fn an_expression_sum_is_cast_on_mysql_only_when_every_column_is_integral() {
+        // Same rule as the single-column cast, applied to the whole
+        // expression: casting `SUM(price * qty)` to an integer truncates it if
+        // price is not one.
+        let integral = Criteria::new().select(
+            Projection::Aggregate(
+                AggregateFn::Sum,
+                Operand::column("id").times(Operand::column("id")),
+            ),
+            "total",
+        );
+        assert!(
+            select_aggregate::<Post>(Dialect::MySql, &integral).sql.contains("CAST"),
+            "an all-integer product was not cast",
+        );
+
+        let mixed = Criteria::new().select(
+            Projection::Aggregate(
+                AggregateFn::Sum,
+                Operand::column("id").times(Operand::column("title")),
+            ),
+            "total",
+        );
+        assert!(
+            !select_aggregate::<Post>(Dialect::MySql, &mixed).sql.contains("CAST"),
+            "a product touching a non-integer column was cast anyway",
+        );
+    }
+
+    #[test]
+    fn every_aggregate_function_renders() {
+        for (func, name) in [
+            (AggregateFn::Count, "COUNT"),
+            (AggregateFn::Sum, "SUM"),
+            (AggregateFn::Min, "MIN"),
+            (AggregateFn::Max, "MAX"),
+            (AggregateFn::Avg, "AVG"),
+        ] {
+            let criteria =
+                Criteria::new().select(Projection::Aggregate(func, Operand::column("id")), "value");
+            let sql = select_aggregate::<Post>(Dialect::Sqlite, &criteria).sql;
+
+            assert!(sql.contains(name), "{func:?} did not render as {name}: {sql}");
+        }
+    }
+
+    // ─── derived-table joins ─────────────────────────────────────────────
+
+    #[test]
+    fn a_derived_table_joins_as_a_subquery() {
+        // SQL will not nest aggregates, so an average per group that then gets
+        // multiplied outside has to arrive as a joined table.
+        let averages = Derived::from("comments", "per_post")
+            .select(Projection::Column("post_id".into()), "post_id")
+            .select(Projection::Avg("length".into()), "avg_length")
+            .where_not_null("length")
+            .group_by(Projection::Column("post_id".into()));
+
+        let criteria = Criteria::new().join_derived(averages, "id", "post_id").select(
+            Projection::Aggregate(
+                AggregateFn::Sum,
+                Operand::column("per_post.avg_length").times(Operand::column("id")),
+            ),
+            "total",
+        );
+        let sql = select_aggregate::<Post>(Dialect::Sqlite, &criteria).sql;
+
+        assert!(sql.contains("JOIN"), "{sql}");
+        assert!(sql.contains("AVG"), "the inner aggregate went missing: {sql}");
+        assert!(sql.contains("GROUP BY"), "the inner grouping went missing: {sql}");
+        assert!(sql.contains(r#""per_post""#), "the derived table was not aliased: {sql}");
+        assert!(
+            sql.contains(r#""posts"."id" = "per_post"."post_id""#),
+            "joined on the wrong columns: {sql}",
+        );
+    }
+
+    #[test]
+    fn a_derived_tables_columns_resolve_against_its_own_table() {
+        // Not against the outer entity's. A derived table is uncorrelated —
+        // that is what lets it be aggregated before the join — so resolving
+        // its columns outward would produce a query that either fails or,
+        // worse, silently reads the wrong table.
+        let latest = Derived::from("post_view_count_statistics", "views")
+            .select(Projection::Column("post_id".into()), "post_id")
+            .select(Projection::Max("view_count".into()), "n")
+            .group_by(Projection::Column("post_id".into()));
+
+        let sql = select_aggregate::<Post>(
+            Dialect::Sqlite,
+            &Criteria::new()
+                .join_derived(latest, "id", "post_id")
+                .select(Projection::Column("views.n".into()), "n"),
+        )
+        .sql;
+
+        assert!(
+            sql.contains(r#""post_view_count_statistics"."view_count""#),
+            "the inner column did not resolve to the inner table: {sql}",
+        );
+        assert!(!sql.contains(r#""posts"."view_count""#), "resolved outward: {sql}");
+    }
+
+    #[test]
+    fn a_derived_join_can_be_left() {
+        // An outer row with nothing in the derived table has to survive, or a
+        // "total per owner" quietly drops every owner with no rows yet.
+        let sums = Derived::from("comments", "per_post")
+            .select(Projection::Column("post_id".into()), "post_id")
+            .select(Projection::Sum("length".into()), "total")
+            .group_by(Projection::Column("post_id".into()));
+
+        let sql = select_aggregate::<Post>(
+            Dialect::Sqlite,
+            &Criteria::new()
+                .left_join_derived(sums, "id", "post_id")
+                .select(Projection::Column("per_post.total".into()), "total"),
+        )
+        .sql;
+
+        assert!(sql.contains("LEFT JOIN"), "{sql}");
+    }
+
+    #[test]
+    fn a_derived_tables_filters_stay_inside_it() {
+        // Hoisting them to the outer WHERE would turn a LEFT JOIN back into an
+        // inner one, and change what an inner join counts.
+        let sums = Derived::from("comments", "per_post")
+            .select(Projection::Column("post_id".into()), "post_id")
+            .select(Projection::Sum("length".into()), "total")
+            .where_eq("approved", true)
+            .group_by(Projection::Column("post_id".into()));
+
+        let sql = select_aggregate::<Post>(
+            Dialect::Sqlite,
+            &Criteria::new()
+                .left_join_derived(sums, "id", "post_id")
+                .select(Projection::Column("per_post.total".into()), "total"),
+        )
+        .sql;
+
+        // `) AS` also ends every projection alias inside the subquery, so the
+        // close has to be matched by the alias it introduces.
+        let closing = sql.find(r#") AS "per_post""#).expect("no derived table close");
+        let filter = sql.find(r#"WHERE "comments"."approved""#).expect("the filter vanished");
+        assert!(filter < closing, "the filter was hoisted out of the subquery: {sql}");
     }
 }
