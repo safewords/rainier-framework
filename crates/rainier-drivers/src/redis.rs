@@ -72,11 +72,48 @@ enum Backend {
 ///     .reconnect(Reconnect::new().max_backoff(Duration::from_secs(2)));
 /// # let _ = settings;
 /// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RedisSettings {
     connect_timeout: Option<Duration>,
     response_timeout: Option<Duration>,
     reconnect: Option<Reconnect>,
+}
+
+impl Default for RedisSettings {
+    /// **Reconnection is on.**
+    ///
+    /// It used to be off, on the reasoning that an application declaring no
+    /// settings should get the behaviour it had before settings existed. That
+    /// reasoning preserved a landmine: the behaviour it had was a connection
+    /// that dies permanently the first time its socket drops, and every clone
+    /// of it — the cache's, the queue's, the broadcaster's — dies with it until
+    /// the process restarts.
+    ///
+    /// Production found it. A Redis pod was OOM-killed and came back in about
+    /// a hundred seconds. The broadcast *subscriber* had its own retry loop and
+    /// reconnected; the *publisher* was one of these connections and did not,
+    /// so every feed for every session was built correctly and then thrown away
+    /// at the final `PUBLISH` for twenty-two minutes, until someone restarted
+    /// the workers.
+    ///
+    /// Surviving a dropped socket is not a tuning choice an application should
+    /// have to know to make. The cost is spelled out in [`Reconnect`] — at
+    /// least one command fails per loss, always — and that is the right
+    /// default to pay: one failed command against every command until a human
+    /// intervenes.
+    ///
+    /// [`without_reconnect`](RedisSettings::without_reconnect) opts out.
+    fn default() -> Self {
+        Self {
+            connect_timeout: None,
+            response_timeout: None,
+            // Capped backoff, because this policy also governs the *first*
+            // connection. Uncapped, a Redis that is down at boot backs off
+            // exponentially through six attempts and the pod looks hung rather
+            // than failing its readiness probe with something to read.
+            reconnect: Some(Reconnect::new().max_backoff(Duration::from_secs(2))),
+        }
+    }
 }
 
 impl RedisSettings {
@@ -133,6 +170,17 @@ impl RedisSettings {
     /// loss, always. What this buys is that the *next* one does not.
     pub fn reconnect(mut self, reconnect: Reconnect) -> Self {
         self.reconnect = Some(reconnect);
+        self
+    }
+
+    /// Do not re-establish the connection when its socket is lost.
+    ///
+    /// The connection then fails every command for the life of the process
+    /// once its socket drops. Worth having for a caller that manages its own
+    /// reconnection — a subscriber loop that reopens the connection itself
+    /// gains nothing from a manager underneath it — and worth nothing else.
+    pub fn without_reconnect(mut self) -> Self {
+        self.reconnect = None;
         self
     }
 
@@ -652,15 +700,10 @@ impl RedisConnector {
     /// server's connection limit under load.
     pub async fn connect(&self) -> Result<RedisConnection> {
         match &self.backend {
-            // Three paths, and the first is the one that matters: with nothing
-            // declared this is the call it has always been, not a configured
-            // call that happens to be configured with nothing.
-            Backend::Single(client) if self.settings.is_unset() => client
-                .get_multiplexed_async_connection()
-                .await
-                .map(RedisConnection::Single)
-                .map_err(redis_error),
-
+            // No special case for "nothing declared" any more. It used to take
+            // a separate path that skipped the connection manager, so the
+            // applications least likely to have thought about reconnection were
+            // exactly the ones that did not get it.
             Backend::Single(client) => match self.settings.reconnection() {
                 Some(reconnect) => client
                     .get_connection_manager_with_config(self.settings.manager_config(reconnect))
@@ -946,9 +989,13 @@ mod tests {
     async fn a_connect_timeout_reaches_the_socket_it_configures() {
         let (url, held) = a_silent_server().await;
 
+        // Reconnection is off for this one so the assertion is about the
+        // timeout and nothing else: with the default policy the connector
+        // retries, and what this measures becomes the retry schedule rather
+        // than the socket timeout it is named for.
         let connector = RedisConnector::open_with(
             &url,
-            RedisSettings::new().connect_timeout(Duration::from_millis(100)),
+            RedisSettings::new().connect_timeout(Duration::from_millis(100)).without_reconnect(),
         )
         .unwrap();
 
@@ -1056,7 +1103,14 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let (url, connections, serving) = a_server_that_hangs_up_once().await;
-        let client = RedisClient::connect(&RedisConnector::open(&url).unwrap()).await.unwrap();
+        // Opting out explicitly, because the default is now to reconnect. This
+        // asserts what the opt-out costs, which is the reason it is a choice
+        // rather than the reason it was the default.
+        let client = RedisClient::connect(
+            &RedisConnector::open_with(&url, RedisSettings::new().without_reconnect()).unwrap(),
+        )
+        .await
+        .unwrap();
 
         assert!(client.ping().await.is_ok(), "the connection works before the socket goes");
         assert!(!client.reconnects());
@@ -1066,6 +1120,32 @@ mod tests {
             "a connection with no reconnection should stay down"
         );
         assert_eq!(connections.load(Ordering::SeqCst), 1, "and should never reconnect");
+
+        serving.abort();
+    }
+
+    /// An application that declares nothing still survives a dropped socket.
+    ///
+    /// This is the regression that broke feeds in production: the *default*
+    /// connection did not reconnect, so the applications least likely to have
+    /// thought about it were exactly the ones that lost realtime until someone
+    /// restarted them. Reconnection is not a tuning choice a caller should have
+    /// to know to make.
+    #[tokio::test]
+    async fn the_default_connection_reconnects() {
+        use std::sync::atomic::Ordering;
+
+        let (url, connections, serving) = a_server_that_hangs_up_once().await;
+        let client = RedisClient::connect(&RedisConnector::open(&url).unwrap()).await.unwrap();
+
+        assert!(client.ping().await.is_ok(), "the connection works before the socket goes");
+        assert!(client.reconnects(), "the default declined to reconnect");
+
+        assert!(
+            ping_until_it_answers(&client).await,
+            "a default connection stayed down after one dropped socket",
+        );
+        assert!(connections.load(Ordering::SeqCst) > 1, "it never re-opened the socket");
 
         serving.abort();
     }
