@@ -185,6 +185,58 @@ the release as a whole and names the crate it landed in.
   than owning it. Not breaking: `rainier-auth` re-exports the whole surface
   at its old paths, and its `bcrypt` feature forwards.
 
+### Fixed
+
+- **A broker outage no longer ends a worker run** (`rainier-queue`). `Worker::run`
+  propagated any error out of `reserve`, which ended the process. Under an
+  orchestrator that is a restart into the same outage, then another, with the
+  backoff growing each time — so a queue whose consumers are all in
+  `CrashLoopBackOff` is not being drained at all, and stays that way for minutes
+  after the broker itself is healthy. That is the failure mode rather than a
+  theoretical one: a Redis Cluster shard lost its master, and both
+  `lewd-backend-worker-interactive` replicas spent three hours restarting instead
+  of consuming the four queues they serve, one of which carries feed generation.
+
+  A reserve failure is now logged, waited out and retried. The wait doubles from
+  `WorkerOptions::sleep` and is capped by `max_error_backoff` (30s), because a
+  worker that retried a dead shard in a tight loop would answer an outage with
+  load, and every replica would do it at once. Only `max_consecutive_errors`
+  (20) back-to-back failures end the run — around eight minutes at the defaults,
+  long enough to sit through a cluster failover and short enough that a worker
+  pointed at a broker that is never coming back still exits non-zero and says
+  so. Consecutive, so a long-lived worker does not slowly spend a budget on
+  unrelated blips; one success resets it.
+
+  This is the judgement already made elsewhere in the same loop — a panicking
+  job fails the job rather than the worker, a uniqueness lock that will not
+  release is logged rather than propagated — applied to the one call that had
+  been left able to take the process down.
+
+  `WorkerStats::errors` counts the refusals. It is deliberately not part of
+  `total()`, which drives `--max-jobs`: a broker outage must not spend a
+  worker's job budget without a job ever having run. `queue:work` prints the
+  count when it is non-zero, since none of the other three numbers move while
+  the queue cannot be reached and the run would otherwise read as a quiet one.
+
+- **Redis Cluster failures say what happened** (`rainier-drivers`). Every cluster
+  error kind fell to an arm that echoed the server's raw `detail()`. For a
+  redirect that detail is the slot and the address, so a downed shard reached
+  the log as `Redis: 11221 :0` — a number, a colon and a zero — in every worker,
+  session read and scheduled task, for three hours, without once naming Redis
+  Cluster or a shard that had lost its master.
+
+  `MOVED`/`ASK` are now read as a redirect and reported as one. An address of
+  `:0` gets its own wording: it is not an ordinary redirect but a node the
+  cluster still credits with slots while having lost its address (`noaddr` in
+  `CLUSTER NODES`), which is what a failed master with no promoted replica
+  leaves behind, and it is unfollowable — there is nowhere to follow it to. The
+  two are a world apart operationally, one resolving in milliseconds and the
+  other never, so they no longer read alike. `CLUSTERDOWN`, `MASTERDOWN`,
+  `TRYAGAIN`, `CROSSSLOT` and a missing node connection are likewise said rather
+  than echoed. All of them stay 503s: the shard is unavailable, the request is
+  not wrong.
+
+
 ## [2.0.0] - 2026-07-31
 
 This release removes third-party branding from the project: the

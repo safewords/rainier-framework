@@ -418,6 +418,14 @@ impl Command for QueueWorkCommand {
             "\nProcessed {}, retried {}, failed {}.",
             stats.processed, stats.released, stats.failed
         );
+
+        // Broker failures are not job outcomes, so none of the three numbers
+        // above move when the queue cannot be reached at all. A run that spent
+        // most of its life backing off otherwise prints as a quiet one.
+        if stats.errors > 0 {
+            println!("The broker refused {} attempt(s) to reserve work.", stats.errors);
+        }
+
         Ok(if stats.failed > 0 { exit::FAILURE } else { exit::SUCCESS })
     }
 }

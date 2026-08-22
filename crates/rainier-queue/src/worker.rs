@@ -94,6 +94,20 @@ pub struct WorkerOptions {
     /// It only ever raises. A job that explicitly asked for more attempts than
     /// this keeps them — the worker is expressing a default, not a ceiling.
     pub tries: Option<u32>,
+    /// How many **consecutive** broker failures to ride out before giving up.
+    ///
+    /// Reserving a job talks to the broker, and a broker has outages: a
+    /// failover, a resharding, a shard whose master is briefly gone. None of
+    /// those are the worker's fault and all of them end. Exiting on the first
+    /// one hands the problem to the supervisor, which restarts into the same
+    /// outage, backs off, and ends up running the worker for a smaller and
+    /// smaller fraction of the time exactly when the backlog is growing.
+    ///
+    /// Consecutive, so this is not a budget that a long-lived worker slowly
+    /// spends on unrelated blips; one success resets it.
+    pub max_consecutive_errors: u32,
+    /// The longest the wait between broker retries grows to.
+    pub max_error_backoff: Duration,
 }
 
 impl Default for WorkerOptions {
@@ -106,6 +120,13 @@ impl Default for WorkerOptions {
             timeout: Some(Duration::from_secs(60)),
             max_time: None,
             tries: None,
+            // Around eight minutes of a broker being unreachable, given the
+            // default one-second sleep and thirty-second ceiling. Long enough
+            // to sit through a cluster failover without noticing; short
+            // enough that a worker pointed at a broker that is never coming
+            // back still exits and says so.
+            max_consecutive_errors: 20,
+            max_error_backoff: Duration::from_secs(30),
         }
     }
 }
@@ -156,9 +177,35 @@ impl WorkerOptions {
         self
     }
 
+    /// Give up after this many back-to-back broker failures.
+    ///
+    /// One is the old behaviour: exit as soon as the broker refuses once.
+    pub fn max_consecutive_errors(mut self, max: u32) -> Self {
+        self.max_consecutive_errors = max.max(1);
+        self
+    }
+
+    /// Cap the wait between broker retries.
+    pub fn max_error_backoff(mut self, backoff: Duration) -> Self {
+        self.max_error_backoff = backoff;
+        self
+    }
+
     /// How many attempts this job actually gets under these options.
     pub fn attempts_for(&self, job_max_attempts: u32) -> u32 {
         job_max_attempts.max(self.tries.unwrap_or(0)).max(1)
+    }
+
+    /// How long to wait after `consecutive` back-to-back broker failures.
+    ///
+    /// Doubles from [`sleep`](Self::sleep), capped at
+    /// [`max_error_backoff`](Self::max_error_backoff). Backing off matters as
+    /// much as not exiting: a worker that retried a dead shard in a tight loop
+    /// would answer an outage with load, and every replica would do it at
+    /// once.
+    pub fn error_backoff(&self, consecutive: u32) -> Duration {
+        let doublings = consecutive.saturating_sub(1).min(16);
+        self.sleep.saturating_mul(1u32 << doublings).min(self.max_error_backoff)
     }
 }
 
@@ -173,6 +220,13 @@ pub struct WorkerStats {
     pub failed: u64,
     /// Turns of the loop that found nothing.
     pub idles: u64,
+    /// Turns of the loop the broker refused.
+    ///
+    /// Not a job outcome — nothing was reserved, so nothing ran. Counted
+    /// because a run that processed a hundred jobs and swallowed nine hundred
+    /// broker failures is not the healthy run its other three numbers
+    /// describe.
+    pub errors: u64,
 }
 
 impl WorkerStats {
@@ -264,9 +318,27 @@ impl Worker {
     /// one job cannot leak per-request-shaped state into the next. That is the
     /// long-running-process hazard a per-request framework never has to think
     /// about.
+    ///
+    /// # A broker failure is not the end of the run
+    ///
+    /// Reserving a job can fail for reasons that have nothing to do with the
+    /// worker or the job: the broker is failing over, a shard has no master,
+    /// the network blinked. This used to propagate, which ended the process —
+    /// and under an orchestrator that is a restart, into the same outage, with
+    /// a backoff that grows each time. A queue whose consumers are in
+    /// `CrashLoopBackOff` is not being consumed at all, and it stays that way
+    /// for minutes after the broker itself is healthy again.
+    ///
+    /// So a failure here is logged, waited out (see
+    /// [`error_backoff`](WorkerOptions::error_backoff)) and retried, and only
+    /// [`max_consecutive_errors`](WorkerOptions::max_consecutive_errors)
+    /// back-to-back failures end the run. It is the same judgement already
+    /// made for a panicking job and for a uniqueness lock that will not
+    /// release: what the worker can survive, it survives.
     pub async fn run(&self) -> Result<WorkerStats> {
         let mut stats = WorkerStats::default();
         let started = std::time::Instant::now();
+        let mut consecutive_errors: u32 = 0;
 
         loop {
             if self.is_stopping() {
@@ -283,17 +355,55 @@ impl Worker {
                 break;
             }
 
-            match self.run_next().await? {
-                Outcome::Idle => {
-                    stats.idles += 1;
-                    if self.options.stop_when_empty {
-                        break;
+            match self.run_next().await {
+                Ok(outcome) => {
+                    consecutive_errors = 0;
+
+                    match outcome {
+                        Outcome::Idle => {
+                            stats.idles += 1;
+                            if self.options.stop_when_empty {
+                                break;
+                            }
+                            tokio::time::sleep(self.options.sleep).await;
+                        }
+                        Outcome::Processed => stats.processed += 1,
+                        Outcome::Released => stats.released += 1,
+                        Outcome::Failed => stats.failed += 1,
                     }
-                    tokio::time::sleep(self.options.sleep).await;
                 }
-                Outcome::Processed => stats.processed += 1,
-                Outcome::Released => stats.released += 1,
-                Outcome::Failed => stats.failed += 1,
+                Err(error) => {
+                    stats.errors += 1;
+                    consecutive_errors += 1;
+
+                    // Still failing after the whole allowance: report it as
+                    // the run's outcome rather than looping forever. A worker
+                    // pointed at a broker that is genuinely gone should end
+                    // and say why, not impersonate a healthy one.
+                    if consecutive_errors >= self.options.max_consecutive_errors {
+                        tracing::error!(
+                            error = %error.message(),
+                            consecutive = consecutive_errors,
+                            "the broker has failed too many times in a row; giving up"
+                        );
+                        return Err(error);
+                    }
+
+                    let backoff = self.options.error_backoff(consecutive_errors);
+                    tracing::warn!(
+                        error = %error.message(),
+                        consecutive = consecutive_errors,
+                        ?backoff,
+                        "could not reserve a job; retrying after a backoff"
+                    );
+
+                    // Scoped bindings are flushed here too. The turn is over
+                    // either way, and anything a half-finished reserve bound
+                    // has no business outliving it.
+                    self.container.flush_scoped();
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
             }
 
             self.container.flush_scoped();
@@ -512,6 +622,7 @@ mod tests {
     use super::*;
     use crate::job::{Job, QueuedJob};
     use crate::queue::MemoryQueue;
+    use rainier_support::BoxFuture;
 
     #[test]
     fn tries_raises_a_jobs_attempts_but_never_lowers_them() {
@@ -921,5 +1032,214 @@ mod tests {
         assert_eq!(backoff_for(2), Duration::from_secs(4));
         assert_eq!(backoff_for(6), Duration::from_secs(64));
         assert_eq!(backoff_for(50), Duration::from_secs(64), "capped");
+    }
+
+    // --- a broker that fails ------------------------------------------------
+
+    /// A queue whose `reserve` fails the first `failures` times it is called
+    /// and behaves normally afterwards — a broker failing over, in other
+    /// words. Everything else delegates, so a job that does get reserved still
+    /// runs through the real code.
+    struct FlakyBroker {
+        inner: MemoryQueue,
+        remaining_failures: AtomicU32,
+        reserve_calls: AtomicU32,
+    }
+
+    impl FlakyBroker {
+        fn new(failures: u32) -> Self {
+            Self {
+                inner: MemoryQueue::new(),
+                remaining_failures: AtomicU32::new(failures),
+                reserve_calls: AtomicU32::new(0),
+            }
+        }
+
+        fn reserve_calls(&self) -> u32 {
+            self.reserve_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Queue for FlakyBroker {
+        fn name(&self) -> &str {
+            "flaky-broker"
+        }
+
+        fn push<'q>(&'q self, job: QueuedJob) -> BoxFuture<'q, Result<String>> {
+            self.inner.push(job)
+        }
+
+        fn reserve<'q>(&'q self, queue: &'q str) -> BoxFuture<'q, Result<Option<QueuedJob>>> {
+            self.reserve_calls.fetch_add(1, Ordering::SeqCst);
+
+            // The shape of the real one: a cluster shard with no master, which
+            // refuses every command for its slots and does not recover on its
+            // own.
+            if self
+                .remaining_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Box::pin(async {
+                    Err(Error::service_unavailable(
+                        "Redis: slot 11221 has no reachable node: its master is gone",
+                    ))
+                });
+            }
+
+            self.inner.reserve(queue)
+        }
+
+        fn acknowledge<'q>(&'q self, job: &'q QueuedJob) -> BoxFuture<'q, Result<()>> {
+            self.inner.acknowledge(job)
+        }
+
+        fn release<'q>(&'q self, job: &'q QueuedJob, delay: Duration) -> BoxFuture<'q, Result<()>> {
+            self.inner.release(job, delay)
+        }
+
+        fn fail<'q>(&'q self, job: &'q QueuedJob, error: &'q str) -> BoxFuture<'q, Result<()>> {
+            self.inner.fail(job, error)
+        }
+
+        fn size<'q>(&'q self, queue: &'q str) -> BoxFuture<'q, Result<u64>> {
+            self.inner.size(queue)
+        }
+
+        fn clear<'q>(&'q self, queue: &'q str) -> BoxFuture<'q, Result<u64>> {
+            self.inner.clear(queue)
+        }
+    }
+
+    /// Options that retry a broker briskly, so the tests do not sleep.
+    fn brisk(max_consecutive: u32) -> WorkerOptions {
+        WorkerOptions::default()
+            .sleep(Duration::from_millis(1))
+            .max_error_backoff(Duration::from_millis(2))
+            .max_consecutive_errors(max_consecutive)
+    }
+
+    #[tokio::test]
+    async fn a_broker_that_fails_and_recovers_does_not_end_the_run() {
+        // The production failure this exists for. `reserve` used to propagate,
+        // which ended the process; under an orchestrator that is a restart
+        // into the same outage, and a queue whose workers are all in
+        // CrashLoopBackOff is not being drained by anybody.
+        let _serial = reset(1);
+        let broker = Arc::new(FlakyBroker::new(3));
+        broker.push(QueuedJob::from_job(&Flaky).unwrap()).await.unwrap();
+
+        let worker = Worker::new(
+            Arc::clone(&broker) as Arc<dyn Queue>,
+            registry(),
+            Arc::new(Container::new()),
+        )
+        .with_options(brisk(20).stop_when_empty());
+
+        let stats = worker.run().await.expect("the run survives the outage");
+
+        assert_eq!(stats.errors, 3, "each refusal is counted");
+        assert_eq!(stats.processed, 1, "and the job still runs once the broker is back");
+        assert_eq!(broker.size("default").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_broker_that_never_recovers_ends_the_run_and_says_why() {
+        // The other half. Riding out an outage must not become pretending to
+        // work forever: a worker pointed at a broker that is genuinely gone
+        // should exit non-zero, so a supervisor and an operator both notice.
+        let broker = Arc::new(FlakyBroker::new(u32::MAX));
+
+        let worker = Worker::new(
+            Arc::clone(&broker) as Arc<dyn Queue>,
+            registry(),
+            Arc::new(Container::new()),
+        )
+        .with_options(brisk(4));
+
+        let error = worker.run().await.expect_err("it gives up rather than looping forever");
+
+        assert!(error.message().contains("slot 11221"), "{}", error.message());
+        assert_eq!(broker.reserve_calls(), 4, "it stops at the allowance, not before or after");
+    }
+
+    #[tokio::test]
+    async fn a_success_resets_the_allowance() {
+        // Consecutive, not cumulative. A worker alive for days accumulates
+        // unrelated blips, and a budget it slowly spent would eventually make
+        // it exit for no reason at all.
+        let _serial = reset(1);
+        let broker = Arc::new(FlakyBroker::new(2));
+        broker.push(QueuedJob::from_job(&Flaky).unwrap()).await.unwrap();
+
+        let worker = Worker::new(
+            Arc::clone(&broker) as Arc<dyn Queue>,
+            registry(),
+            Arc::new(Container::new()),
+        )
+        // Three would not survive a cumulative count: two failures,
+        // then a success, then the idle turn that drains the queue.
+        .with_options(brisk(3).stop_when_empty());
+
+        let stats = worker.run().await.expect("two failures then a success is not three failures");
+
+        assert_eq!(stats.errors, 2);
+        assert_eq!(stats.processed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_stop_is_honoured_while_backing_off_from_a_broker() {
+        // A worker waiting out an outage must still answer SIGTERM, or a
+        // rollout during one sits out the whole termination grace period.
+        let broker = Arc::new(FlakyBroker::new(u32::MAX));
+
+        let worker = Arc::new(
+            Worker::new(
+                Arc::clone(&broker) as Arc<dyn Queue>,
+                registry(),
+                Arc::new(Container::new()),
+            )
+            .with_options(
+                WorkerOptions::default()
+                    .sleep(Duration::from_millis(20))
+                    .max_error_backoff(Duration::from_millis(20))
+                    .max_consecutive_errors(1_000),
+            ),
+        );
+
+        let signalled = Arc::clone(&worker);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            signalled.stop();
+        });
+
+        let stats = tokio::time::timeout(Duration::from_secs(5), worker.run())
+            .await
+            .expect("the loop notices the stop rather than backing off forever")
+            .expect("stopping is not a failure");
+
+        assert!(stats.errors > 0, "it was in the middle of an outage");
+    }
+
+    #[test]
+    fn the_broker_backoff_doubles_from_sleep_and_is_capped() {
+        let options = WorkerOptions::default()
+            .sleep(Duration::from_secs(1))
+            .max_error_backoff(Duration::from_secs(30));
+
+        assert_eq!(options.error_backoff(1), Duration::from_secs(1), "the first wait is `sleep`");
+        assert_eq!(options.error_backoff(2), Duration::from_secs(2));
+        assert_eq!(options.error_backoff(5), Duration::from_secs(16));
+        assert_eq!(options.error_backoff(6), Duration::from_secs(30), "capped");
+        assert_eq!(options.error_backoff(u32::MAX), Duration::from_secs(30), "never overflows");
+    }
+
+    #[test]
+    fn broker_errors_are_not_job_outcomes() {
+        // `total()` drives `--max-jobs`, and a broker outage must not spend a
+        // worker's job budget without a job ever having run.
+        let stats = WorkerStats { errors: 500, ..WorkerStats::default() };
+
+        assert_eq!(stats.total(), 0);
     }
 }

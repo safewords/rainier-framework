@@ -773,6 +773,9 @@ fn anyhow_from(error: redis::RedisError) -> anyhow::Error {
 /// A short description of what went wrong, for the message.
 trait Category {
     fn category_message(&self) -> String;
+
+    /// A `MOVED` or `ASK` redirect, said in words.
+    fn redirect_message(&self) -> String;
 }
 
 impl Category for redis::RedisError {
@@ -783,11 +786,62 @@ impl Category for redis::RedisError {
             redis::ErrorKind::IoError => "the server could not be reached".to_string(),
             redis::ErrorKind::AuthenticationFailed => "authentication failed".to_string(),
             redis::ErrorKind::TypeError => "the reply was not the expected type".to_string(),
+
+            // The cluster kinds, each said rather than echoed.
+            //
+            // These used to fall to the arm below, whose `detail()` for a
+            // redirect is the raw payload — a slot and an address, as in
+            // `11221 :0`. That was the whole message. `Redis: 11221 :0`
+            // appeared in every worker, session read and scheduled task for
+            // three hours of a production outage without once saying that a
+            // shard had lost its master, which is the only fact any of those
+            // lines was carrying.
+            redis::ErrorKind::Moved | redis::ErrorKind::Ask => self.redirect_message(),
+            redis::ErrorKind::ClusterDown => {
+                "the cluster is down: some slots have no node serving them".to_string()
+            }
+            redis::ErrorKind::MasterDown => {
+                "the shard's master is down and the command cannot be served".to_string()
+            }
+            redis::ErrorKind::TryAgain => {
+                "the slot is mid-migration; the command should be retried".to_string()
+            }
+            redis::ErrorKind::CrossSlot => {
+                "the command's keys span more than one slot; they need a shared hash tag"
+                    .to_string()
+            }
+            redis::ErrorKind::ClusterConnectionNotFound => {
+                "no connection to the node that owns this slot".to_string()
+            }
+
             redis::ErrorKind::ResponseError => {
                 self.detail().unwrap_or("the server rejected the command").to_string()
             }
             _ => self.detail().unwrap_or("the command failed").to_string(),
         }
+    }
+
+    fn redirect_message(&self) -> String {
+        let Some((address, slot)) = self.redirect_node() else {
+            return "the cluster redirected the command, and the redirect could not be read"
+                .to_string();
+        };
+
+        // An address of `:0` — no host, port zero — is a node the cluster
+        // still credits with slots but has lost the address of; `CLUSTER
+        // NODES` flags it `noaddr`. It is what a master that died with no
+        // replica promoted in its place leaves behind, and the redirect is
+        // unfollowable: there is nowhere to follow it to. Every command for a
+        // key in that range gets this, indefinitely, and the shape of it is
+        // nothing like an ordinary redirect — so it does not get an ordinary
+        // redirect's wording.
+        if address.is_empty() || address.starts_with(':') || address.ends_with(":0") {
+            return format!(
+                "slot {slot} has no reachable node: its master is gone and no replica took over"
+            );
+        }
+
+        format!("slot {slot} has moved to {address}")
     }
 }
 
@@ -1190,6 +1244,82 @@ mod tests {
         assert!(outcome.is_err(), "an unset connect timeout should still wait indefinitely");
 
         held.abort();
+    }
+
+    // --- cluster errors -----------------------------------------------------
+
+    fn server_error(kind: redis::ErrorKind, detail: &str) -> Error {
+        redis_error(redis::RedisError::from((kind, "cluster", detail.to_string())))
+    }
+
+    #[test]
+    fn a_redirect_to_an_addressless_node_says_the_shard_lost_its_master() {
+        // The production case this arm exists for. A master died, no replica
+        // was promoted, and the cluster kept assigning it the slots while
+        // forgetting its address — so it answered `MOVED 11221 :0`, which is
+        // a redirect nothing can follow.
+        let err = server_error(redis::ErrorKind::Moved, "11221 :0");
+
+        let message = err.message();
+        assert!(message.contains("slot 11221"), "{message}");
+        assert!(message.contains("no reachable node"), "{message}");
+        assert!(message.contains("no replica took over"), "{message}");
+    }
+
+    #[test]
+    fn an_addressless_redirect_is_not_reported_as_an_ordinary_move() {
+        // The two are a world apart operationally — one resolves itself in
+        // milliseconds, the other never does — so they must not read alike.
+        let stranded = server_error(redis::ErrorKind::Moved, "11221 :0");
+        let ordinary = server_error(redis::ErrorKind::Moved, "11221 10.42.1.126:6379");
+
+        assert!(
+            ordinary.message().contains("has moved to 10.42.1.126:6379"),
+            "{}",
+            ordinary.message()
+        );
+        assert!(!ordinary.message().contains("no reachable node"), "{}", ordinary.message());
+        assert!(!stranded.message().contains("has moved to"), "{}", stranded.message());
+    }
+
+    #[test]
+    fn a_bare_slot_and_port_zero_never_reaches_the_log_on_its_own() {
+        // What this whole arm replaces: `Redis: 11221 :0` was the entire
+        // message, and it named neither Redis Cluster nor a downed shard.
+        let err = server_error(redis::ErrorKind::Moved, "11221 :0");
+
+        assert_ne!(err.message(), "Redis: 11221 :0");
+        assert!(err.message().len() > "Redis: 11221 :0".len(), "{}", err.message());
+    }
+
+    #[test]
+    fn the_other_cluster_kinds_are_said_rather_than_echoed() {
+        for (kind, expected) in [
+            (redis::ErrorKind::ClusterDown, "the cluster is down"),
+            (redis::ErrorKind::MasterDown, "master is down"),
+            (redis::ErrorKind::TryAgain, "mid-migration"),
+            (redis::ErrorKind::CrossSlot, "shared hash tag"),
+        ] {
+            let message = server_error(kind, "raw server text").message().to_string();
+            assert!(message.contains(expected), "{kind:?}: {message}");
+            assert!(!message.contains("raw server text"), "{kind:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_cluster_failure_is_a_503_like_every_other_dependency_failure() {
+        // It is the shard being unavailable, not the request being wrong.
+        assert_eq!(server_error(redis::ErrorKind::Moved, "11221 :0").status(), 503);
+        assert_eq!(server_error(redis::ErrorKind::ClusterDown, "").status(), 503);
+    }
+
+    #[test]
+    fn an_unreadable_redirect_still_says_it_was_a_redirect() {
+        // `detail()` is the server's, and a server that sends something else
+        // must not produce a message that claims a slot number it never saw.
+        let err = server_error(redis::ErrorKind::Moved, "not-a-slot");
+
+        assert!(err.message().contains("could not be read"), "{}", err.message());
     }
 }
 
