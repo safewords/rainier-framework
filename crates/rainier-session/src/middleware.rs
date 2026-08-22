@@ -7,8 +7,29 @@ use rainier_middleware::{Middleware, Next};
 use rainier_support::Result;
 
 use crate::manager::{SessionConfig, SessionManager};
-use crate::session::Session;
+use crate::session::{Session, SessionData};
 use crate::store::SessionStore;
+
+/// A loaded session, and whether it is safe to write back.
+struct Loaded {
+    session: Session,
+    /// The store could not be read, so this session stands in for one that
+    /// very likely still exists. Writing it back would replace the real one
+    /// with an empty session under a new id; see `load`.
+    detached: bool,
+}
+
+impl Loaded {
+    /// A session that may be persisted as usual.
+    fn attached(session: Session) -> Self {
+        Self { session, detached: false }
+    }
+
+    /// A session that must not be persisted.
+    fn detached(session: Session) -> Self {
+        Self { session, detached: true }
+    }
+}
 
 /// Loads the session before the handler and persists it afterwards.
 ///
@@ -60,9 +81,9 @@ impl StartSession {
     }
 
     /// Load the session the request's cookie names, or start a fresh one.
-    async fn load(&self, request: &Request) -> Session {
+    async fn load(&self, request: &Request) -> Loaded {
         let Some(value) = request.cookie(&self.config.cookie) else {
-            return Session::new();
+            return Loaded::attached(Session::new());
         };
 
         // The store decides what a cookie value means, and whether it is one
@@ -71,24 +92,45 @@ impl StartSession {
         // good one, and a bad one is not worth failing a page over.
         let (id, carried) = match self.store.decode(value) {
             Ok(decoded) => decoded,
-            Err(_) => return Session::new(),
+            Err(_) => return Loaded::attached(Session::new()),
         };
 
         // A client-side store has already produced the data; there is nothing
         // to read.
         if let Some(data) = carried {
-            return Session::restore(id, data);
+            return Loaded::attached(Session::restore(id, data));
         }
 
         match self.store.read(&id).await {
-            Ok(Some(data)) => Session::restore(id, data),
-            Ok(None) => Session::new(),
+            Ok(Some(data)) => Loaded::attached(Session::restore(id, data)),
+            // No such session. A fresh one, which may take a new id: there is
+            // nothing on the other end of the old one to lose.
+            Ok(None) => Loaded::attached(Session::new()),
             Err(e) => {
                 // The store being unreachable must not take the request with
-                // it: a visitor gets a fresh session and the page renders.
-                // Failing here would turn a cache blip into a total outage.
-                tracing::error!(error = %e, "could not read the session; starting a new one");
-                Session::new()
+                // it: the page still renders. Failing here would turn a cache
+                // blip into a total outage.
+                //
+                // But it must not take the *session* with it either, which is
+                // what starting a fresh one used to do. A new session gets a
+                // new id, `save` then writes it and sets it as the cookie, and
+                // the real session — intact in the store, merely unreadable
+                // for this one request — is orphaned. Every signed-in visitor
+                // is silently logged out by a blip, and a Redis Cluster shard
+                // that lost its master logged out every visitor for three
+                // hours and left four thousand abandoned sessions behind.
+                //
+                // So the session is *detached*: the id the cookie already
+                // carries, no data, and `handle` neither writes it back nor
+                // moves the cookie. The request sees an empty session and
+                // anything written to it is lost, which is the honest
+                // consequence of a store that cannot be reached — and when the
+                // store returns, the visitor is still signed in.
+                tracing::error!(
+                    error = %e,
+                    "could not read the session; serving this request without one"
+                );
+                Loaded::detached(Session::restore(id, SessionData::default()))
             }
         }
     }
@@ -120,11 +162,19 @@ impl StartSession {
 #[async_trait::async_trait]
 impl Middleware for StartSession {
     async fn handle(&self, mut request: Request, next: Next) -> Response {
-        let session = self.load(&request).await;
+        let Loaded { session, detached } = self.load(&request).await;
         let started_empty = session.is_empty();
 
         request.extensions_mut().insert(session.clone());
         let response = next.run(request).await;
+
+        // The store could not be read. Saving now would write an empty session
+        // over the real one and move the cookie to it, so the visitor would be
+        // logged out by an outage they otherwise rode through. Leave both
+        // alone; see `load`.
+        if detached {
+            return response;
+        }
 
         // A session that was empty and stayed empty is not worth a row or a
         // cookie — otherwise every anonymous hit on a public page allocates
@@ -188,10 +238,10 @@ impl Default for SessionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::SessionData;
     use crate::store::MemorySessionStore;
     use rainier_middleware::Pipeline;
     use rainier_support::BoxedFuture;
+    use std::sync::Mutex;
 
     fn middleware() -> (Arc<StartSession>, Arc<MemorySessionStore>) {
         let store = Arc::new(MemorySessionStore::default());
@@ -423,5 +473,184 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), rainier_http::StatusCode::OK);
+    }
+
+    /// A store that holds one session and refuses every read, so a request
+    /// arrives with a cookie naming a session that is really there and really
+    /// unreadable — a shard mid-failover, which is the case that matters.
+    struct UnreadableStore {
+        writes: Arc<Mutex<Vec<(String, SessionData)>>>,
+        destroys: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl UnreadableStore {
+        fn new() -> Self {
+            Self {
+                writes: Arc::new(Mutex::new(Vec::new())),
+                destroys: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl SessionStore for UnreadableStore {
+        fn name(&self) -> &str {
+            "unreadable"
+        }
+
+        fn read<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> rainier_support::BoxFuture<'a, Result<Option<SessionData>>> {
+            Box::pin(async {
+                Err(rainier_support::Error::service_unavailable(
+                    "Redis: slot 15558 has no reachable node: its master is gone",
+                ))
+            })
+        }
+
+        fn write<'a>(
+            &'a self,
+            id: &'a str,
+            data: &'a SessionData,
+        ) -> rainier_support::BoxFuture<'a, Result<()>> {
+            let writes = Arc::clone(&self.writes);
+            let entry = (id.to_string(), data.clone());
+            Box::pin(async move {
+                writes.lock().unwrap().push(entry);
+                Ok(())
+            })
+        }
+
+        fn destroy<'a>(&'a self, id: &'a str) -> rainier_support::BoxFuture<'a, Result<()>> {
+            let destroys = Arc::clone(&self.destroys);
+            let id = id.to_string();
+            Box::pin(async move {
+                destroys.lock().unwrap().push(id);
+                Ok(())
+            })
+        }
+    }
+
+    /// A request carrying a session cookie, the way a signed-in visitor's is.
+    ///
+    /// The id has to be one this application could have minted, or `decode`
+    /// rejects the cookie before the store is read at all — a different path
+    /// than the one these tests are about.
+    fn with_session_cookie(config: &SessionConfig) -> (Request, String) {
+        let id = crate::session::generate_session_id();
+        let request =
+            Request::builder().header("cookie", &format!("{}={}", config.cookie, id)).build();
+        (request, id)
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_session_is_not_overwritten_with_an_empty_one() {
+        // The production failure. The store was reachable enough to hold the
+        // session and not reachable enough to return it; starting a fresh one
+        // wrote an empty session under a new id and set that as the cookie, so
+        // the real one was orphaned and the visitor was signed out by a blip.
+        let store = Arc::new(UnreadableStore::new());
+        let writes = Arc::clone(&store.writes);
+        let destroys = Arc::clone(&store.destroys);
+
+        let start = Arc::new(StartSession::new(Arc::clone(&store) as Arc<dyn SessionStore>));
+        let (request, _real_id) = with_session_cookie(&SessionConfig::default());
+
+        let response = run(&start, request, |request| {
+            Box::pin(async move {
+                // A handler that writes, which is what used to force the save.
+                request.session().unwrap().put("x", 1).unwrap();
+                Response::text("the page still renders")
+            })
+        })
+        .await;
+
+        assert_eq!(response.status(), rainier_http::StatusCode::OK);
+        assert!(writes.lock().unwrap().is_empty(), "nothing may be written over the real session");
+        assert!(destroys.lock().unwrap().is_empty(), "and nothing may be destroyed");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_session_does_not_move_the_cookie() {
+        // The other half of being signed out: even without a write, a response
+        // that sets a cookie for a new id points the next request at the new
+        // session and abandons the real one.
+        let store = Arc::new(UnreadableStore::new());
+        let start = Arc::new(StartSession::new(store as Arc<dyn SessionStore>));
+        let config = SessionConfig::default();
+        let (request, _real_id) = with_session_cookie(&config);
+
+        let response = run(&start, request, |request| {
+            Box::pin(async move {
+                request.session().unwrap().put("x", 1).unwrap();
+                Response::text("ok")
+            })
+        })
+        .await;
+
+        let set_cookie: Vec<_> = response
+            .into_http()
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter(|v| v.starts_with(&config.cookie))
+            .map(|v| v.to_string())
+            .collect();
+
+        assert!(set_cookie.is_empty(), "the session cookie must not move: {set_cookie:?}");
+    }
+
+    #[tokio::test]
+    async fn a_session_that_is_merely_absent_still_starts_a_fresh_one() {
+        // The distinction the fix rests on. `Ok(None)` is a session that is
+        // genuinely gone — expired, or never existed — and there is nothing on
+        // the other end of that id to protect, so it must still behave as it
+        // always did. Only a read that *failed* is held back.
+        struct Empty {
+            writes: Arc<Mutex<usize>>,
+        }
+
+        impl SessionStore for Empty {
+            fn name(&self) -> &str {
+                "empty"
+            }
+            fn read<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> rainier_support::BoxFuture<'a, Result<Option<SessionData>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn write<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a SessionData,
+            ) -> rainier_support::BoxFuture<'a, Result<()>> {
+                let writes = Arc::clone(&self.writes);
+                Box::pin(async move {
+                    *writes.lock().unwrap() += 1;
+                    Ok(())
+                })
+            }
+            fn destroy<'a>(&'a self, _: &'a str) -> rainier_support::BoxFuture<'a, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let writes = Arc::new(Mutex::new(0usize));
+        let store = Arc::new(Empty { writes: Arc::clone(&writes) });
+        let start = Arc::new(StartSession::new(store as Arc<dyn SessionStore>));
+        let (request, _) = with_session_cookie(&SessionConfig::default());
+
+        let response = run(&start, request, |request| {
+            Box::pin(async move {
+                request.session().unwrap().put("x", 1).unwrap();
+                Response::text("ok")
+            })
+        })
+        .await;
+
+        assert_eq!(response.status(), rainier_http::StatusCode::OK);
+        assert_eq!(*writes.lock().unwrap(), 1, "an absent session is still replaced and saved");
     }
 }

@@ -187,6 +187,30 @@ the release as a whole and names the crate it landed in.
 
 ### Fixed
 
+- **An unreadable session is no longer replaced with an empty one**
+  (`rainier-session`). `StartSession` treated a store *read failure* the same as
+  a session that was not there: it started a fresh one. That session has a new
+  id, so `save` wrote it to the store and set it as the cookie, and the real
+  session — intact, merely unreadable for that one request — was orphaned. The
+  effect is that every signed-in visitor is silently signed out by a blip, and
+  the cost is paid twice: once by them, and once by a store now holding an
+  abandoned session for every request the outage touched. Measured in
+  production at roughly four thousand of them, on a platform with fifteen
+  accounts, after a Redis Cluster shard lost its master for three hours.
+
+  A failed read now yields a **detached** session: the id the cookie already
+  carries, no data, and neither written back nor allowed to move the cookie.
+  The request still renders, which is what the previous behaviour was reaching
+  for and is preserved — anything written to that session is lost, which is the
+  honest consequence of a store that cannot be reached. When the store returns,
+  the visitor is still signed in.
+
+  `Ok(None)` is deliberately untouched. A session that is genuinely absent —
+  expired, or never issued — has nothing on the other end of its id to protect,
+  and still starts and saves a fresh one exactly as before. The fix rests
+  entirely on that distinction, and a test pins it so the two cannot collapse
+  back into one.
+
 - **A broker outage no longer ends a worker run** (`rainier-queue`). `Worker::run`
   propagated any error out of `reserve`, which ended the process. Under an
   orchestrator that is a restart into the same outage, then another, with the
