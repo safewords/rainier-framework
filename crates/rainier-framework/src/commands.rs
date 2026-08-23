@@ -281,17 +281,102 @@ impl Command for MigrateRollbackCommand {
     }
 }
 
-/// The default connection's declared concurrency, if the application declared
-/// its queues rather than handing over a built manager.
+/// The queues declared for this application, if it declared any.
+fn declarations(app: &Application) -> Option<rainier_queue::Connections> {
+    app.resolve::<rainier_config::Config>().ok()?.get(crate::keys::QUEUES)
+}
+
+/// One worker's worth of work: a connection, the queues to drain on it, and
+/// how many at once.
+struct Pool {
+    connection: Option<String>,
+    queues: Vec<String>,
+    /// The backend's budget: how many of *its* jobs run at once, whichever
+    /// queues they came from.
+    concurrency: Option<usize>,
+    /// A narrower ceiling for individual queues, within that budget.
+    limits: std::collections::BTreeMap<String, usize>,
+}
+
+/// Group the queues to drain by the connection each one declares it lives on.
 ///
-/// `None` at every step is the same answer — "nothing was declared" — so this
-/// reads as one chain rather than four nested matches. An application that
-/// built its own `QueueManager` has no declaration to read, and gets the
-/// worker's own default of one.
-fn declared_concurrency(app: &Application) -> Option<usize> {
-    let config = app.resolve::<rainier_config::Config>().ok()?;
-    let connections: rainier_queue::Connections = config.get(crate::keys::QUEUES)?;
-    connections.get(connections.default_name())?.concurrency()
+/// This is what lets a single `queue:work` serve two backends: the queue names
+/// which connection it is on, and each group becomes its own worker with that
+/// connection's — or its own — concurrency.
+///
+/// An application that declared nothing gets one pool on the default
+/// connection, which is every deployment that has never thought about this.
+fn plan(app: &Application, queues: Vec<String>, connection: Option<&str>) -> Vec<Pool> {
+    let Some(declared) = declarations(app) else {
+        return vec![Pool {
+            connection: connection.map(str::to_owned),
+            queues,
+            concurrency: None,
+            limits: std::collections::BTreeMap::new(),
+        }];
+    };
+
+    // An explicit `--connection` means "this pool and no other": the queues
+    // are drained there whatever they declare, because the operator naming a
+    // connection is answering the same question more specifically.
+    if let Some(name) = connection {
+        let concurrency = declared.get(name).and_then(|c| c.concurrency());
+        let limits = queues
+            .iter()
+            .filter_map(|queue| Some((queue.clone(), declared.queue(queue)?.concurrency?)))
+            .collect();
+        return vec![Pool { connection: Some(name.to_owned()), queues, concurrency, limits }];
+    }
+
+    // Grouped in first-seen order so the priority order within a pool is the
+    // order the queues were asked for, and the pools themselves are stable.
+    let mut pools: Vec<Pool> = Vec::new();
+    for queue in queues {
+        let on = declared.connection_for(&queue);
+
+        // `None` for the default one. `QueueManager` holds its default queue
+        // directly and does not also register it under its name, so asking for
+        // it by name finds nothing — and the declaration names it, because
+        // that is how a config file says "the usual place".
+        let on = (on != declared.default_name()).then(|| on.to_owned());
+
+        // Two limits, and they are different questions. The connection's is
+        // the backend's budget — how many of its jobs run at once, whichever
+        // queue they came from. The queue's is a ceiling within that, so one
+        // slow queue cannot fill every slot on a shared backend.
+        //
+        // They are no longer reconciled by taking the larger, which quietly
+        // gave a queue more than it asked for. Both are carried and both are
+        // enforced: `WorkerOptions::concurrency` bounds the pool and
+        // `queue_limits` bounds each queue inside it.
+        let budget = declared
+            .get(on.as_deref().unwrap_or_else(|| declared.default_name()))
+            .and_then(|c| c.concurrency());
+        let limit = declared.queue(&queue).and_then(|q| q.concurrency);
+
+        match pools.iter_mut().find(|pool| pool.connection == on) {
+            Some(pool) => {
+                pool.queues.push(queue.clone());
+                if let Some(limit) = limit {
+                    pool.limits.insert(queue, limit);
+                }
+            }
+            None => {
+                let mut limits = std::collections::BTreeMap::new();
+                if let Some(limit) = limit {
+                    limits.insert(queue.clone(), limit);
+                }
+                pools.push(Pool {
+                    connection: on,
+                    queues: vec![queue],
+                    concurrency: budget,
+                    limits,
+                });
+            }
+        }
+    }
+
+    pools
 }
 
 /// `queue:work` — process queued jobs.
@@ -312,6 +397,7 @@ impl Command for QueueWorkCommand {
         Some(
             "Usage:\n  queue:work [--queue=default,high] [--once] [--max-jobs=N] [--sleep=1]\n\n\
              Options:\n  \
+             --connection Which declared connection to drain. Defaults to the default one.\n  \
              --concurrency How many jobs at once. Defaults to the connection's declaration.\n  \
              --queue     Comma-separated queues, in priority order.\n              Defaults to the queues the application declared.\n  \
              --once      Process what is waiting, then stop\n  \
@@ -331,6 +417,8 @@ impl Command for QueueWorkCommand {
         // unit. That failure is silent: the worker starts, drains a queue
         // nothing is dispatched to, and reports itself healthy while
         // processing nothing.
+        let connection = args.option("connection");
+
         let queues: Vec<String> = match args.option("queue") {
             Some(flag) => flag
                 .split(',')
@@ -348,25 +436,13 @@ impl Command for QueueWorkCommand {
             return Ok(1);
         }
 
-        let mut options = WorkerOptions::default()
-            .queues(queues.clone())
-            .sleep(Duration::from_secs(args.parsed_or("sleep", 1u64)));
+        // One pool per connection the requested queues live on, so a single
+        // process can drain two backends — which is what a queue declaring its
+        // own connection buys.
+        let pools = plan(app, queues.clone(), connection);
 
-        // How many at once comes from the connection declaration, because
-        // `queue:work` is one process draining everything: the number
-        // describes the backend being consumed rather than this invocation.
-        // A flag alone would have to be repeated in a Dockerfile, a chart and
-        // a systemd unit, and those copies drift.
-        if let Some(declared) = declared_concurrency(app) {
-            options = options.concurrency(declared);
-        }
-
-        // `--concurrency` still overrides, for the one-off that is not the
-        // deployment: draining a backlog by hand, or pinning it to one to
-        // reproduce an ordering bug.
-        if let Some(flag) = args.option("concurrency").and_then(|v| v.parse::<usize>().ok()) {
-            options = options.concurrency(flag);
-        }
+        let mut options =
+            WorkerOptions::default().sleep(Duration::from_secs(args.parsed_or("sleep", 1u64)));
 
         if args.flag("once") {
             options = options.stop_when_empty();
@@ -401,17 +477,61 @@ impl Command for QueueWorkCommand {
             options = options.tries(tries);
         }
 
-        let mut worker = Worker::new(
-            Arc::clone(manager.queue()),
-            Arc::clone(manager.registry()),
-            Arc::clone(app.container()),
-        )
-        .with_options(options);
+        // `--concurrency` overrides every pool, for the one-off that is not
+        // the deployment: draining a backlog by hand, or pinning it to one to
+        // reproduce an ordering bug.
+        let override_concurrency = args.option("concurrency").and_then(|v| v.parse::<usize>().ok());
 
-        // Worker events are how an application observes its queue; wire them
-        // up when a dispatcher is available.
-        if let Ok(events) = app.resolve::<Dispatcher>() {
-            worker = worker.with_events(events);
+        let mut workers = Vec::with_capacity(pools.len());
+        for pool in pools {
+            // Refused rather than defaulted when it names a connection nobody
+            // declared: falling back to the default would put the pool on the
+            // wrong backend, accept every job pushed to it, and drain a queue
+            // nothing writes to — silently, while reporting itself healthy.
+            let queue = match &pool.connection {
+                Some(name) => match manager.connection(name) {
+                    Some(queue) => queue,
+                    None => {
+                        eprintln!("`{name}` is not a declared connection.");
+                        let declared: Vec<&str> = manager.connection_names().collect();
+                        if declared.is_empty() {
+                            eprintln!("This application declared none.");
+                        } else {
+                            eprintln!("Declared: {}.", declared.join(", "));
+                        }
+                        return Ok(exit::FAILURE);
+                    }
+                },
+                None => manager.queue(),
+            };
+
+            let mut pool_options = options.clone().queues(pool.queues.clone());
+            if let Some(concurrency) = override_concurrency.or(pool.concurrency) {
+                pool_options = pool_options.concurrency(concurrency);
+            }
+            for (queue, limit) in &pool.limits {
+                pool_options = pool_options.queue_limit(queue, *limit);
+            }
+
+            let mut worker = Worker::new(
+                Arc::clone(queue),
+                Arc::clone(manager.registry()),
+                Arc::clone(app.container()),
+            )
+            .with_options(pool_options);
+
+            // Worker events are how an application observes its queue; wire
+            // them up when a dispatcher is available.
+            if let Ok(events) = app.resolve::<Dispatcher>() {
+                worker = worker.with_events(events);
+            }
+
+            println!(
+                "Processing jobs from {}: {}",
+                pool.connection.as_deref().unwrap_or("the default connection"),
+                pool.queues.join(", ")
+            );
+            workers.push(Arc::new(worker));
         }
 
         // Stop taking work when asked to stop.
@@ -428,21 +548,54 @@ impl Command for QueueWorkCommand {
         // the behaviour a grace period is for: a worker that abandoned work
         // halfway to exit promptly would trade a slow rollout for redelivered
         // jobs.
-        let worker = Arc::new(worker);
-        let signalled = Arc::clone(&worker);
-
+        //
+        // **Every** pool is signalled, or a shutdown would stop one worker and
+        // leave the others reserving — the pod would still sit out its grace
+        // period, which is the failure this exists to prevent.
+        let signalled: Vec<Arc<Worker>> = workers.iter().map(Arc::clone).collect();
         tokio::spawn(async move {
             if let Some(signal) = stop_signal().await {
                 tracing::info!(
                     signal,
-                    "shutting down: finishing the job in flight and taking no more"
+                    "shutting down: finishing the jobs in flight and taking no more"
                 );
-                signalled.stop();
+                for worker in &signalled {
+                    worker.stop();
+                }
             }
         });
 
-        println!("Processing jobs from: {}", queues.join(", "));
-        let stats = worker.run().await?;
+        // Run together rather than in turn: two pools in sequence would leave
+        // the second backend undrained for as long as the first had work,
+        // which for a `--once` run is until it is empty and otherwise forever.
+        let mut runs = Vec::with_capacity(workers.len());
+        for worker in &workers {
+            runs.push(worker.run());
+        }
+        let results = futures_util::future::join_all(runs).await;
+
+        // Summed across pools. A failure in any of them is a failure of the
+        // run, and the first error is returned rather than swallowed — but
+        // only after every pool has finished, so one broker being unreachable
+        // does not abandon work already reserved elsewhere.
+        let mut stats = rainier_queue::WorkerStats::default();
+        let mut failure = None;
+        for result in results {
+            match result {
+                Ok(pool) => {
+                    stats.processed += pool.processed;
+                    stats.released += pool.released;
+                    stats.failed += pool.failed;
+                    stats.errors += pool.errors;
+                    stats.idles += pool.idles;
+                }
+                Err(e) => failure = failure.or(Some(e)),
+            }
+        }
+
+        if let Some(e) = failure {
+            return Err(e);
+        }
 
         println!(
             "\nProcessed {}, retried {}, failed {}.",
@@ -721,6 +874,138 @@ mod tests {
 
         let console = Console::new("rainier").register(QueueWorkCommand);
         assert_eq!(console.run_argv(&app, ["queue:work", "--once"]).await, exit::FAILURE);
+    }
+
+    #[tokio::test]
+    async fn queue_work_drains_the_connection_it_was_given() {
+        // Two pools on one backend is the case this exists for: each names its
+        // own connection, and each connection carries its own concurrency.
+        use rainier_queue::{Job, JobContext};
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize)]
+        struct Ping;
+
+        #[async_trait::async_trait]
+        impl Job for Ping {
+            const NAME: &'static str = "test.ping.connection";
+            async fn handle(&self, _: &JobContext) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let app = app().await;
+        let default = Arc::new(MemoryQueue::new());
+        let intense = Arc::new(MemoryQueue::new());
+        let registry = Arc::new(JobRegistry::new().with::<Ping>());
+
+        let manager = QueueManager::new(Arc::clone(&default) as Arc<_>, registry)
+            .with_connection("intense", Arc::clone(&intense) as Arc<_>);
+
+        // Pushed to the *named* connection, so a worker that drained the
+        // default would leave it and report success.
+        use rainier_queue::Queue as _;
+        intense.push(rainier_queue::QueuedJob::from_job(&Ping).unwrap()).await.unwrap();
+        app.instance(manager);
+
+        let console = Console::new("rainier").register(QueueWorkCommand);
+        assert_eq!(
+            console.run_argv(&app, ["queue:work", "--once", "--connection=intense"]).await,
+            exit::SUCCESS
+        );
+
+        assert_eq!(intense.size("default").await.unwrap(), 0, "the named connection was drained");
+    }
+
+    #[tokio::test]
+    async fn queue_work_refuses_a_connection_nobody_declared() {
+        // Falling back to the default would put the pool on the wrong backend:
+        // it would accept every job pushed to it and drain a queue nothing
+        // writes to, silently, while reporting itself healthy.
+        let app = app().await;
+        let manager =
+            QueueManager::new(Arc::new(MemoryQueue::new()) as Arc<_>, Arc::new(JobRegistry::new()));
+        app.instance(manager);
+
+        let console = Console::new("rainier").register(QueueWorkCommand);
+        assert_eq!(
+            console.run_argv(&app, ["queue:work", "--once", "--connection=nowhere"]).await,
+            exit::FAILURE
+        );
+    }
+
+    #[tokio::test]
+    async fn one_worker_drains_two_backends_because_the_queues_say_where_they_live() {
+        // The whole point of a queue declaring its connection: a single
+        // `queue:work`, no flags, draining queues that live on different
+        // backends. Before this it took two processes and two `--queue` lists
+        // kept in step by hand.
+        use rainier_queue::{
+            Connections, Job, JobContext, Queue as _, QueueDeclaration, QueuedJob,
+        };
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize)]
+        struct Fast;
+
+        #[async_trait::async_trait]
+        impl Job for Fast {
+            const NAME: &'static str = "test.two.fast";
+            const QUEUE: &'static str = "latency";
+            async fn handle(&self, _: &JobContext) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct Slow;
+
+        #[async_trait::async_trait]
+        impl Job for Slow {
+            const NAME: &'static str = "test.two.slow";
+            const QUEUE: &'static str = "intense";
+            async fn handle(&self, _: &JobContext) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let app = app().await;
+
+        // Two genuinely different backends, so a worker draining the wrong one
+        // leaves its jobs behind rather than quietly succeeding.
+        let latency = Arc::new(MemoryQueue::new());
+        let intense = Arc::new(MemoryQueue::new());
+
+        let manager = QueueManager::new(
+            Arc::clone(&latency) as Arc<_>,
+            Arc::new(JobRegistry::new().with::<Fast>().with::<Slow>()),
+        )
+        .with_connection("intense", Arc::clone(&intense) as Arc<_>);
+
+        latency.push(QueuedJob::from_job(&Fast).unwrap()).await.unwrap();
+        intense.push(QueuedJob::from_job(&Slow).unwrap()).await.unwrap();
+
+        // The declaration is what routes them; nothing is passed on the
+        // command line.
+        app.resolve::<rainier_config::Config>()
+            .unwrap()
+            .set(
+                crate::keys::QUEUES,
+                Connections::new("default")
+                    .with("default", rainier_queue::ConnectionConfig::memory())
+                    .with("intense", rainier_queue::ConnectionConfig::memory())
+                    .with_queue(QueueDeclaration::new("latency"))
+                    .with_queue(QueueDeclaration::new("intense").on("intense")),
+            )
+            .unwrap();
+
+        app.instance(manager);
+
+        let console = Console::new("rainier").register(QueueWorkCommand);
+        assert_eq!(console.run_argv(&app, ["queue:work", "--once"]).await, exit::SUCCESS);
+
+        assert_eq!(latency.size("latency").await.unwrap(), 0, "the default backend was drained");
+        assert_eq!(intense.size("intense").await.unwrap(), 0, "the named backend was drained");
     }
 
     #[test]

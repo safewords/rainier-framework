@@ -101,8 +101,8 @@ pub mod sqs;
 pub mod worker;
 
 pub use connections::{
-    ConnectionConfig, Connections, DatabaseConnection, KafkaConnection, QueueResources,
-    RedisConnection, SqsConnection, SqsCredentials,
+    ConnectionConfig, Connections, DatabaseConnection, KafkaConnection, QueueDeclaration,
+    QueueResources, RedisConnection, SqsConnection, SqsCredentials,
 };
 pub use database::{DatabaseQueue, FailedJobRow, JobRow};
 pub use driver::QueueDriver;

@@ -1,5 +1,6 @@
 //! The [`Worker`] loop, and the events it fires.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +60,19 @@ pub enum Outcome {
     Released,
     /// A job failed for the last time.
     Failed,
+}
+
+/// Drop a finished job out of its queue's in-flight count.
+///
+/// Removed at zero rather than left, so the map holds only what is running and
+/// a long run does not accumulate an entry per queue it has ever touched.
+fn finished(running: &mut BTreeMap<String, usize>, queue: &str) {
+    if let Some(count) = running.get_mut(queue) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            running.remove(queue);
+        }
+    }
 }
 
 /// Record one finished job against the run's statistics.
@@ -156,6 +170,19 @@ pub struct WorkerOptions {
     /// An application that needs per-job state under concurrency should carry
     /// it in the job's own payload rather than the container.
     pub concurrency: usize,
+
+    /// A per-queue ceiling, within [`concurrency`](Self::concurrency).
+    ///
+    /// One worker serves every queue on a connection, so without this the
+    /// connection's limit is the only one there is and a slow queue can fill
+    /// every slot. A queue named here is reserved from only while it has fewer
+    /// than its own limit in flight; the worker waits for one of *its* jobs to
+    /// finish rather than skipping ahead, which is what makes the number a
+    /// limit rather than a suggestion.
+    ///
+    /// Queues not named here are bounded only by `concurrency`. A `BTreeMap`
+    /// so a `Debug` of the options reads the same way twice.
+    pub queue_limits: BTreeMap<String, usize>,
 }
 
 impl Default for WorkerOptions {
@@ -179,6 +206,7 @@ impl Default for WorkerOptions {
             // default above 1 would change the failure behaviour of every
             // existing deployment on upgrade, silently.
             concurrency: 1,
+            queue_limits: BTreeMap::new(),
         }
     }
 }
@@ -209,6 +237,16 @@ impl WorkerOptions {
     /// crate spends the most effort avoiding.
     pub fn concurrency(mut self, concurrency: usize) -> Self {
         self.concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Cap `queue` at `limit` jobs at once, within the worker's own
+    /// concurrency.
+    ///
+    /// Clamped to at least one, for the same reason: a queue admitting zero is
+    /// drained by nobody while the worker reports itself healthy.
+    pub fn queue_limit(mut self, queue: impl Into<String>, limit: usize) -> Self {
+        self.queue_limits.insert(queue.into(), limit.max(1));
         self
     }
 
@@ -378,7 +416,28 @@ impl Worker {
     /// several jobs in flight: reserving and processing are one turn at
     /// `concurrency: 1` and separate ones above it.
     async fn reserve_next(&self) -> Result<Option<QueuedJob>> {
+        self.reserve_within(&BTreeMap::new()).await
+    }
+
+    /// Reserve from the first queue that has anything and is under its own
+    /// limit, in priority order.
+    ///
+    /// A queue at its limit is **skipped, not waited on**: the worker moves to
+    /// the next one rather than idling, which is the difference between a cap
+    /// that shapes the mix and a cap that stalls the whole worker. Waiting
+    /// happens where it belongs — in the run loop, once nothing can be
+    /// reserved at all.
+    async fn reserve_within(
+        &self,
+        in_flight: &BTreeMap<String, usize>,
+    ) -> Result<Option<QueuedJob>> {
         for queue in &self.options.queues {
+            if let Some(limit) = self.options.queue_limits.get(queue) {
+                if in_flight.get(queue).copied().unwrap_or(0) >= *limit {
+                    continue;
+                }
+            }
+
             if let Some(job) = self.queue.reserve(queue).await? {
                 return Ok(Some(job));
             }
@@ -419,6 +478,12 @@ impl Worker {
         let concurrency = self.options.concurrency.max(1);
         let mut in_flight = FuturesUnordered::new();
 
+        // How many of each queue's jobs are running, so a per-queue limit can
+        // be checked before reserving. Kept beside the futures rather than in
+        // the worker, because it is the run's state and two concurrent runs of
+        // the same worker would otherwise share a count neither owns.
+        let mut running: BTreeMap<String, usize> = BTreeMap::new();
+
         loop {
             // Whether the run is finishing. Separated from "break now",
             // because work already reserved has to be drained either way: a
@@ -450,10 +515,15 @@ impl Worker {
             // Fill the free slots before waiting on any of them, so a worker
             // with room does not sit on an idle socket while jobs queue up.
             if !finishing && in_flight.len() < concurrency {
-                match self.reserve_next().await {
+                match self.reserve_within(&running).await {
                     Ok(Some(job)) => {
                         consecutive_errors = 0;
-                        in_flight.push(self.process(job));
+                        let queue = job.queue.clone();
+                        *running.entry(queue.clone()).or_insert(0) += 1;
+                        in_flight.push(async move {
+                            let outcome = self.process(job).await;
+                            (queue, outcome)
+                        });
                         continue;
                     }
                     Ok(None) => {
@@ -508,7 +578,8 @@ impl Worker {
                         } else {
                             tokio::select! {
                                 _ = tokio::time::sleep(backoff) => {}
-                                Some(outcome) = in_flight.next() => {
+                                Some((queue, outcome)) = in_flight.next() => {
+                                    finished(&mut running, &queue);
                                     tally(&mut stats, outcome);
                                 }
                             }
@@ -520,7 +591,8 @@ impl Worker {
 
             // Either the slots are full, or the run is finishing with work
             // still out. Both mean: wait for one to land.
-            if let Some(outcome) = in_flight.next().await {
+            if let Some((queue, outcome)) = in_flight.next().await {
+                finished(&mut running, &queue);
                 tally(&mut stats, outcome);
             }
 
@@ -1021,6 +1093,95 @@ mod tests {
 
         assert_eq!(stats.processed, 4, "processed {} with a limit of 4", stats.processed);
         assert_eq!(queue.size("default").await.unwrap(), 6, "the rest is left for somebody");
+    }
+
+    /// The same overlapping job, but dispatched to a named queue.
+    #[derive(Serialize, Deserialize)]
+    struct Hogging;
+
+    #[async_trait::async_trait]
+    impl Job for Hogging {
+        const NAME: &'static str = "test.hogging";
+        const QUEUE: &'static str = "slow";
+        const TRIES: u32 = 1;
+
+        async fn handle(&self, _: &JobContext) -> Result<()> {
+            use std::sync::atomic::Ordering;
+
+            let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+            HIGH_WATER.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_queue_limit_caps_that_queue_inside_the_workers_own_concurrency() {
+        // The reason both numbers exist. The connection's budget is 6, so the
+        // worker may run six at once — but `slow` declared 2, and one slow
+        // queue must not be able to fill every slot on a shared backend.
+        use std::sync::atomic::Ordering;
+
+        let _observing = observing();
+        IN_FLIGHT.store(0, Ordering::SeqCst);
+        HIGH_WATER.store(0, Ordering::SeqCst);
+
+        let queue = Arc::new(MemoryQueue::new());
+        for _ in 0..8 {
+            queue.push(QueuedJob::from_job(&Hogging).unwrap()).await.unwrap();
+        }
+
+        let worker = Worker::new(
+            Arc::clone(&queue) as Arc<dyn Queue>,
+            Arc::new(JobRegistry::new().with::<Hogging>()),
+            Arc::new(Container::new()),
+        )
+        .with_options(
+            WorkerOptions::default()
+                .stop_when_empty()
+                .queues(["slow".to_string()])
+                .concurrency(6)
+                .queue_limit("slow", 2),
+        );
+
+        let stats = worker.run().await.expect("drains");
+
+        assert_eq!(stats.processed, 8, "every job still runs");
+        assert!(
+            HIGH_WATER.load(Ordering::SeqCst) <= 2,
+            "ran {} at once with a queue limit of 2",
+            HIGH_WATER.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queue_without_a_limit_uses_the_whole_budget() {
+        // The other half: a limit is opt-in, and a queue that declares none is
+        // bounded only by the connection's.
+        use std::sync::atomic::Ordering;
+
+        let _observing = observing();
+        IN_FLIGHT.store(0, Ordering::SeqCst);
+        HIGH_WATER.store(0, Ordering::SeqCst);
+
+        let queue = Arc::new(MemoryQueue::new());
+        for _ in 0..8 {
+            queue.push(QueuedJob::from_job(&Hogging).unwrap()).await.unwrap();
+        }
+
+        let worker = Worker::new(
+            Arc::clone(&queue) as Arc<dyn Queue>,
+            Arc::new(JobRegistry::new().with::<Hogging>()),
+            Arc::new(Container::new()),
+        )
+        .with_options(
+            WorkerOptions::default().stop_when_empty().queues(["slow".to_string()]).concurrency(4),
+        );
+
+        worker.run().await.expect("drains");
+
+        assert!(HIGH_WATER.load(Ordering::SeqCst) > 2, "the budget was not used");
     }
 
     fn worker(queue: Arc<MemoryQueue>) -> Worker {

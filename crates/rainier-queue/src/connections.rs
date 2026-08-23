@@ -204,6 +204,76 @@ fn reservation_setting(driver: QueueDriver) -> Option<&'static str> {
     }
 }
 
+/// A declared queue.
+///
+/// The queue names an application dispatches to were the last thing here that
+/// was a bare string: `Job::QUEUE` is one, `--queue` takes a list of them, and
+/// nothing said which backend any of them lived on. A deployment with two
+/// connections had to answer that on a command line, in every place a worker
+/// was started.
+///
+/// ```
+/// # use rainier_queue::QueueDeclaration;
+/// QueueDeclaration {
+///     name: "intense-workloads".into(),
+///     connection: Some("intense".into()),
+///     concurrency: Some(1),
+/// };
+/// ```
+///
+/// A struct literal with public fields and [`Default`], like every other
+/// declaration in this framework.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueDeclaration {
+    /// The name jobs are dispatched to, and the name a worker drains.
+    pub name: String,
+
+    /// Which declared connection this queue lives on.
+    ///
+    /// A **reference** to an entry in `connections`, resolved at build time —
+    /// a name that matches nothing is a boot failure rather than a silent
+    /// fallback to the default, because a queue pointed at the wrong backend
+    /// accepts every job pushed to it and is drained by nobody.
+    ///
+    /// `None` means the default connection, which is what a single-connection
+    /// application gets without saying anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
+
+    /// How many jobs from this queue run at once.
+    ///
+    /// `None` takes the connection's, which takes the worker's default of one.
+    /// Declared here as well as on the connection because two queues on the
+    /// same backend can want different limits — a queue of slow exports and a
+    /// queue of like-counter updates are the same Redis and nothing like the
+    /// same workload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<usize>,
+}
+
+impl QueueDeclaration {
+    /// A queue on the default connection.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into(), connection: None, concurrency: None }
+    }
+
+    /// Put it on a named connection.
+    pub fn on(mut self, connection: impl Into<String>) -> Self {
+        self.connection = Some(connection.into());
+        self
+    }
+
+    /// Run up to `concurrency` of this queue's jobs at once.
+    ///
+    /// Clamped to at least one: a queue admitting zero jobs is drained by
+    /// nobody while the worker reports itself healthy.
+    pub fn concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = Some(concurrency.max(1));
+        self
+    }
+}
+
 /// The queue connections an application declares, and which of them is the
 /// default.
 ///
@@ -224,6 +294,20 @@ pub struct Connections {
     /// run.
     #[serde(default)]
     connections: BTreeMap<String, ConnectionConfig>,
+
+    /// The queues this application declares, each naming its connection.
+    ///
+    /// Optional, and empty is the ordinary case: an application with one
+    /// backend has nothing to say here, and a worker falls back to the queues
+    /// its registered jobs use. It earns its keep the moment there are two
+    /// connections, because that is when "which backend is this queue on"
+    /// stops having an obvious answer.
+    ///
+    /// A `Vec` rather than a map keyed on name, because the order is the
+    /// **priority order** a worker drains them in — the same meaning `--queue`
+    /// has, and a map would lose it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    queues: Vec<QueueDeclaration>,
 }
 
 /// The connection name assumed when a `queue` section does not say.
@@ -243,7 +327,7 @@ impl Connections {
     /// The name has to be declared with [`with`](Self::with) before
     /// [`build`](Self::build) will succeed.
     pub fn new(default: impl Into<String>) -> Self {
-        Self { default: default.into(), connections: BTreeMap::new() }
+        Self { default: default.into(), connections: BTreeMap::new(), queues: Vec::new() }
     }
 
     /// Declare a connection under `name`.
@@ -264,6 +348,36 @@ impl Connections {
     /// The declaration filed under `name`.
     pub fn get(&self, name: &str) -> Option<&ConnectionConfig> {
         self.connections.get(name)
+    }
+
+    /// Declare a queue, naming the connection it lives on.
+    ///
+    /// Order is priority order: a worker reserves from the first of these that
+    /// has anything waiting.
+    pub fn with_queue(mut self, queue: QueueDeclaration) -> Self {
+        self.queues.push(queue);
+        self
+    }
+
+    /// Every declared queue, in the priority order they were declared in.
+    pub fn queues(&self) -> &[QueueDeclaration] {
+        &self.queues
+    }
+
+    /// The declaration for `queue`, if it has one.
+    pub fn queue(&self, queue: &str) -> Option<&QueueDeclaration> {
+        self.queues.iter().find(|declared| declared.name == queue)
+    }
+
+    /// Which connection `queue` lives on — its declaration's, or the default.
+    ///
+    /// The question a worker actually asks, answered in one place so that
+    /// "undeclared" and "declared without a connection" cannot come to mean
+    /// different things.
+    pub fn connection_for(&self, queue: &str) -> &str {
+        self.queue(queue)
+            .and_then(|declared| declared.connection.as_deref())
+            .unwrap_or(&self.default)
     }
 
     /// Every declared name, in a stable order.
@@ -309,6 +423,30 @@ impl Connections {
                 self.default,
                 self.declared()
             )));
+        }
+
+        // Every queue's connection reference has to name something declared.
+        //
+        // Refused rather than defaulted, for the same reason the default check
+        // above is: a queue pointed at a backend nobody declared would fall
+        // back to the default, accept every job dispatched to it, and be
+        // drained by a worker looking somewhere else entirely. That failure
+        // raises nothing, retries nothing and leaves no failed row.
+        //
+        // Checked here rather than at deserialisation because it is a question
+        // about the *set* — a `QueueDeclaration` on its own cannot know which
+        // connections exist.
+        for queue in &self.queues {
+            if let Some(connection) = &queue.connection {
+                if !self.connections.contains_key(connection) {
+                    return Err(Error::internal(format!(
+                        "queue `{}` names connection `{connection}`, which is not declared; \
+                         declared connections are {}",
+                        queue.name,
+                        self.declared()
+                    )));
+                }
+            }
         }
 
         let mut built: Vec<(&str, Arc<dyn Queue>)> = Vec::with_capacity(self.connections.len());
@@ -2402,6 +2540,96 @@ impl From<ConnectionConfig> for RawConnection {
 
 #[cfg(test)]
 mod tests {
+
+    // --- queues as declarations --------------------------------------------
+
+    #[test]
+    fn a_queue_declares_the_connection_it_lives_on() {
+        let connections: Connections = serde_json::from_value(json!({
+            "default": "primary",
+            "connections": {
+                "primary": { "driver": "database" },
+                "intense": { "driver": "database", "concurrency": 1 },
+            },
+            "queues": [
+                { "name": "default" },
+                { "name": "intense-workloads", "connection": "intense", "concurrency": 1 },
+            ],
+        }))
+        .expect("parses");
+
+        assert_eq!(connections.connection_for("intense-workloads"), "intense");
+        assert_eq!(connections.queue("intense-workloads").unwrap().concurrency, Some(1));
+    }
+
+    #[test]
+    fn a_queue_without_a_connection_is_on_the_default_one() {
+        // What a single-connection application gets without saying anything.
+        let connections = Connections::new("primary").with_queue(QueueDeclaration::new("default"));
+
+        assert_eq!(connections.connection_for("default"), "primary");
+    }
+
+    #[test]
+    fn an_undeclared_queue_is_on_the_default_connection() {
+        // A queue nobody declared is not an error: `Job::QUEUE` is a bare name
+        // and most applications never declare any of them.
+        let connections = Connections::new("primary");
+
+        assert_eq!(connections.connection_for("whatever"), "primary");
+    }
+
+    #[tokio::test]
+    async fn a_queue_naming_an_undeclared_connection_fails_the_build() {
+        // The failure this prevents is silent: the queue would fall back to
+        // the default, accept every job, and be drained by nobody.
+        let connections = Connections::new("primary")
+            .with("primary", ConnectionConfig::memory())
+            .with_queue(QueueDeclaration::new("exports").on("nowhere"));
+
+        let resources =
+            QueueResources::new(Arc::new(JobRegistry::new()), Arc::new(Container::new()));
+        let err = connections.build(&resources).await.expect_err("refused");
+
+        assert!(err.message().contains("nowhere"), "{}", err.message());
+        assert!(err.message().contains("exports"), "{}", err.message());
+    }
+
+    #[test]
+    fn the_declared_order_is_the_priority_order() {
+        // A `Vec`, not a map: the order is what a worker drains them in, and
+        // a map would lose it.
+        let connections = Connections::new("primary")
+            .with_queue(QueueDeclaration::new("high"))
+            .with_queue(QueueDeclaration::new("default"));
+
+        let names: Vec<&str> = connections.queues().iter().map(|q| q.name.as_str()).collect();
+        assert_eq!(names, ["high", "default"]);
+    }
+
+    #[test]
+    fn a_queue_declaration_round_trips() {
+        let connections = Connections::new("primary")
+            .with("primary", ConnectionConfig::memory())
+            .with_queue(QueueDeclaration::new("exports").concurrency(2));
+
+        let json = serde_json::to_value(&connections).expect("serialises");
+        let back: Connections = serde_json::from_value(json).expect("deserialises");
+
+        assert_eq!(back.queue("exports").unwrap().concurrency, Some(2));
+    }
+
+    #[test]
+    fn an_unknown_field_on_a_queue_is_refused_naming_itself() {
+        let err = serde_json::from_value::<Connections>(json!({
+            "default": "primary",
+            "connections": { "primary": { "driver": "memory" } },
+            "queues": [{ "name": "exports", "connexion": "intense" }],
+        }))
+        .expect_err("refused");
+
+        assert!(err.to_string().contains("connexion"), "{err}");
+    }
 
     // --- concurrency, declared on the connection ---------------------------
 
