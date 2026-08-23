@@ -26,6 +26,10 @@
 
 use std::sync::Arc;
 
+pub use crate::mailers::{
+    CloudflareMailer, FileMailer, MailerConfig, MailgunMailer, SmtpMailer, TokenMailer,
+};
+
 use rainier_config::Config;
 use rainier_support::{Error, Result};
 use rainier_view::ViewEngine;
@@ -42,23 +46,94 @@ use crate::keys;
 /// empty — each error names the feature or the variable, because "mail is
 /// not working" should take one read of the boot log to diagnose.
 pub fn transport(config: &Config) -> Result<Arc<dyn Transport>> {
-    match config.setting(keys::MAIL_DRIVER)? {
-        MailDriver::Log => Ok(Arc::new(LogTransport)),
-        MailDriver::Memory => Ok(Arc::new(MemoryTransport::new())),
-        MailDriver::File => {
-            let directory = config
-                .get(keys::MAIL_FILE_PATH)
-                .filter(|path| !path.trim().is_empty())
-                .unwrap_or_else(|| "storage/mail".into());
-            Ok(Arc::new(FileTransport::new(directory)?))
-        }
-        MailDriver::Smtp => smtp(config),
-        MailDriver::Cloudflare => cloudflare(config),
-        MailDriver::Ses => ses(),
-        MailDriver::Postmark => postmark(config),
-        MailDriver::Mailgun => mailgun(config),
-        MailDriver::Sendgrid => sendgrid(config),
-        MailDriver::Resend => resend(config),
+    build_declared(&declared(config)?)
+}
+
+/// The declaration this configuration describes.
+///
+/// An explicit `mail.mailer` section wins; otherwise the loose `MAIL_*` values
+/// are folded into the same shape. Folding rather than branching is what keeps
+/// there being **one** construction path: a declaration and a set of variables
+/// cannot produce different transports, because the variables become a
+/// declaration before anything is built.
+pub fn declared(config: &Config) -> Result<MailerConfig> {
+    if let Some(declared) = config.get(keys::MAILER) {
+        return Ok(declared);
+    }
+
+    let text = |key| config.get(key).filter(|value: &String| !value.trim().is_empty());
+
+    let driver = config.setting(keys::MAIL_DRIVER)?;
+
+    // Refused rather than dropped. `u16::try_from(...).ok()` would leave a
+    // deployment that wrote `MAIL_PORT=70000` connecting on the encryption's
+    // default port instead — the setting read, understood by whoever wrote it,
+    // and then ignored.
+    let port = match config.get(keys::MAIL_PORT).unwrap_or(0) {
+        0 => None,
+        port => Some(
+            u16::try_from(port)
+                .map_err(|_| Error::internal(format!("`MAIL_PORT={port}` is not a port")))?,
+        ),
+    };
+
+    let raw = serde_json::json!({
+        "driver": driver,
+        "path": text(keys::MAIL_FILE_PATH),
+        "host": text(keys::MAIL_HOST),
+        "port": port,
+        "username": text(keys::MAIL_USERNAME),
+        "password": text(keys::MAIL_PASSWORD),
+        "encryption": config.setting(keys::MAIL_ENCRYPTION)?,
+        "timeout_secs": u64::try_from(config.get(keys::MAIL_TIMEOUT).unwrap_or(30)).ok(),
+        // One `token` field for four providers that each name it differently.
+        // Read in driver order rather than merged, so a deployment carrying a
+        // stale key for a provider it no longer uses cannot supply the
+        // credential for the one it does.
+        "token": match driver {
+            MailDriver::Cloudflare => text(keys::MAIL_CLOUDFLARE_TOKEN),
+            MailDriver::Postmark => text(keys::MAIL_POSTMARK_TOKEN),
+            MailDriver::Sendgrid => text(keys::MAIL_SENDGRID_KEY),
+            MailDriver::Resend => text(keys::MAIL_RESEND_KEY),
+            _ => None,
+        },
+        "domain": text(keys::MAIL_MAILGUN_DOMAIN),
+        "secret": text(keys::MAIL_MAILGUN_SECRET),
+        "endpoint": text(keys::MAIL_MAILGUN_ENDPOINT),
+    });
+
+    // `null` is how the fields above say "unset", and `deny_unknown_fields`
+    // has no quarrel with a key whose value is absent — but a `None` port on a
+    // `u16` field would still fail to deserialise, so they are stripped.
+    let raw = match raw {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields.into_iter().filter(|(_, value)| !value.is_null()).collect(),
+        ),
+        other => other,
+    };
+
+    serde_json::from_value(raw).map_err(|e| {
+        Error::internal(format!("the mail settings do not describe a usable mailer: {e}"))
+    })
+}
+
+/// Build the transport a declaration names.
+///
+/// The one place a mail transport is constructed. `transport` reaches it by
+/// way of `declared`, so the `MAIL_*` variables and a `mail.mailer` section
+/// are two spellings of one thing rather than two implementations of it.
+pub(crate) fn build_declared(declared: &MailerConfig) -> Result<Arc<dyn Transport>> {
+    match declared {
+        MailerConfig::Log => Ok(Arc::new(LogTransport)),
+        MailerConfig::Memory => Ok(Arc::new(MemoryTransport::new())),
+        MailerConfig::File(file) => Ok(Arc::new(FileTransport::new(&file.path)?)),
+        MailerConfig::Smtp(declared) => smtp(declared),
+        MailerConfig::Cloudflare(declared) => cloudflare(declared),
+        MailerConfig::Ses => ses(),
+        MailerConfig::Postmark(declared) => postmark(declared),
+        MailerConfig::Mailgun(declared) => mailgun(declared),
+        MailerConfig::SendGrid(declared) => sendgrid(declared),
+        MailerConfig::Resend(declared) => resend(declared),
     }
 }
 
@@ -96,22 +171,6 @@ pub fn mailer_over(
     mailer
 }
 
-/// A setting the selected driver cannot work without.
-#[cfg(any(
-    feature = "mail-smtp",
-    feature = "mail-postmark",
-    feature = "mail-mailgun",
-    feature = "mail-sendgrid",
-    feature = "mail-resend"
-))]
-fn require(config: &Config, key: rainier_config::Key<String>, name: &str) -> Result<String> {
-    config.get(key).filter(|value| !value.trim().is_empty()).ok_or_else(|| {
-        Error::internal(format!(
-            "`MAIL_DRIVER` selects a driver that needs `{name}`, which is not set."
-        ))
-    })
-}
-
 /// The refusal a sender compiled out answers with — at boot, naming the
 /// feature, rather than a mailer that quietly logs instead of sending.
 #[allow(dead_code, reason = "unused only when every mail feature is enabled")]
@@ -123,51 +182,39 @@ fn feature_missing(driver: &str, feature: &str) -> Error {
 }
 
 #[cfg(feature = "mail-smtp")]
-fn smtp(config: &Config) -> Result<Arc<dyn Transport>> {
-    let host = require(config, keys::MAIL_HOST, "MAIL_HOST")?;
+fn smtp(declared: &SmtpMailer) -> Result<Arc<dyn Transport>> {
+    let mut builder = SmtpTransport::builder(&declared.host)
+        .encryption(declared.encryption)
+        .timeout(std::time::Duration::from_secs(declared.timeout_secs));
 
-    let seconds = config.get(keys::MAIL_TIMEOUT).unwrap_or(30);
-    let seconds = u64::try_from(seconds).map_err(|_| {
-        Error::internal(format!("`MAIL_TIMEOUT={seconds}` is not a number of seconds"))
-    })?;
-
-    let mut builder = SmtpTransport::builder(host)
-        .encryption(config.setting(keys::MAIL_ENCRYPTION)?)
-        .timeout(std::time::Duration::from_secs(seconds));
-
-    let port = config.get(keys::MAIL_PORT).unwrap_or(0);
-    if port > 0 {
-        builder = builder.port(
-            u16::try_from(port)
-                .map_err(|_| Error::internal(format!("`MAIL_PORT={port}` is not a port")))?,
-        );
+    if let Some(port) = declared.port {
+        builder = builder.port(port);
     }
 
-    let username = config.get(keys::MAIL_USERNAME).unwrap_or_default();
-    if !username.is_empty() {
-        builder =
-            builder.credentials(username, config.get(keys::MAIL_PASSWORD).unwrap_or_default());
+    // A username with no password is still credentials — some relays accept
+    // an empty one — so this follows the username rather than requiring both.
+    if let Some(username) = &declared.username {
+        builder = builder.credentials(username, declared.password.clone().unwrap_or_default());
     }
 
     Ok(Arc::new(builder.build()?))
 }
 
 #[cfg(not(feature = "mail-smtp"))]
-fn smtp(_: &Config) -> Result<Arc<dyn Transport>> {
+fn smtp(_: &SmtpMailer) -> Result<Arc<dyn Transport>> {
     Err(feature_missing("smtp", "mail-smtp"))
 }
 
 #[cfg(feature = "mail-smtp")]
-fn cloudflare(config: &Config) -> Result<Arc<dyn Transport>> {
+fn cloudflare(declared: &CloudflareMailer) -> Result<Arc<dyn Transport>> {
     // The one setting an application supplies. Host, port, implicit TLS and
     // the `api_token` username are the service's, not a deployment's, so the
     // driver holds them rather than asking four times for the same answer.
-    let token = require(config, keys::MAIL_CLOUDFLARE_TOKEN, "MAIL_CLOUDFLARE_TOKEN")?;
-    Ok(Arc::new(rainier_mail::cloudflare::cloudflare_smtp(token)?))
+    Ok(Arc::new(rainier_mail::cloudflare::cloudflare_smtp(&declared.token)?))
 }
 
 #[cfg(not(feature = "mail-smtp"))]
-fn cloudflare(_: &Config) -> Result<Arc<dyn Transport>> {
+fn cloudflare(_: &CloudflareMailer) -> Result<Arc<dyn Transport>> {
     // The same feature as `smtp`, because it *is* the SMTP transport with
     // settings applied — naming `mail-smtp` here rather than inventing a
     // `mail-cloudflare` keeps the fix one flag rather than a guess.
@@ -188,54 +235,46 @@ fn ses() -> Result<Arc<dyn Transport>> {
 }
 
 #[cfg(feature = "mail-postmark")]
-fn postmark(config: &Config) -> Result<Arc<dyn Transport>> {
-    let token = require(config, keys::MAIL_POSTMARK_TOKEN, "MAIL_POSTMARK_TOKEN")?;
-    Ok(Arc::new(PostmarkTransport::new(http(), token)))
+fn postmark(declared: &TokenMailer) -> Result<Arc<dyn Transport>> {
+    Ok(Arc::new(PostmarkTransport::new(http(), &declared.token)))
 }
 
 #[cfg(not(feature = "mail-postmark"))]
-fn postmark(_: &Config) -> Result<Arc<dyn Transport>> {
+fn postmark(_: &TokenMailer) -> Result<Arc<dyn Transport>> {
     Err(feature_missing("postmark", "mail-postmark"))
 }
 
 #[cfg(feature = "mail-mailgun")]
-fn mailgun(config: &Config) -> Result<Arc<dyn Transport>> {
-    let domain = require(config, keys::MAIL_MAILGUN_DOMAIN, "MAIL_MAILGUN_DOMAIN")?;
-    let secret = require(config, keys::MAIL_MAILGUN_SECRET, "MAIL_MAILGUN_SECRET")?;
-
-    let mut transport = MailgunTransport::new(http(), domain, secret);
-    if let Some(endpoint) =
-        config.get(keys::MAIL_MAILGUN_ENDPOINT).filter(|url| !url.trim().is_empty())
-    {
+fn mailgun(declared: &MailgunMailer) -> Result<Arc<dyn Transport>> {
+    let mut transport = MailgunTransport::new(http(), &declared.domain, &declared.secret);
+    if let Some(endpoint) = &declared.endpoint {
         transport = transport.with_base_url(endpoint);
     }
     Ok(Arc::new(transport))
 }
 
 #[cfg(not(feature = "mail-mailgun"))]
-fn mailgun(_: &Config) -> Result<Arc<dyn Transport>> {
+fn mailgun(_: &MailgunMailer) -> Result<Arc<dyn Transport>> {
     Err(feature_missing("mailgun", "mail-mailgun"))
 }
 
 #[cfg(feature = "mail-sendgrid")]
-fn sendgrid(config: &Config) -> Result<Arc<dyn Transport>> {
-    let key = require(config, keys::MAIL_SENDGRID_KEY, "MAIL_SENDGRID_KEY")?;
-    Ok(Arc::new(SendGridTransport::new(http(), key)))
+fn sendgrid(declared: &TokenMailer) -> Result<Arc<dyn Transport>> {
+    Ok(Arc::new(SendGridTransport::new(http(), &declared.token)))
 }
 
 #[cfg(not(feature = "mail-sendgrid"))]
-fn sendgrid(_: &Config) -> Result<Arc<dyn Transport>> {
+fn sendgrid(_: &TokenMailer) -> Result<Arc<dyn Transport>> {
     Err(feature_missing("sendgrid", "mail-sendgrid"))
 }
 
 #[cfg(feature = "mail-resend")]
-fn resend(config: &Config) -> Result<Arc<dyn Transport>> {
-    let key = require(config, keys::MAIL_RESEND_KEY, "MAIL_RESEND_KEY")?;
-    Ok(Arc::new(ResendTransport::new(http(), key)))
+fn resend(declared: &TokenMailer) -> Result<Arc<dyn Transport>> {
+    Ok(Arc::new(ResendTransport::new(http(), &declared.token)))
 }
 
 #[cfg(not(feature = "mail-resend"))]
-fn resend(_: &Config) -> Result<Arc<dyn Transport>> {
+fn resend(_: &TokenMailer) -> Result<Arc<dyn Transport>> {
     Err(feature_missing("resend", "mail-resend"))
 }
 

@@ -538,6 +538,27 @@ config_keys! {
 
     // --- mail --------------------------------------------------------------
 
+    /// The mailer, as a declaration — `mail.mailer`.
+    ///
+    /// The typed sibling of [`MAIL_DRIVER`] and the ten `MAIL_*` values whose
+    /// relevance depended on it. Set this and the rest are ignored; set none
+    /// of it and they are folded into the same shape, so the two are one
+    /// construction path rather than two.
+    ///
+    /// ```
+    /// use rainier_framework::config::Config;
+    /// use rainier_framework::keys;
+    /// use rainier_framework::mail::{MailerConfig, TokenMailer};
+    ///
+    /// let config = Config::new();
+    /// config.set(keys::MAILER, MailerConfig::Resend(TokenMailer {
+    ///     token: "re_example".into(),
+    /// })).unwrap();
+    ///
+    /// assert_eq!(config.string("mail.mailer.driver").as_deref(), Some("resend"));
+    /// ```
+    pub MAILER: crate::mailers::MailerConfig = "mail.mailer";
+
     /// Where mail goes.
     pub MAIL_DRIVER: MailDriver = "mail.driver";
 

@@ -125,6 +125,7 @@ pub mod kafka;
 pub mod keys;
 pub mod limits;
 pub mod mail;
+pub mod mailers;
 pub mod notifications;
 pub mod observability;
 pub mod public;
