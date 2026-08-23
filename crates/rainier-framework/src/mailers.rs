@@ -266,6 +266,38 @@ impl MailerConfig {
         !matches!(self, Self::Log | Self::Memory | Self::File(_))
     }
 
+    /// Refuse a declaration the driver cannot work with.
+    ///
+    /// # Why this is not only in the deserialiser
+    ///
+    /// `TryFrom<RawMailer>` catches a bad *section*, but these are public
+    /// structs with public fields and an application can write
+    /// `SmtpMailer { host: String::new(), .. }` in Rust without going near
+    /// serde. Without this that builds a transport pointed at nothing, boots,
+    /// serves, and fails on the first message somebody needed — which is the
+    /// exact failure the section-level check exists to prevent, reached by the
+    /// other door.
+    ///
+    /// Same messages either way, so a reader cannot tell which door they came
+    /// through and does not need to.
+    pub fn validate(&self) -> Result<()> {
+        let refuse =
+            |field: &str| Err(rainier_support::Error::internal(missing(self.driver(), field)));
+
+        match self {
+            Self::Smtp(smtp) if smtp.host.trim().is_empty() => refuse("host"),
+            Self::Cloudflare(c) if c.token.trim().is_empty() => refuse("token"),
+            Self::Postmark(t) | Self::SendGrid(t) | Self::Resend(t)
+                if t.token.trim().is_empty() =>
+            {
+                refuse("token")
+            }
+            Self::Mailgun(m) if m.domain.trim().is_empty() => refuse("domain"),
+            Self::Mailgun(m) if m.secret.trim().is_empty() => refuse("secret"),
+            _ => Ok(()),
+        }
+    }
+
     /// Build the transport this declares.
     ///
     /// # Errors
@@ -273,6 +305,7 @@ impl MailerConfig {
     /// When the driver's feature is off, or the declaration is missing
     /// something the driver cannot work without.
     pub fn build(&self) -> Result<Arc<dyn Transport>> {
+        self.validate()?;
         super::mail::build_declared(self)
     }
 }
@@ -330,19 +363,25 @@ fn variable_for(driver: MailDriver, field: &str) -> &'static str {
     }
 }
 
+/// What a driver says when something it cannot work without is absent.
+///
+/// One function, so the deserialiser and [`MailerConfig::validate`] cannot
+/// come to word the same refusal differently.
+fn missing(driver: MailDriver, field: &str) -> String {
+    let variable = variable_for(driver, field);
+    format!(
+        "the `{driver}` mailer needs `{field}` (`{variable}`); without it the transport \
+         builds, boots and fails on the first message somebody actually needed."
+    )
+}
+
 /// A setting the declared driver cannot work without.
 fn required(
     value: Option<String>,
     name: &str,
     driver: MailDriver,
 ) -> std::result::Result<String, String> {
-    value.filter(|v| !v.trim().is_empty()).ok_or_else(|| {
-        let variable = variable_for(driver, name);
-        format!(
-            "the `{driver}` mailer needs `{name}` (`{variable}`); without it the transport \
-             builds, boots and fails on the first message somebody actually needed."
-        )
-    })
+    value.filter(|v| !v.trim().is_empty()).ok_or_else(|| missing(driver, name))
 }
 
 impl TryFrom<RawMailer> for MailerConfig {
@@ -555,6 +594,40 @@ mod tests {
         let declared = parse(json!({"driver": "file"})).expect("parses");
 
         assert_eq!(declared, MailerConfig::File(FileMailer { path: "storage/mail".into() }));
+    }
+
+    #[test]
+    fn a_struct_literal_is_validated_too() {
+        // The other door: these are public structs, so an application can
+        // write one in Rust without going near serde. Building it must refuse
+        // for the same reason and in the same words.
+        let declared = MailerConfig::Smtp(SmtpMailer { host: "   ".into(), ..Default::default() });
+
+        let err = declared.validate().expect_err("refused");
+
+        assert!(err.message().contains("MAIL_HOST"), "{}", err.message());
+        assert!(err.message().contains("host"), "{}", err.message());
+    }
+
+    #[test]
+    fn a_complete_declaration_validates() {
+        for declared in [
+            MailerConfig::Log,
+            MailerConfig::Ses,
+            MailerConfig::File(FileMailer::default()),
+            MailerConfig::Smtp(SmtpMailer {
+                host: "smtp.example.com".into(),
+                ..Default::default()
+            }),
+            MailerConfig::Resend(TokenMailer { token: "re_x".into() }),
+            MailerConfig::Mailgun(MailgunMailer {
+                domain: "mg.example.com".into(),
+                secret: "k".into(),
+                endpoint: None,
+            }),
+        ] {
+            declared.validate().unwrap_or_else(|e| panic!("{declared:?}: {}", e.message()));
+        }
     }
 
     #[test]
