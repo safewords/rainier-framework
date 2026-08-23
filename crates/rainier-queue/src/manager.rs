@@ -294,23 +294,44 @@ impl QueueManager {
 
     /// The queues a worker drains when it is told nothing else.
     ///
-    /// The declaration if there is one, and otherwise a single queue: the
-    /// application's configured default.
+    /// The declaration if there is one, and otherwise **every queue the
+    /// registered jobs declare** — one process, all of it.
     ///
-    /// Deliberately **not** every queue the registered jobs use. A job that
-    /// names a queue is asking to be drained by a worker dedicated to it, and
-    /// a plain `queue:work` picking it up anyway would defeat the reason it
-    /// was moved off the default — usually that it is slow, and would block
-    /// the queue it was taken out of. So a job on a named queue does not run
-    /// until something is told to drain that queue, which is the same
-    /// arrangement Laravel has.
+    /// # This used to be a single `default` queue, deliberately
     ///
-    /// The cost is that a named queue nobody drains is silent, and the
-    /// framework cannot tell that from a queue that is merely idle. That is
-    /// what [`queues`](JobRegistry::queues) is for: it reports what the binary
-    /// has registered, so a deployment check can compare the two.
+    /// The argument was sound while a worker ran one job at a time: a job put
+    /// on a named queue was usually moved there *because* it was slow, and a
+    /// plain `queue:work` picking it up would block the queue it had been
+    /// taken out of. Dedicating a process to it was the only way to stop that.
+    ///
+    /// [`WorkerOptions::concurrency`](crate::WorkerOptions::concurrency)
+    /// answers it differently. A slow job now occupies one slot rather than
+    /// the whole process, so draining everything together no longer means the
+    /// slow thing starves the fast one — which is what made the split
+    /// necessary. What the split cost was the failure the old doc admitted to:
+    /// a named queue nobody was told to drain is silent, indistinguishable
+    /// from a queue that is merely idle, and it stays that way until somebody
+    /// notices jobs are not running.
+    ///
+    /// It is not a complete answer, and the remaining edge is worth knowing:
+    /// with `concurrency: n`, *n* slow jobs still fill every slot and delay
+    /// the rest. Priority order helps — earlier queues are reserved from
+    /// first — but nothing reserves capacity per queue. A deployment that
+    /// needs that guarantee still runs a second worker with an explicit
+    /// `--queue`, which is why the flag and the declaration both remain.
     pub fn default_queues(&self) -> Vec<String> {
-        self.default_queues.clone().unwrap_or_else(|| vec!["default".to_string()])
+        if let Some(declared) = &self.default_queues {
+            return declared.clone();
+        }
+
+        // Every queue this binary has something to run. Empty only when no job
+        // is registered at all, and a worker draining nothing is worse than one
+        // draining a queue that happens to be idle — so `default` is the floor.
+        let registered = self.registry.queues();
+        if registered.is_empty() {
+            return vec!["default".to_string()];
+        }
+        registered.to_vec()
     }
 
     /// Declare a connection reachable as `name`.
@@ -877,11 +898,17 @@ mod tests {
     }
 
     #[test]
-    fn a_job_on_a_named_queue_is_not_drained_by_a_plain_worker() {
-        // The rule, and the reason for it: a job that names a queue is asking
-        // for a worker dedicated to it, usually because it is slow and would
-        // block the queue it was taken out of. A plain `queue:work` picking it
-        // up anyway would defeat the move.
+    fn a_job_on_a_named_queue_is_drained_by_a_plain_worker() {
+        // **This assertion is the reverse of what it was**, and deliberately.
+        //
+        // It used to hold that a job naming a queue wanted a worker dedicated
+        // to it, because a slow job would otherwise block the queue it had
+        // been moved off. That was true while a worker ran one job at a time.
+        // `WorkerOptions::concurrency` makes a slow job occupy one slot rather
+        // than the process, so one worker can drain everything without the
+        // slow thing starving the fast one — and the cost of the old rule was
+        // real: a named queue nobody was told to drain is silent, and looks
+        // exactly like a queue that is merely idle.
         #[derive(serde::Serialize, serde::Deserialize)]
         struct Slow;
         #[async_trait::async_trait]
@@ -896,7 +923,30 @@ mod tests {
         let registry = Arc::new(JobRegistry::new().with::<Slow>());
         let manager = QueueManager::new(Arc::new(MemoryQueue::new()), registry);
 
-        assert_eq!(manager.default_queues(), ["default"]);
+        assert_eq!(manager.default_queues(), ["intense-workloads"]);
+    }
+
+    #[test]
+    fn an_explicit_declaration_still_wins_over_every_registered_queue() {
+        // The escape hatch the reversal above leaves in place: a deployment
+        // that does want a dedicated worker says so, and is not overruled by
+        // what happens to be registered in the binary.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Slow;
+        #[async_trait::async_trait]
+        impl Job for Slow {
+            const NAME: &'static str = "stats.rebuild";
+            const QUEUE: &'static str = "intense-workloads";
+            async fn handle(&self, _: &JobContext) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let registry = Arc::new(JobRegistry::new().with::<Slow>());
+        let manager =
+            QueueManager::new(Arc::new(MemoryQueue::new()), registry).with_default_queues(["high"]);
+
+        assert_eq!(manager.default_queues(), ["high"]);
     }
 
     #[test]

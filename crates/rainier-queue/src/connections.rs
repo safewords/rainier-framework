@@ -729,6 +729,29 @@ impl ConnectionConfig {
         Self::Database(DatabaseConnection::new())
     }
 
+    /// How many jobs a worker draining this connection runs at once.
+    ///
+    /// `None` is the worker's own default of one. `sync` and `memory` are
+    /// always `None` and cannot declare otherwise: `sync` has already run the
+    /// job on the calling thread, and `memory` exists for tests — neither has
+    /// a worker for the number to describe.
+    ///
+    /// Declared on the connection rather than the worker because `queue:work`
+    /// is one process draining every queue, so there is a single consumer per
+    /// deployment and "how many at once" is a property of what is being
+    /// consumed. A command-line flag would have to be repeated in a
+    /// Dockerfile, a chart and a systemd unit, and those copies drift — which
+    /// is the failure `--queue` already produces.
+    pub fn concurrency(&self) -> Option<usize> {
+        match self {
+            Self::Sync | Self::Memory => None,
+            Self::Database(connection) => connection.concurrency,
+            Self::Redis(connection) => connection.concurrency,
+            Self::Sqs(connection) => connection.concurrency,
+            Self::Kafka(connection) => connection.concurrency,
+        }
+    }
+
     /// How long this connection lets a worker hold a job before another may
     /// take it, whatever the driver calls it, and **including the driver's own
     /// default** when the declaration is silent.
@@ -913,9 +936,19 @@ impl std::fmt::Debug for ConnectionConfig {
 #[derive(Clone, Debug, Default)]
 pub struct DatabaseConnection {
     reservation: Option<Duration>,
+    /// How many jobs a worker draining this runs at once.
+    concurrency: Option<usize>,
 }
 
 impl DatabaseConnection {
+    /// Run up to `concurrency` jobs at once on a worker draining this.
+    ///
+    /// Clamped to at least one: a worker admitting zero jobs reports itself
+    /// healthy and drains nothing.
+    pub fn concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = Some(concurrency.max(1));
+        self
+    }
     /// The driver's own defaults.
     pub fn new() -> Self {
         Self::default()
@@ -986,14 +1019,25 @@ pub struct RedisConnection {
     reconnect: bool,
     reconnect_attempts: Option<u32>,
     reconnect_max_backoff: Option<Duration>,
+    /// How many jobs a worker draining this runs at once.
+    concurrency: Option<usize>,
 }
 
 impl RedisConnection {
+    /// Run up to `concurrency` jobs at once on a worker draining this.
+    ///
+    /// Clamped to at least one: a worker admitting zero jobs reports itself
+    /// healthy and drains nothing.
+    pub fn concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = Some(concurrency.max(1));
+        self
+    }
     /// A connection to the server at `url` — `redis://host:port/db`, or
     /// `rediss://` for TLS.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            concurrency: None,
             cluster_seeds: None,
             prefix: None,
             reservation: None,
@@ -1375,14 +1419,25 @@ pub struct SqsConnection {
     visibility_timeout: Option<Duration>,
     wait_time: Option<Duration>,
     credentials: SqsCredentials,
+    /// How many jobs a worker draining this runs at once.
+    concurrency: Option<usize>,
 }
 
 impl SqsConnection {
+    /// Run up to `concurrency` jobs at once on a worker draining this.
+    ///
+    /// Clamped to at least one: a worker admitting zero jobs reports itself
+    /// healthy and drains nothing.
+    pub fn concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = Some(concurrency.max(1));
+        self
+    }
     /// The queue at `queue_url`, authenticating with the [ambient credential
     /// chain](SqsCredentials::Chain).
     pub fn new(queue_url: impl Into<String>) -> Self {
         Self {
             queue_url: queue_url.into(),
+            concurrency: None,
             region: None,
             endpoint: None,
             visibility_timeout: None,
@@ -1615,9 +1670,19 @@ pub struct KafkaConnection {
     group: Option<String>,
     topic_prefix: Option<String>,
     lease: Option<Duration>,
+    /// How many jobs a worker draining this runs at once.
+    concurrency: Option<usize>,
 }
 
 impl KafkaConnection {
+    /// Run up to `concurrency` jobs at once on a worker draining this.
+    ///
+    /// Clamped to at least one: a worker admitting zero jobs reports itself
+    /// healthy and drains nothing.
+    pub fn concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = Some(concurrency.max(1));
+        self
+    }
     /// Bootstrap from `brokers`.
     ///
     /// Every one is a **seed**: the client asks whichever answers for the
@@ -1626,6 +1691,7 @@ impl KafkaConnection {
     pub fn new(brokers: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             brokers: brokers.into_iter().map(Into::into).collect(),
+            concurrency: None,
             group: None,
             topic_prefix: None,
             lease: None,
@@ -1793,6 +1859,16 @@ struct RawConnection {
     min_connections: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pool_size: Option<serde_json::Value>,
+
+    /// How many jobs a worker draining this connection runs at once.
+    ///
+    /// On the connection rather than on the worker because `queue:work` is one
+    /// process draining everything: there is a single consumer per deployment,
+    /// so "how many at once" is a property of the backend it is consuming, and
+    /// putting it on the command line would mean repeating it in a Dockerfile,
+    /// a chart and a systemd unit — the same drift `--queue` already causes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    concurrency: Option<usize>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reservation: Option<u64>,
@@ -2017,7 +2093,8 @@ impl RawConnection {
         // fire only on the driver the setting belongs to, and on any other
         // driver "the `redis` driver does not use `table`" is the truer of the
         // two messages.
-        let declared: [(&str, bool); 21] = [
+        let declared: [(&str, bool); 22] = [
+            ("concurrency", self.concurrency.is_some()),
             ("reservation", self.reservation.is_some()),
             ("url", self.url.is_some()),
             ("prefix", self.prefix.is_some()),
@@ -2084,9 +2161,10 @@ impl TryFrom<RawConnection> for ConnectionConfig {
 
             QueueDriver::Database => {
                 raw.reject_a_table_name()?;
-                raw.reject_settings_it_ignores(&["reservation"])?;
+                raw.reject_settings_it_ignores(&["reservation", "concurrency"])?;
                 Ok(Self::Database(DatabaseConnection {
                     reservation: raw.reservation.map(Duration::from_secs),
+                    concurrency: raw.concurrency,
                 }))
             }
 
@@ -2097,6 +2175,7 @@ impl TryFrom<RawConnection> for ConnectionConfig {
             // against its first entry.
             QueueDriver::Redis | QueueDriver::RedisCluster => {
                 raw.reject_settings_it_ignores(&[
+                    "concurrency",
                     "url",
                     "prefix",
                     "reservation",
@@ -2128,6 +2207,7 @@ impl TryFrom<RawConnection> for ConnectionConfig {
                 let clustered = raw.driver == QueueDriver::RedisCluster || seeds.len() > 1;
 
                 let connection = RedisConnection {
+                    concurrency: raw.concurrency,
                     cluster_seeds: clustered.then(|| seeds.clone()),
                     url: seeds.first().cloned().unwrap_or(url),
                     prefix: raw.prefix,
@@ -2146,6 +2226,7 @@ impl TryFrom<RawConnection> for ConnectionConfig {
             QueueDriver::Sqs => {
                 raw.reject_url_composition()?;
                 raw.reject_settings_it_ignores(&[
+                    "concurrency",
                     "queue_url",
                     "region",
                     "endpoint",
@@ -2181,6 +2262,7 @@ impl TryFrom<RawConnection> for ConnectionConfig {
                 };
 
                 let connection = SqsConnection {
+                    concurrency: raw.concurrency,
                     queue_url,
                     region: raw.region,
                     endpoint: raw.endpoint,
@@ -2194,13 +2276,20 @@ impl TryFrom<RawConnection> for ConnectionConfig {
             }
 
             QueueDriver::Kafka => {
-                raw.reject_settings_it_ignores(&["brokers", "group", "topic_prefix", "lease"])?;
+                raw.reject_settings_it_ignores(&[
+                    "concurrency",
+                    "brokers",
+                    "group",
+                    "topic_prefix",
+                    "lease",
+                ])?;
 
                 let brokers = raw.brokers.ok_or_else(|| {
                     Error::internal("a `kafka` connection needs its bootstrap `brokers`")
                 })?;
 
                 let connection = KafkaConnection {
+                    concurrency: raw.concurrency,
                     brokers,
                     group: raw.group,
                     topic_prefix: raw.topic_prefix,
@@ -2221,6 +2310,7 @@ impl From<ConnectionConfig> for RawConnection {
         // never carries one, so nothing can round-trip back out.
         let blank = |driver| Self {
             driver,
+            concurrency: None,
             queue: None,
             retry_after: None,
             after_commit: None,
@@ -2257,11 +2347,13 @@ impl From<ConnectionConfig> for RawConnection {
             ConnectionConfig::Memory => blank(QueueDriver::Memory),
 
             ConnectionConfig::Database(connection) => Self {
+                concurrency: connection.concurrency,
                 reservation: connection.reservation.map(|d| d.as_secs()),
                 ..blank(QueueDriver::Database)
             },
 
             ConnectionConfig::Redis(connection) => Self {
+                concurrency: connection.concurrency,
                 url: Some(connection.url),
                 prefix: connection.prefix,
                 reservation: connection.reservation.map(|d| d.as_secs()),
@@ -2284,6 +2376,7 @@ impl From<ConnectionConfig> for RawConnection {
                     }
                 };
                 Self {
+                    concurrency: connection.concurrency,
                     queue_url: Some(connection.queue_url),
                     region: connection.region,
                     endpoint: connection.endpoint,
@@ -2296,6 +2389,7 @@ impl From<ConnectionConfig> for RawConnection {
             }
 
             ConnectionConfig::Kafka(connection) => Self {
+                concurrency: connection.concurrency,
                 brokers: Some(connection.brokers),
                 group: connection.group,
                 topic_prefix: connection.topic_prefix,
@@ -2308,6 +2402,89 @@ impl From<ConnectionConfig> for RawConnection {
 
 #[cfg(test)]
 mod tests {
+
+    // --- concurrency, declared on the connection ---------------------------
+
+    #[test]
+    fn a_connection_declares_how_many_jobs_run_at_once() {
+        let connections: Connections = serde_json::from_value(json!({
+            "default": "primary",
+            "connections": {
+                "primary": { "driver": "database", "concurrency": 8 },
+            },
+        }))
+        .expect("parses");
+
+        assert_eq!(connections.get("primary").unwrap().concurrency(), Some(8));
+    }
+
+    #[test]
+    fn a_connection_that_does_not_say_leaves_it_to_the_worker() {
+        // `None` rather than a number copied from `WorkerOptions::default`,
+        // so the two cannot drift into this declaring a value the worker
+        // stopped using.
+        let connections: Connections = serde_json::from_value(json!({
+            "default": "primary",
+            "connections": { "primary": { "driver": "database" } },
+        }))
+        .expect("parses");
+
+        assert_eq!(connections.get("primary").unwrap().concurrency(), None);
+    }
+
+    #[test]
+    fn concurrency_survives_a_round_trip() {
+        let declared =
+            ConnectionConfig::Redis(RedisConnection::new("redis://cache:6379").concurrency(4));
+
+        let json = serde_json::to_value(declared).expect("serialises");
+        let back: ConnectionConfig = serde_json::from_value(json).expect("deserialises");
+
+        assert_eq!(back.concurrency(), Some(4));
+    }
+
+    #[test]
+    fn the_builder_clamps_zero_to_one() {
+        // A worker admitting zero jobs reports itself healthy and drains
+        // nothing, which is the failure this module exists to prevent.
+        assert_eq!(RedisConnection::new("redis://x").concurrency(0).concurrency, Some(1));
+    }
+
+    #[test]
+    fn sync_and_memory_refuse_a_concurrency_rather_than_ignoring_it() {
+        // Neither has a worker for the number to describe: `sync` has already
+        // run the job on the calling thread, and `memory` is for tests. An
+        // accepted setting would leave somebody believing they had bounded
+        // something.
+        for driver in ["sync", "memory"] {
+            let err = serde_json::from_value::<ConnectionConfig>(
+                json!({ "driver": driver, "concurrency": 4 }),
+            )
+            .expect_err("refused");
+
+            assert!(err.to_string().contains("concurrency"), "{err}");
+        }
+    }
+
+    #[test]
+    fn every_driver_with_a_worker_accepts_one() {
+        for value in [
+            json!({ "driver": "database", "concurrency": 2 }),
+            json!({ "driver": "redis", "url": "redis://x", "concurrency": 2 }),
+            json!({
+                "driver": "sqs",
+                "queue_url": "https://sqs.example.com/0/q",
+                "region": "us-east-1",
+                "concurrency": 2,
+            }),
+            json!({ "driver": "kafka", "brokers": ["a:9092"], "concurrency": 2 }),
+        ] {
+            let declared: ConnectionConfig =
+                serde_json::from_value(value.clone()).unwrap_or_else(|e| panic!("{value}: {e}"));
+
+            assert_eq!(declared.concurrency(), Some(2), "{value}");
+        }
+    }
     use super::*;
     use crate::job::{Job, JobContext, QueuedJob};
     use serde::{Deserialize, Serialize};

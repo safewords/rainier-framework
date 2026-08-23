@@ -281,6 +281,19 @@ impl Command for MigrateRollbackCommand {
     }
 }
 
+/// The default connection's declared concurrency, if the application declared
+/// its queues rather than handing over a built manager.
+///
+/// `None` at every step is the same answer — "nothing was declared" — so this
+/// reads as one chain rather than four nested matches. An application that
+/// built its own `QueueManager` has no declaration to read, and gets the
+/// worker's own default of one.
+fn declared_concurrency(app: &Application) -> Option<usize> {
+    let config = app.resolve::<rainier_config::Config>().ok()?;
+    let connections: rainier_queue::Connections = config.get(crate::keys::QUEUES)?;
+    connections.get(connections.default_name())?.concurrency()
+}
+
 /// `queue:work` — process queued jobs.
 #[derive(Debug, Default)]
 pub struct QueueWorkCommand;
@@ -299,6 +312,7 @@ impl Command for QueueWorkCommand {
         Some(
             "Usage:\n  queue:work [--queue=default,high] [--once] [--max-jobs=N] [--sleep=1]\n\n\
              Options:\n  \
+             --concurrency How many jobs at once. Defaults to the connection's declaration.\n  \
              --queue     Comma-separated queues, in priority order.\n              Defaults to the queues the application declared.\n  \
              --once      Process what is waiting, then stop\n  \
              --max-jobs  Stop after N jobs (a worker that recycles)\n  \
@@ -337,6 +351,22 @@ impl Command for QueueWorkCommand {
         let mut options = WorkerOptions::default()
             .queues(queues.clone())
             .sleep(Duration::from_secs(args.parsed_or("sleep", 1u64)));
+
+        // How many at once comes from the connection declaration, because
+        // `queue:work` is one process draining everything: the number
+        // describes the backend being consumed rather than this invocation.
+        // A flag alone would have to be repeated in a Dockerfile, a chart and
+        // a systemd unit, and those copies drift.
+        if let Some(declared) = declared_concurrency(app) {
+            options = options.concurrency(declared);
+        }
+
+        // `--concurrency` still overrides, for the one-off that is not the
+        // deployment: draining a backlog by hand, or pinning it to one to
+        // reproduce an ordering bug.
+        if let Some(flag) = args.option("concurrency").and_then(|v| v.parse::<usize>().ok()) {
+            options = options.concurrency(flag);
+        }
 
         if args.flag("once") {
             options = options.stop_when_empty();

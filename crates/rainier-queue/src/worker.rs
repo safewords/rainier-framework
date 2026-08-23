@@ -61,6 +61,28 @@ pub enum Outcome {
     Failed,
 }
 
+/// Record one finished job against the run's statistics.
+///
+/// A free function so the run loop can call it from inside a `select!` arm,
+/// where a `&mut self` method on the worker would borrow across the branch.
+///
+/// An error here is the *processing* failing rather than the broker, so it
+/// does not touch the consecutive-error count: that budget exists for a broker
+/// that cannot be reached, and spending it on jobs that ran and failed would
+/// end a healthy worker for doing its job.
+fn tally(stats: &mut WorkerStats, outcome: Result<Outcome>) {
+    match outcome {
+        Ok(Outcome::Idle) => stats.idles += 1,
+        Ok(Outcome::Processed) => stats.processed += 1,
+        Ok(Outcome::Released) => stats.released += 1,
+        Ok(Outcome::Failed) => stats.failed += 1,
+        Err(error) => {
+            tracing::warn!(error = %error.message(), "a job could not be processed");
+            stats.errors += 1;
+        }
+    }
+}
+
 /// How a worker behaves.
 #[derive(Debug, Clone)]
 pub struct WorkerOptions {
@@ -108,6 +130,32 @@ pub struct WorkerOptions {
     pub max_consecutive_errors: u32,
     /// The longest the wait between broker retries grows to.
     pub max_error_backoff: Duration,
+
+    /// How many jobs this worker runs at once. `1` is one at a time.
+    ///
+    /// # What this is, precisely
+    ///
+    /// Concurrency, not parallelism. The jobs run as futures on this worker's
+    /// own task, so a job that `await`s — an HTTP call, a query, an upload —
+    /// yields and lets the others progress, and a job that computes without
+    /// awaiting holds them all until it finishes. That is still strictly
+    /// better than one at a time, which holds them *and* the reserve loop, but
+    /// CPU-bound work belongs in `spawn_blocking` either way.
+    ///
+    /// Spawning each job as its own task would give real parallelism and is
+    /// deliberately not done: it needs `'static` jobs and a shared worker, and
+    /// the failure it would buy — a panicking task detaching from the run that
+    /// is supposed to be counting it — is worse than the limit above.
+    ///
+    /// # Scoped container bindings become per-*batch*
+    ///
+    /// The worker flushes the container's scoped bindings when nothing is in
+    /// flight, so with `concurrency: 1` they are per-job exactly as before.
+    /// Above that they are shared by whatever runs together, because a flush
+    /// when one job finished would pull state out from under its neighbours.
+    /// An application that needs per-job state under concurrency should carry
+    /// it in the job's own payload rather than the container.
+    pub concurrency: usize,
 }
 
 impl Default for WorkerOptions {
@@ -127,6 +175,10 @@ impl Default for WorkerOptions {
             // back still exits and says so.
             max_consecutive_errors: 20,
             max_error_backoff: Duration::from_secs(30),
+            // One at a time, which is what this worker has always done. A
+            // default above 1 would change the failure behaviour of every
+            // existing deployment on upgrade, silently.
+            concurrency: 1,
         }
     }
 }
@@ -147,6 +199,16 @@ impl WorkerOptions {
     /// Stop after `max` jobs — for a worker that should recycle periodically.
     pub fn max_jobs(mut self, max: u64) -> Self {
         self.max_jobs = Some(max);
+        self
+    }
+
+    /// Run up to `concurrency` jobs at once.
+    ///
+    /// Clamped to at least one: a worker admitting zero jobs is a process that
+    /// reports itself healthy and drains nothing, which is the failure this
+    /// crate spends the most effort avoiding.
+    pub fn concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency.max(1);
         self
     }
 
@@ -304,12 +366,24 @@ impl Worker {
 
     /// Reserve and run one job from the first queue that has one.
     pub async fn run_next(&self) -> Result<Outcome> {
+        match self.reserve_next().await? {
+            Some(job) => self.process(job).await,
+            None => Ok(Outcome::Idle),
+        }
+    }
+
+    /// Reserve from the first queue that has anything, in priority order.
+    ///
+    /// Split out from [`run_next`](Self::run_next) so the run loop can hold
+    /// several jobs in flight: reserving and processing are one turn at
+    /// `concurrency: 1` and separate ones above it.
+    async fn reserve_next(&self) -> Result<Option<QueuedJob>> {
         for queue in &self.options.queues {
             if let Some(job) = self.queue.reserve(queue).await? {
-                return self.process(job).await;
+                return Ok(Some(job));
             }
         }
-        Ok(Outcome::Idle)
+        Ok(None)
     }
 
     /// Run until stopped, drained, or the job limit is reached.
@@ -336,77 +410,126 @@ impl Worker {
     /// made for a panicking job and for a uniqueness lock that will not
     /// release: what the worker can survive, it survives.
     pub async fn run(&self) -> Result<WorkerStats> {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
         let mut stats = WorkerStats::default();
         let started = std::time::Instant::now();
         let mut consecutive_errors: u32 = 0;
 
+        let concurrency = self.options.concurrency.max(1);
+        let mut in_flight = FuturesUnordered::new();
+
         loop {
-            if self.is_stopping() {
-                break;
-            }
-            if self.options.max_jobs.is_some_and(|max| stats.total() >= max) {
-                break;
-            }
-            // Checked between jobs, never mid-job: a worker that abandoned
-            // work halfway through to meet a deadline would be a worse problem
-            // than the leak the deadline exists to bound.
-            if self.options.max_time.is_some_and(|max| started.elapsed() >= max) {
-                tracing::info!(max_time = ?self.options.max_time, "worker reached its time limit");
+            // Whether the run is finishing. Separated from "break now",
+            // because work already reserved has to be drained either way: a
+            // job dropped mid-flight is a job that stays reserved until its
+            // reservation lapses, which is the slowest possible way to fail.
+            let finishing = self.is_stopping()
+                || self
+                    .options
+                    .max_jobs
+                    .is_some_and(|max| stats.total() + in_flight.len() as u64 >= max)
+                // Checked between jobs, never mid-job: a worker that abandoned
+                // work halfway through to meet a deadline would be a worse
+                // problem than the leak the deadline exists to bound.
+                || self.options.max_time.is_some_and(|max| {
+                    let reached = started.elapsed() >= max;
+                    if reached && in_flight.is_empty() {
+                        tracing::info!(
+                            max_time = ?self.options.max_time,
+                            "worker reached its time limit"
+                        );
+                    }
+                    reached
+                });
+
+            if finishing && in_flight.is_empty() {
                 break;
             }
 
-            match self.run_next().await {
-                Ok(outcome) => {
-                    consecutive_errors = 0;
+            // Fill the free slots before waiting on any of them, so a worker
+            // with room does not sit on an idle socket while jobs queue up.
+            if !finishing && in_flight.len() < concurrency {
+                match self.reserve_next().await {
+                    Ok(Some(job)) => {
+                        consecutive_errors = 0;
+                        in_flight.push(self.process(job));
+                        continue;
+                    }
+                    Ok(None) => {
+                        consecutive_errors = 0;
 
-                    match outcome {
-                        Outcome::Idle => {
+                        // Nothing waiting *and* nothing running is the only
+                        // true idle. With work in flight the queue being empty
+                        // is not idleness, and counting it as such would make
+                        // `--once` stop while jobs were still running.
+                        if in_flight.is_empty() {
                             stats.idles += 1;
                             if self.options.stop_when_empty {
                                 break;
                             }
+                            self.container.flush_scoped();
                             tokio::time::sleep(self.options.sleep).await;
+                            continue;
                         }
-                        Outcome::Processed => stats.processed += 1,
-                        Outcome::Released => stats.released += 1,
-                        Outcome::Failed => stats.failed += 1,
                     }
-                }
-                Err(error) => {
-                    stats.errors += 1;
-                    consecutive_errors += 1;
+                    Err(error) => {
+                        stats.errors += 1;
+                        consecutive_errors += 1;
 
-                    // Still failing after the whole allowance: report it as
-                    // the run's outcome rather than looping forever. A worker
-                    // pointed at a broker that is genuinely gone should end
-                    // and say why, not impersonate a healthy one.
-                    if consecutive_errors >= self.options.max_consecutive_errors {
-                        tracing::error!(
+                        // Still failing after the whole allowance: report it as
+                        // the run's outcome rather than looping forever. A
+                        // worker pointed at a broker that is genuinely gone
+                        // should end and say why, not impersonate a healthy
+                        // one.
+                        if consecutive_errors >= self.options.max_consecutive_errors {
+                            tracing::error!(
+                                error = %error.message(),
+                                consecutive = consecutive_errors,
+                                "the broker has failed too many times in a row; giving up"
+                            );
+                            return Err(error);
+                        }
+
+                        let backoff = self.options.error_backoff(consecutive_errors);
+                        tracing::warn!(
                             error = %error.message(),
                             consecutive = consecutive_errors,
-                            "the broker has failed too many times in a row; giving up"
+                            ?backoff,
+                            "could not reserve a job; retrying after a backoff"
                         );
-                        return Err(error);
+
+                        // A broker that cannot be reached does not stop the
+                        // jobs already running, so the backoff waits alongside
+                        // them rather than instead of them.
+                        if in_flight.is_empty() {
+                            self.container.flush_scoped();
+                            tokio::time::sleep(backoff).await;
+                        } else {
+                            tokio::select! {
+                                _ = tokio::time::sleep(backoff) => {}
+                                Some(outcome) = in_flight.next() => {
+                                    tally(&mut stats, outcome);
+                                }
+                            }
+                        }
+                        continue;
                     }
-
-                    let backoff = self.options.error_backoff(consecutive_errors);
-                    tracing::warn!(
-                        error = %error.message(),
-                        consecutive = consecutive_errors,
-                        ?backoff,
-                        "could not reserve a job; retrying after a backoff"
-                    );
-
-                    // Scoped bindings are flushed here too. The turn is over
-                    // either way, and anything a half-finished reserve bound
-                    // has no business outliving it.
-                    self.container.flush_scoped();
-                    tokio::time::sleep(backoff).await;
-                    continue;
                 }
             }
 
-            self.container.flush_scoped();
+            // Either the slots are full, or the run is finishing with work
+            // still out. Both mean: wait for one to land.
+            if let Some(outcome) = in_flight.next().await {
+                tally(&mut stats, outcome);
+            }
+
+            // Only with nothing in flight, or a finishing job would drop the
+            // bindings its neighbours are still using. At `concurrency: 1`
+            // this is every job, exactly as before.
+            if in_flight.is_empty() {
+                self.container.flush_scoped();
+            }
         }
 
         Ok(stats)
@@ -748,6 +871,156 @@ mod tests {
 
         assert_eq!(stats.total(), 0, "a stopped worker takes nothing new");
         assert_eq!(queue.size("default").await.unwrap(), 3, "the work is left for somebody");
+    }
+
+    /// Counts how many of these are running at once, and the high-water mark.
+    ///
+    /// Globals rather than fields, because a job is reconstructed from its
+    /// payload on every run and cannot carry a handle to the test.
+    static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static HIGH_WATER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Serialises every test that reads those two.
+    ///
+    /// Cargo runs tests in one process on many threads, so two of these
+    /// running together share the counters and each sees the other's jobs —
+    /// which shows up as a high-water mark above the limit under test and
+    /// reads exactly like the worker admitting too much work. Written down
+    /// because that is the "passes alone, fails in the suite" shape this
+    /// workspace has been caught by before.
+    static OBSERVED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the observation lock, surviving a panic in whichever test held it
+    /// last: a poisoned mutex here would turn one real failure into a cascade
+    /// of unrelated ones.
+    fn observing() -> std::sync::MutexGuard<'static, ()> {
+        OBSERVED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Sleeps, so overlapping runs are observable.
+    #[derive(Serialize, Deserialize)]
+    struct Overlapping;
+
+    #[async_trait::async_trait]
+    impl Job for Overlapping {
+        const NAME: &'static str = "test.overlapping";
+        const TRIES: u32 = 1;
+
+        async fn handle(&self, _: &JobContext) -> Result<()> {
+            use std::sync::atomic::Ordering;
+
+            let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+            HIGH_WATER.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A queue holding `count` overlapping jobs, and a worker that drains it.
+    async fn overlapping_run(count: usize, concurrency: usize) -> (WorkerStats, usize) {
+        use std::sync::atomic::Ordering;
+
+        let _observing = observing();
+        IN_FLIGHT.store(0, Ordering::SeqCst);
+        HIGH_WATER.store(0, Ordering::SeqCst);
+
+        let queue = Arc::new(MemoryQueue::new());
+        for _ in 0..count {
+            queue.push(QueuedJob::from_job(&Overlapping).unwrap()).await.unwrap();
+        }
+
+        let worker = Worker::new(
+            Arc::clone(&queue) as Arc<dyn Queue>,
+            Arc::new(JobRegistry::new().with::<Overlapping>()),
+            Arc::new(Container::new()),
+        )
+        .with_options(WorkerOptions::default().stop_when_empty().concurrency(concurrency));
+
+        let stats = worker.run().await.expect("drains");
+        (stats, HIGH_WATER.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn one_at_a_time_is_still_one_at_a_time() {
+        // The regression guard for every deployment that upgrades into this.
+        // A default above 1 would change how failures interleave without
+        // anybody asking for it.
+        assert_eq!(WorkerOptions::default().concurrency, 1);
+
+        let (stats, high_water) = overlapping_run(4, 1).await;
+
+        assert_eq!(stats.processed, 4);
+        assert_eq!(high_water, 1, "concurrency 1 must never overlap two jobs");
+    }
+
+    #[tokio::test]
+    async fn concurrency_runs_several_jobs_at_once() {
+        let (stats, high_water) = overlapping_run(6, 3).await;
+
+        assert_eq!(stats.processed, 6, "every job still runs exactly once");
+        assert!(high_water > 1, "nothing overlapped; concurrency did nothing");
+        assert!(high_water <= 3, "ran {high_water} at once with a limit of 3");
+    }
+
+    #[tokio::test]
+    async fn concurrency_never_exceeds_the_limit() {
+        // The limit is the whole contract: a worker that quietly runs more
+        // than it was told to is one that exhausts a connection pool nobody
+        // sized for it.
+        let (_, high_water) = overlapping_run(20, 4).await;
+
+        assert!(high_water <= 4, "ran {high_water} at once with a limit of 4");
+    }
+
+    #[tokio::test]
+    async fn zero_concurrency_is_clamped_rather_than_draining_nothing() {
+        // A worker admitting zero jobs reports itself healthy and processes
+        // nothing, which is the failure mode this crate works hardest to
+        // avoid.
+        let (stats, high_water) = overlapping_run(2, 0).await;
+
+        assert_eq!(stats.processed, 2);
+        assert_eq!(high_water, 1);
+    }
+
+    #[tokio::test]
+    async fn stopping_when_empty_waits_for_what_is_still_running() {
+        // `--once` means "process what is waiting", not "abandon it". A job
+        // dropped mid-flight stays reserved until its reservation lapses,
+        // which is the slowest possible way to fail.
+        let (stats, _) = overlapping_run(5, 3).await;
+
+        assert_eq!(stats.processed, 5, "an in-flight job was abandoned");
+    }
+
+    #[tokio::test]
+    async fn max_jobs_is_not_overshot_by_the_jobs_already_in_flight() {
+        // The limit counts what is running as well as what has finished, or a
+        // worker asked for two would reserve a third while the first two were
+        // still going and recycle late every time.
+        use std::sync::atomic::Ordering;
+
+        let _observing = observing();
+        IN_FLIGHT.store(0, Ordering::SeqCst);
+        HIGH_WATER.store(0, Ordering::SeqCst);
+
+        let queue = Arc::new(MemoryQueue::new());
+        for _ in 0..10 {
+            queue.push(QueuedJob::from_job(&Overlapping).unwrap()).await.unwrap();
+        }
+
+        let worker = Worker::new(
+            Arc::clone(&queue) as Arc<dyn Queue>,
+            Arc::new(JobRegistry::new().with::<Overlapping>()),
+            Arc::new(Container::new()),
+        )
+        .with_options(WorkerOptions::default().concurrency(4).max_jobs(4));
+
+        let stats = worker.run().await.expect("stops at the limit");
+
+        assert_eq!(stats.processed, 4, "processed {} with a limit of 4", stats.processed);
+        assert_eq!(queue.size("default").await.unwrap(), 6, "the rest is left for somebody");
     }
 
     fn worker(queue: Arc<MemoryQueue>) -> Worker {
