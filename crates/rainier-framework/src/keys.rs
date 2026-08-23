@@ -73,6 +73,7 @@
 //! }
 //! ```
 
+use rainier_broadcast::BroadcasterConfig;
 use rainier_cache::{CacheDriver, Stores as CacheStores};
 use rainier_config::{config_keys, AppEnv};
 use rainier_crypt::{CryptScheme, HashDriver};
@@ -309,6 +310,37 @@ config_keys! {
     /// [`Config::merge`](rainier_config::Config::merge) or replaces the section
     /// outright.
     pub FILESYSTEMS: Disks = "filesystems";
+
+    /// The broadcaster, as a declaration — `broadcasting`.
+    ///
+    /// The typed sibling of every other backend's section. Set this instead of
+    /// building an `Arc<dyn Broadcaster>` by hand, and the framework opens the
+    /// connection, applies the prefix and attaches the Pusher signature.
+    ///
+    /// ```
+    /// use rainier_framework::broadcast::{BroadcasterConfig, RedisBroadcast};
+    /// use rainier_framework::config::Config;
+    /// use rainier_framework::keys;
+    ///
+    /// let config = Config::new();
+    /// config.set(keys::BROADCASTING, BroadcasterConfig::Redis(RedisBroadcast {
+    ///     url: "redis://cache:6379".into(),
+    ///     key: Some("app-key".into()),
+    ///     secret: Some("app-secret".into()),
+    ///     ..Default::default()
+    /// })).unwrap();
+    ///
+    /// assert_eq!(config.string("broadcasting.driver").as_deref(), Some("redis"));
+    /// ```
+    ///
+    /// A declaration that cannot be built **fails the boot**, like a queue
+    /// connection or a disk. An application that would rather lose realtime
+    /// than fail to start says so in as many words, with
+    /// `BroadcasterConfig::build_or_log` and
+    /// [`with_broadcasting`](crate::Rainier::with_broadcasting) — because
+    /// degrading silently is the failure that reads as "the site works and
+    /// nothing updates live", which nobody reports for hours.
+    pub BROADCASTING: BroadcasterConfig = "broadcasting";
 
     /// Which declared disk [`Storage`](rainier_filesystem::Storage) uses when a
     /// call does not name one.

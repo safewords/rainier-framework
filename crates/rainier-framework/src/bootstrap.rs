@@ -388,6 +388,37 @@ impl Rainier {
         self
     }
 
+    /// Declare the broadcaster, and let the framework build it.
+    ///
+    /// The declarative sibling of [`with_broadcasting`](Self::with_broadcasting),
+    /// and the same relationship [`with_queues`](Self::with_queues) has to
+    /// [`with_queue`](Self::with_queue). Opening the connector, applying the
+    /// prefix, attaching the Pusher signature and feature-gating the driver are
+    /// the framework's questions, and every application that broadcasts was
+    /// answering them again by hand.
+    ///
+    /// ```no_run
+    /// # use rainier_framework::broadcast::{BroadcasterConfig, RedisBroadcast};
+    /// # use rainier_framework::Rainier;
+    /// Rainier::new(".").with_broadcaster(BroadcasterConfig::Redis(RedisBroadcast {
+    ///     url: "redis://cache:6379".into(),
+    ///     key: Some("app-key".into()),
+    ///     secret: Some("app-secret".into()),
+    ///     ..Default::default()
+    /// }))
+    /// # ;
+    /// ```
+    ///
+    /// A declaration the framework cannot build fails the boot — see
+    /// [`keys::BROADCASTING`] for why, and for the way to ask for the
+    /// degrading behaviour on purpose.
+    pub fn with_broadcaster(mut self, broadcaster: rainier_broadcast::BroadcasterConfig) -> Self {
+        if let Err(e) = self.config.set(keys::BROADCASTING, broadcaster) {
+            self.deferred = self.deferred.or(Some(e));
+        }
+        self
+    }
+
     /// Serve these WebSocket routes.
     ///
     /// On the **same port** as HTTP: a socket connection begins as a `GET`
@@ -641,7 +672,21 @@ impl Rainier {
         // Broadcasts default to the log, for the same reason notifications do
         // — except the risk here is the reverse one: publishing a private
         // channel to a relay the application never meant to reach.
-        app.instance(self.broadcasting.unwrap_or_else(rainier_broadcast::Broadcasting::log));
+        //
+        // An application that handed over a built `Broadcasting` keeps it: that
+        // is the escape hatch for anything this cannot express, and for the
+        // deployment that chose `build_or_log` over failing to start.
+        let broadcasting = match self.broadcasting {
+            Some(broadcasting) => broadcasting,
+            None => match app.resolve::<Config>()?.get(keys::BROADCASTING) {
+                // Declared and unbuildable is a boot failure, like a queue
+                // connection or a disk. Publishing nowhere is not a lesser
+                // failure than storing nowhere; it is a quieter one.
+                Some(declared) => declared.build().await?,
+                None => rainier_broadcast::Broadcasting::log(),
+            },
+        };
+        app.instance(broadcasting);
 
         // Notifications default to the log channel. Not to mail: a default that
         // can reach a real person is a default that reaches one from staging.

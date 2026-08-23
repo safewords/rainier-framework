@@ -67,6 +67,7 @@
 
 pub mod auth;
 pub mod broadcaster;
+pub mod broadcasters;
 pub mod channel;
 pub mod event;
 pub mod manager;
@@ -82,6 +83,7 @@ pub mod redis;
 
 pub use auth::{ChannelAccess, ChannelParams, ChannelRegistry};
 pub use broadcaster::{Broadcaster, LogBroadcaster, MemoryBroadcaster};
+pub use broadcasters::{BroadcasterConfig, KafkaBroadcast, RedisBroadcast};
 pub use channel::Channel;
 pub use event::{Broadcast, Broadcastable};
 pub use manager::Broadcasting;
