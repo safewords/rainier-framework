@@ -214,10 +214,12 @@ fn reservation_setting(driver: QueueDriver) -> Option<&'static str> {
 ///
 /// ```
 /// # use rainier_queue::QueueDeclaration;
+/// # use std::time::Duration;
 /// QueueDeclaration {
 ///     name: "intense-workloads".into(),
 ///     connection: Some("intense".into()),
 ///     concurrency: Some(1),
+///     timeout: Some(Duration::from_secs(900)),
 /// };
 /// ```
 ///
@@ -250,12 +252,73 @@ pub struct QueueDeclaration {
     /// same workload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<usize>,
+
+    /// How long a job from this queue may run before it is abandoned.
+    ///
+    /// # Why the queue is a good place to say this
+    ///
+    /// A queue usually exists *because* its jobs share a duration. Work is put
+    /// on `intense-workloads` precisely because it takes minutes, and on
+    /// `post-interactions` precisely because somebody is waiting on it. The
+    /// number was previously stated on the worker command line, which meant a
+    /// deployment needed one worker process per timeout — the timeout was the
+    /// thing the pools were really partitioning.
+    ///
+    /// Stated here, one worker drains both and each job gets the limit its
+    /// queue asked for.
+    ///
+    /// # Where it sits in the order
+    ///
+    /// Highest first:
+    ///
+    /// 1. an operator's `--timeout` on the command line, which overrides
+    ///    everything — the escape hatch for draining a backlog or reproducing
+    ///    a hang, and deliberately not something a chart should pass by habit;
+    /// 2. [`Job::TIMEOUT`](crate::Job::TIMEOUT), because a job that knows it
+    ///    is the exception is a better authority than the queue it happens to
+    ///    be on;
+    /// 3. this;
+    /// 4. [`WorkerOptions::timeout`](crate::WorkerOptions::timeout), the
+    ///    worker's own default, for queues that never said.
+    ///
+    /// # It must be shorter than the connection's reservation
+    ///
+    /// A job that outlives its reservation is handed to a second worker while
+    /// the first is still running it — it runs twice, at once, and neither
+    /// attempt fails. Raising a queue's timeout past
+    /// `reservation` / `visibility_timeout` / `lease` is the way into that,
+    /// and [`Connections::check_reservations`] is what catches it.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "secs")]
+    pub timeout: Option<Duration>,
+}
+
+/// `Option<Duration>` as whole seconds in the configuration tree.
+///
+/// A bare `Duration` serialises as `{"secs":900,"nanos":0}`, which is correct
+/// and unreadable in a config file that a person edits. Seconds match how the
+/// connections in this module already spell their reservations.
+mod secs {
+    use super::Duration;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<Duration>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.map(|d| d.as_secs()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Duration>, D::Error> {
+        Ok(Option::<u64>::deserialize(deserializer)?.map(Duration::from_secs))
+    }
 }
 
 impl QueueDeclaration {
     /// A queue on the default connection.
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), connection: None, concurrency: None }
+        Self { name: name.into(), connection: None, concurrency: None, timeout: None }
     }
 
     /// Put it on a named connection.
@@ -270,6 +333,16 @@ impl QueueDeclaration {
     /// nobody while the worker reports itself healthy.
     pub fn concurrency(mut self, concurrency: usize) -> Self {
         self.concurrency = Some(concurrency.max(1));
+        self
+    }
+
+    /// Abandon a job from this queue after `timeout`.
+    ///
+    /// A job declaring its own still wins; see [`timeout`](Self::timeout) for
+    /// the full order and for why this must stay under the connection's
+    /// reservation.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 }
@@ -543,13 +616,49 @@ impl Connections {
             let setting = reservation_setting(connection.driver())
                 .expect("a driver with a reservation names it");
 
-            let Some(timeout) = worker.timeout else {
+            // The LONGEST a job on this connection may run, not the worker's
+            // blanket default.
+            //
+            // Checking only `worker.timeout` would pass exactly the
+            // configurations most likely to be wrong: a deployment whose latency
+            // queues sit at the 60-second default and whose one slow queue
+            // declares fifteen minutes reads as safe, and it is the slow queue
+            // that outlives the claim. An operator's override replaces every
+            // declaration, so where one is set it is the only number that can
+            // apply.
+            //
+            // A job's own `Job::TIMEOUT` is NOT visible here: it lives on the
+            // registry, which this does not have. Declaring a long timeout on the
+            // queue rather than on each job is what brings it inside this check.
+            let longest = match worker.timeout_override {
+                Some(explicit) => explicit,
+                None => {
+                    let declared = worker
+                        .queues
+                        .iter()
+                        .filter_map(|queue| worker.queue_timeouts.get(queue))
+                        .copied()
+                        .max();
+
+                    // A queue that declared nothing falls back to the worker's
+                    // default, so that is in the running too; `None` there means
+                    // unbounded, which no finite claim survives.
+                    match (declared, worker.timeout) {
+                        (_, None) => None,
+                        (Some(declared), Some(default)) => Some(declared.max(default)),
+                        (None, Some(default)) => Some(default),
+                    }
+                }
+            };
+
+            let Some(timeout) = longest else {
                 return Err(Error::internal(format!(
-                    "queue connection `{name}` lets another worker reclaim a job after {}s, and \
-                     this worker has no timeout, so a job may run for longer than that — at \
-                     which point it is running in two workers at once, and neither knows. Give \
-                     the worker a timeout shorter than `{setting}`, or raise `{setting}` above \
-                     the longest a job can take",
+                    "queue connection `{name}` lets another worker reclaim a job after \
+                     {}s, and nothing bounds how long a job may run, so one may run for \
+                     longer than that — at which point it is running in two workers at \
+                     once, and neither knows. Give the worker, or the queue, a timeout \
+                     shorter than `{setting}`, or raise `{setting}` above the longest a \
+                     job can take",
                     reservation.as_secs()
                 )));
             };
@@ -559,12 +668,12 @@ impl Connections {
             }
 
             return Err(Error::internal(format!(
-                "queue connection `{name}` lets another worker reclaim a job after {}s, but this \
-                 worker will let one run for {}s. A job that outlives the {}s claim is handed to \
-                 a second worker while the first is still running it: it runs twice, at the same \
-                 time, and nothing reports anything — both workers believe they hold it, and \
-                 neither attempt fails. Raise `{setting}` above the worker's timeout, or lower \
-                 the timeout below it",
+                "queue connection `{name}` lets another worker reclaim a job after {}s, but \
+                 a job on it may run for {}s. A job that outlives the {}s claim is handed \
+                 to a second worker while the first is still running it: it runs twice, at \
+                 the same time, and nothing reports anything — both workers believe they \
+                 hold it, and neither attempt fails. Raise `{setting}` above the longest \
+                 timeout declared for it, or lower that timeout below it",
                 reservation.as_secs(),
                 timeout.as_secs(),
                 reservation.as_secs()
@@ -3251,7 +3360,88 @@ mod tests {
         let worker = WorkerOptions::default().timeout(None);
         let err = connections.check_reservations(&worker).err().expect("no timeout");
 
-        assert!(err.message().contains("no timeout"), "{}", err.message());
+        assert!(err.message().contains("nothing bounds"), "{}", err.message());
+    }
+
+    #[test]
+    fn a_queues_declared_timeout_is_checked_against_the_reservation() {
+        // The case this check used to miss entirely. The worker's own default
+        // is a safe sixty seconds and the connection reclaims at ninety, so
+        // looking only at the worker says yes — while the queue quietly lets
+        // one of its jobs run for fifteen minutes, which is six reservations.
+        let connections = Connections::new("primary").with("primary", ConnectionConfig::database());
+
+        let worker = WorkerOptions::default()
+            .queues(["latency", "intense"])
+            .queue_timeout("intense", Duration::from_secs(900));
+
+        let err = connections.check_reservations(&worker).err().expect("900s outlives a 90s claim");
+
+        assert!(err.message().contains("900s"), "{}", err.message());
+        assert!(err.message().contains("runs twice"), "{}", err.message());
+    }
+
+    #[test]
+    fn a_queue_timeout_inside_the_reservation_is_fine() {
+        let connections = Connections::new("primary").with("primary", ConnectionConfig::database());
+
+        let worker = WorkerOptions::default()
+            .queues(["intense"])
+            .queue_timeout("intense", Duration::from_secs(80));
+
+        connections.check_reservations(&worker).expect("80s is inside the 90s claim");
+    }
+
+    #[test]
+    fn a_timeout_declared_for_a_queue_this_worker_does_not_drain_is_not_its_problem() {
+        // Two pools on one connection is a normal shape, and each is checked
+        // against the queues it actually serves. Holding a worker to a number
+        // declared for somebody else's queue would refuse a correct config.
+        let connections = Connections::new("primary").with("primary", ConnectionConfig::database());
+
+        let worker = WorkerOptions::default()
+            .queues(["latency"])
+            .queue_timeout("intense", Duration::from_secs(900));
+
+        connections.check_reservations(&worker).expect("it does not drain `intense`");
+    }
+
+    #[test]
+    fn an_operators_override_is_what_gets_checked_when_there_is_one() {
+        // `--timeout` replaces every declaration, so it is the only duration
+        // that can apply and therefore the only one worth checking. A safe
+        // declaration underneath does not make an unsafe override safe.
+        let connections = Connections::new("primary").with("primary", ConnectionConfig::database());
+
+        let worker = WorkerOptions::default()
+            .queues(["intense"])
+            .queue_timeout("intense", Duration::from_secs(30))
+            .override_timeout(Some(Duration::from_secs(900)));
+
+        let err = connections.check_reservations(&worker).err().expect("the override outlives it");
+        assert!(err.message().contains("900s"), "{}", err.message());
+    }
+
+    #[test]
+    fn a_declared_timeout_survives_the_config_round_trip() {
+        // Declarations are stored in the configuration tree and read back out
+        // to be built; a field lost in that round trip is a setting that reads
+        // as honoured and does nothing. Seconds rather than serde's default
+        // `{secs, nanos}`, so a person can edit the file.
+        let declared = QueueDeclaration::new("intense").timeout(Duration::from_secs(900));
+
+        let json = serde_json::to_value(&declared).expect("serialises");
+        assert_eq!(json.get("timeout").and_then(serde_json::Value::as_u64), Some(900));
+
+        let back: QueueDeclaration = serde_json::from_value(json).expect("deserialises");
+        assert_eq!(back.timeout, Some(Duration::from_secs(900)));
+        assert_eq!(back, declared);
+    }
+
+    #[test]
+    fn a_queue_that_declares_no_timeout_serialises_without_the_key() {
+        let json = serde_json::to_value(QueueDeclaration::new("plain")).expect("serialises");
+        assert!(json.get("timeout").is_none(), "{json}");
     }
 
     #[test]

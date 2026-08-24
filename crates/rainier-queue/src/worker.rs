@@ -110,7 +110,50 @@ pub struct WorkerOptions {
     /// Stop as soon as the queues are empty, rather than waiting for more.
     pub stop_when_empty: bool,
     /// Give up on a job that runs longer than this.
+    ///
+    /// The **lowest** authority of the four: it applies to a job whose queue
+    /// declared no timeout and which declared none itself. See
+    /// [`timeout_override`](Self::timeout_override) for the whole order.
     pub timeout: Option<Duration>,
+
+    /// An operator's timeout, which outranks every declaration.
+    ///
+    /// # The order, highest first
+    ///
+    /// 1. this;
+    /// 2. [`Job::TIMEOUT`](crate::Job::TIMEOUT);
+    /// 3. [`queue_timeouts`](Self::queue_timeouts), from
+    ///    [`QueueDeclaration::timeout`](crate::QueueDeclaration::timeout);
+    /// 4. [`timeout`](Self::timeout).
+    ///
+    /// # Why an override exists at all, having been refused before
+    ///
+    /// It used to be that nothing could overrule a job's own limit, on the
+    /// grounds that a flag which could would make the declaration a decoy.
+    /// That is the right default and it is still what 2–4 express. What it
+    /// left no room for is the operator at a terminal: draining a backlog
+    /// where every job is known to be slow, or pinning a limit down to
+    /// reproduce a hang. Those are not the deployment disagreeing with the
+    /// application, they are somebody deliberately taking the wheel.
+    ///
+    /// So the distinction is *who is asking*, and the answer is: only an
+    /// explicit `--timeout`. A chart that passes one by habit turns every
+    /// declaration into a decoy again — which is exactly why lewd's stopped.
+    ///
+    /// `Some(None)` is `--timeout=0`: run with no limit at all. The nesting is
+    /// load-bearing, because "no override given" and "overridden to
+    /// unlimited" are different answers and a single `Option` cannot hold
+    /// both.
+    pub timeout_override: Option<Option<Duration>>,
+
+    /// A per-queue timeout, from each queue's declaration.
+    ///
+    /// Beaten by a job's own limit and by an operator's `--timeout`; beats the
+    /// worker's default. Queues not named here fall through to
+    /// [`timeout`](Self::timeout).
+    ///
+    /// A `BTreeMap` so a `Debug` of the options reads the same way twice.
+    pub queue_timeouts: BTreeMap<String, Duration>,
     /// Stop once the worker has been running this long.
     ///
     /// A long-lived process accumulates whatever it leaks — memory,
@@ -193,6 +236,8 @@ impl Default for WorkerOptions {
             max_jobs: None,
             stop_when_empty: false,
             timeout: Some(Duration::from_secs(60)),
+            timeout_override: None,
+            queue_timeouts: BTreeMap::new(),
             max_time: None,
             tries: None,
             // Around eight minutes of a broker being unreachable, given the
@@ -256,9 +301,34 @@ impl WorkerOptions {
         self
     }
 
-    /// Abandon a job that exceeds this duration.
+    /// Abandon a job that exceeds this duration, unless something more
+    /// specific said otherwise.
+    ///
+    /// The worker's own default. To overrule a declaration, use
+    /// [`override_timeout`](Self::override_timeout).
     pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Overrule every declared timeout, including each job's own.
+    ///
+    /// For an operator taking the wheel — draining a backlog, reproducing a
+    /// hang. `None` means no limit at all. Not for a chart: see
+    /// [`WorkerOptions::timeout_override`].
+    pub fn override_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout_override = Some(timeout);
+        self
+    }
+
+    /// Abandon a job from `queue` after `timeout`, unless the job says
+    /// otherwise.
+    ///
+    /// Set from [`QueueDeclaration::timeout`](crate::QueueDeclaration::timeout)
+    /// when the worker is planned; naming it here is what a test or a
+    /// hand-built worker does.
+    pub fn queue_timeout(mut self, queue: impl Into<String>, timeout: Duration) -> Self {
+        self.queue_timeouts.insert(queue.into(), timeout);
         self
     }
 
@@ -619,12 +689,22 @@ impl Worker {
         ));
 
         let started = std::time::Instant::now();
-        // The job's own limit wins.
+        // Four answers to "how long may this run", most specific first.
         //
-        // The worker's is a backstop for jobs that never said how long they
-        // need; one that did know is the better authority, and overriding it
-        // from the command line would make the declaration a decoy.
-        let timeout = self.registry.timeout_for(&job.name).or(self.options.timeout);
+        // An operator's explicit `--timeout` is the only thing that overrules
+        // a declaration, and it exists for the person at a terminal rather
+        // than for a chart — see `WorkerOptions::timeout_override`. Below it
+        // the job knows better than its queue, and the queue knows better than
+        // the worker's blanket default, because a queue mostly exists to
+        // gather work of one duration.
+        let timeout = match self.options.timeout_override {
+            Some(explicit) => explicit,
+            None => self
+                .registry
+                .timeout_for(&job.name)
+                .or_else(|| self.options.queue_timeouts.get(&job.queue).copied())
+                .or(self.options.timeout),
+        };
 
         // Guarded, so a panic fails this job rather than the worker — see
         // [`CatchPanic`].
@@ -909,6 +989,23 @@ mod tests {
         const NAME: &'static str = "test.patient";
         const TRIES: u32 = 1;
         const TIMEOUT: Option<Duration> = Some(Duration::from_secs(5));
+
+        async fn handle(&self, _: &JobContext) -> Result<()> {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(())
+        }
+    }
+
+    /// Declares a limit far shorter than it takes, so it fails on its own
+    /// terms unless something overrules it.
+    #[derive(Serialize, Deserialize)]
+    struct Impatient;
+
+    #[async_trait::async_trait]
+    impl Job for Impatient {
+        const NAME: &'static str = "test.impatient";
+        const TRIES: u32 = 1;
+        const TIMEOUT: Option<Duration> = Some(Duration::from_millis(1));
 
         async fn handle(&self, _: &JobContext) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1342,6 +1439,140 @@ mod tests {
 
         assert_eq!(stats.failed, 0, "the job's own timeout should have applied");
         assert_eq!(stats.processed, 1);
+    }
+
+    /// The four answers to "how long may this run", in order.
+    ///
+    /// An operator's `--timeout` beats a job's own, which beats its queue's,
+    /// which beats the worker's default. Each of the four tests below moves
+    /// exactly one step of that ladder.
+    async fn ran(options: WorkerOptions, job: QueuedJob, registry: JobRegistry) -> WorkerStats {
+        let queue = Arc::new(MemoryQueue::new());
+        queue.push(job).await.unwrap();
+
+        Worker::new(
+            Arc::clone(&queue) as Arc<dyn Queue>,
+            Arc::new(registry),
+            Arc::new(Container::new()),
+        )
+        .with_options(options.stop_when_empty())
+        .run()
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_queues_timeout_applies_to_a_job_that_declared_none() {
+        // `Slow` sleeps for thirty seconds and says nothing about it, so
+        // without the queue's limit this would hold the worker until the
+        // default sixty elapsed.
+        let stats = ran(
+            WorkerOptions::default()
+                .queues(["slow"])
+                .queue_timeout("slow", Duration::from_millis(50)),
+            QueuedJob::from_job(&Slow).unwrap().on_queue("slow"),
+            JobRegistry::new().with::<Slow>(),
+        )
+        .await;
+
+        assert_eq!(stats.failed, 1, "the queue's timeout should have abandoned it");
+        assert_eq!(stats.processed, 0);
+    }
+
+    #[tokio::test]
+    async fn a_queues_timeout_beats_the_workers_default() {
+        // Both are set and they disagree. The queue is the more specific
+        // statement, so a job on it is held to fifty milliseconds rather than
+        // to the worker's ten seconds — which is the whole point of declaring
+        // one per queue instead of one per worker process.
+        let started = std::time::Instant::now();
+        let stats = ran(
+            WorkerOptions::default()
+                .queues(["slow"])
+                .timeout(Some(Duration::from_secs(10)))
+                .queue_timeout("slow", Duration::from_millis(50)),
+            QueuedJob::from_job(&Slow).unwrap().on_queue("slow"),
+            JobRegistry::new().with::<Slow>(),
+        )
+        .await;
+
+        assert_eq!(stats.failed, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it waited out the worker's timeout, so the queue's was ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_jobs_own_timeout_beats_its_queues() {
+        // `Patient` takes 50ms and declares five seconds. The queue says one
+        // millisecond; the job knows better, because it is the exception its
+        // queue is not describing.
+        let stats = ran(
+            WorkerOptions::default()
+                .queues(["slow"])
+                .queue_timeout("slow", Duration::from_millis(1)),
+            QueuedJob::from_job(&Patient).unwrap().on_queue("slow"),
+            JobRegistry::new().with::<Patient>(),
+        )
+        .await;
+
+        assert_eq!(stats.processed, 1, "the job's own timeout should have applied");
+        assert_eq!(stats.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_override_beats_even_a_jobs_own_timeout() {
+        // The operator at a terminal, pinning a limit down to reproduce a
+        // hang. `Patient` declares five seconds and would otherwise finish.
+        let stats = ran(
+            WorkerOptions::default().override_timeout(Some(Duration::from_millis(1))),
+            QueuedJob::from_job(&Patient).unwrap(),
+            JobRegistry::new().with::<Patient>(),
+        )
+        .await;
+
+        assert_eq!(stats.failed, 1, "--timeout must overrule the job's own declaration");
+    }
+
+    #[tokio::test]
+    async fn an_override_of_none_removes_every_limit() {
+        // `--timeout=0`. `Impatient` declares one millisecond and takes fifty,
+        // so it fails on its own terms and passes only if the override
+        // genuinely means "no limit" rather than "no override".
+        let unbounded = ran(
+            WorkerOptions::default().override_timeout(None),
+            QueuedJob::from_job(&Impatient).unwrap(),
+            JobRegistry::new().with::<Impatient>(),
+        )
+        .await;
+        assert_eq!(unbounded.processed, 1, "the override should have removed the limit");
+
+        // The same job without it, so the test cannot pass by the job being
+        // fast enough after all.
+        let bounded = ran(
+            WorkerOptions::default(),
+            QueuedJob::from_job(&Impatient).unwrap(),
+            JobRegistry::new().with::<Impatient>(),
+        )
+        .await;
+        assert_eq!(bounded.failed, 1, "without the override its own 1ms limit applies");
+    }
+
+    #[tokio::test]
+    async fn a_queue_timeout_is_matched_against_the_queue_the_job_is_on() {
+        // Named for another queue, so it must not apply.
+        let stats = ran(
+            WorkerOptions::default()
+                .queues(["slow"])
+                .timeout(Some(Duration::from_millis(50)))
+                .queue_timeout("other", Duration::from_secs(30)),
+            QueuedJob::from_job(&Slow).unwrap().on_queue("slow"),
+            JobRegistry::new().with::<Slow>(),
+        )
+        .await;
+
+        assert_eq!(stats.failed, 1, "a timeout for `other` must not rescue a job on `slow`");
     }
 
     #[tokio::test]

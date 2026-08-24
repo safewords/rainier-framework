@@ -296,6 +296,8 @@ struct Pool {
     concurrency: Option<usize>,
     /// A narrower ceiling for individual queues, within that budget.
     limits: std::collections::BTreeMap<String, usize>,
+    /// How long a job from each queue may run, where its declaration said.
+    timeouts: std::collections::BTreeMap<String, Duration>,
 }
 
 /// Group the queues to drain by the connection each one declares it lives on.
@@ -313,6 +315,7 @@ fn plan(app: &Application, queues: Vec<String>, connection: Option<&str>) -> Vec
             queues,
             concurrency: None,
             limits: std::collections::BTreeMap::new(),
+            timeouts: std::collections::BTreeMap::new(),
         }];
     };
 
@@ -325,7 +328,20 @@ fn plan(app: &Application, queues: Vec<String>, connection: Option<&str>) -> Vec
             .iter()
             .filter_map(|queue| Some((queue.clone(), declared.queue(queue)?.concurrency?)))
             .collect();
-        return vec![Pool { connection: Some(name.to_owned()), queues, concurrency, limits }];
+        // Naming a connection changes which backend the queues are drained
+        // from, not how long their jobs may take — that belongs to the queue
+        // either way.
+        let timeouts = queues
+            .iter()
+            .filter_map(|queue| Some((queue.clone(), declared.queue(queue)?.timeout?)))
+            .collect();
+        return vec![Pool {
+            connection: Some(name.to_owned()),
+            queues,
+            concurrency,
+            limits,
+            timeouts,
+        }];
     }
 
     // Grouped in first-seen order so the priority order within a pool is the
@@ -353,12 +369,16 @@ fn plan(app: &Application, queues: Vec<String>, connection: Option<&str>) -> Vec
             .get(on.as_deref().unwrap_or_else(|| declared.default_name()))
             .and_then(|c| c.concurrency());
         let limit = declared.queue(&queue).and_then(|q| q.concurrency);
+        let timeout = declared.queue(&queue).and_then(|q| q.timeout);
 
         match pools.iter_mut().find(|pool| pool.connection == on) {
             Some(pool) => {
                 pool.queues.push(queue.clone());
                 if let Some(limit) = limit {
-                    pool.limits.insert(queue, limit);
+                    pool.limits.insert(queue.clone(), limit);
+                }
+                if let Some(timeout) = timeout {
+                    pool.timeouts.insert(queue, timeout);
                 }
             }
             None => {
@@ -366,11 +386,16 @@ fn plan(app: &Application, queues: Vec<String>, connection: Option<&str>) -> Vec
                 if let Some(limit) = limit {
                     limits.insert(queue.clone(), limit);
                 }
+                let mut timeouts = std::collections::BTreeMap::new();
+                if let Some(timeout) = timeout {
+                    timeouts.insert(queue.clone(), timeout);
+                }
                 pools.push(Pool {
                     connection: on,
                     queues: vec![queue],
                     concurrency: budget,
                     limits,
+                    timeouts,
                 });
             }
         }
@@ -423,6 +448,9 @@ impl Command for QueueWorkCommand {
              --queue     Comma-separated queues, in priority order.\n              Defaults to the queues the application declared.\n  \
              --once      Process what is waiting, then stop\n  \
              --max-jobs  Stop after N jobs (a worker that recycles)\n  \
+             --timeout   Abandon a job after N seconds, OVERRIDING what the job\n  \
+             and its queue declared; 0 is no limit. For an operator\n  \
+             draining or debugging, not for a chart to pass by habit.\n  \
              --sleep     Seconds to wait when the queue is empty",
         )
     }
@@ -1101,6 +1129,49 @@ mod tests {
 
         assert_eq!(pools[0].concurrency, Some(4));
         assert_eq!(pools[0].limits.get("latency"), Some(&20));
+    }
+
+    #[tokio::test]
+    async fn a_queues_declared_timeout_reaches_the_worker() {
+        // The declaration is inert unless `plan` carries it across, and an
+        // ignored timeout is invisible: jobs keep being killed at the old
+        // number while the config says otherwise.
+        use rainier_queue::{ConnectionConfig, Connections, QueueDeclaration};
+
+        let app = app_declaring(
+            Connections::new("default")
+                .with("default", ConnectionConfig::memory())
+                .with_queue(QueueDeclaration::new("latency"))
+                .with_queue(QueueDeclaration::new("intense").timeout(Duration::from_secs(900))),
+        )
+        .await;
+
+        let pools = plan(&app, vec!["latency".into(), "intense".into()], None);
+
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].timeouts.get("intense"), Some(&Duration::from_secs(900)));
+        assert!(
+            !pools[0].timeouts.contains_key("latency"),
+            "a queue that declared nothing must fall through to the worker's default"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_timeout_survives_naming_the_connection() {
+        // `--connection` says which backend to drain, not how long its jobs
+        // may take; the queue answers that either way.
+        use rainier_queue::{ConnectionConfig, Connections, QueueDeclaration};
+
+        let app = app_declaring(
+            Connections::new("default")
+                .with("default", ConnectionConfig::memory())
+                .with_queue(QueueDeclaration::new("intense").timeout(Duration::from_secs(900))),
+        )
+        .await;
+
+        let pools = plan(&app, vec!["intense".into()], Some("default"));
+
+        assert_eq!(pools[0].timeouts.get("intense"), Some(&Duration::from_secs(900)));
     }
 
     #[tokio::test]
