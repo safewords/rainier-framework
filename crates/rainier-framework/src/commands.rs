@@ -534,6 +534,10 @@ impl Command for QueueWorkCommand {
                 pool_options = pool_options.queue_limit(queue, *limit);
             }
 
+            // Captured before the options are handed to the worker, for the
+            // line below.
+            let running = pool_options.concurrency;
+
             let mut worker = Worker::new(
                 Arc::clone(queue),
                 Arc::clone(manager.registry()),
@@ -547,10 +551,27 @@ impl Command for QueueWorkCommand {
                 worker = worker.with_events(events);
             }
 
+            // Says how many at once, and any narrower per-queue ceiling.
+            //
+            // Printed because there is otherwise no way to tell from outside
+            // whether a declared concurrency is in effect: the symptom of one
+            // being ignored is *slowness*, which looks like the application
+            // simply being slow. An operator reading a worker's first line
+            // should be able to see the number the declaration asked for.
+            let ceilings = if pool.limits.is_empty() {
+                String::new()
+            } else {
+                let named: Vec<String> =
+                    pool.limits.iter().map(|(queue, limit)| format!("{queue}={limit}")).collect();
+                format!(" (ceilings: {})", named.join(", "))
+            };
+
             println!(
-                "Processing jobs from {}: {}",
+                "Processing jobs from {}: {} — {} at a time{}",
                 pool.connection.as_deref().unwrap_or("the default connection"),
-                pool.queues.join(", ")
+                pool.queues.join(", "),
+                running,
+                ceilings
             );
             workers.push(Arc::new(worker));
         }
