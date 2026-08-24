@@ -2490,21 +2490,52 @@ impl From<ConnectionConfig> for RawConnection {
                 ..blank(QueueDriver::Database)
             },
 
-            ConnectionConfig::Redis(connection) => Self {
-                concurrency: connection.concurrency,
-                url: Some(connection.url),
-                prefix: connection.prefix,
-                reservation: connection.reservation.map(|d| d.as_secs()),
-                connect_timeout_ms: connection.connect_timeout.map(millis),
-                response_timeout_ms: connection.response_timeout.map(millis),
-                // Written back only when it was asked for, so a round trip does
-                // not say more than the original did, and never as `false`,
-                // which is the default and would read as a decision.
-                reconnect: connection.reconnect.then_some(true),
-                reconnect_attempts: connection.reconnect_attempts,
-                reconnect_max_backoff_ms: connection.reconnect_max_backoff.map(millis),
-                ..blank(QueueDriver::Redis)
-            },
+            ConnectionConfig::Redis(connection) => {
+                // **A cluster has to say so, even with one seed.**
+                //
+                // This wrote `redis` unconditionally, and `try_from` decides a
+                // connection is clustered from `driver == redis-cluster ||
+                // seeds.len() > 1`. So a cluster declared with a single seed —
+                // which is the ordinary case when a deployment points at one
+                // Service DNS name and lets the client discover the shards —
+                // came back out of a round trip as a *single-server*
+                // connection.
+                //
+                // That is the exact failure this module is written around, and
+                // it reached production: the worker connected to one node and
+                // answered `MOVED` for every queue whose slot lived on another,
+                // so nothing was drained, nothing failed, and no job was ever
+                // marked failed because none of them ran.
+                //
+                // A `Connections` is stored in the configuration tree and read
+                // back out to be built, so this round trip is not hypothetical:
+                // it is the normal path.
+                let clustered = connection.is_cluster();
+                let url = match &connection.cluster_seeds {
+                    // Every seed, not the first: the whole point of a seed list
+                    // is that one dead node does not make the cluster
+                    // unreachable.
+                    Some(seeds) => seeds.join(","),
+                    None => connection.url.clone(),
+                };
+
+                Self {
+                    concurrency: connection.concurrency,
+                    url: Some(url),
+                    prefix: connection.prefix,
+                    reservation: connection.reservation.map(|d| d.as_secs()),
+                    connect_timeout_ms: connection.connect_timeout.map(millis),
+                    response_timeout_ms: connection.response_timeout.map(millis),
+                    // Written back only when it was asked for, so a round trip
+                    // does not say more than the original did, and never as
+                    // `false`, which is the default and would read as a
+                    // decision.
+                    reconnect: connection.reconnect.then_some(true),
+                    reconnect_attempts: connection.reconnect_attempts,
+                    reconnect_max_backoff_ms: connection.reconnect_max_backoff.map(millis),
+                    ..blank(if clustered { QueueDriver::RedisCluster } else { QueueDriver::Redis })
+                }
+            }
 
             ConnectionConfig::Sqs(connection) => {
                 let (key, secret) = match connection.credentials {
@@ -2540,6 +2571,91 @@ impl From<ConnectionConfig> for RawConnection {
 
 #[cfg(test)]
 mod tests {
+
+    // --- a cluster must survive the configuration tree ---------------------
+
+    #[test]
+    fn a_single_seed_cluster_is_still_a_cluster_after_a_round_trip() {
+        // This is the bug that took production's queue down. A cluster
+        // declared with one seed — a Service DNS name the client discovers the
+        // shards from, which is how a chart usually writes it — serialised as
+        // `driver: redis` and came back a single-server connection. The worker
+        // then reached one node and answered `MOVED` for every queue whose
+        // slot lived elsewhere: nothing drained, nothing failed, and no job was
+        // marked failed, because none of them ran.
+        let declared = ConnectionConfig::Redis(
+            RedisConnection::cluster(["redis://lewd-redis-leader:6379/"]).expect("declares"),
+        );
+
+        let json = serde_json::to_value(declared).expect("serialises");
+        assert_eq!(json["driver"], "redis-cluster", "the driver must say cluster: {json}");
+
+        let back: ConnectionConfig = serde_json::from_value(json).expect("deserialises");
+        let ConnectionConfig::Redis(connection) = back else {
+            panic!("expected a redis connection");
+        };
+
+        assert!(connection.is_cluster(), "a round trip turned a cluster into one server");
+    }
+
+    #[test]
+    fn every_seed_survives_a_round_trip() {
+        // One dead seed must not make the cluster unreachable, which it would
+        // if only the first were written back.
+        let declared = ConnectionConfig::Redis(
+            RedisConnection::cluster(["redis://a:6379/", "redis://b:6379/", "redis://c:6379/"])
+                .expect("declares"),
+        );
+
+        let json = serde_json::to_value(declared).expect("serialises");
+        let back: ConnectionConfig = serde_json::from_value(json).expect("deserialises");
+        let ConnectionConfig::Redis(connection) = back else {
+            panic!("expected a redis connection");
+        };
+
+        assert!(connection.is_cluster());
+        assert_eq!(connection.cluster_seeds.as_ref().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn a_single_server_connection_stays_single_server() {
+        // The other direction: declaring one server must not be promoted to a
+        // cluster, which would make the client ask a plain Redis for a
+        // topology it does not have.
+        let declared = ConnectionConfig::Redis(RedisConnection::new("redis://cache:6379/"));
+
+        let json = serde_json::to_value(declared).expect("serialises");
+        assert_eq!(json["driver"], "redis");
+
+        let back: ConnectionConfig = serde_json::from_value(json).expect("deserialises");
+        let ConnectionConfig::Redis(connection) = back else {
+            panic!("expected a redis connection");
+        };
+
+        assert!(!connection.is_cluster());
+    }
+
+    #[test]
+    fn a_declared_cluster_survives_a_whole_connections_round_trip() {
+        // The path that actually broke: `Connections` is set into the
+        // configuration tree and read back out to be built.
+        let connections = Connections::new("default").with(
+            "default",
+            ConnectionConfig::Redis(
+                RedisConnection::cluster(["redis://one-service-name:6379/"]).expect("declares"),
+            ),
+        );
+
+        let json = serde_json::to_value(&connections).expect("serialises");
+        let back: Connections = serde_json::from_value(json).expect("deserialises");
+
+        let ConnectionConfig::Redis(connection) = back.get("default").expect("declared").clone()
+        else {
+            panic!("expected a redis connection");
+        };
+
+        assert!(connection.is_cluster(), "the cluster was lost in the configuration tree");
+    }
 
     // --- queues as declarations --------------------------------------------
 
