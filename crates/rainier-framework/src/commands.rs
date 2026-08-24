@@ -376,6 +376,27 @@ fn plan(app: &Application, queues: Vec<String>, connection: Option<&str>) -> Vec
         }
     }
 
+    // A pool whose connection named no budget takes the widest ceiling its
+    // queues asked for.
+    //
+    // Without this a declaration is silently inert: a queue saying
+    // `concurrency: 20` inside a pool left at the worker's default of one runs
+    // one job at a time, and the number reads as configuration that is being
+    // honoured. An ignored setting is the failure this whole area is arranged
+    // to avoid, and it is worse here than most, because the symptom is
+    // *slowness* rather than an error.
+    //
+    // The widest rather than the sum: the connection's number is a budget for
+    // the backend, and adding the queues' ceilings together would let a
+    // declaration of two twenties become forty connections' worth of work
+    // against a Redis nobody sized for it. A deployment that wants more says
+    // so on the connection, which is the thing the budget belongs to.
+    for pool in &mut pools {
+        if pool.concurrency.is_none() {
+            pool.concurrency = pool.limits.values().copied().max();
+        }
+    }
+
     pools
 }
 
@@ -1006,6 +1027,83 @@ mod tests {
 
         assert_eq!(latency.size("latency").await.unwrap(), 0, "the default backend was drained");
         assert_eq!(intense.size("intense").await.unwrap(), 0, "the named backend was drained");
+    }
+
+    /// An application whose configuration carries `queues`.
+    async fn app_declaring(queues: rainier_queue::Connections) -> Arc<Application> {
+        let app = app().await;
+        app.resolve::<rainier_config::Config>().unwrap().set(crate::keys::QUEUES, queues).unwrap();
+        app
+    }
+
+    #[tokio::test]
+    async fn a_queues_ceiling_is_not_silently_inert() {
+        // A queue declaring `concurrency: 20` inside a pool left at the
+        // worker's default of one runs a job at a time, and the number reads
+        // as configuration that is being honoured. The symptom is slowness
+        // rather than an error, which is the worst way for a setting to be
+        // ignored.
+        use rainier_queue::{Connections, QueueDeclaration};
+
+        let app = app_declaring(
+            Connections::new("default")
+                .with("default", rainier_queue::ConnectionConfig::memory())
+                .with_queue(QueueDeclaration::new("latency").concurrency(20))
+                .with_queue(QueueDeclaration::new("slow").concurrency(2)),
+        )
+        .await;
+
+        let pools = plan(&app, vec!["latency".into(), "slow".into()], None);
+
+        assert_eq!(pools.len(), 1, "both queues are on the one connection");
+        assert_eq!(pools[0].concurrency, Some(20), "the pool took the widest ceiling");
+        assert_eq!(pools[0].limits.get("slow"), Some(&2), "and the narrow one is still narrow");
+    }
+
+    #[tokio::test]
+    async fn a_declared_connection_budget_wins_over_the_queues() {
+        // The connection's number is the backend's budget. A deployment that
+        // says it means it, even when a queue asked for more.
+        use rainier_queue::{ConnectionConfig, Connections, DatabaseConnection, QueueDeclaration};
+
+        let app = app_declaring(
+            Connections::new("default")
+                .with(
+                    "default",
+                    ConnectionConfig::Database(DatabaseConnection::new().concurrency(4)),
+                )
+                .with_queue(QueueDeclaration::new("latency").concurrency(20)),
+        )
+        .await;
+
+        let pools = plan(&app, vec!["latency".into()], None);
+
+        assert_eq!(pools[0].concurrency, Some(4));
+        assert_eq!(pools[0].limits.get("latency"), Some(&20));
+    }
+
+    #[tokio::test]
+    async fn queues_are_grouped_by_the_connection_they_declare() {
+        use rainier_queue::{ConnectionConfig, Connections, QueueDeclaration};
+
+        let app = app_declaring(
+            Connections::new("default")
+                .with("default", ConnectionConfig::memory())
+                .with("intense", ConnectionConfig::memory())
+                .with_queue(QueueDeclaration::new("latency"))
+                .with_queue(QueueDeclaration::new("heavy").on("intense").concurrency(1)),
+        )
+        .await;
+
+        let pools = plan(&app, vec!["latency".into(), "heavy".into()], None);
+
+        assert_eq!(pools.len(), 2, "two backends, two workers");
+        let heavy = pools
+            .iter()
+            .find(|pool| pool.connection.as_deref() == Some("intense"))
+            .expect("a pool on the named connection");
+        assert_eq!(heavy.queues, ["heavy"]);
+        assert_eq!(heavy.concurrency, Some(1));
     }
 
     #[test]
