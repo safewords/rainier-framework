@@ -229,3 +229,62 @@ mod tests {
         assert!(!env.iter().any(|(k, _)| k == "SOME_SECRET_THING"));
     }
 }
+
+#[cfg(test)]
+mod the_allowlist_itself {
+    use super::*;
+
+    /// The environment panel is the highest-risk thing on the page, so the
+    /// allowlist is checked against the same denylist everything else is.
+    ///
+    /// This is a guard on a *future* edit, not on today's list. Adding
+    /// `DATABASE_URL` or `AWS_SECRET_ACCESS_KEY` here would put a credential on
+    /// an error page, and it is the kind of one-line change that looks harmless
+    /// in review — "it would be useful to see the database host". This fails
+    /// before it ships.
+    #[test]
+    fn no_name_on_the_environment_allowlist_looks_like_a_secret() {
+        // Set every allowed name so `environment()` returns all of them,
+        // rather than only the ones this process happens to have.
+        for (name, _) in sample_allowlist() {
+            std::env::set_var(name, "value");
+        }
+
+        for (name, _) in environment() {
+            assert!(
+                !is_secret_key(&name),
+                "{name} is on the environment allowlist and matches the secret denylist. \
+                 Either it does not belong on the page, or the denylist is wrong — but the \
+                 two must not disagree."
+            );
+        }
+    }
+
+    #[test]
+    fn a_credential_shaped_variable_is_not_shown_even_if_it_exists() {
+        // The allowlist is the whole defence here: these are never named, so
+        // they can never be rendered, however the denylist evolves.
+        for name in ["DATABASE_URL", "AWS_SECRET_ACCESS_KEY", "IDENTITY_SERVICE_API_SECRET"] {
+            std::env::set_var(name, "a-real-looking-credential");
+        }
+
+        let shown = environment();
+        assert!(
+            !shown.iter().any(|(_, v)| v.contains("a-real-looking-credential")),
+            "the environment panel is an allowlist and must not pick these up"
+        );
+    }
+
+    fn sample_allowlist() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("APP_ENV", "local"),
+            ("APP_DEBUG", "true"),
+            ("APP_URL", "http://localhost"),
+            ("APP_NAME", "app"),
+            ("RUST_LOG", "debug"),
+            ("RUST_BACKTRACE", "1"),
+            ("HOSTNAME", "box"),
+            ("KUBERNETES_SERVICE_HOST", "10.0.0.1"),
+        ]
+    }
+}
