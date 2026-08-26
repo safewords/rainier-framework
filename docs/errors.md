@@ -213,26 +213,32 @@ not apply and the full message is shown.
 status and a sentence, a 500 in development gives you the stack, the source
 around each frame, and the request that caused it.
 
-```rust
-use rainier_debug::DebugExceptionRenderer;
-
-// In bootstrap, before the server starts.
-rainier_debug::install_panic_hook();
-
-let kernel = Kernel::from_shared(router, global)
-    .with_renderer(Arc::new(
-        DebugExceptionRenderer::new()
-            .with_environment(config.app.env())          // not the raw APP_ENV
-            .with_editor("phpstorm://open?file={file}&line={line}"),
-    ));
-```
-
-Two environment variables make it useful:
+**You do not have to wire it up.** The framework's `debug-page` feature is on
+by default, and the builder installs the page — and the panic hook — whenever
+`APP_DEBUG` is true *and* `AppEnv::may_leak_details()` permits it. So the whole
+of the setup is three variables:
 
 ```env
 APP_DEBUG=true
+APP_ENV=local
 RUST_BACKTRACE=1
 ```
+
+To configure it, or to substitute a page of your own, go through the builder.
+An application never holds the `Kernel` — `Rainier::boot` constructs it — so
+`Kernel::with_renderer` is not reachable from one:
+
+```rust
+Rainier::new(".")
+    .with_exception_renderer(Arc::new(
+        DebugExceptionRenderer::new()
+            .with_editor("phpstorm://open?file={file}&line={line}"),
+    ))
+```
+
+`RAINIER_DEBUG_EDITOR` sets the editor template without touching bootstrap,
+which matters because the right value differs per person on one team. Compile
+the whole thing out with `default-features = false`.
 
 `RUST_BACKTRACE` is what makes a stack exist at all — [`Error::new`] captures
 one only when it is set, so that production pays nothing. It is read **once per
@@ -245,10 +251,17 @@ Three independent locks, because this page discloses precisely what an attacker
 would like to read:
 
 1. **`debug` must be true** — the kernel's flag, from `app.debug`.
-2. **An environment named `production` (or `prod`) refuses regardless**, even
-   with `APP_DEBUG=true`. That combination is a misconfiguration, and it is not
-   resolved in favour of disclosure: the page is suppressed *and* 5xx messages
-   are hidden, exactly as though debug were off. `allow_in_production()` is the
+2. **The environment must permit disclosure** — `AppEnv::may_leak_details()`,
+   which the builder passes in. Note that **`AppEnv` defaults to
+   `Production`**, so a process that never set `APP_ENV` refuses. That is the
+   conservative direction, and it is why going through the builder is stronger
+   than constructing the renderer yourself: on its own the crate can only
+   compare the `APP_ENV` string, and an absent name is not the string
+   "production".
+
+   `APP_DEBUG=true` in production is a misconfiguration, and it is not resolved
+   in favour of disclosure: the page is suppressed *and* 5xx messages stay
+   hidden, exactly as though debug were off. `allow_in_production()` is the
    only way past, and is deliberately awkward to type.
 3. **Values are redacted** — see below.
 

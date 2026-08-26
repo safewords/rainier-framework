@@ -17,6 +17,9 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# For the doc example only: the builder is how an application reaches this
+# renderer, so the example that shows it has to compile against the framework.
+rainier-framework = { workspace = true }
 
 [lints]
 workspace = true

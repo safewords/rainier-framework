@@ -80,6 +80,8 @@ pub struct Rainier {
     instances: Vec<Box<dyn Fn(&Application)>>,
     schedule: Option<rainier_scheduler::Schedule>,
     storage: Option<Storage>,
+    /// Overrides both the default renderer and the debug page.
+    exception_renderer: Option<Arc<dyn rainier_server::ExceptionRenderer>>,
     providers: Vec<Arc<dyn ServiceProvider>>,
     install_facades: bool,
     install_tracing: bool,
@@ -124,6 +126,7 @@ impl Rainier {
             instances: Vec::new(),
             schedule: None,
             storage: None,
+            exception_renderer: None,
             providers: Vec::new(),
             install_facades: true,
             install_tracing: true,
@@ -143,6 +146,35 @@ impl Rainier {
     /// Adjust the configuration.
     pub fn configure(self, adjust: impl FnOnce(&Config)) -> Self {
         adjust(&self.config);
+        self
+    }
+
+    /// Render exceptions with `renderer` instead of the built-in ones.
+    ///
+    /// The application never holds the [`Kernel`] — this builder constructs it
+    /// — so this is how an application reaches the renderer at all.
+    ///
+    /// Setting it **replaces** the debug error page as well as the default
+    /// one. Left unset, the builder installs `rainier-debug`'s page when
+    /// `APP_DEBUG` is true (unless the `debug-page` feature is off), and the
+    /// plain renderer otherwise.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use rainier_framework::Rainier;
+    /// # use rainier_debug::DebugExceptionRenderer;
+    /// # fn wire(app: Rainier) -> Rainier {
+    /// // A page of your own, or the debug one configured differently:
+    /// app.with_exception_renderer(Arc::new(
+    ///     DebugExceptionRenderer::new().with_editor("vscode://file/{file}:{line}"),
+    /// ))
+    /// # }
+    /// ```
+    pub fn with_exception_renderer(
+        mut self,
+        renderer: Arc<dyn rainier_server::ExceptionRenderer>,
+    ) -> Self {
+        self.exception_renderer = Some(renderer);
         self
     }
 
@@ -824,8 +856,59 @@ impl Rainier {
         // the route table that carries it instead.
         crate::cors::warn_if_cors_cannot_answer_a_preflight(&global, &compiled);
 
-        let kernel = Kernel::from_shared(Arc::clone(&compiled), global)
-            .with_debug(app.resolve::<Config>()?.get_or(keys::APP_DEBUG, false));
+        let settings_for_kernel = app.resolve::<Config>()?;
+        let debug = settings_for_kernel.get_or(keys::APP_DEBUG, false);
+        let mut kernel = Kernel::from_shared(Arc::clone(&compiled), global).with_debug(debug);
+
+        // The exception renderer, in order of preference:
+        //
+        //   1. whatever the application set with `with_exception_renderer`;
+        //   2. the debug error page, when `APP_DEBUG` is on and the
+        //      `debug-page` feature is compiled in;
+        //   3. the plain one the kernel already has.
+        //
+        // Installed HERE rather than left to each application's bootstrap
+        // because the application never holds the kernel — this builder
+        // constructs it and hands over an `Application`. Without this the
+        // renderer was unreachable and the feature was inert, which is exactly
+        // what shipping a port with no way to plug into it produces.
+        if let Some(renderer) = self.exception_renderer {
+            kernel = kernel.with_renderer(renderer);
+        } else {
+            #[cfg(feature = "debug-page")]
+            {
+                // TWO gates, and the second is the framework's own.
+                //
+                // `APP_DEBUG` is the developer's switch. `may_leak_details()`
+                // is `rainier-config`'s answer to "may a failure show its
+                // internals to the client" — and it is the better guard,
+                // because `AppEnv` **defaults to Production**. A process that
+                // never set `APP_ENV` is production here, which is the
+                // conservative direction and something a string comparison
+                // inside `rainier-debug` cannot reproduce: an absent name is
+                // simply not the string "production".
+                let environment: rainier_config::AppEnv =
+                    settings_for_kernel.get_or(keys::APP_ENV, rainier_config::AppEnv::default());
+
+                if debug && environment.may_leak_details() {
+                    let mut page = rainier_debug::DebugExceptionRenderer::new()
+                        .with_disclosure_allowed(environment.may_leak_details());
+
+                    if let Ok(editor) = std::env::var("RAINIER_DEBUG_EDITOR") {
+                        if !editor.trim().is_empty() {
+                            page = page.with_editor(editor);
+                        }
+                    }
+
+                    // A panic's stack is discarded by `catch_unwind`, so the
+                    // hook that records it has to be installed before anything
+                    // can panic. Idempotent, and it chains to the previous
+                    // hook rather than replacing it.
+                    rainier_debug::install_panic_hook();
+                    kernel = kernel.with_renderer(Arc::new(page));
+                }
+            }
+        }
 
         app.instance_arc(Arc::clone(&compiled));
         app.instance_arc(urls);

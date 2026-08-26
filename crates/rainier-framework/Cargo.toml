@@ -27,6 +27,9 @@ rainier-auth = { workspace = true }
 rainier-queue = { workspace = true }
 rainier-mail = { workspace = true }
 rainier-server = { workspace = true }
+# Optional: see the `debug-page` feature. Depends on rainier-server, which this
+# crate also depends on, so there is no cycle.
+rainier-debug = { workspace = true, optional = true }
 rainier-console = { workspace = true }
 rainier-cache = { workspace = true }
 rainier-crypt = { workspace = true }
@@ -56,7 +59,16 @@ tracing-subscriber = { workspace = true }
 base64 = { workspace = true }
 
 [features]
-default = []
+default = ["debug-page"]
+# The developer-facing error page (`rainier-debug`) — the stack, the source
+# around each frame, and the request that caused it, instead of a status and a
+# sentence.
+#
+# On by default, and safe to leave on: the renderer installs itself only when
+# `APP_DEBUG` is true, and refuses outright when the environment names
+# production. Turn it off with `default-features = false` if you would rather
+# the crate were not linked at all.
+debug-page = ["dep:rainier-debug"]
 # The native sea-orm executor (MySQL / Postgres / SQLite).
 sea-orm-executor = ["rainier-database/sea-orm-executor"]
 # Redis, everywhere it can be used: the cache, the queue, and the broadcast

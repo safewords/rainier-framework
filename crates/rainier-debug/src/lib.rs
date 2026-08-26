@@ -5,14 +5,38 @@
 //! and useless at 2am. This gives you the stack, the source around each frame,
 //! and the request that caused it.
 //!
+//! # You almost certainly do not have to wire this up
+//!
+//! `rainier-framework` installs it for you. Its `debug-page` feature is on by
+//! default, and its builder constructs the page whenever `APP_DEBUG` is true
+//! **and** `AppEnv::may_leak_details()` says this deployment may show its
+//! internals. It installs the panic hook at the same time.
+//!
+//! So the whole of the setup is:
+//!
+//! ```env
+//! APP_DEBUG=true
+//! APP_ENV=local
+//! RUST_BACKTRACE=1
+//! ```
+//!
+//! To configure it, or to use a page of your own, go through the builder —
+//! an application never holds the [`Kernel`](rainier_server::Kernel), so
+//! `Kernel::with_renderer` is not reachable from one:
+//!
 //! ```no_run
-//! use std::sync::Arc;
-//! use rainier_debug::DebugExceptionRenderer;
-//! # use rainier_server::Kernel;
-//! # fn wire(kernel: Kernel) -> Kernel {
-//! kernel.with_renderer(Arc::new(DebugExceptionRenderer::new()))
+//! # use std::sync::Arc;
+//! # use rainier_debug::DebugExceptionRenderer;
+//! # use rainier_framework::Rainier;
+//! # fn wire(app: Rainier) -> Rainier {
+//! app.with_exception_renderer(Arc::new(
+//!     DebugExceptionRenderer::new().with_editor("phpstorm://open?file={file}&line={line}"),
+//! ))
 //! # }
 //! ```
+//!
+//! Compile it out entirely with `default-features = false` on
+//! `rainier-framework`.
 //!
 //! # It cannot render in production
 //!
@@ -23,28 +47,36 @@
 //! 1. **`debug` must be true.** The kernel passes it from `app.debug`
 //!    (`APP_DEBUG`). False is the default, and false means this renderer
 //!    delegates to the plain one without looking at anything.
-//! 2. **`APP_ENV=production` refuses regardless.** Even with `APP_DEBUG=true`.
-//!    A production environment with debug accidentally on is precisely the
-//!    accident that has to be survivable, and the two flags disagreeing is a
-//!    misconfiguration this crate does not resolve in favour of disclosure.
-//!    [`DebugExceptionRenderer::allow_in_production`] exists and is the only
-//!    way past it — it is deliberately awkward and deliberately named.
+//! 2. **The environment must permit disclosure.** The framework passes
+//!    `AppEnv::may_leak_details()` to
+//!    [`with_disclosure_allowed`](DebugExceptionRenderer::with_disclosure_allowed),
+//!    and `AppEnv` **defaults to `Production`** — so a process that never set
+//!    `APP_ENV` is treated as production and refuses. Constructed directly,
+//!    this crate falls back to comparing the `APP_ENV` string, which is
+//!    strictly weaker; prefer the builder.
+//!
+//!    A production deployment with `APP_DEBUG` accidentally on is the accident
+//!    that has to be survivable, so it is not resolved in favour of
+//!    disclosure: the page is suppressed **and** 5xx messages stay hidden,
+//!    exactly as if debug were off. Forwarding `debug` to the fallback
+//!    renderer here was a real hole — it hid the page and printed its most
+//!    sensitive line. [`allow_in_production`](DebugExceptionRenderer::allow_in_production)
+//!    is the only way past, and is deliberately awkward to type.
 //! 3. **Values are redacted anyway.** See [`redact`]: keys that look like
 //!    credentials are replaced, everything else is truncated, and the
 //!    environment panel is an allowlist. This is what makes a *screenshot* of
 //!    the page safe, which is how Whoops has historically leaked secrets — not
 //!    by being reachable, but by being pasted into a ticket.
 //!
-//! # What you need for a useful page
+//! # `RUST_BACKTRACE` is what makes the stack exist
 //!
-//! ```env
-//! APP_DEBUG=true
-//! RUST_BACKTRACE=1
-//! ```
+//! It is read **once per process**, so setting it means restarting the
+//! application. Without it every error still renders — with the message, the
+//! request, and no stack — and the page says so rather than looking broken.
 //!
-//! `RUST_BACKTRACE` is read once per process, so it has to be set before the
-//! application starts. Without it every error still renders — with the message,
-//! the request and no stack, and the page says so rather than looking broken.
+//! That is the trade [`Error::new`](rainier_support::Error::new) makes:
+//! `Backtrace::capture()` returns `Disabled` without walking a frame when the
+//! variable is unset, so production pays nothing for a feature it never uses.
 //!
 //! Source excerpts additionally need the source to be *on the machine*, at the
 //! path the debug info recorded. True when you `cargo run`; false inside a
@@ -141,11 +173,34 @@ impl DebugExceptionRenderer {
 
     /// State the environment rather than reading it from the process.
     ///
-    /// What the bootstrap should use when it already has the parsed config —
-    /// `app.env` — rather than making this crate re-read the variable and
-    /// possibly disagree with the application about which environment it is in.
+    /// What to use when you have the name as a string. If you have Rainier's
+    /// parsed `AppEnv`, prefer [`with_disclosure_allowed`] — it asks the
+    /// framework's own question instead of re-deriving it here.
+    ///
+    /// [`with_disclosure_allowed`]: Self::with_disclosure_allowed
     pub fn with_environment(mut self, name: &str) -> Self {
         self.env_is_production = env_names_production(Some(name));
+        self
+    }
+
+    /// Say outright whether this deployment may show its internals.
+    ///
+    /// The framework's builder passes `AppEnv::may_leak_details()` here, which
+    /// is better than any string comparison this crate could make:
+    ///
+    /// - `AppEnv` **defaults to `Production`**, so a process with no `APP_ENV`
+    ///   is treated as production. [`with_environment`] cannot match that — an
+    ///   absent name is simply not the string "production" — so the two
+    ///   disagree in the unsafe direction on exactly the deployment that forgot
+    ///   to set the variable.
+    /// - `may_leak_details` is spelled separately from `is_developing` in
+    ///   `rainier-config` on purpose, because the two drift apart the moment
+    ///   somebody debugs staging. Asking the framework means this page follows
+    ///   that decision instead of having a second opinion about it.
+    ///
+    /// [`with_environment`]: Self::with_environment
+    pub fn with_disclosure_allowed(mut self, allowed: bool) -> Self {
+        self.env_is_production = !allowed;
         self
     }
 
@@ -485,5 +540,75 @@ mod tests {
 
         assert!(body.contains("\"debug\""));
         assert!(body.contains("the search index is unreachable"));
+    }
+}
+
+#[cfg(test)]
+mod disclosure_gate {
+    use super::*;
+    use rainier_http::{Method, Request};
+
+    fn request() -> Request {
+        Request::builder().method(Method::GET).uri("/x").build()
+    }
+
+    fn error() -> RenderedError {
+        RenderedError {
+            status: 500,
+            message: "a connection string lives here".into(),
+            details: None,
+            disclosable: false,
+            kind: Some("Internal".into()),
+            backtrace: None,
+        }
+    }
+
+    async fn body(renderer: &DebugExceptionRenderer, debug: bool) -> String {
+        renderer.render(&request(), &error(), debug).into_string().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn disclosure_refused_hides_everything_even_with_debug_on() {
+        // What the framework passes when `AppEnv::may_leak_details()` is
+        // false — including for a process that never set `APP_ENV` at all,
+        // since `AppEnv` defaults to Production.
+        let renderer = DebugExceptionRenderer::new().with_disclosure_allowed(false);
+        let out = body(&renderer, true).await;
+
+        assert!(!out.contains("a connection string lives here"));
+        assert!(out.contains("Server Error"));
+    }
+
+    #[tokio::test]
+    async fn disclosure_allowed_renders_the_page() {
+        let renderer = DebugExceptionRenderer::new().with_disclosure_allowed(true);
+        let out = body(&renderer, true).await;
+
+        assert!(out.contains("a connection string lives here"));
+    }
+
+    #[tokio::test]
+    async fn disclosure_allowed_still_needs_debug() {
+        // Two gates, not one. `may_leak_details()` being true is the
+        // environment's permission; `APP_DEBUG` is still the switch.
+        let renderer = DebugExceptionRenderer::new().with_disclosure_allowed(true);
+        let out = body(&renderer, false).await;
+
+        assert!(!out.contains("a connection string lives here"));
+        assert!(out.contains("Server Error"));
+    }
+
+    #[tokio::test]
+    async fn with_disclosure_allowed_overrides_a_production_env_string() {
+        // The framework's answer wins over this crate's own string guess,
+        // whichever way it points — they must not silently disagree.
+        let renderer = DebugExceptionRenderer::new()
+            .with_environment("production")
+            .with_disclosure_allowed(true);
+        assert!(body(&renderer, true).await.contains("a connection string lives here"));
+
+        let renderer =
+            DebugExceptionRenderer::new().with_environment("local").with_disclosure_allowed(false);
+        assert!(!body(&renderer, true).await.contains("a connection string lives here"));
     }
 }

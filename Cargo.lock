@@ -3304,6 +3304,7 @@ dependencies = [
 name = "rainier-debug"
 version = "2.0.0"
 dependencies = [
+ "rainier-framework",
  "rainier-http",
  "rainier-server",
  "rainier-support",
@@ -3394,6 +3395,7 @@ dependencies = [
  "rainier-container",
  "rainier-crypt",
  "rainier-database",
+ "rainier-debug",
  "rainier-drivers",
  "rainier-events",
  "rainier-filesystem",
