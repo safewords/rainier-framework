@@ -1,0 +1,22 @@
+[package]
+name = "rainier-debug"
+description = "The debug error page for Rainier: a stack with source excerpts, the request that caused it, and hard guards against ever rendering in production."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-http = { workspace = true }
+rainier-server = { workspace = true }
+
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

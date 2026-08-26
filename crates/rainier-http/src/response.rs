@@ -393,6 +393,23 @@ pub struct RenderedError {
     /// connection string, a file path or a query. The kernel substitutes a
     /// generic message unless the application is in debug mode.
     pub disclosable: bool,
+    /// The [`ErrorKind`] this came from, as a short label.
+    ///
+    /// A string rather than the enum, because `rainier-http` renders the error
+    /// and does not otherwise need to reason about its kind — and because a
+    /// renderer wants it for display, not for a match.
+    pub kind: Option<String>,
+    /// The stack the error was constructed on, rendered.
+    ///
+    /// `None` unless `RUST_BACKTRACE` was set for the process. Carried as a
+    /// `String` rather than a `Backtrace` because `RenderedError` is `Clone`
+    /// and a `Backtrace` is not — and because the only consumer parses text
+    /// anyway (see `rainier-debug`).
+    ///
+    /// Lives in the response extensions like the rest of this struct, so it
+    /// never reaches a client on its own account. What decides whether a
+    /// developer ever sees it is the exception renderer.
+    pub backtrace: Option<String>,
 }
 
 /// Renders a framework error as JSON.
@@ -419,6 +436,10 @@ impl IntoResponse for Error {
             message: self.message().to_string(),
             details: self.details().cloned(),
             disclosable,
+            kind: Some(format!("{:?}", self.kind())),
+            // Rendered here, at the boundary, because this is the last place
+            // that holds the `Error` itself.
+            backtrace: self.backtrace().map(|b| b.to_string()),
         });
         response
     }

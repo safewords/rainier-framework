@@ -21,6 +21,7 @@
 pub mod build_info;
 pub mod error;
 pub mod extensions;
+pub mod panic_backtrace;
 pub mod setting;
 pub mod str;
 

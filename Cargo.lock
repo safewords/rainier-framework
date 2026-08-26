@@ -3301,6 +3301,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rainier-debug"
+version = "2.0.0"
+dependencies = [
+ "rainier-http",
+ "rainier-server",
+ "rainier-support",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rainier-drivers"
 version = "2.0.0"
 dependencies = [

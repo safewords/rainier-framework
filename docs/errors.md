@@ -204,3 +204,98 @@ A job returning `Err` is released for another attempt. A command returning
 `Err` prints the message and exits non-zero. A provider returning `Err` aborts
 the boot. In none of those cases is there a client, so the disclosure rule does
 not apply and the full message is shown.
+
+---
+
+## The debug error page
+
+`rainier-debug` is the framework's answer to PHP's [Whoops]: instead of a
+status and a sentence, a 500 in development gives you the stack, the source
+around each frame, and the request that caused it.
+
+```rust
+use rainier_debug::DebugExceptionRenderer;
+
+// In bootstrap, before the server starts.
+rainier_debug::install_panic_hook();
+
+let kernel = Kernel::from_shared(router, global)
+    .with_renderer(Arc::new(
+        DebugExceptionRenderer::new()
+            .with_environment(config.app.env())          // not the raw APP_ENV
+            .with_editor("phpstorm://open?file={file}&line={line}"),
+    ));
+```
+
+Two environment variables make it useful:
+
+```env
+APP_DEBUG=true
+RUST_BACKTRACE=1
+```
+
+`RUST_BACKTRACE` is what makes a stack exist at all — [`Error::new`] captures
+one only when it is set, so that production pays nothing. It is read **once per
+process**, so setting it means restarting the application. Without it the page
+still renders, with the message and the request and no stack, and says so.
+
+### It cannot render in production
+
+Three independent locks, because this page discloses precisely what an attacker
+would like to read:
+
+1. **`debug` must be true** — the kernel's flag, from `app.debug`.
+2. **An environment named `production` (or `prod`) refuses regardless**, even
+   with `APP_DEBUG=true`. That combination is a misconfiguration, and it is not
+   resolved in favour of disclosure: the page is suppressed *and* 5xx messages
+   are hidden, exactly as though debug were off. `allow_in_production()` is the
+   only way past, and is deliberately awkward to type.
+3. **Values are redacted** — see below.
+
+### What is redacted, and what is not
+
+Whoops has been the proximate cause of real credential disclosure, and rarely
+because the page was reachable: far more often it was **screenshotted into a
+ticket**. So the request panels deny by name and truncate everything else:
+
+| | Treatment |
+|---|---|
+| Keys matching `password`, `token`, `secret`, `key`, `auth`, `cookie`, `session`, `card`, … | replaced outright, at every depth of nested JSON |
+| A key that *contains* a secret, like `credentials` | the whole subtree goes, innocuous parts included |
+| Everything else | shown, truncated past 300 bytes |
+| The environment | an **allowlist** — `APP_ENV`, `RUST_LOG` and a handful more, never the whole environment |
+| Cookie values | always replaced; the *names* are listed, because "which cookies were present" is a real question |
+
+**The source excerpt is the exception, and it is worth knowing.** Redaction
+filters the request; it cannot filter your source, and the page prints sixteen
+lines of it around every frame. A credential hardcoded near a failing line will
+be on the page. That is inherent to showing source — Whoops is the same — and
+is why the page is debug-only rather than merely redacted.
+
+### Frames are filtered, not hidden
+
+A Rust backtrace through an async runtime is sixty frames of which four are
+yours, so each frame is classified `app`, `framework` or `vendor` and the page
+opens on the first application frame with the others one click away. `j`/`k`
+move between them.
+
+The capture machinery is trimmed off the top — you want the line that called
+`Error::internal`, not `Error::internal` itself.
+
+### Panics
+
+`catch_unwind` gives the kernel a panic's payload and **not** its stack: by the
+time it returns, unwinding has already happened. So `install_panic_hook()`
+records a backtrace at the `panic!` site into a thread-local, and the kernel
+takes it back out on the same thread. Skip the hook and a panic still renders a
+page, with the message and no stack.
+
+### What a container changes
+
+Source excerpts need the source **on the machine, at the path the debug info
+recorded**. True under `cargo run`; false in an image built elsewhere, where
+the page shows the frames without code and explains why rather than showing an
+empty panel.
+
+[Whoops]: https://github.com/filp/whoops
+[`Error::new`]: https://docs.rs/rainier-support

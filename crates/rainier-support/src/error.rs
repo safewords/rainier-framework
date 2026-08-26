@@ -12,7 +12,9 @@
 //! auth, authorization, and model-not-found — no component needs to know the
 //! others' error types.
 
+use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt;
+use std::sync::Arc;
 
 /// The class of failure, which is also the HTTP status it renders as.
 ///
@@ -81,12 +83,33 @@ pub struct Error {
     message: String,
     details: Option<serde_json::Value>,
     source: Option<anyhow::Error>,
+    backtrace: Option<Arc<Backtrace>>,
 }
 
 impl Error {
     /// Build an error of an explicit kind.
+    ///
+    /// Captures a backtrace, which is what lets a debug error page show where
+    /// the failure came from rather than where it was rendered. Those are
+    /// different stacks and only the first one is useful: by the time the
+    /// kernel's exception renderer runs, the handler that failed has already
+    /// returned.
+    ///
+    /// **This is free unless somebody asked for it.**
+    /// [`Backtrace::capture`] consults `RUST_BACKTRACE` / `RUST_LIB_BACKTRACE`
+    /// once, and with neither set it returns [`BacktraceStatus::Disabled`]
+    /// without walking a single frame. So the cost in production is one
+    /// already-cached atomic read and an `Option` that is always `None` — and
+    /// a developer gets the stack by exporting one variable, with no rebuild.
+    ///
+    /// `Arc`, because `Error` is cloned onto a `RenderedError` and moved
+    /// between tasks, and a backtrace is comparatively large.
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into(), details: None, source: None }
+        let backtrace = match Backtrace::capture() {
+            captured if captured.status() == BacktraceStatus::Captured => Some(Arc::new(captured)),
+            _ => None,
+        };
+        Self { kind, message: message.into(), details: None, source: None, backtrace }
     }
 
     /// 500 — an internal failure.
@@ -192,6 +215,27 @@ impl Error {
     /// The underlying cause, if one was attached.
     pub fn source_error(&self) -> Option<&anyhow::Error> {
         self.source.as_ref()
+    }
+
+    /// The stack this error was constructed on, when one was captured.
+    ///
+    /// `None` unless `RUST_BACKTRACE` (or `RUST_LIB_BACKTRACE`) was set for
+    /// the process — see [`Error::new`]. Read by the debug error page in
+    /// `rainier-debug`; nothing in a production path looks at it.
+    pub fn backtrace(&self) -> Option<&Backtrace> {
+        self.backtrace.as_deref()
+    }
+
+    /// Adopt a backtrace captured somewhere else.
+    ///
+    /// For the one case that cannot capture its own: a panic. The kernel
+    /// catches panics with `catch_unwind`, which discards the stack — so a
+    /// panic hook records it and the kernel attaches it here. Without this the
+    /// error page for a panic would show the unwinding site rather than the
+    /// `panic!`.
+    pub fn with_backtrace(mut self, backtrace: Arc<Backtrace>) -> Self {
+        self.backtrace = Some(backtrace);
+        self
     }
 }
 

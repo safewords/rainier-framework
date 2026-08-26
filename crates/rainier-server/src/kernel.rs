@@ -183,6 +183,17 @@ impl Kernel {
                     },
                     details: None,
                     disclosable: false,
+                    kind: Some("Panic".to_string()),
+                    // Taken from the thread-local a panic hook filled in at the
+                    // `panic!` site. `catch_unwind` gives us the payload and
+                    // nothing else — by the time we are here the stack has
+                    // already unwound, so without the hook this is `None` and
+                    // the error page shows a panic with no stack.
+                    //
+                    // Same thread: `catch_unwind` returns on the thread that
+                    // panicked. See `rainier_support::panic_backtrace`.
+                    backtrace: rainier_support::panic_backtrace::take_panic_backtrace()
+                        .map(|b| b.to_string()),
                 };
                 // The request was consumed by the pipeline, so render against
                 // a stand-in that preserves only what the renderer needs.
