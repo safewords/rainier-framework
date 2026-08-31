@@ -393,7 +393,14 @@ pub struct RenderedError {
     /// connection string, a file path or a query. The kernel substitutes a
     /// generic message unless the application is in debug mode.
     pub disclosable: bool,
-    /// The [`ErrorKind`] this came from, as a short label.
+    /// The [`ErrorKind`](rainier_support::ErrorKind) this came from, as a
+    /// short label.
+    ///
+    /// Qualified rather than bare: the type is not in scope in this file — the
+    /// field below is a `String` — so `[`ErrorKind`]` resolved to nothing, and
+    /// this crate denies `rustdoc::broken_intra_doc_links`. That had the whole
+    /// `rustdoc` job failing, which is also why nothing else in it was being
+    /// checked.
     ///
     /// A string rather than the enum, because `rainier-http` renders the error
     /// and does not otherwise need to reason about its kind — and because a

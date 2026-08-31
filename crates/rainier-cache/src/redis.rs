@@ -149,10 +149,14 @@ impl RedisCache {
     ///    all 16384 slots assigned. A slot left unassigned by an interrupted
     ///    resharding takes the client's whole slot map with it, and the
     ///    symptom is every command failing rather than the one key.
-    /// 2. **Reachability of each shard**, by reading
-    ///    [`HEALTH_PROBES`](Self::HEALTH_PROBES) keys in different slots. A
-    ///    node whose socket died — a pod restarted underneath a client with no
-    ///    reconnection — fails here and nowhere else.
+    /// 2. **Reachability of each shard**, by reading `HEALTH_PROBES` (16) keys
+    ///    in different slots. A node whose socket died — a pod restarted
+    ///    underneath a client with no reconnection — fails here and nowhere
+    ///    else.
+    ///
+    ///    Named rather than linked: the constant is private, an internal
+    ///    tuning number and not API, and a public doc linking to it failed the
+    ///    whole `rustdoc` job — which is why nothing else in it was checked.
     ///
     /// On a single node it is a `PING`, because there is one shard and one
     /// socket and nothing else to learn.

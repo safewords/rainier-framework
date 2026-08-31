@@ -1,6 +1,6 @@
 //! Verifying tokens against a **remote** JWKS.
 //!
-//! [`Jwt`](rainier_crypt::jwt::Jwt) verifies a token against a key ring you
+//! [`rainier_crypt::jwt::Jwt`] verifies a token against a key ring you
 //! already hold, and [`JwtKeyRing::from_jwks`](rainier_crypt::jwt::JwtKeyRing::from_jwks)
 //! builds a ring from a JWKS document. What was missing — and what every
 //! relying party ended up hand-rolling (see the copy in `maps-api`'s

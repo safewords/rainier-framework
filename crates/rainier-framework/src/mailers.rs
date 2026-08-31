@@ -27,7 +27,7 @@
 //!
 //! # It did not grow a second way to build a transport
 //!
-//! [`transport`](super::mail::transport) still reads the loose keys, and now
+//! [`transport`](fn@super::mail::transport) still reads the loose keys, and now
 //! does it by folding them into a [`MailerConfig`] and building *that*. There
 //! is one construction path, so a declaration and a set of variables cannot
 //! drift into producing different transports — which is the failure a parallel
