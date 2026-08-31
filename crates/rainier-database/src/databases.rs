@@ -248,11 +248,22 @@
 //! on work whose answer nobody is waiting for — which keeps the queue full and
 //! is how a brief spike becomes a sustained one.
 //!
-//! **`max_lifetime` is the guard against a connection that is not there.** A
-//! load balancer or a database that drops long-lived connections leaves the pool
-//! holding sockets that look open and fail on first use, so the failures land on
-//! whichever query happened to draw a dead one. Recycling on an age is what
-//! stops that presenting as intermittent errors nobody can reproduce.
+//! **`max_lifetime` and `test_before_acquire` are the guard against a
+//! connection that is not there.** A load balancer or a database that drops
+//! long-lived connections leaves the pool holding sockets that look open and
+//! fail on first use, so the failures land on whichever query happened to draw
+//! a dead one. Recycling on an age is what stops that presenting as
+//! intermittent errors nobody can reproduce.
+//!
+//! Age is only half of it, and the half that does not cover a restart. When a
+//! database goes through a rolling restart or a failover it closes every
+//! connection it holds *now*, and the ones the pool is keeping are then neither
+//! old enough for `max_lifetime` to retire nor alive. `test_before_acquire`
+//! pings before handing one out and is what catches those; it defaults to
+//! `true` on [`PoolConfig`](rainier_orm::PoolConfig) for that reason, after a
+//! Galera rolling restart served `500`s from a healthy application on
+//! 2026-08-31. Turning it off trades a sub-millisecond round-trip for that
+//! failure mode returning.
 //!
 //! ## What this section deliberately does not carry
 //!

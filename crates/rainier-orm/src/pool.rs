@@ -68,14 +68,43 @@ pub struct PoolConfig {
     /// Recycle a connection older than this regardless of use — guards against
     /// server-side timeouts and load-balancer connection caps. `None` disables.
     pub max_lifetime: Option<Duration>,
-    /// Ping a connection before handing it out. Costs a round-trip but
-    /// guarantees liveness — worth it on serverless where sockets get frozen.
+    /// Ping a connection before handing it out. Costs a round-trip and is what
+    /// stops a socket the server has already closed reaching a query.
     pub test_before_acquire: bool,
 }
 
 impl Default for PoolConfig {
     /// Long-running-server defaults: up to 10 connections, drain when idle,
-    /// recycle hourly, no per-acquire ping.
+    /// recycle every half hour, and ping before handing one out.
+    ///
+    /// # Why the ping is on
+    ///
+    /// This was `false` until 2026-08-30, on the reasoning that a server —
+    /// unlike a frozen serverless isolate — keeps its sockets alive, so the
+    /// round-trip bought nothing. That holds while the *database* stays up,
+    /// and databases do not.
+    ///
+    /// On 2026-08-31 a Galera rolling restart took lewd.net's MariaDB through
+    /// its three replicas. The pool went on holding connections to a server
+    /// that had closed them, handed one to the next request that asked, and
+    /// the query came back `peer closed connection without sending TLS
+    /// close_notify` — a `500` on a write somebody had just submitted. The
+    /// module docs on `rainier-database` already describe this exact shape
+    /// ("sockets that look open and fail on first use… intermittent errors
+    /// nobody can reproduce") and name `max_lifetime` as the guard, but
+    /// `max_lifetime` only retires a connection for being *old*. A connection
+    /// the server closed a second ago is neither old nor alive, and only a
+    /// pre-acquire ping can tell.
+    ///
+    /// The cost is one round-trip per acquire, which against a database in the
+    /// same datacentre is sub-millisecond and is what `sqlx` itself does by
+    /// default — this type was overriding that default to `false`, so every
+    /// Rainier server was less resilient than the pool underneath it.
+    ///
+    /// It does not make a restart invisible: a connection that dies *mid*
+    /// query still fails that query, and a database that is unreachable is
+    /// unreachable. What it removes is the failure that outlives the outage —
+    /// the pool serving dead sockets after the server is healthy again.
     fn default() -> Self {
         Self {
             max_connections: 10,
@@ -83,7 +112,7 @@ impl Default for PoolConfig {
             acquire_timeout: Duration::from_secs(30),
             idle_timeout: Some(Duration::from_secs(10 * 60)),
             max_lifetime: Some(Duration::from_secs(30 * 60)),
-            test_before_acquire: false,
+            test_before_acquire: true,
         }
     }
 }
@@ -151,6 +180,30 @@ mod tests {
         assert_eq!(pool.min_connections, 1, "dropping to zero drops the schema");
         assert_eq!(pool.idle_timeout, None, "reaping it while idle loses everything");
         assert_eq!(pool.max_lifetime, None, "so does recycling it");
+    }
+
+    #[test]
+    fn the_server_default_pings_before_handing_a_connection_out() {
+        // The guard against a database that restarted under a live pool. With
+        // this off, the pool keeps sockets the server has already closed and
+        // the failure lands on whichever query draws one — which is how a
+        // MariaDB rolling restart became `500`s on lewd.net writes, and why
+        // this default changed. See `Default`'s own doc comment.
+        //
+        // `max_lifetime` is NOT the same guard and does not replace it: it
+        // retires a connection for being old, and a connection closed a second
+        // ago is young.
+        let pool = PoolConfig::default();
+
+        assert!(pool.test_before_acquire, "a server pool must not hand out a dead socket");
+        assert!(pool.max_lifetime.is_some(), "ageing connections out is still worth doing");
+    }
+
+    #[test]
+    fn an_in_memory_pool_does_not_pay_for_a_ping() {
+        // Nothing can close this connection but us — the database is the
+        // connection — so the round-trip would be pure cost.
+        assert!(!PoolConfig::in_memory().test_before_acquire);
     }
 
     #[test]
