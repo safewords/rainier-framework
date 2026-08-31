@@ -309,6 +309,54 @@ fn a_subquery_is_not_scoped_and_says_so() {
 }
 
 #[test]
+fn a_derived_table_is_not_scoped_and_says_so() {
+    // The second place automatic scoping stops, and it was an unpinned one:
+    // `derived_select` arrived with joinable derived tables and was never added
+    // to `EXEMPT`, so the guard above had been failing rather than guarding.
+    //
+    // The reason is the same as a subquery's. `Derived::from` names its table
+    // as a string, `derived_select` takes no `E`, and nothing can read a
+    // `#[orm(soft_delete)]` marker off a name. Scoping it with the *outer*
+    // entity's column would be worse than leaving it: the derived table need
+    // not have a `deleted_at` at all, so that predicate is wrong rather than
+    // merely absent.
+    //
+    // So a derived table over a soft-deleting table aggregates tombstoned rows
+    // unless the caller says otherwise — and, exactly as with a subquery,
+    // saying so is one call on the derived table itself.
+    use rainier_database::{AggregateFn, Derived, Operand, Projection};
+
+    let averages = |derived: Derived| {
+        let criteria = Criteria::new().join_derived(derived, "id", "post_id").select(
+            Projection::Aggregate(
+                AggregateFn::Sum,
+                Operand::column("per_post.avg_length").times(Operand::column("id")),
+            ),
+            "total",
+        );
+        statement::select_aggregate::<Document>(Dialect::Sqlite, &criteria).sql
+    };
+
+    let base = || {
+        Derived::from("comments", "per_post")
+            .select(Projection::Column("post_id".into()), "post_id")
+            .select(Projection::Avg("length".into()), "avg_length")
+            .group_by(Projection::Column("post_id".into()))
+    };
+
+    // Qualified to the derived table's own name, so this cannot be satisfied
+    // by the outer entity's predicate sitting elsewhere in the same statement.
+    const INNER_LIVE: &str = r#""comments"."deleted_at" IS NULL"#;
+
+    let unscoped = averages(base());
+    assert!(!unscoped.contains(INNER_LIVE), "the derived table is not scoped for you: {unscoped}",);
+    assert!(unscoped.contains(LIVE), "the outer table still is: {unscoped}");
+
+    let stated = averages(base().where_null("deleted_at"));
+    assert!(stated.contains(INNER_LIVE), "saying so is one call: {stated}");
+}
+
+#[test]
 fn every_dialect_renders_the_scope() {
     for dialect in [Dialect::Sqlite, Dialect::MySql, Dialect::Postgres] {
         let sql = statement::select_matching::<Document>(dialect, &Criteria::new()).sql;
@@ -351,6 +399,13 @@ fn no_select_builder_is_left_unscoped() {
         // table's tombstone column — a wrong predicate rather than a missing
         // one. See `a_subquery_is_not_scoped_and_says_so`.
         ("subquery_select", "the inner table is a name, not an entity"),
+        // Same shape as `subquery_select`, and missed when derived joins
+        // landed: `Derived` holds `table: String`, `derived_select` takes no
+        // `E`, so there is no type to read a marker from. Scoping it with the
+        // OUTER entity's column would filter the derived table by a tombstone
+        // column it may not even have. Pinned by
+        // `a_derived_table_is_not_scoped_and_says_so`.
+        ("derived_select", "the table is a name, not an entity"),
     ];
 
     /// What counts as having been scoped.
