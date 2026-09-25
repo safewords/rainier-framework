@@ -517,6 +517,15 @@ Things to know:
   column list, before anything renders. A sharded entity is refused — the
   statement runs on one database.
 
+### Many rows at once
+
+`statement::insert_many(dialect, &rows)` writes a batch of one entity as a
+single `INSERT … VALUES (…), (…)` — a snapshot or an event batch without a
+round trip per row. Each row renders as `insert` renders it, so an
+auto-increment key is still the database's. Every database caps the
+placeholders in one statement (MySQL 65,535, SQLite 32,766): chunk so that
+rows × columns stays under it.
+
 ## Named queries
 
 `EntityRepository<M>` already does CRUD for every model, so an

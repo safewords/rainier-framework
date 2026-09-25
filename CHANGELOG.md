@@ -29,6 +29,9 @@ the release as a whole and names the crate it landed in.
   clause whose assignments read the incoming row through `incoming(col)`, and
   `statement::select` reads one as rows. Columns and select width are checked
   before rendering; sharded entities are refused.
+- **`statement::insert_many`** (`rainier-database`): many rows of one entity
+  in one `INSERT … VALUES (…), (…)`, rendered per row exactly as `insert`
+  renders one. Refuses an empty batch and one that spans shards.
 
 - **Disks declared in configuration** (`rainier-filesystem`). A `filesystems`
   section — a `default` naming one of a `disks` map, each entry naming **its

@@ -913,6 +913,45 @@ pub fn upsert_with<E: Entity>(dialect: Dialect, entity: &E, plan: &Upsert) -> Re
     Ok(Prepared { sql, params: params.0, route })
 }
 
+/// `INSERT INTO table (…) VALUES (…), (…), …` — many rows, one statement.
+///
+/// For an append — a snapshot, a batch of events — where a statement per row
+/// is a round trip per row. Each row is rendered exactly as [`insert`] renders
+/// it, so an auto-increment key is left to the database.
+///
+/// Placeholders are per value, and every database caps how many one statement
+/// may carry (MySQL 65,535; SQLite 32,766); chunk the rows so that
+/// `rows × columns` stays under it.
+///
+/// # Errors
+///
+/// If `rows` is empty — there is no `VALUES ()` to write — or if the rows
+/// would route to different shards, which no one statement can reach.
+pub fn insert_many<E: Entity>(dialect: Dialect, rows: &[E]) -> Result<Prepared> {
+    let Some(first) = rows.first() else {
+        return Err(Error::msg(format!("insert_many into `{}` was given no rows", E::table())));
+    };
+    let columns: Vec<&str> = first.insert_values().iter().map(|(column, _)| *column).collect();
+    let route = route_from_pairs::<E>(&first.insert_values());
+
+    let mut stmt = SqQuery::insert();
+    stmt.into_table(alias(E::table()));
+    stmt.columns(columns.iter().map(|c| alias(c)));
+    for row in rows {
+        let pairs = row.insert_values();
+        if route_from_pairs::<E>(&pairs) != route {
+            return Err(Error::msg(format!(
+                "insert_many into `{}` spans shards; one statement reaches one",
+                E::table()
+            )));
+        }
+        stmt.values_panic(pairs.into_iter().map(|(_, value)| SimpleExpr::from(Expr::val(value))));
+    }
+
+    let (sql, params) = dialect.build_query(&stmt);
+    Ok(Prepared { sql, params: params.0, route })
+}
+
 /// `SELECT …` from a [`SubSelect`] — a query that is not one entity's rows:
 /// a derived table, a union, a ranking. Read it with the executor's row API
 /// and decode by the names given to [`SubSelect::select_as`].

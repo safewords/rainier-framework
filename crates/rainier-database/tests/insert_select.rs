@@ -352,3 +352,41 @@ fn a_mismatched_or_unknown_column_is_refused_before_anything_renders() {
             .unwrap_err();
     assert!(err.to_string().contains("no conflict columns"), "{err}");
 }
+
+/// An append-only series with a database-assigned key.
+#[derive(Debug, Clone, PartialEq, Entity)]
+#[orm(table = "view_points")]
+struct ViewPoint {
+    #[orm(pk, auto_increment)]
+    id: u64,
+    post_id: u64,
+    views: u64,
+}
+
+#[tokio::test]
+async fn insert_many_writes_every_row_in_one_statement_and_leaves_the_key_to_the_database() {
+    let db = world().await;
+    for sql in rainier_orm::schema::schema_ddl::<ViewPoint>(Dialect::Sqlite) {
+        db.statement(&sql).await.expect("create table");
+    }
+    let rows: Vec<ViewPoint> = [(7, 10), (8, 0), (9, 42)]
+        .map(|(post_id, views)| ViewPoint { id: 0, post_id, views })
+        .into();
+
+    let prepared = statement::insert_many(db.dialect(), &rows).unwrap();
+    assert_eq!(prepared.sql.matches("(?, ?)").count(), 3, "{}", prepared.sql);
+    assert_eq!(db.execute(prepared).await.unwrap().rows_affected, 3);
+
+    let mut got: Vec<(u64, u64, u64)> = db
+        .fetch_all::<ViewPoint>(statement::select_all::<ViewPoint>(db.dialect()))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.id, p.post_id, p.views))
+        .collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![(1, 7, 10), (2, 8, 0), (3, 9, 42)]);
+
+    let err = statement::insert_many::<ViewPoint>(db.dialect(), &[]).unwrap_err();
+    assert!(err.to_string().contains("given no rows"), "{err}");
+}
