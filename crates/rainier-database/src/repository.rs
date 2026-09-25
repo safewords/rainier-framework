@@ -745,6 +745,9 @@ fn expression_type<E: rainier_orm::Entity>(
             };
             E::columns().iter().find(|col| col.name == name).map_or(ColumnType::Text, |col| col.ty)
         }
+        // An alias names a value this criteria selects; its type is not
+        // knowable from here.
+        Expression::Selected(_) => ColumnType::Text,
         Expression::Incoming(c) => {
             E::columns().iter().find(|col| col.name == c).map_or(ColumnType::Text, |col| col.ty)
         }
@@ -771,6 +774,8 @@ fn expression_type<E: rainier_orm::Entity>(
             | Function::NullIf
             | Function::Greatest
             | Function::Least => args.first().map_or(ColumnType::Text, of),
+            Function::VecDistanceCosine => ColumnType::Double,
+            Function::VecFromText => ColumnType::Binary,
         },
         Expression::Arithmetic(left, _, right) => match (of(left), of(right)) {
             (ColumnType::Double, _) | (_, ColumnType::Double) => ColumnType::Double,

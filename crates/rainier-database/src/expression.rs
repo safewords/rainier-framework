@@ -94,6 +94,8 @@ pub enum Expression {
     /// assignments of [`statement::upsert_select`](crate::statement::upsert_select);
     /// see [`incoming`].
     Incoming(String),
+    /// A select-list alias of the same query — see [`selected`].
+    Selected(String),
 }
 
 /// An arithmetic operator.
@@ -145,6 +147,15 @@ pub enum Function {
     /// which keeps `NULL` absorbing everywhere, where Postgres's own `CONCAT`
     /// would skip it.
     Concat,
+    /// Cosine *distance* between two vectors, in `[0, 2]`:
+    /// `VEC_DISTANCE_COSINE(a, b)` on MariaDB (11.7+), pgvector's `a <=> b` on
+    /// Postgres, sqlite-vec's `vec_distance_cosine(a, b)` on SQLite. MySQL 9
+    /// spells it differently and is not supported. Each needs its extension or
+    /// version; nothing emulates it.
+    VecDistanceCosine,
+    /// A vector from its text form, `'[0.1, 0.2, …]'`: `VEC_FromText` on
+    /// MariaDB, `CAST(… AS vector)` on Postgres, `vec_f32` on SQLite.
+    VecFromText,
 }
 
 /// A type to [`cast`] to, named the way each dialect names it.
@@ -611,6 +622,29 @@ pub fn concat(args: impl IntoIterator<Item = Expression>) -> Expression {
     function(Function::Concat, args)
 }
 
+/// Cosine distance between two vectors — see [`Function::VecDistanceCosine`].
+///
+/// To let MariaDB answer from its vector index, select it under a name and
+/// order by that name, with a limit:
+/// `.select_as(vec_distance_cosine(col("embedding"), vec_from_text(q)), "d")
+/// .order_by(selected("d")).limit(k)`. Ordering by the expression again does
+/// not use the index.
+pub fn vec_distance_cosine(a: impl Into<Expression>, b: impl Into<Expression>) -> Expression {
+    function(Function::VecDistanceCosine, [a.into(), b.into()])
+}
+
+/// A vector from its bound text form — see [`Function::VecFromText`].
+pub fn vec_from_text(text: impl Into<Expression>) -> Expression {
+    function(Function::VecFromText, [text.into()])
+}
+
+/// A name from this query's own select list, unqualified — for `ORDER BY`
+/// (every dialect) and `HAVING` (MySQL and SQLite). A [`col`] would qualify it
+/// with the query's table, which has no such column.
+pub fn selected(name: impl Into<String>) -> Expression {
+    Expression::Selected(name.into())
+}
+
 /// `CAST(x AS …)`.
 pub fn cast(x: impl Into<Expression>, to: CastAs) -> Expression {
     Expression::Cast(Box::new(x.into()), to)
@@ -913,7 +947,10 @@ impl Expression {
     fn collect_columns<'a>(&'a self, out: &mut Vec<&'a str>) {
         match self {
             Expression::Column(c) => out.push(c),
-            Expression::Value(_) | Expression::SubSelect(_) | Expression::Incoming(_) => {}
+            Expression::Value(_)
+            | Expression::SubSelect(_)
+            | Expression::Incoming(_)
+            | Expression::Selected(_) => {}
             Expression::Function(_, args) => args.iter().for_each(|a| a.collect_columns(out)),
             Expression::Arithmetic(l, _, r) => {
                 l.collect_columns(out);
@@ -1056,6 +1093,7 @@ pub(crate) fn render_expression(dialect: Dialect, e: &Expression, resolve: Resol
             }
             _ => Expr::col((Alias::new("excluded"), Alias::new(column))),
         },
+        Expression::Selected(name) => Expr::col(Alias::new(name)),
     }
 }
 
@@ -1088,6 +1126,23 @@ fn render_function(
         Function::Least => match dialect {
             Dialect::Sqlite => call("MIN", args),
             _ => call("LEAST", args),
+        },
+        Function::VecDistanceCosine => match dialect {
+            Dialect::MySql => call("VEC_DISTANCE_COSINE", args),
+            Dialect::Postgres => {
+                let mut args = args.into_iter();
+                let (a, b) = (args.next().expect("two arguments"), args.next().expect("two"));
+                a.binary(BinOper::Custom("<=>"), b)
+            }
+            Dialect::Sqlite => call("vec_distance_cosine", args),
+        },
+        Function::VecFromText => match dialect {
+            Dialect::MySql => call("VEC_FromText", args),
+            Dialect::Postgres => {
+                let text = args.into_iter().next().expect("one argument");
+                Func::cast_as(text, Alias::new("vector")).into()
+            }
+            Dialect::Sqlite => call("vec_f32", args),
         },
         Function::Concat => match dialect {
             Dialect::MySql => call("CONCAT", args),
@@ -1425,6 +1480,26 @@ mod tests {
         assert!(sql(Dialect::Postgres, &e)
             .0
             .contains(r#"GREATEST(CAST("posts"."n" AS BIGINT) - $1, $2)"#));
+    }
+
+    #[test]
+    fn cosine_distance_is_spelled_by_each_vector_extension() {
+        let d = vec_distance_cosine(col("embedding"), vec_from_text("[1,0]")).lt(0.5_f64);
+        assert!(sql(Dialect::MySql, &d)
+            .0
+            .contains("VEC_DISTANCE_COSINE(`posts`.`embedding`, VEC_FromText(?)) < ?"));
+        assert!(sql(Dialect::Postgres, &d)
+            .0
+            .contains(r#""posts"."embedding" <=> CAST($1 AS vector)"#));
+        assert!(sql(Dialect::Sqlite, &d)
+            .0
+            .contains(r#"vec_distance_cosine("posts"."embedding", vec_f32(?))"#));
+    }
+
+    #[test]
+    fn a_selected_name_is_not_qualified_with_the_table() {
+        let (sql, _) = sql(Dialect::MySql, &selected("distance").lt(1_i64));
+        assert!(sql.contains("`distance` < ?") && !sql.contains("`posts`.`distance`"), "{sql}");
     }
 
     #[test]
