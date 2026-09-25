@@ -1,11 +1,11 @@
 //! Password hashing — the [`Hasher`] port and its Argon2 implementation.
 
 use argon2::{Algorithm, Argon2, Params, Version};
-use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use password_hash::phc::PasswordHash;
+use password_hash::{PasswordHasher, PasswordVerifier};
 use rainier_support::{Error, Result};
 
 use super::legacy::{LegacySchemes, LegacyVerifier};
-use rand::rngs::OsRng;
 
 /// Hashes and verifies passwords.
 ///
@@ -179,10 +179,9 @@ impl Argon2Hasher {
 
 impl Hasher for Argon2Hasher {
     fn hash(&self, plain: &str) -> Result<String> {
-        let salt = SaltString::generate(&mut OsRng);
-        let hash = self
+        let hash: PasswordHash = self
             .argon2()?
-            .hash_password(plain.as_bytes(), &salt)
+            .hash_password_with_rng(&mut crate::os_rng(), plain.as_bytes())
             .map_err(|e| Error::internal(format!("could not hash the password: {e}")))?;
         Ok(hash.to_string())
     }

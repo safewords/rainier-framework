@@ -16,10 +16,10 @@ pub const TOKEN_KEY: &str = "_token";
 /// than a counter or a timestamp — anything guessable here is an account
 /// takeover.
 pub fn generate_session_id() -> String {
-    use rand::RngCore;
+    use rand::Rng as _;
 
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

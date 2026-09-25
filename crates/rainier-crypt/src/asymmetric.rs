@@ -53,10 +53,8 @@ pub struct SigningKeyPair {
 impl SigningKeyPair {
     /// A fresh keypair from the OS CSPRNG.
     pub fn generate() -> Self {
-        use rand::RngCore;
-
         let mut seed = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut seed);
+        crate::fill_random(&mut seed);
         Self::from_seed(seed)
     }
 
@@ -260,10 +258,8 @@ pub struct BoxKeyPair {
 impl BoxKeyPair {
     /// A fresh keypair from the OS CSPRNG.
     pub fn generate() -> Self {
-        use rand::RngCore;
-
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        crate::fill_random(&mut bytes);
         Self::from_bytes(bytes)
     }
 

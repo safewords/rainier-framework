@@ -10,7 +10,7 @@
 //! the protocol — publishing goes out over Redis — so this is a pure function
 //! of the socket id, the channel and the secret.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{json, Value};
 use sha2::Sha256;
 

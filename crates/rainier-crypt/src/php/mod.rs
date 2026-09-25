@@ -163,7 +163,7 @@ impl PhpEncrypter {
         match self.writes {
             PhpCipher::Aes256Cbc => {
                 let mut iv = [0u8; primitive::CBC_IV_LEN];
-                rand::Rng::fill(&mut rand::thread_rng(), &mut iv[..]);
+                crate::fill_random(&mut iv[..]);
 
                 let ciphertext = primitive::cbc_encrypt(key.bytes(), &iv, plain)?;
 
@@ -176,7 +176,7 @@ impl PhpEncrypter {
             }
             PhpCipher::Aes256Gcm => {
                 let mut nonce = [0u8; primitive::GCM_IV_LEN];
-                rand::Rng::fill(&mut rand::thread_rng(), &mut nonce[..]);
+                crate::fill_random(&mut nonce[..]);
 
                 let (ciphertext, tag) = primitive::gcm_encrypt(key.bytes(), &nonce, plain)?;
                 envelope::encode_gcm(&nonce, &ciphertext, &tag)
@@ -345,7 +345,7 @@ mod tests {
         // The detail every reimplementation gets wrong. The rule itself lives
         // in the envelope module now; this pins the composition against an
         // independent HMAC.
-        use hmac::Mac as _;
+        use hmac::{KeyInit as _, Mac as _};
 
         let key = Key::generate();
         let payload = PhpEncrypter::new(KeyRing::new(key.clone())).encrypt("covered").unwrap();

@@ -53,10 +53,8 @@ impl Key {
 
     /// A fresh key from the OS CSPRNG. What `key:generate` calls.
     pub fn generate() -> Self {
-        use rand::RngCore;
-
         let mut bytes = [0u8; KEY_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        crate::fill_random(&mut bytes);
         Self::from_bytes(bytes)
     }
 

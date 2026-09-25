@@ -93,6 +93,23 @@ pub use url::UrlSigner;
 
 use std::sync::Arc;
 
+/// The operating system's CSPRNG, as an infallible `CryptoRng`.
+///
+/// Every key, nonce and salt in this crate comes from here rather than from a
+/// userspace generator: the OS source is what `OsRng` was before rand 0.10
+/// renamed it `SysRng` and made it fallible. `UnwrapErr` turns an OS failure
+/// into a panic, which is what `OsRng` did — there is nothing sound to do with
+/// a key that could not be made random.
+pub(crate) fn os_rng() -> rand::rand_core::UnwrapErr<rand::rngs::SysRng> {
+    rand::rand_core::UnwrapErr(rand::rngs::SysRng)
+}
+
+/// Fill `buf` from [`os_rng`].
+pub(crate) fn fill_random(buf: &mut [u8]) {
+    use rand::Rng as _;
+    os_rng().fill_bytes(buf);
+}
+
 use rainier_support::Result;
 use serde::de::DeserializeOwned;
 use serde::Serialize;

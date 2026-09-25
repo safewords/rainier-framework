@@ -107,14 +107,14 @@ impl SessionChannels {
     /// is also what an auth route compares against, and a short one makes that
     /// comparison worth attempting.
     pub fn mint() -> String {
-        use rand::Rng;
+        use rand::RngExt as _;
 
         // Two u64s of randomness rendered as hex: 32 alphanumeric characters,
         // from the OS entropy source rather than a seeded generator. A key
         // that a restart could produce twice would put two sessions on one
         // channel, which is what this module exists to prevent.
-        let mut rng = rand::thread_rng();
-        format!("{:016x}{:016x}", rng.gen::<u64>(), rng.gen::<u64>())
+        let mut rng = rand::rng();
+        format!("{:016x}{:016x}", rng.random::<u64>(), rng.random::<u64>())
     }
 
     /// Whether a key may be used as part of a channel name.

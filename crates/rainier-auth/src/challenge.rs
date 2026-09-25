@@ -265,10 +265,10 @@ impl Challenges {
     /// derived from the clock is a code somebody can predict, and the whole
     /// value of this is that they cannot.
     fn generate(&self) -> String {
-        use rand::Rng;
+        use rand::RngExt as _;
 
-        let mut rng = rand::thread_rng();
-        (0..self.digits).map(|_| char::from(b'0' + rng.gen_range(0..10))).collect()
+        let mut rng = rand::rng();
+        (0..self.digits).map(|_| char::from(b'0' + rng.random_range(0..10))).collect()
     }
 }
 

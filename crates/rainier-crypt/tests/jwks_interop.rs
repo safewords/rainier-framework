@@ -24,7 +24,9 @@ use rsa::signature::Verifier;
 use rsa::{BigUint, RsaPublicKey};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::Sha256;
+// rsa 0.9 is on the digest 0.10 generation; its own sha2 re-export is the one
+// its verifier accepts, while the framework itself is on sha2 0.11.
+use rsa::sha2::Sha256;
 
 #[derive(Serialize)]
 struct Claims {

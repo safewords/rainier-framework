@@ -53,7 +53,7 @@
 //! `us-east-1` — which S3 accepts as an alias for the default region — fails
 //! against R2, and the error says nothing about regions.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;

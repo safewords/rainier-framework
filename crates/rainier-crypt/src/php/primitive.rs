@@ -13,8 +13,8 @@
 //! instead of reusing it.
 
 use aes::cipher::block_padding::Pkcs7;
-use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use hmac::Mac as _;
+use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
+use hmac::{KeyInit as _, Mac as _};
 use rainier_support::{Error, Result};
 
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
@@ -34,7 +34,7 @@ pub(super) const GCM_TAG_LEN: usize = 16;
 pub(super) fn cbc_encrypt(key: &[u8], iv: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
     Ok(Aes256CbcEnc::new_from_slices(key, iv)
         .map_err(|_| Error::internal("the key or IV is the wrong length for AES-256-CBC"))?
-        .encrypt_padded_vec_mut::<Pkcs7>(plain))
+        .encrypt_padded_vec::<Pkcs7>(plain))
 }
 
 /// The inverse. **Only** call this after the MAC over the envelope has been
@@ -43,7 +43,7 @@ pub(super) fn cbc_encrypt(key: &[u8], iv: &[u8], plain: &[u8]) -> Result<Vec<u8>
 pub(super) fn cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     Aes256CbcDec::new_from_slices(key, iv)
         .map_err(|_| Error::internal("the key or IV is the wrong length for AES-256-CBC"))?
-        .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
+        .decrypt_padded_vec::<Pkcs7>(ciphertext)
         .map_err(|_| Error::internal("the ciphertext did not decrypt"))
 }
 
@@ -66,8 +66,9 @@ pub(super) fn gcm_encrypt(key: &[u8], nonce: &[u8], plain: &[u8]) -> Result<(Vec
     let cipher: aes_gcm::Aes256Gcm = aes_gcm::KeyInit::new_from_slice(key)
         .map_err(|_| Error::internal("the key is the wrong length for AES-256-GCM"))?;
 
-    let mut sealed =
-        cipher.encrypt(nonce.into(), plain).map_err(|_| Error::internal("encryption failed"))?;
+    let mut sealed = cipher
+        .encrypt(nonce.try_into().map_err(|_| Error::internal("encryption failed"))?, plain)
+        .map_err(|_| Error::internal("encryption failed"))?;
 
     let tag = sealed.split_off(sealed.len() - GCM_TAG_LEN);
     Ok((sealed, tag))
@@ -93,7 +94,12 @@ pub(super) fn gcm_decrypt(
     sealed.extend_from_slice(tag);
 
     cipher
-        .decrypt(nonce.into(), sealed.as_ref())
+        .decrypt(
+            nonce
+                .try_into()
+                .map_err(|_| Error::internal("the nonce is the wrong length for AES-256-GCM"))?,
+            sealed.as_ref(),
+        )
         .map_err(|_| Error::internal("the ciphertext failed authentication"))
 }
 

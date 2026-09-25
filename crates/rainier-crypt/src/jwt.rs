@@ -158,14 +158,14 @@ impl JwtKey {
 
     /// An ES256 key from a PKCS#8 PEM private key.
     pub fn es256_from_pem(kid: impl Into<String>, pem: &str) -> Result<Self> {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
         use p256::pkcs8::DecodePrivateKey;
         use p256::SecretKey;
 
         let secret = SecretKey::from_pkcs8_pem(pem)
             .map_err(|e| Error::internal(format!("could not read the P-256 private key: {e}")))?;
 
-        let point = secret.public_key().to_encoded_point(false);
+        let point = secret.public_key().to_sec1_point(false);
         let jwk = json!({
             "kty": "EC",
             "crv": "P-256",
@@ -203,7 +203,7 @@ impl JwtKey {
         use rsa::pkcs8::{EncodePrivateKey, LineEnding};
         use rsa::RsaPrivateKey;
 
-        let private = RsaPrivateKey::new(&mut rand::thread_rng(), bits)
+        let private = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, bits)
             .map_err(|e| Error::internal(format!("could not generate an RSA key: {e}")))?;
         let pem = private
             .to_pkcs8_pem(LineEnding::LF)
@@ -217,7 +217,10 @@ impl JwtKey {
     pub fn generate_es256(kid: impl Into<String>) -> Result<Self> {
         use p256::pkcs8::{EncodePrivateKey, LineEnding};
 
-        let secret = p256::SecretKey::random(&mut rand::thread_rng());
+        let secret = {
+            use p256::elliptic_curve::Generate as _;
+            p256::SecretKey::generate_from_rng(&mut crate::os_rng())
+        };
         let pem = secret
             .to_pkcs8_pem(LineEnding::LF)
             .map_err(|e| Error::internal(format!("could not encode the key: {e}")))?;
@@ -286,9 +289,9 @@ impl JwtKey {
                     .map_err(|e| Error::internal(format!("could not load the RSA key: {e}")))?
             }
             "EC" => {
-                use p256::elliptic_curve::sec1::FromEncodedPoint;
+                use p256::elliptic_curve::sec1::FromSec1Point;
                 use p256::pkcs8::EncodePublicKey;
-                use p256::{AffinePoint, EncodedPoint};
+                use p256::{AffinePoint, Sec1Point};
 
                 let curve = field("crv")?;
                 if curve != "P-256" {
@@ -297,16 +300,21 @@ impl JwtKey {
                     )));
                 }
 
-                let point = EncodedPoint::from_affine_coordinates(
-                    decode("x")?.as_slice().into(),
-                    decode("y")?.as_slice().into(),
-                    false,
-                );
+                let (x, y) = (decode("x")?, decode("y")?);
+                // `try_into`, not `into`: the coordinates come from a JWKS document, and
+                // the old conversion panicked on a wrong length instead of refusing it.
+                fn coordinate(c: &[u8]) -> Result<&p256::FieldBytes> {
+                    c.try_into().map_err(|_| {
+                        Error::internal(
+                            "this JWKS entry has a coordinate of the wrong length for P-256",
+                        )
+                    })
+                }
+                let point =
+                    Sec1Point::from_affine_coordinates(coordinate(&x)?, coordinate(&y)?, false);
 
-                let affine = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&point))
-                    .ok_or_else(|| {
-                    Error::internal("this JWKS entry is not a point on P-256")
-                })?;
+                let affine = Option::<AffinePoint>::from(AffinePoint::from_sec1_point(&point))
+                    .ok_or_else(|| Error::internal("this JWKS entry is not a point on P-256"))?;
 
                 let public = p256::PublicKey::from_affine(affine).map_err(|e| {
                     Error::internal(format!("this JWKS entry is not a P-256 key: {e}"))
@@ -658,7 +666,8 @@ mod tests {
         static PEM: OnceLock<String> = OnceLock::new();
 
         PEM.get_or_init(|| {
-            let private = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).expect("generate");
+            let private =
+                rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("generate");
             private.to_pkcs8_pem(LineEnding::LF).expect("encode").to_string()
         })
         .clone()
@@ -730,7 +739,8 @@ mod tests {
         static PEM: OnceLock<String> = OnceLock::new();
 
         PEM.get_or_init(|| {
-            let private = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).expect("generate");
+            let private =
+                rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("generate");
             private.to_pkcs8_pem(LineEnding::LF).expect("encode").to_string()
         })
         .clone()

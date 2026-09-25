@@ -136,18 +136,18 @@ impl Cipher {
         match self {
             Cipher::XChaCha20Poly1305 => XChaCha20Poly1305::new_from_slice(&derived)
                 .map_err(|_| failed())?
-                .encrypt(nonce.into(), payload)
+                .encrypt(nonce.try_into().map_err(|_| failed())?, payload)
                 .map_err(|_| failed()),
             Cipher::ChaCha20Poly1305 => ChaCha20Poly1305::new_from_slice(&derived)
                 .map_err(|_| failed())?
-                .encrypt(nonce.into(), payload)
+                .encrypt(nonce.try_into().map_err(|_| failed())?, payload)
                 .map_err(|_| failed()),
             Cipher::Aes256Gcm => {
                 use aes_gcm::aead::Aead as _;
                 aes_gcm::KeyInit::new_from_slice(&derived)
                     .map(|cipher: Aes256Gcm| cipher)
                     .map_err(|_| failed())?
-                    .encrypt(nonce.into(), payload)
+                    .encrypt(nonce.try_into().map_err(|_| failed())?, payload)
                     .map_err(|_| failed())
             }
             Cipher::Aes128Gcm => {
@@ -155,7 +155,7 @@ impl Cipher {
                 aes_gcm::KeyInit::new_from_slice(&derived)
                     .map(|cipher: Aes128Gcm| cipher)
                     .map_err(|_| failed())?
-                    .encrypt(nonce.into(), payload)
+                    .encrypt(nonce.try_into().map_err(|_| failed())?, payload)
                     .map_err(|_| failed())
             }
             Cipher::Aes256GcmSiv => {
@@ -163,7 +163,7 @@ impl Cipher {
                 aes_gcm_siv::KeyInit::new_from_slice(&derived)
                     .map(|cipher: Aes256GcmSiv| cipher)
                     .map_err(|_| failed())?
-                    .encrypt(nonce.into(), payload)
+                    .encrypt(nonce.try_into().map_err(|_| failed())?, payload)
                     .map_err(|_| failed())
             }
         }
@@ -183,18 +183,18 @@ impl Cipher {
         match self {
             Cipher::XChaCha20Poly1305 => XChaCha20Poly1305::new_from_slice(&derived)
                 .map_err(|_| failed())?
-                .decrypt(nonce.into(), payload)
+                .decrypt(nonce.try_into().map_err(|_| failed())?, payload)
                 .map_err(|_| failed()),
             Cipher::ChaCha20Poly1305 => ChaCha20Poly1305::new_from_slice(&derived)
                 .map_err(|_| failed())?
-                .decrypt(nonce.into(), payload)
+                .decrypt(nonce.try_into().map_err(|_| failed())?, payload)
                 .map_err(|_| failed()),
             Cipher::Aes256Gcm => {
                 use aes_gcm::aead::Aead as _;
                 aes_gcm::KeyInit::new_from_slice(&derived)
                     .map(|cipher: Aes256Gcm| cipher)
                     .map_err(|_| failed())?
-                    .decrypt(nonce.into(), payload)
+                    .decrypt(nonce.try_into().map_err(|_| failed())?, payload)
                     .map_err(|_| failed())
             }
             Cipher::Aes128Gcm => {
@@ -202,7 +202,7 @@ impl Cipher {
                 aes_gcm::KeyInit::new_from_slice(&derived)
                     .map(|cipher: Aes128Gcm| cipher)
                     .map_err(|_| failed())?
-                    .decrypt(nonce.into(), payload)
+                    .decrypt(nonce.try_into().map_err(|_| failed())?, payload)
                     .map_err(|_| failed())
             }
             Cipher::Aes256GcmSiv => {
@@ -210,7 +210,7 @@ impl Cipher {
                 aes_gcm_siv::KeyInit::new_from_slice(&derived)
                     .map(|cipher: Aes256GcmSiv| cipher)
                     .map_err(|_| failed())?
-                    .decrypt(nonce.into(), payload)
+                    .decrypt(nonce.try_into().map_err(|_| failed())?, payload)
                     .map_err(|_| failed())
             }
         }
@@ -218,10 +218,8 @@ impl Cipher {
 
     /// A fresh nonce of the right length for this cipher.
     pub fn nonce(self) -> Vec<u8> {
-        use rand::RngCore;
-
         let mut nonce = vec![0u8; self.nonce_len()];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        crate::fill_random(&mut nonce);
         nonce
     }
 
