@@ -32,15 +32,17 @@ use rainier_orm::sea_query::{
     Query as SqQuery, SelectStatement, SimpleExpr, SubQueryStatement, Value,
 };
 use rainier_orm::{
-    key_condition, key_route, row_key_condition, ColumnType, Dialect, Entity, Result, ShardRoute,
-    SingleKey, TrashScope, Upsert,
+    key_condition, key_route, row_key_condition, ColumnType, Dialect, Entity, Error, Result,
+    ShardRoute, SingleKey, TrashScope, Upsert,
 };
 
 use crate::criteria::{
     AggregateFn, Assignment, Comparison, Criteria, DatePart, Derived, JoinKind, Operand, Operator,
     Projection, Subquery, SubqueryPredicate,
 };
-use crate::expression::{predicate_condition, render_expression};
+use crate::expression::{
+    predicate_condition, render_expression, render_sub_select, Expression, SubSelect,
+};
 
 /// A rendered statement: SQL, its ordered bind values, and where to run it.
 ///
@@ -909,6 +911,150 @@ pub fn upsert_with<E: Entity>(dialect: Dialect, entity: &E, plan: &Upsert) -> Re
 
     let (sql, params) = dialect.build_query(&stmt);
     Ok(Prepared { sql, params: params.0, route })
+}
+
+/// `SELECT …` from a [`SubSelect`] — a query that is not one entity's rows:
+/// a derived table, a union, a ranking. Read it with the executor's row API
+/// and decode by the names given to [`SubSelect::select_as`].
+///
+/// No soft-delete scope is applied: a `SubSelect` names tables, not entities,
+/// so a `deleted_at IS NULL` it needs is written into it.
+pub fn select(dialect: Dialect, source: &SubSelect) -> Prepared {
+    let (sql, params) = dialect.build_query(&render_sub_select(dialect, source));
+    Prepared { sql, params: params.0, route: ShardRoute::Global }
+}
+
+/// `INSERT INTO table (columns…) SELECT …` — rows computed by the database
+/// and written without leaving it.
+///
+/// `columns` are the entity's, matched by position against `source`'s select
+/// list. Neither soft-delete scope nor timestamps are applied: the source
+/// names tables rather than entities, and every value written is one it
+/// selects — `val(now)` for a timestamp.
+///
+/// # Errors
+///
+/// If a column is not one of `E`'s, if `source` selects a different number of
+/// expressions than there are columns, or if `E` is sharded — the statement
+/// runs on one database and a sharded entity's rows live on several.
+pub fn insert_select<E: Entity>(
+    dialect: Dialect,
+    columns: &[&str],
+    source: &SubSelect,
+) -> Result<Prepared> {
+    let stmt = insert_select_statement::<E>(dialect, columns, source)?;
+    let (sql, params) = dialect.build_query(&stmt);
+    Ok(Prepared { sql, params: params.0, route: ShardRoute::Global })
+}
+
+/// [`insert_select`], and on a key conflict update the stored row instead:
+/// `ON DUPLICATE KEY UPDATE` on MySQL, `ON CONFLICT (…) DO UPDATE` elsewhere.
+///
+/// Each `set` pair is `column = expression`. In the expression a plain
+/// [`col`](crate::expression::col) is the stored value — qualify it with the
+/// table, `col("t.score")`, to say so — and
+/// [`incoming`](crate::expression::incoming) is the value this insert tried
+/// to write. MySQL evaluates the assignments left to right, each seeing the
+/// ones before it; SQLite and Postgres all see the stored row. Order the
+/// pairs so both readings agree: anything that compares against a stored
+/// column goes before the assignment that overwrites it.
+///
+/// Two source rows with the same key are applied one after the other on MySQL
+/// and SQLite; Postgres refuses the statement ("cannot affect row a second
+/// time"). Aggregate the source by the key when that can happen there.
+///
+/// # Errors
+///
+/// As [`insert_select`], and if `conflict` or a `set` column is not one of
+/// `E`'s, or `conflict` is empty.
+pub fn upsert_select<E: Entity>(
+    dialect: Dialect,
+    columns: &[&str],
+    source: &SubSelect,
+    conflict: &[&str],
+    set: &[(&str, Expression)],
+) -> Result<Prepared> {
+    if conflict.is_empty() {
+        return Err(Error::msg(format!(
+            "upsert_select into `{}` names no conflict columns",
+            E::table()
+        )));
+    }
+    known_columns::<E>(conflict.iter().copied().chain(set.iter().map(|(c, _)| *c)))?;
+
+    // SQLite reads `SELECT … FROM a JOIN b ON …` followed by `ON CONFLICT` as
+    // a join constraint unless the select has a `WHERE`; its documentation's
+    // own advice is `WHERE true`. Harmless everywhere, so not dialect-gated.
+    let guarded;
+    let source = if source.has_filter() {
+        source
+    } else {
+        guarded = source.clone().filter(crate::expression::all([]));
+        &guarded
+    };
+    let mut stmt = insert_select_statement::<E>(dialect, columns, source)?;
+
+    let table = E::table();
+    let resolve = |spec: &str| column_ref_in(spec, table);
+    let mut on_conflict = OnConflict::columns(conflict.iter().map(|c| alias(c)));
+    if set.is_empty() {
+        // Insert-or-ignore, spelled as `upsert` spells it: a no-op
+        // self-assignment, since MySQL has no `DO NOTHING`.
+        on_conflict.value(alias(conflict[0]), Expr::col(alias(conflict[0])));
+    } else {
+        for (column, expression) in set {
+            on_conflict.value(alias(column), render_expression(dialect, expression, &resolve));
+        }
+    }
+    stmt.on_conflict(on_conflict);
+
+    let (sql, params) = dialect.build_query(&stmt);
+    Ok(Prepared { sql, params: params.0, route: ShardRoute::Global })
+}
+
+fn insert_select_statement<E: Entity>(
+    dialect: Dialect,
+    columns: &[&str],
+    source: &SubSelect,
+) -> Result<rainier_orm::sea_query::InsertStatement> {
+    if !E::shard_columns().is_empty() {
+        return Err(Error::msg(format!(
+            "`{}` is sharded; INSERT … SELECT runs on one database",
+            E::table()
+        )));
+    }
+    known_columns::<E>(columns.iter().copied())?;
+    if columns.len() != source.width() {
+        return Err(Error::msg(format!(
+            "INSERT INTO `{}` names {} columns but its SELECT produces {}",
+            E::table(),
+            columns.len(),
+            source.width()
+        )));
+    }
+
+    let mut stmt = SqQuery::insert();
+    stmt.into_table(alias(E::table()));
+    stmt.columns(columns.iter().map(|c| alias(c)));
+    stmt.select_from(render_sub_select(dialect, source)).map_err(|e| Error::msg(e.to_string()))?;
+    Ok(stmt)
+}
+
+fn known_columns<'a, E: Entity>(columns: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    for column in columns {
+        if !E::columns().iter().any(|c| c.name == column) {
+            return Err(Error::msg(format!("`{}` has no column `{column}`", E::table())));
+        }
+    }
+    Ok(())
+}
+
+/// `"name"` against `table`, `"t.name"` as written.
+fn column_ref_in(spec: &str, table: &str) -> ColumnRef {
+    match spec.split_once('.') {
+        Some((t, column)) => (alias(t), alias(column)).into_column_ref(),
+        None => (alias(table), alias(spec)).into_column_ref(),
+    }
 }
 
 /// `UPDATE table SET … WHERE pk = ?` — every non-key column.

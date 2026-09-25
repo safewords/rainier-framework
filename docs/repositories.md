@@ -412,10 +412,110 @@ Mind the empty-set behaviour for the others — `SUM`, `MIN`, `MAX` and `AVG` ov
 no rows are `NULL`, which writes `NULL` into the target column, or fails outright
 if it is `NOT NULL`.
 
-`Assignment::Subquery` is not a stand-in for `Increment` on two counts:
-`Projection` has no arithmetic, so there is nothing to write `n + ?` with; and a
-subquery reading the table being updated is MySQL error 1093, with no portable
-way around it.
+`Assignment::Subquery` is not a stand-in for `Increment`: a subquery reading
+the table being updated is MySQL error 1093, with no portable way around it.
+Arithmetic on the stored value is `Assignment::Expression`, below.
+
+### Expressions
+
+`rainier_database::expression` is the general form of everything above: an
+`Expression` is a value (`col`, `val`, `lower`, `coalesce`, `greatest`,
+`concat`, `cast`, `case`, arithmetic, aggregates, `row_number()` windows, a
+scalar `SubSelect`) and a `Predicate` compares two of them, nests with
+`all`/`any`/`not`, or tests `EXISTS`, `IN (SELECT …)`, `BETWEEN`, `LIKE`.
+
+```rust
+use rainier_framework::database::expression::*;
+
+Criteria::new()
+    // (a AND b) OR (c AND d)
+    .where_expr(any([
+        all([col("decommissioned_at").is_not_null(), col("decommissioned_at").lt(cutoff)]),
+        all([col("decommissioned_at").is_null(), col("last_heartbeat_at").lt(cutoff)]),
+    ]))
+    // a self-join and an anti-join, each with its own ON
+    .join_as("follows", "f", col("f.followed_id").eq(col("id")))
+    .left_join_as("blocks", "b", all([col("b.blocked_id").eq(col("id")), col("b.blocker_id").eq(viewer)]))
+    .where_expr(col("b.id").is_null())
+    .order_by_expr(case(col("username").eq(term), 0_i64).otherwise(1_i64), false);
+
+// SET ref_count = GREATEST(ref_count - ?, 0)
+Assignment::Expression(greatest([cast(col("ref_count"), CastAs::Integer).minus(1_i64), val(0_i64)]));
+```
+
+Two rules keep it injection-proof. **A bare literal is always a bound value**,
+never a column — `col("x").eq("y")` compares against the string `'y'`, and a
+column on the right is spelled `col`. **Identifiers are quoted**, split on the
+dot, never interpolated. `contains`/`starts_with`/`ends_with` escape the term's
+own `%` and `_`, so a search for `50%` does not match everything starting with
+`50`.
+
+Each function renders per dialect: `GREATEST` is `MAX` on SQLite, `CONCAT` is
+`||` outside MySQL, `CAST(… AS SIGNED)` is `INTEGER` on SQLite and `BIGINT` on
+Postgres. The same query runs in production and in the SQLite test suite.
+
+### Statements the database computes: `INSERT … SELECT`
+
+A pipeline whose whole computation is one `SELECT` — rank, score, write — does
+not need to bring its rows into the process. `SubSelect` is a full query: it
+joins (`join`, `left_join`, and `join_select` for a derived table), groups,
+filters groups with `having`, orders, limits, reads a derived table with
+`from_select`, and concatenates with `union_all`. `statement::insert_select`
+writes its rows into an entity's table, and `statement::select` reads them.
+
+```rust
+use rainier_framework::database::{expression::*, statement, SubSelect};
+
+// Each profile's top 100 co-followed profiles, by how many followers they share.
+let pairs = SubSelect::from("followers").alias("fa")
+    .join("followers", "fb", all([
+        col("fb.profile_id").eq(col("fa.profile_id")),
+        col("fb.followed_profile_id").ne(col("fa.followed_profile_id")),
+    ]))
+    .select_as(col("fa.followed_profile_id"), "a")
+    .select_as(col("fb.followed_profile_id"), "b")
+    .select_as(count_all(), "shared")
+    .select_as(row_number().partition_by([col("fa.followed_profile_id")]).order_by_desc(count_all()), "rk")
+    .group_by(col("fa.followed_profile_id"))
+    .group_by(col("fb.followed_profile_id"))
+    .having(count_all().gte(3_i64));
+let top = SubSelect::from_select(pairs).alias("ranked")
+    .select(col("a")).select(col("b")).select(col("shared")).select(val(now))
+    .filter(col("rk").lte(100_i64));
+
+db.execute(statement::insert_select::<CoFollow>(
+    db.dialect(),
+    &["a_profile_id", "b_profile_id", "co_followers", "computed_at"],
+    &top,
+)?).await?;
+```
+
+`statement::upsert_select` adds the conflict clause — `ON DUPLICATE KEY UPDATE`
+on MySQL, `ON CONFLICT (…) DO UPDATE` elsewhere. In its assignments `col` is the
+stored value and `incoming("score")` is the value being inserted (`VALUES(score)`
+or `excluded.score`). **MySQL evaluates the assignments left to right**, each
+seeing the ones before it, where SQLite and Postgres all see the stored row; so
+an assignment that compares against a stored column goes *before* the one that
+overwrites it, and then every dialect agrees.
+
+Things to know:
+
+- Top-K-per-group is a window in a derived table filtered by its rank —
+  `ROW_NUMBER()` cannot appear in the `WHERE` of the query that computes it.
+- Pruning a table to its top K is `delete_matching` with `where_expr(exists(…))`
+  over a ranked derived table of the same table. MySQL refuses a `DELETE` whose
+  sub-select reads the target directly (error 1093); a derived table holding a
+  window function is always materialised, which is what makes this portable.
+- Write `HAVING` with the aggregate spelled out (`count_all().gte(3)`), not its
+  alias — Postgres does not resolve select aliases there.
+- Integer `/` truncates on SQLite and Postgres. Cast one side to `Real` for a
+  ratio.
+- No soft-delete scope and no timestamps: a `SubSelect` names tables, not
+  entities, so a `deleted_at IS NULL` it needs is written into it, and a
+  timestamp is a selected `val(now)`.
+- Columns are checked against the entity, and the select's width against the
+  column list, before anything renders. A sharded entity is refused — the
+  statement runs on one database.
 
 ## Named queries
 

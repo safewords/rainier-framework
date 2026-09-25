@@ -48,12 +48,12 @@
 //! [`Criteria::join_as`](crate::Criteria::join_as).
 
 use rainier_orm::sea_query::{
-    Alias, Asterisk, BinOper, ColumnRef, Cond, Expr, ExprTrait as _, Func, IntoColumnRef, LikeExpr,
-    Query as SqQuery, SelectStatement, SubQueryStatement, Value,
+    Alias, Asterisk, BinOper, ColumnRef, Cond, Expr, ExprTrait as _, Func, IntoColumnRef, JoinType,
+    LikeExpr, Order, Query as SqQuery, SelectStatement, SubQueryStatement, UnionType, Value,
 };
 use rainier_orm::Dialect;
 
-use crate::criteria::{AggregateFn, Comparison, DatePart};
+use crate::criteria::{AggregateFn, Comparison, DatePart, JoinKind};
 
 /// A value-producing SQL expression.
 ///
@@ -89,6 +89,11 @@ pub enum Expression {
     Window(Box<Window>),
     /// A scalar sub-select: `(SELECT … )`, which must produce one value.
     SubSelect(Box<SubSelect>),
+    /// The value an upsert is trying to insert into a column — `VALUES(col)`
+    /// on MySQL, `excluded.col` elsewhere. Only meaningful in the conflict
+    /// assignments of [`statement::upsert_select`](crate::statement::upsert_select);
+    /// see [`incoming`].
+    Incoming(String),
 }
 
 /// An arithmetic operator.
@@ -274,8 +279,13 @@ pub enum Predicate {
     Not(Box<Predicate>),
 }
 
-/// A `SELECT` used inside an expression: `EXISTS (…)`, `IN (…)`, or a scalar
-/// `(…)`.
+/// A `SELECT` built from expressions.
+///
+/// Used inside an expression — `EXISTS (…)`, `IN (…)`, a scalar `(…)` — and,
+/// since it can join, group, rank and union, as a query in its own right: the
+/// row source of [`statement::insert_select`](crate::statement::insert_select),
+/// or a derived table another `SubSelect` reads [`from_select`](Self::from_select)
+/// or [`join_select`](Self::join_select)s.
 ///
 /// Uncorrelated by default. Correlate it by naming the outer query's columns
 /// qualified — `col("posts.id")` — in its predicates; its own columns are
@@ -283,14 +293,60 @@ pub enum Predicate {
 /// a sub-select over the outer query's own table is otherwise the same name in
 /// two scopes, and `t.id = t.parent_id` would compare the inner row with
 /// itself. See `SUBQUERY_ALIAS` in the statement builder for that history.
+///
+/// ```
+/// use rainier_database::expression::*;
+///
+/// // Top three posts per profile, by likes:
+/// // SELECT profile_id, id FROM (
+/// //   SELECT p.profile_id, p.id,
+/// //          ROW_NUMBER() OVER (PARTITION BY p.profile_id ORDER BY COUNT(*) DESC) AS rk
+/// //   FROM posts p INNER JOIN post_likes l ON l.post_id = p.id
+/// //   GROUP BY p.profile_id, p.id
+/// // ) ranked WHERE rk <= 3
+/// let ranked = SubSelect::from("posts")
+///     .alias("p")
+///     .join("post_likes", "l", col("l.post_id").eq(col("p.id")))
+///     .select_as(col("p.profile_id"), "profile_id")
+///     .select_as(col("p.id"), "id")
+///     .select_as(row_number().partition_by([col("p.profile_id")]).order_by_desc(count_all()), "rk")
+///     .group_by(col("p.profile_id"))
+///     .group_by(col("p.id"));
+/// let top = SubSelect::from_select(ranked)
+///     .alias("ranked")
+///     .select(col("profile_id"))
+///     .select(col("id"))
+///     .filter(col("rk").lte(3_i64));
+/// # let _ = top;
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubSelect {
-    table: String,
+    source: Source,
     alias: String,
-    select: Vec<Expression>,
+    select: Vec<(Expression, Option<String>)>,
+    joins: Vec<SubJoin>,
     filter: Vec<Predicate>,
     group_by: Vec<Expression>,
+    having: Vec<Predicate>,
+    order_by: Vec<(Expression, bool)>,
     limit: Option<u64>,
+    offset: Option<u64>,
+    unions: Vec<SubSelect>,
+}
+
+/// What a [`SubSelect`] reads, or joins.
+#[derive(Debug, Clone, PartialEq)]
+enum Source {
+    Table(String),
+    Select(Box<SubSelect>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SubJoin {
+    kind: JoinKind,
+    source: Source,
+    alias: String,
+    on: Predicate,
 }
 
 /// The alias a [`SubSelect`] gets unless it is given one.
@@ -299,13 +355,31 @@ const DEFAULT_SUB_ALIAS: &str = "_rainier_sub";
 impl SubSelect {
     /// `SELECT … FROM table AS _rainier_sub`.
     pub fn from(table: impl Into<String>) -> Self {
+        Self::with_source(Source::Table(table.into()))
+    }
+
+    /// `SELECT … FROM (<select>) AS _rainier_sub` — a derived table.
+    ///
+    /// The inner select's own alias names *its* source inside it; the derived
+    /// table is named by this select's [`alias`](Self::alias), and its columns
+    /// are the inner select's [`select_as`](Self::select_as) names.
+    pub fn from_select(select: SubSelect) -> Self {
+        Self::with_source(Source::Select(Box::new(select)))
+    }
+
+    fn with_source(source: Source) -> Self {
         Self {
-            table: table.into(),
+            source,
             alias: DEFAULT_SUB_ALIAS.to_string(),
             select: Vec::new(),
+            joins: Vec::new(),
             filter: Vec::new(),
             group_by: Vec::new(),
+            having: Vec::new(),
+            order_by: Vec::new(),
             limit: None,
+            offset: None,
+            unions: Vec::new(),
         }
     }
 
@@ -319,8 +393,51 @@ impl SubSelect {
     /// Add a selected expression. An `EXISTS` needs none; an `IN` or a scalar
     /// needs exactly one.
     pub fn select(mut self, expression: impl Into<Expression>) -> Self {
-        self.select.push(expression.into());
+        self.select.push((expression.into(), None));
         self
+    }
+
+    /// Add a selected expression under a name — `expr AS name`. A derived
+    /// table's columns are these names.
+    pub fn select_as(mut self, expression: impl Into<Expression>, name: impl Into<String>) -> Self {
+        self.select.push((expression.into(), Some(name.into())));
+        self
+    }
+
+    fn join_source(mut self, kind: JoinKind, source: Source, alias: String, on: Predicate) -> Self {
+        self.joins.push(SubJoin { kind, source, alias, on });
+        self
+    }
+
+    /// `INNER JOIN table AS alias ON <on>`. Join one table twice under two
+    /// aliases for a self-join.
+    pub fn join(self, table: impl Into<String>, alias: impl Into<String>, on: Predicate) -> Self {
+        self.join_source(JoinKind::Inner, Source::Table(table.into()), alias.into(), on)
+    }
+
+    /// `LEFT JOIN table AS alias ON <on>`.
+    pub fn left_join(
+        self,
+        table: impl Into<String>,
+        alias: impl Into<String>,
+        on: Predicate,
+    ) -> Self {
+        self.join_source(JoinKind::Left, Source::Table(table.into()), alias.into(), on)
+    }
+
+    /// `INNER JOIN (<select>) AS alias ON <on>` — a derived table.
+    pub fn join_select(self, select: SubSelect, alias: impl Into<String>, on: Predicate) -> Self {
+        self.join_source(JoinKind::Inner, Source::Select(Box::new(select)), alias.into(), on)
+    }
+
+    /// `LEFT JOIN (<select>) AS alias ON <on>`.
+    pub fn left_join_select(
+        self,
+        select: SubSelect,
+        alias: impl Into<String>,
+        on: Predicate,
+    ) -> Self {
+        self.join_source(JoinKind::Left, Source::Select(Box::new(select)), alias.into(), on)
     }
 
     /// `AND` a predicate.
@@ -335,15 +452,61 @@ impl SubSelect {
         self
     }
 
+    /// `AND` a predicate into `HAVING`. Spell the aggregate out —
+    /// `count_all().gte(3)` — rather than naming its alias: Postgres does not
+    /// resolve a select alias in `HAVING`.
+    pub fn having(mut self, predicate: Predicate) -> Self {
+        self.having.push(predicate);
+        self
+    }
+
+    /// `ORDER BY expr ASC`.
+    pub fn order_by(mut self, expression: impl Into<Expression>) -> Self {
+        self.order_by.push((expression.into(), false));
+        self
+    }
+
+    /// `ORDER BY expr DESC`.
+    pub fn order_by_desc(mut self, expression: impl Into<Expression>) -> Self {
+        self.order_by.push((expression.into(), true));
+        self
+    }
+
     /// `LIMIT`.
     pub fn limit(mut self, n: u64) -> Self {
         self.limit = Some(n);
         self
     }
 
-    /// The table read.
+    /// `OFFSET`.
+    pub fn offset(mut self, n: u64) -> Self {
+        self.offset = Some(n);
+        self
+    }
+
+    /// `… UNION ALL <other>`. Each member selects the same number of columns;
+    /// the first member's names are the result's. Rows are not deduplicated.
+    pub fn union_all(mut self, other: SubSelect) -> Self {
+        self.unions.push(other);
+        self
+    }
+
+    /// The table read, or `""` for a select that reads a derived table.
     pub fn table(&self) -> &str {
-        &self.table
+        match &self.source {
+            Source::Table(table) => table,
+            Source::Select(_) => "",
+        }
+    }
+
+    /// How many expressions this select produces per row.
+    pub fn width(&self) -> usize {
+        self.select.len()
+    }
+
+    /// Whether this select has a `WHERE` of its own.
+    pub(crate) fn has_filter(&self) -> bool {
+        !self.filter.is_empty()
     }
 }
 
@@ -365,6 +528,20 @@ pub fn col(spec: impl Into<String>) -> Expression {
 /// A bound value.
 pub fn val(value: impl Into<Value>) -> Expression {
     Expression::Value(value.into())
+}
+
+/// The value an upsert is trying to write to `column` — `VALUES(column)` on
+/// MySQL, `excluded.column` on SQLite and Postgres.
+///
+/// Use it on the right of a conflict assignment:
+/// `("score", col("t.score").plus(incoming("score")))` accumulates. A plain
+/// [`col`] there is the *stored* value. Every assignment reads the stored row
+/// as it was before the update on SQLite and Postgres, but MySQL evaluates
+/// them left to right and a later one sees an earlier one's result — so put
+/// an assignment that compares against a stored column *before* the one that
+/// overwrites it.
+pub fn incoming(column: impl Into<String>) -> Expression {
+    Expression::Incoming(column.into())
 }
 
 /// A bare value converts to a *bound value*, never to a column. See the
@@ -736,7 +913,7 @@ impl Expression {
     fn collect_columns<'a>(&'a self, out: &mut Vec<&'a str>) {
         match self {
             Expression::Column(c) => out.push(c),
-            Expression::Value(_) | Expression::SubSelect(_) => {}
+            Expression::Value(_) | Expression::SubSelect(_) | Expression::Incoming(_) => {}
             Expression::Function(_, args) => args.iter().for_each(|a| a.collect_columns(out)),
             Expression::Arithmetic(l, _, r) => {
                 l.collect_columns(out);
@@ -873,6 +1050,12 @@ pub(crate) fn render_expression(dialect: Dialect, e: &Expression, resolve: Resol
             None,
             Box::new(SubQueryStatement::SelectStatement(render_sub_select(dialect, select))),
         ),
+        Expression::Incoming(column) => match dialect {
+            Dialect::MySql => {
+                Func::cust(Alias::new("VALUES")).arg(Expr::col(Alias::new(column))).into()
+            }
+            _ => Expr::col((Alias::new("excluded"), Alias::new(column))),
+        },
     }
 }
 
@@ -1105,14 +1288,45 @@ fn sub_select_statement(
     let resolve = move |spec: &str| qualified(spec, &alias);
 
     let mut stmt = SqQuery::select();
-    stmt.from_as(Alias::new(&select.table), Alias::new(&select.alias));
+    match &select.source {
+        Source::Table(table) => {
+            stmt.from_as(Alias::new(table), Alias::new(&select.alias));
+        }
+        Source::Select(inner) => {
+            stmt.from_subquery(render_sub_select(dialect, inner), Alias::new(&select.alias));
+        }
+    }
     if existence_only || select.select.is_empty() {
         // A constant rather than a bound `1`: see `subquery_select` in the
         // statement builder — a bound one would be a stray parameter.
         stmt.expr(Expr::Constant(Value::Int(Some(1))));
     } else {
-        for e in &select.select {
-            stmt.expr(render_expression(dialect, e, &resolve));
+        for (e, name) in &select.select {
+            let e = render_expression(dialect, e, &resolve);
+            match name {
+                Some(name) => stmt.expr_as(e, Alias::new(name)),
+                None => stmt.expr(e),
+            };
+        }
+    }
+    for join in &select.joins {
+        let kind = match join.kind {
+            JoinKind::Inner => JoinType::InnerJoin,
+            JoinKind::Left => JoinType::LeftJoin,
+        };
+        let on = predicate_condition(dialect, &join.on, &resolve);
+        match &join.source {
+            Source::Table(table) => {
+                stmt.join_as(kind, Alias::new(table), Alias::new(&join.alias), on);
+            }
+            Source::Select(inner) => {
+                stmt.join_subquery(
+                    kind,
+                    render_sub_select(dialect, inner),
+                    Alias::new(&join.alias),
+                    on,
+                );
+            }
         }
     }
     let mut cond = Cond::all();
@@ -1123,13 +1337,33 @@ fn sub_select_statement(
     for g in &select.group_by {
         stmt.add_group_by([render_expression(dialect, g, &resolve)]);
     }
+    if !select.having.is_empty() {
+        let mut having = Cond::all();
+        for p in &select.having {
+            having = having.add(predicate_condition(dialect, p, &resolve));
+        }
+        stmt.cond_having(having);
+    }
+    if !existence_only {
+        for (e, descending) in &select.order_by {
+            let order = if *descending { Order::Desc } else { Order::Asc };
+            stmt.order_by_expr(render_expression(dialect, e, &resolve), order);
+        }
+        for member in &select.unions {
+            stmt.union(UnionType::All, render_sub_select(dialect, member));
+        }
+    }
     if let Some(n) = select.limit {
         stmt.limit(n);
+    }
+    if let Some(n) = select.offset {
+        stmt.offset(n);
     }
     stmt
 }
 
-fn render_sub_select(dialect: Dialect, select: &SubSelect) -> SelectStatement {
+/// Render a [`SubSelect`] as a statement of its own.
+pub(crate) fn render_sub_select(dialect: Dialect, select: &SubSelect) -> SelectStatement {
     sub_select_statement(dialect, select, false)
 }
 

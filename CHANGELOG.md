@@ -12,6 +12,24 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **General SQL expressions** (`rainier-database`). `expression::Expression`
+  and `Predicate`: columns, bound values, portable functions (`LOWER`,
+  `COALESCE`, `NULLIF`, `GREATEST`, `CONCAT`, …), arithmetic, `CAST`, `CASE`,
+  aggregates with `DISTINCT`, date parts, `ROW_NUMBER`/`RANK`/`DENSE_RANK`
+  windows, scalar sub-selects; any-to-any comparisons, escaped `LIKE`, `IN`
+  lists and sub-selects, `BETWEEN`, `EXISTS`, nested `AND`/`OR`/`NOT`. Each
+  renders per dialect. `Criteria` takes them in `where_expr`, `having`,
+  `select_expr`, `group_by_expr`, `order_by_expr` and `join_as`/`left_join_as`
+  (self-joins, anti-joins), and `Assignment::Expression` writes `SET col =
+  <expr>`. See `docs/repositories.md#expressions`.
+- **`INSERT … SELECT`** (`rainier-database`). `SubSelect` is now a full query:
+  joins (including derived tables), `HAVING`, `ORDER BY`, `OFFSET`,
+  `from_select` and `union_all`. `statement::insert_select` writes its rows
+  into an entity's table, `statement::upsert_select` adds a per-dialect conflict
+  clause whose assignments read the incoming row through `incoming(col)`, and
+  `statement::select` reads one as rows. Columns and select width are checked
+  before rendering; sharded entities are refused.
+
 - **Disks declared in configuration** (`rainier-filesystem`). A `filesystems`
   section — a `default` naming one of a `disks` map, each entry naming **its
   own** driver and settings — deserialises into `Disks` and builds a `Storage`

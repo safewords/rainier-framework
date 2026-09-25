@@ -745,6 +745,9 @@ fn expression_type<E: rainier_orm::Entity>(
             };
             E::columns().iter().find(|col| col.name == name).map_or(ColumnType::Text, |col| col.ty)
         }
+        Expression::Incoming(c) => {
+            E::columns().iter().find(|col| col.name == c).map_or(ColumnType::Text, |col| col.ty)
+        }
         Expression::Value(v) => match v {
             Value::Bool(_) => ColumnType::Bool,
             Value::TinyInt(_) | Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
