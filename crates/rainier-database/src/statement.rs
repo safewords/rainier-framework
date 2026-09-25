@@ -913,6 +913,34 @@ pub fn upsert_with<E: Entity>(dialect: Dialect, entity: &E, plan: &Upsert) -> Re
     Ok(Prepared { sql, params: params.0, route })
 }
 
+/// `INSERT` with the primary key written as the entity holds it, auto-increment
+/// or not.
+///
+/// For rows whose ids are part of what is being written: a fixture that other
+/// rows refer to by id, an import, a restore. [`insert`] leaves an
+/// auto-increment key to the database, which is what an ordinary create wants
+/// and exactly what these cannot have.
+///
+/// On Postgres an explicit id does not advance the column's sequence; a later
+/// ordinary insert can collide with it until the sequence is moved past it.
+pub fn insert_with_key<E: Entity>(dialect: Dialect, entity: &E) -> Prepared {
+    let mut pairs = entity.insert_values();
+    for (column, value) in E::primary_key_columns().iter().zip(entity.pk_values()).rev() {
+        if !pairs.iter().any(|(c, _)| c == column) {
+            pairs.insert(0, (column, value));
+        }
+    }
+
+    let route = route_from_pairs::<E>(&pairs);
+    let mut stmt = SqQuery::insert();
+    stmt.into_table(alias(E::table()));
+    stmt.columns(pairs.iter().map(|(column, _)| alias(column)));
+    stmt.values_panic(pairs.into_iter().map(|(_, value)| SimpleExpr::from(Expr::val(value))));
+
+    let (sql, params) = dialect.build_query(&stmt);
+    Prepared { sql, params: params.0, route }
+}
+
 /// `INSERT INTO table (…) VALUES (…), (…), …` — many rows, one statement.
 ///
 /// For an append — a snapshot, a batch of events — where a statement per row

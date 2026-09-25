@@ -390,3 +390,28 @@ async fn insert_many_writes_every_row_in_one_statement_and_leaves_the_key_to_the
     let err = statement::insert_many::<ViewPoint>(db.dialect(), &[]).unwrap_err();
     assert!(err.to_string().contains("given no rows"), "{err}");
 }
+
+#[tokio::test]
+async fn insert_with_key_keeps_an_explicit_auto_increment_id() {
+    let db = world().await;
+    for sql in rainier_orm::schema::schema_ddl::<ViewPoint>(Dialect::Sqlite) {
+        db.statement(&sql).await.expect("create table");
+    }
+    let row = ViewPoint { id: 100, post_id: 7, views: 1 };
+    assert!(statement::insert(db.dialect(), &row, None).sql.contains("(\"post_id\", \"views\")"));
+
+    db.execute(statement::insert_with_key(db.dialect(), &row)).await.unwrap();
+    // An ordinary insert afterwards continues past it.
+    let next = ViewPoint { id: 0, post_id: 8, views: 2 };
+    db.execute(statement::insert(db.dialect(), &next, None)).await.unwrap();
+
+    let mut ids: Vec<u64> = db
+        .fetch_all::<ViewPoint>(statement::select_all::<ViewPoint>(db.dialect()))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![100, 101]);
+}

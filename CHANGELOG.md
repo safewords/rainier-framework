@@ -32,6 +32,10 @@ the release as a whole and names the crate it landed in.
 - **`statement::insert_many`** (`rainier-database`): many rows of one entity
   in one `INSERT … VALUES (…), (…)`, rendered per row exactly as `insert`
   renders one. Refuses an empty batch and one that spans shards.
+- **`statement::insert_with_key`** (`rainier-database`): an `INSERT` that
+  writes the entity's primary key even when it is auto-increment — for
+  fixtures other rows refer to by id, imports and restores. `insert` still
+  leaves such a key to the database.
 - **Vector distance in expressions** (`rainier-database`):
   `vec_distance_cosine(a, b)` and `vec_from_text(text)` render as MariaDB's
   `VEC_DISTANCE_COSINE`/`VEC_FromText`, pgvector's `<=>`/`CAST(… AS vector)`,
