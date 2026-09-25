@@ -9,7 +9,7 @@
   <a href="https://github.com/safewords/rainier-framework/actions/workflows/ci.yml"><img src="https://github.com/safewords/rainier-framework/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/safewords/rainier-framework/actions/workflows/ci.yml"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fsafewords%2Frainier-framework%2Fmain%2F.github%2Fbadges%2Ftests.json%3Fv%3D1&labelColor=1B2024" alt="Tests"></a>
   <a href="https://crates.io/crates/rainier-framework"><img src="https://img.shields.io/crates/d/rainier-framework?label=downloads&color=C75232&labelColor=1B2024" alt="Downloads"></a>
-  <a href="https://github.com/safewords/rainier-framework/actions/workflows/ci.yml"><img src="https://img.shields.io/badge/rust-1.88%2B-C75232?logo=rust&logoColor=white&labelColor=1B2024" alt="Rust 1.88+"></a>
+  <a href="https://github.com/safewords/rainier-framework/actions/workflows/ci.yml"><img src="https://img.shields.io/badge/rust-1.89%2B-C75232?logo=rust&logoColor=white&labelColor=1B2024" alt="Rust 1.89+"></a>
   <a href="#licence"><img src="https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-C75232?labelColor=1B2024" alt="MIT OR Apache-2.0"></a>
 
 </p>

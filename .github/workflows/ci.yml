@@ -186,24 +186,24 @@ jobs:
           MAIL_SMTP_REQUIRED: ${{ matrix.name == 'all features' && '1' || '' }}
 
   msrv:
-    name: minimum supported Rust (1.88, default features)
+    name: minimum supported Rust (1.89, default features)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       # The ARC runner image has no C toolchain; see the action.
       - uses: ./.github/actions/system-deps
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
 
       # Default features only, and that is the honest scope of the claim.
-      # `rust-version = "1.88"` is the floor for *Rainier's own* code, which is
+      # `rust-version = "1.89"` is the floor for *Rainier's own* code, which is
       # what the wasm-safe default build compiles. Turning on a driver pulls in
       # third-party crates with their own, higher floors:
       #
-      #   default            1.88
-      #   sea-orm-executor   1.88  (via `home`, transitively)
+      #   default            1.89  (via `aes` 0.9, through `rainier-crypt`)
+      #   sea-orm-executor   1.89
       #   http-client        1.86  (via `reqwest` -> `url` -> `idna` -> `icu_*`)
       #   aws-*              1.94  (the AWS SDKs)
       #

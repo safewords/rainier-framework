@@ -45,7 +45,7 @@ use redis::{Cmd, FromRedisValue};
 enum Backend {
     Single(redis::Client),
     #[cfg(feature = "redis-cluster")]
-    Cluster(redis::cluster::ClusterClient),
+    Cluster(Box<redis::cluster::ClusterClient>),
 }
 
 /// What a connection may wait for, and what it does when its socket goes away.
@@ -612,7 +612,7 @@ impl RedisConnector {
             .map_err(|e| Error::internal(format!("could not open a Redis cluster client: {e}")))?;
 
         Ok(Self {
-            backend: Backend::Cluster(client),
+            backend: Backend::Cluster(Box::new(client)),
             description: format!("redis-cluster({count} seeds)"),
             settings,
             // The first seed, because a subscriber wants one node and any node

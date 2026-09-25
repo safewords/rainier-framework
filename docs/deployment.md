@@ -267,7 +267,7 @@ The sample project ships a working [`Dockerfile`][dockerfile]; this is what is
 in it and why.
 
 ```dockerfile
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.89-bookworm AS builder
 WORKDIR /build
 
 # Dependencies in their own layer: manifests, a stub main, then the real source.

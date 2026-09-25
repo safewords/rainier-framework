@@ -133,6 +133,10 @@ the release as a whole and names the crate it landed in.
 
 ### Changed
 
+- **The minimum supported Rust version is 1.89**, up from 1.88. `aes` 0.9,
+  which the RustCrypto generation `rainier-crypt` now builds on, declares 1.89,
+  and it is in the default build.
+
 - **The PHP compat layer is layered like one** (`rainier-crypt`). "Php" in
   `PhpEncrypter` names a wire format, not a cipher, and the type no longer
   fuses the two: `php::envelope` is the codec (JSON/base64/hex and which
