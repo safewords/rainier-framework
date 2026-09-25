@@ -368,6 +368,13 @@ impl<E: Entity> EntityRepository<E> {
     /// The same query [`Repository::aggregate`] runs — that one delegates here,
     /// so a model and a composite-key entity cannot drift apart.
     pub async fn aggregate_rows(&self, criteria: Criteria) -> Result<Vec<OwnedRow>> {
+        // Aliases that are this model's own table joined again — a self-join.
+        // Their columns are this model's columns, so their types are known.
+        let self_aliases: Vec<&str> = criteria
+            .on_joins()
+            .filter(|(table, ..)| *table == E::table())
+            .map(|(_, alias, ..)| alias)
+            .collect();
         let requests: Vec<ColumnRequest> = criteria
             .projections()
             .iter()
@@ -376,7 +383,7 @@ impl<E: Entity> EntityRepository<E> {
                 // the joined columns this entity cannot type.
                 let ty = criteria
                     .projection_type(name)
-                    .unwrap_or_else(|| column_type_of::<E>(projection));
+                    .unwrap_or_else(|| column_type_of::<E>(projection, &self_aliases));
                 ColumnRequest::new(name.clone(), ty)
             })
             .collect();
@@ -649,7 +656,10 @@ impl<M> std::fmt::Debug for EntityRepository<M> {
 /// Only the projections whose type is genuinely fixed regardless of input are
 /// hardcoded: a count is integral, and a date part is an integer by
 /// construction (the SQLite branch casts for exactly that reason).
-fn column_type_of<E: rainier_orm::Entity>(projection: &Projection) -> rainier_orm::ColumnType {
+fn column_type_of<E: rainier_orm::Entity>(
+    projection: &Projection,
+    self_aliases: &[&str],
+) -> rainier_orm::ColumnType {
     use rainier_orm::ColumnType;
 
     /// The declared type of one of the entity's own columns.
@@ -701,6 +711,91 @@ fn column_type_of<E: rainier_orm::Entity>(projection: &Projection) -> rainier_or
         Projection::Column(c) | Projection::Min(c) | Projection::Max(c) => {
             declared::<E>(c).unwrap_or(ColumnType::Text)
         }
+        Projection::Expression(e) => expression_type::<E>(e, self_aliases),
+    }
+}
+
+/// The type an [`Expression`](crate::expression::Expression) produces, as best
+/// it can be known without asking the database — the same policy as
+/// [`column_type_of`]: fixed where the SQL fixes it, the column's own type
+/// where one column carries through, `Text` where nothing is known. A caller
+/// who knows better says so with [`Criteria::select_as`](crate::Criteria::select_as).
+fn expression_type<E: rainier_orm::Entity>(
+    e: &crate::expression::Expression,
+    self_aliases: &[&str],
+) -> rainier_orm::ColumnType {
+    use crate::expression::{CastAs, Expression, Function};
+    use rainier_orm::sea_query::Value;
+    use rainier_orm::ColumnType;
+
+    let of = |e: &Expression| expression_type::<E>(e, self_aliases);
+    match e {
+        Expression::Column(c) => {
+            // A qualified column is this model's own when it is qualified by
+            // the model's table or by an alias of it (a self-join); anything
+            // else is a table this entity cannot type.
+            let name = match c.split_once('.') {
+                None => c.as_str(),
+                Some((qualifier, name))
+                    if qualifier == E::table() || self_aliases.contains(&qualifier) =>
+                {
+                    name
+                }
+                Some(_) => return ColumnType::Text,
+            };
+            E::columns().iter().find(|col| col.name == name).map_or(ColumnType::Text, |col| col.ty)
+        }
+        Expression::Value(v) => match v {
+            Value::Bool(_) => ColumnType::Bool,
+            Value::TinyInt(_) | Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                ColumnType::BigInt
+            }
+            Value::TinyUnsigned(_)
+            | Value::SmallUnsigned(_)
+            | Value::Unsigned(_)
+            | Value::BigUnsigned(_) => ColumnType::BigUint,
+            Value::Float(_) | Value::Double(_) => ColumnType::Double,
+            _ => ColumnType::Text,
+        },
+        Expression::Function(f, args) => match f {
+            Function::Length => ColumnType::BigInt,
+            Function::Lower | Function::Upper | Function::Trim | Function::Concat => {
+                ColumnType::Text
+            }
+            Function::Abs
+            | Function::Round
+            | Function::Coalesce
+            | Function::NullIf
+            | Function::Greatest
+            | Function::Least => args.first().map_or(ColumnType::Text, of),
+        },
+        Expression::Arithmetic(left, _, right) => match (of(left), of(right)) {
+            (ColumnType::Double, _) | (_, ColumnType::Double) => ColumnType::Double,
+            _ => ColumnType::BigInt,
+        },
+        Expression::Cast(_, to) => match to {
+            CastAs::Integer => ColumnType::BigInt,
+            CastAs::Unsigned => ColumnType::BigUint,
+            CastAs::Real => ColumnType::Double,
+            CastAs::Text => ColumnType::Text,
+            CastAs::Date => ColumnType::Date,
+        },
+        Expression::Case(arms, otherwise) => arms
+            .first()
+            .map(|(_, result)| result)
+            .or(otherwise.as_deref())
+            .map_or(ColumnType::Text, of),
+        Expression::Aggregate { function, argument, .. } => match function {
+            AggregateFn::Count => ColumnType::BigInt,
+            AggregateFn::Avg => ColumnType::Double,
+            AggregateFn::Sum => match argument.as_deref().map(of) {
+                Some(ColumnType::Double) => ColumnType::Double,
+                _ => ColumnType::BigInt,
+            },
+            AggregateFn::Min | AggregateFn::Max => argument.as_deref().map_or(ColumnType::Text, of),
+        },
+        Expression::DatePart(..) | Expression::Window(_) => ColumnType::BigInt,
+        Expression::SubSelect(_) => ColumnType::Text,
     }
 }
 

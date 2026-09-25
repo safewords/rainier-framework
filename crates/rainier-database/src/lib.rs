@@ -67,6 +67,7 @@
 pub mod connection;
 pub mod criteria;
 pub mod databases;
+pub mod expression;
 pub mod factory;
 pub mod manager;
 pub mod migrator;
@@ -89,6 +90,7 @@ pub use databases::{
     DatabaseConfig, DatabaseCredentials, DatabaseDriver, DatabaseRole, Databases, DsnDatabase,
     PoolSettings, ServerDatabase, SqliteDatabase,
 };
+pub use expression::{Expression, Predicate, SubSelect};
 pub use factory::{Factory, HasFactory};
 pub use manager::DatabaseManager;
 pub use migrator::{Down, Migration, Migrator, Step};

@@ -35,6 +35,8 @@ use rainier_orm::sea_query::{ColumnRef, Expr, Func, SimpleExpr, Value};
 use rainier_orm::ColumnType;
 use rainier_orm::TrashScope;
 
+use crate::expression::{Expression, Predicate};
+
 /// One recorded predicate.
 #[derive(Debug, Clone)]
 pub enum Constraint {
@@ -179,6 +181,16 @@ pub enum Projection {
     /// and they read better than `Aggregate(AggregateFn::Sum,
     /// Operand::column("x"))` for the same thing.
     Aggregate(AggregateFn, Operand),
+    /// Any [`Expression`] — a function, a `CASE`, a cast, a window, an
+    /// aggregate over any of those. The general form of every variant above;
+    /// see [`crate::expression`].
+    Expression(Box<Expression>),
+}
+
+impl From<Expression> for Projection {
+    fn from(expression: Expression) -> Self {
+        Projection::Expression(Box::new(expression))
+    }
 }
 
 /// An arithmetic operator between two [`Operand`]s.
@@ -207,12 +219,13 @@ pub enum Operator {
 /// statement as a string — losing the dialect handling, the shard routing and
 /// the soft-delete scope along with it, none of which the string knows about.
 ///
-/// # What it does not try to be
+/// # The general form
 ///
-/// A general SQL expression language. There are no function calls, no `CASE`,
-/// no casts: those are how a query builder turns into a second-rate dialect of
-/// SQL that only its author can read. This is arithmetic over columns and
-/// literals, because that is the shape that kept forcing the escape hatch.
+/// This is arithmetic over columns and literals, and nothing more. Function
+/// calls, `CASE`, casts, windows and predicates of any shape are
+/// [`crate::expression`], which [`Projection::Expression`] and the
+/// `*_expr` methods on [`Criteria`] accept; `Operand` stays for the aggregates
+/// that already use it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     /// A column — `"name"` on the query's own table, `"table.name"` on a joined
@@ -313,6 +326,12 @@ impl Projection {
             // `a * b` would qualify half of it and leave the rest ambiguous.
             // Callers wanting the set ask [`Operand::columns`].
             Projection::Aggregate(..) => None,
+            // The same answer for the same reason: an expression names a
+            // column only when it *is* one.
+            Projection::Expression(e) => match e.as_ref() {
+                Expression::Column(c) => Some(c),
+                _ => None,
+            },
         }
     }
 }
@@ -798,6 +817,19 @@ pub enum Assignment {
     Increment(i64),
     /// A correlated subquery, re-evaluated for each updated row.
     Subquery(Subquery),
+    /// Any [`Expression`] over the row being written — `SET n =
+    /// GREATEST(CAST(n AS SIGNED) - ?, 0)`, `SET name = TRIM(name)`.
+    ///
+    /// Unqualified columns name the row being updated. The general form of
+    /// [`Increment`](Assignment::Increment), which stays because it reads
+    /// better for the common case.
+    Expression(Expression),
+}
+
+impl From<Expression> for Assignment {
+    fn from(expression: Expression) -> Self {
+        Assignment::Expression(expression)
+    }
 }
 
 impl From<Value> for Assignment {
@@ -976,6 +1008,14 @@ pub struct Criteria {
     /// Which rows of a soft-deleting model this criteria may see. Means nothing
     /// to a model with no tombstone column — see [`with_trashed`](Criteria::with_trashed).
     trash: TrashScope,
+    /// General predicates, `AND`-ed with the rest — see [`where_expr`](Criteria::where_expr).
+    predicates: Vec<Predicate>,
+    /// `HAVING` predicates, `AND`-ed — see [`having`](Criteria::having).
+    havings: Vec<Predicate>,
+    /// `(expression, descending)`, rendered after the column orders.
+    expr_orders: Vec<(Expression, bool)>,
+    /// `(table, alias, kind, on)` — see [`join_as`](Criteria::join_as).
+    on_joins: Vec<(String, String, JoinKind, Predicate)>,
 }
 
 impl Criteria {
@@ -1426,7 +1466,101 @@ impl Criteria {
         self
     }
 
-    /// Combine with `other`: its constraints, joins and orders are appended,
+    /// `AND` any [`Predicate`] — nested `AND`/`OR`/`NOT`, column-to-column
+    /// comparisons, functions, `BETWEEN`, `IN (SELECT …)`, `EXISTS`. See
+    /// [`crate::expression`].
+    ///
+    /// It filters every statement this criteria builds — the `SELECT`, its
+    /// `COUNT`, and an `UPDATE` or `DELETE` by it — exactly as the `where_*`
+    /// methods do.
+    pub fn where_expr(mut self, predicate: Predicate) -> Self {
+        self.predicates.push(predicate);
+        self
+    }
+
+    /// `HAVING predicate` — a filter on groups, after aggregation. Only an
+    /// aggregate query ([`Repository::aggregate`](crate::Repository::aggregate))
+    /// has groups to filter.
+    pub fn having(mut self, predicate: Predicate) -> Self {
+        self.havings.push(predicate);
+        self
+    }
+
+    /// Select an [`Expression`] as `alias`. The expression form of
+    /// [`select`](Criteria::select).
+    pub fn select_expr(self, expression: Expression, alias: impl Into<String>) -> Self {
+        self.select(Projection::from(expression), alias)
+    }
+
+    /// `GROUP BY expression`.
+    pub fn group_by_expr(self, expression: Expression) -> Self {
+        self.group_by(Projection::from(expression))
+    }
+
+    /// `ORDER BY expression` — a `CASE`, a function, arithmetic.
+    ///
+    /// Expression orders come **after** the column orders from
+    /// [`order_by`](Criteria::order_by), whatever order they were called in.
+    /// When the two are mixed and the order matters, write every term here —
+    /// `order_by_expr(col("x"), false)` is a column order.
+    pub fn order_by_expr(mut self, expression: Expression, descending: bool) -> Self {
+        self.expr_orders.push((expression, descending));
+        self
+    }
+
+    /// `INNER JOIN table AS alias ON predicate`.
+    ///
+    /// The general join: any `ON` condition, and an alias, which is what
+    /// joining one table twice needs — a follower of a follower, or both ends
+    /// of a block list. Columns of the joined table are `"alias.column"`.
+    pub fn join_as(
+        mut self,
+        table: impl Into<String>,
+        alias: impl Into<String>,
+        on: Predicate,
+    ) -> Self {
+        self.on_joins.push((table.into(), alias.into(), JoinKind::Inner, on));
+        self
+    }
+
+    /// `LEFT JOIN table AS alias ON predicate`.
+    ///
+    /// With a bound predicate in the `ON` and an `IS NULL` on the joined key
+    /// in the `WHERE`, this is an anti-join: "rows with no matching row for
+    /// *this* viewer", which a `WHERE` alone cannot say without losing the
+    /// rows that have no match at all.
+    pub fn left_join_as(
+        mut self,
+        table: impl Into<String>,
+        alias: impl Into<String>,
+        on: Predicate,
+    ) -> Self {
+        self.on_joins.push((table.into(), alias.into(), JoinKind::Left, on));
+        self
+    }
+
+    /// The recorded general predicates.
+    pub fn predicates(&self) -> &[Predicate] {
+        &self.predicates
+    }
+
+    /// The recorded `HAVING` predicates.
+    pub fn havings(&self) -> &[Predicate] {
+        &self.havings
+    }
+
+    /// The recorded expression orders.
+    pub fn expr_orders(&self) -> &[(Expression, bool)] {
+        &self.expr_orders
+    }
+
+    /// The recorded aliased joins, as `(table, alias, kind, on)`.
+    pub fn on_joins(&self) -> impl Iterator<Item = (&str, &str, JoinKind, &Predicate)> {
+        self.on_joins.iter().map(|(t, a, k, p)| (t.as_str(), a.as_str(), *k, p))
+    }
+
+    /// Combine with `other`: every filter, join, projection, group and order
+    /// of it is appended,
     /// its paging wins wherever it sets any, and a soft-delete scope on either
     /// side survives.
     pub fn merge(mut self, other: Criteria) -> Self {
@@ -1438,6 +1572,21 @@ impl Criteria {
         // `AND`-ed parenthesised predicate that goes the same way.
         self.subqueries.extend(other.subqueries);
         self.or_groups.extend(other.or_groups);
+        self.predicates.extend(other.predicates);
+        // Every other part too. This used to carry only the fields above and
+        // silently drop the rest — a scope that added a left join, a derived
+        // join or a projection merged into nothing, and the query it was meant
+        // to shape ran without it.
+        self.typed_joins.extend(other.typed_joins);
+        self.derived_joins.extend(other.derived_joins);
+        self.on_joins.extend(other.on_joins);
+        self.projections.extend(other.projections);
+        self.projection_types.extend(other.projection_types);
+        self.groups.extend(other.groups);
+        self.havings.extend(other.havings);
+        self.distinct |= other.distinct;
+        self.alias_orders.extend(other.alias_orders);
+        self.expr_orders.extend(other.expr_orders);
         self.orders.extend(other.orders);
         self.limit = other.limit.or(self.limit);
         self.offset = other.offset.or(self.offset);
@@ -1470,8 +1619,12 @@ impl Criteria {
     pub fn is_empty(&self) -> bool {
         self.constraints.is_empty()
             && self.joins.is_empty()
+            && self.typed_joins.is_empty()
+            && self.derived_joins.is_empty()
+            && self.on_joins.is_empty()
             && self.or_groups.is_empty()
             && self.subqueries.is_empty()
+            && self.predicates.is_empty()
     }
 
     /// The recorded predicates.

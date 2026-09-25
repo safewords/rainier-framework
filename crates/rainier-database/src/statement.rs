@@ -40,6 +40,7 @@ use crate::criteria::{
     AggregateFn, Assignment, Comparison, Criteria, DatePart, Derived, JoinKind, Operand, Operator,
     Projection, Subquery, SubqueryPredicate,
 };
+use crate::expression::{predicate_condition, render_expression};
 
 /// A rendered statement: SQL, its ordered bind values, and where to run it.
 ///
@@ -341,6 +342,11 @@ fn projection_expr_in(
             Func::sum(SimpleExpr::Case(Box::new(case))).into()
         }
 
+        // The general form: any expression, rendered by the expression module
+        // against the same resolver, so its columns qualify exactly like the
+        // variants above.
+        Projection::Expression(e) => render_expression(dialect, e, resolve),
+
         // The whole calendar date, not one component of it.
         Projection::DateOf(c) => match dialect {
             // `date(x)` yields `YYYY-MM-DD`; SQLite has no DATE type to cast to.
@@ -597,6 +603,12 @@ fn criteria_condition<E: Entity>(dialect: Dialect, criteria: &Criteria) -> (Cond
     for predicate in criteria.subquery_predicates() {
         condition = condition.add(subquery_predicate_expr::<E>(dialect, predicate));
     }
+    // General predicates — see `crate::expression`. Like subqueries they never
+    // move the route: an equality inside an `OR` or a function says nothing
+    // about which shard every matching row is on.
+    for predicate in criteria.predicates() {
+        condition = condition.add(predicate_condition(dialect, predicate, &column_ref::<E>));
+    }
 
     (condition, route)
 }
@@ -625,6 +637,10 @@ pub fn select_aggregate<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Pre
 
     for projection in criteria.groups() {
         stmt.add_group_by([projection_expr::<E>(dialect, projection)]);
+    }
+
+    for predicate in criteria.havings() {
+        stmt.cond_having(predicate_condition(dialect, predicate, &column_ref::<E>));
     }
 
     for (name, descending) in criteria.alias_orders() {
@@ -729,6 +745,18 @@ fn apply_criteria<E: Entity>(
         stmt.join(join_type(kind), alias(table), on);
     }
 
+    // Aliased joins with any `ON` — the self-join and the anti-join. Their
+    // bound `ON` values come before the `WHERE`'s, which is the order the
+    // placeholders appear in the SQL.
+    for (table, table_alias, kind, on) in criteria.on_joins() {
+        stmt.join_as(
+            join_type(kind),
+            alias(table),
+            alias(table_alias),
+            predicate_condition(dialect, on, &column_ref::<E>),
+        );
+    }
+
     let (condition, route) = criteria_condition::<E>(dialect, criteria);
     stmt.cond_where(condition);
 
@@ -744,6 +772,10 @@ fn apply_criteria<E: Entity>(
     for (column, descending) in criteria.orders() {
         let order = if *descending { Order::Desc } else { Order::Asc };
         stmt.order_by(column_ref::<E>(column), order);
+    }
+    for (expression, descending) in criteria.expr_orders() {
+        let order = if *descending { Order::Desc } else { Order::Asc };
+        stmt.order_by_expr(render_expression(dialect, expression, &column_ref::<E>), order);
     }
 
     if with_paging {
@@ -997,6 +1029,11 @@ pub fn update_matching_with<E: Entity>(
             Assignment::Subquery(subquery) => {
                 stmt.value(alias(&column), subquery_scalar::<E>(dialect, &subquery))
             }
+            // Qualified to the table like every other column this module
+            // writes; inside an `UPDATE` of that table it can only mean the
+            // row being written.
+            Assignment::Expression(expression) => stmt
+                .value(alias(&column), render_expression(dialect, &expression, &column_ref::<E>)),
         };
     }
 
