@@ -34,6 +34,9 @@ impl SeaOrmExecutor {
             DbBackend::MySql => Dialect::MySql,
             DbBackend::Postgres => Dialect::Postgres,
             DbBackend::Sqlite => Dialect::Sqlite,
+            // `DatabaseBackend` is non-exhaustive since sea-orm 2; this crate
+            // compiles only the three sqlx backends, so nothing else reaches here.
+            other => panic!("rainier has no SQL dialect for the {other:?} backend"),
         };
         Self { db, dialect }
     }
@@ -121,7 +124,11 @@ impl SeaOrmExecutor {
             let statements = statements.clone();
             Box::pin(async move {
                 for statement in &statements {
-                    sea_orm::sqlx::Executor::execute(&mut *conn, statement.as_str()).await?;
+                    // Owned SQL: sqlx 0.9 wants the text to outlive the connection borrow.
+                    // These are the configured session statements, not user input.
+                    sea_orm::sqlx::raw_sql(sea_orm::sqlx::AssertSqlSafe(statement.clone()))
+                        .execute(&mut *conn)
+                        .await?;
                 }
                 Ok(())
             })
@@ -158,7 +165,7 @@ impl Executor for SeaOrmExecutor {
 
     async fn fetch_all(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Box<dyn Row>>> {
         let stmt = self.statement(sql, params);
-        let rows = self.db.query_all(stmt).await.map_err(Error::from)?;
+        let rows = self.db.query_all_raw(stmt).await.map_err(Error::from)?;
         let dialect = self.dialect;
         Ok(rows
             .into_iter()
@@ -168,7 +175,7 @@ impl Executor for SeaOrmExecutor {
 
     async fn execute(&self, sql: &str, params: Vec<Value>) -> Result<ExecOutcome> {
         let stmt = self.statement(sql, params);
-        let res = self.db.execute(stmt).await.map_err(Error::from)?;
+        let res = self.db.execute_raw(stmt).await.map_err(Error::from)?;
         Ok(ExecOutcome {
             rows_affected: res.rows_affected(),
             last_insert_id: res.last_insert_id() as i64,

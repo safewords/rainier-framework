@@ -94,10 +94,10 @@ impl Cell {
             Cell::Int(value) => Some(V::BigInt(Some(*value))),
             Cell::Uint(value) => Some(V::BigUnsigned(Some(*value))),
             Cell::Float(value) => Some(V::Double(Some(*value))),
-            Cell::Text(value) => Some(V::String(Some(Box::new(value.clone())))),
-            Cell::Bytes(value) => Some(V::Bytes(Some(Box::new(value.clone())))),
-            Cell::Timestamp(value) => Some(V::ChronoDateTimeUtc(Some(Box::new(*value)))),
-            Cell::Date(value) => Some(V::ChronoDate(Some(Box::new(*value)))),
+            Cell::Text(value) => Some(V::String(Some(value.clone()))),
+            Cell::Bytes(value) => Some(V::Bytes(Some(value.clone()))),
+            Cell::Timestamp(value) => Some(V::ChronoDateTimeUtc(Some(*value))),
+            Cell::Date(value) => Some(V::ChronoDate(Some(*value))),
         }
     }
 }

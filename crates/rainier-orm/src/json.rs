@@ -68,7 +68,7 @@ impl<T: Serialize> crate::ToColumn for Json<T> {
         // Serialization failure is unexpected for a well-formed `T`; fall back
         // to JSON null rather than panicking at the binding layer.
         let s = serde_json::to_string(&self.0).unwrap_or_else(|_| "null".to_string());
-        sea_query::Value::String(Some(Box::new(s)))
+        sea_query::Value::String(Some(s))
     }
 }
 

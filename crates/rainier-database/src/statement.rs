@@ -26,6 +26,7 @@
 //! deployment routes the same way whether a query goes through here or through
 //! `repo::` directly.
 
+use rainier_orm::sea_query::ExprTrait as _;
 use rainier_orm::sea_query::{
     Alias, Asterisk, ColumnRef, Cond, Expr, Func, IntoColumnRef, JoinType, OnConflict, Order,
     Query as SqQuery, SelectStatement, SimpleExpr, SubQueryStatement, Value,
@@ -256,10 +257,10 @@ fn integral_column<E: Entity>(name: &str) -> bool {
 /// hand-concatenated expression can.
 fn operand_expr(operand: &Operand, resolve: &dyn Fn(&str) -> ColumnRef) -> SimpleExpr {
     match operand {
-        Operand::Column(name) => Expr::col(resolve(name)).into(),
+        Operand::Column(name) => Expr::col(resolve(name)),
         // `Expr::val`, so it is bound as a parameter rather than written into
         // the SQL. A literal in a projection is still caller-supplied.
-        Operand::Literal(value) => Expr::val(value.clone()).into(),
+        Operand::Literal(value) => Expr::val(value.clone()),
         Operand::Arithmetic(left, op, right) => {
             let left = operand_expr(left, resolve);
             let right = operand_expr(right, resolve);
@@ -287,7 +288,7 @@ fn projection_expr_in(
     let col = |name: &str| Expr::col(resolve(name));
 
     match projection {
-        Projection::Column(c) => col(c).into(),
+        Projection::Column(c) => col(c),
         Projection::CountAll => Func::count(Expr::col(Asterisk)).into(),
         Projection::Count(c) => Func::count(col(c)).into(),
         // `SUM` of an integer column, read back as an integer.
@@ -362,7 +363,7 @@ fn projection_expr_in(
                 // sortable as a number rather than as "01" < "02" < "10".
                 Dialect::Sqlite => Func::cast_as(
                     Func::cust(Alias::new("strftime"))
-                        .args([SimpleExpr::from(Expr::val(sqlite)), col(c).into()]),
+                        .args([SimpleExpr::from(Expr::val(sqlite)), col(c)]),
                     Alias::new("INTEGER"),
                 )
                 .into(),
@@ -371,7 +372,7 @@ fn projection_expr_in(
                 // goes through the same builder path as the other two instead
                 // of needing raw SQL for its unusual argument syntax.
                 Dialect::Postgres => Func::cust(Alias::new("date_part"))
-                    .args([SimpleExpr::from(Expr::val(postgres)), col(c).into()])
+                    .args([SimpleExpr::from(Expr::val(postgres)), col(c)])
                     .into(),
                 _ => Func::cust(Alias::new(mysql)).arg(col(c)).into(),
             }

@@ -30,6 +30,7 @@
 //! construction and are deliberately left unscoped, which is what makes a bulk
 //! tombstone or restore expressible at all — see [`rainier_orm::trash`].
 
+use rainier_orm::sea_query::ExprTrait as _;
 use rainier_orm::sea_query::{ColumnRef, Expr, Func, SimpleExpr, Value};
 use rainier_orm::ColumnType;
 use rainier_orm::TrashScope;
@@ -1414,14 +1415,14 @@ impl Criteria {
     /// than return an error. No table has more than `i64::MAX` rows, so the
     /// clamp changes no result.
     pub fn limit(mut self, n: u64) -> Self {
-        self.limit = Some(n.min(i64::MAX as u64));
+        self.limit = Some(Ord::min(n, i64::MAX as u64));
         self
     }
 
     /// `OFFSET n`. Clamped like [`limit`](Self::limit), and for the same
     /// reason.
     pub fn offset(mut self, n: u64) -> Self {
-        self.offset = Some(n.min(i64::MAX as u64));
+        self.offset = Some(Ord::min(n, i64::MAX as u64));
         self
     }
 

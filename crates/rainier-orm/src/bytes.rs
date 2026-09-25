@@ -58,7 +58,7 @@ impl crate::SqlType for Base64Bytes {
 }
 impl crate::ToColumn for Base64Bytes {
     fn to_value(&self) -> sea_query::Value {
-        sea_query::Value::String(Some(Box::new(self.to_column_str())))
+        sea_query::Value::String(Some(self.to_column_str()))
     }
 }
 impl crate::FromColumn for Base64Bytes {

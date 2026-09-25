@@ -18,6 +18,7 @@
 
 use crate::route::route_for;
 use crate::{Entity, Error, Result, ShardRoute};
+use sea_query::ExprTrait as _;
 use sea_query::{Alias, Cond, Expr, Value};
 
 /// `WHERE a = ? AND b = ?` over the whole of `E`'s primary key.

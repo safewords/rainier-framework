@@ -404,9 +404,9 @@ mod tests {
         let args = to_hrana_args(vec![
             Value::BigInt(Some(5)),
             Value::BigUnsigned(Some(18_000_000_000_000_000_000)),
-            Value::String(Some(Box::new("hi".into()))),
+            Value::String(Some("hi".into())),
             Value::Bool(Some(true)),
-            Value::Bytes(Some(Box::new(vec![1u8, 2, 255]))),
+            Value::Bytes(Some(vec![1u8, 2, 255])),
             Value::Int(None),
         ])
         .unwrap();

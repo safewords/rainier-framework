@@ -6,6 +6,7 @@
 
 use rainier_drivers::sql::SeaOrmExecutor;
 use rainier_orm::sea_query::Cond;
+use rainier_orm::sea_query::ExprTrait as _;
 use rainier_orm::{repo, schema, Entity, Executor, PoolConfig};
 
 #[derive(Debug, Clone, Entity)]

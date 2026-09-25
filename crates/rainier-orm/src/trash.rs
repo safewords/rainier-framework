@@ -125,6 +125,7 @@
 //! nobody asked.
 
 use crate::Entity;
+use sea_query::ExprTrait as _;
 use sea_query::{ColumnRef, Expr, SimpleExpr, Value};
 
 /// Which rows of a soft-deleting table a read may see.

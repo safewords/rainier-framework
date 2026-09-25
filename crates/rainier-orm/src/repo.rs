@@ -60,6 +60,7 @@ use crate::route::route_for;
 use crate::trash::{scope_predicate, SoftDeletes, TrashScope};
 use crate::{Entity, Executor, Result, ShardRoute, SingleKey};
 use core::future::Future;
+use sea_query::ExprTrait as _;
 use sea_query::{
     Alias, Expr, IntoColumnRef, OnConflict, Order, Query, SelectStatement, SimpleExpr, Value,
 };
@@ -567,7 +568,7 @@ where
     fn new(exec: &'a X, page_size: u64) -> Self {
         Self {
             exec,
-            page_size: page_size.max(1),
+            page_size: Ord::max(page_size, 1),
             after: None,
             done: false,
             trash: TrashScope::Active,

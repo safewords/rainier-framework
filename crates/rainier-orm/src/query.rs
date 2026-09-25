@@ -52,6 +52,7 @@ use crate::trash::{scope_predicate, SoftDeletes, TrashScope};
 use crate::{repo, Entity, Executor, Result, ShardRoute};
 use core::future::Future;
 use core::marker::PhantomData;
+use sea_query::ExprTrait as _;
 use sea_query::{
     Alias, Asterisk, ColumnRef, Cond, Expr, Func, IntoColumnRef, JoinType, Order, Query as SqQuery,
     SimpleExpr, Value,
@@ -453,7 +454,7 @@ impl<E: Entity> Query<E> {
                 Some(r) => r.get_i64("cnt")?.unwrap_or(0),
                 None => 0,
             };
-            Ok(n.max(0) as u64)
+            Ok(Ord::max(n, 0) as u64)
         }
     }
 

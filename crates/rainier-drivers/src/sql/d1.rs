@@ -237,7 +237,7 @@ fn value_to_json(v: Value) -> Result<Json> {
         V::BigUnsigned(o) => o.map(Json::from).unwrap_or(Json::Null),
         V::Float(o) => o.map(|f| Json::from(f as f64)).unwrap_or(Json::Null),
         V::Double(o) => o.map(Json::from).unwrap_or(Json::Null),
-        V::String(o) => o.map(|s| Json::String(*s)).unwrap_or(Json::Null),
+        V::String(o) => o.map(Json::String).unwrap_or(Json::Null),
         V::Char(o) => o.map(|c| Json::String(c.to_string())).unwrap_or(Json::Null),
         V::Bytes(o) => {
             o.map(|b| Json::Array(b.iter().map(|x| Json::from(*x)).collect())).unwrap_or(Json::Null)
@@ -315,9 +315,9 @@ mod tests {
     fn lowers_bind_values_to_json() {
         let params = to_json_params(vec![
             Value::BigUnsigned(Some(7)),
-            Value::String(Some(Box::new("hi".into()))),
+            Value::String(Some("hi".into())),
             Value::Bool(Some(true)),
-            Value::Bytes(Some(Box::new(vec![0u8, 9, 255]))),
+            Value::Bytes(Some(vec![0u8, 9, 255])),
             Value::Int(None),
         ])
         .unwrap();

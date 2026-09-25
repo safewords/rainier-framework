@@ -47,7 +47,7 @@ macro_rules! impl_string_column {
         impl $crate::ToColumn for $t {
             fn to_value(&self) -> $crate::sea_query::Value {
                 $crate::sea_query::Value::String(::core::option::Option::Some(
-                    ::std::boxed::Box::new($crate::StringColumn::to_column_str(self)),
+                    $crate::StringColumn::to_column_str(self),
                 ))
             }
         }

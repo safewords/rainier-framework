@@ -81,6 +81,7 @@
 //! ```
 
 use crate::{Dialect, Error, Result};
+use sea_query::ExprTrait as _;
 use sea_query::{Alias, Expr, Func, OnConflict, SimpleExpr};
 
 /// What one column does when the insert collides with a stored row.

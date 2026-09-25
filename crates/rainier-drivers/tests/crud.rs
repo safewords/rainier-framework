@@ -138,7 +138,7 @@ async fn crud_mysql_container() {
     let db = Database::connect(&url).await.expect("connect mysql");
     // Isolate from other runs / the in-memory test's table name.
     let _ = db
-        .execute(sea_orm::Statement::from_string(
+        .execute_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::MySql,
             "DROP TABLE IF EXISTS widgets",
         ))

@@ -40,9 +40,9 @@ impl Dialect {
     /// statements carry no bind values.
     pub fn build_schema<S: SchemaStatementBuilder>(&self, stmt: &S) -> String {
         match self {
-            Dialect::MySql => stmt.build_any(&MysqlQueryBuilder),
-            Dialect::Postgres => stmt.build_any(&PostgresQueryBuilder),
-            Dialect::Sqlite => stmt.build_any(&SqliteQueryBuilder),
+            Dialect::MySql => stmt.build(MysqlQueryBuilder),
+            Dialect::Postgres => stmt.build(PostgresQueryBuilder),
+            Dialect::Sqlite => stmt.build(SqliteQueryBuilder),
         }
     }
 }
