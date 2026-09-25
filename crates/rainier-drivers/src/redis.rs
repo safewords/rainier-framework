@@ -239,15 +239,15 @@ impl RedisSettings {
     }
 
     /// These settings as the client's own connection options.
+    ///
+    /// Both timeouts are passed through as declared, `None` included. redis
+    /// 1.x defaults to a 500ms response and 1s connect timeout where 0.27 had
+    /// none; leaving an undeclared one to the client would have given every
+    /// deployment a timeout it never asked for.
     fn async_config(&self) -> redis::AsyncConnectionConfig {
-        let mut config = redis::AsyncConnectionConfig::new();
-        if let Some(timeout) = self.connect_timeout {
-            config = config.set_connection_timeout(timeout);
-        }
-        if let Some(timeout) = self.response_timeout {
-            config = config.set_response_timeout(timeout);
-        }
-        config
+        redis::AsyncConnectionConfig::new()
+            .set_connection_timeout(self.connect_timeout)
+            .set_response_timeout(self.response_timeout)
     }
 
     /// These settings as the client's own reconnection options.
@@ -259,16 +259,12 @@ impl RedisSettings {
             .set_number_of_retries(reconnect.attempts as usize);
 
         if let Some(ceiling) = reconnect.max_backoff {
-            // Milliseconds, which is the unit this option is in.
-            config = config.set_max_delay(ceiling.as_millis().min(u64::MAX as u128) as u64);
+            config = config.set_max_delay(ceiling);
         }
-        if let Some(timeout) = self.connect_timeout {
-            config = config.set_connection_timeout(timeout);
-        }
-        if let Some(timeout) = self.response_timeout {
-            config = config.set_response_timeout(timeout);
-        }
+        // As declared, `None` included — see `async_config`.
         config
+            .set_connection_timeout(self.connect_timeout)
+            .set_response_timeout(self.response_timeout)
     }
 }
 
@@ -783,9 +779,11 @@ impl Category for redis::RedisError {
         // The full error frequently includes the connection string. The kind
         // and the detail are what a log line needs; the address is not.
         match self.kind() {
-            redis::ErrorKind::IoError => "the server could not be reached".to_string(),
+            redis::ErrorKind::Io => "the server could not be reached".to_string(),
             redis::ErrorKind::AuthenticationFailed => "authentication failed".to_string(),
-            redis::ErrorKind::TypeError => "the reply was not the expected type".to_string(),
+            redis::ErrorKind::UnexpectedReturnType => {
+                "the reply was not the expected type".to_string()
+            }
 
             // The cluster kinds, each said rather than echoed.
             //
@@ -796,17 +794,18 @@ impl Category for redis::RedisError {
             // three hours of a production outage without once saying that a
             // shard had lost its master, which is the only fact any of those
             // lines was carrying.
-            redis::ErrorKind::Moved | redis::ErrorKind::Ask => self.redirect_message(),
-            redis::ErrorKind::ClusterDown => {
+            redis::ErrorKind::Server(redis::ServerErrorKind::Moved)
+            | redis::ErrorKind::Server(redis::ServerErrorKind::Ask) => self.redirect_message(),
+            redis::ErrorKind::Server(redis::ServerErrorKind::ClusterDown) => {
                 "the cluster is down: some slots have no node serving them".to_string()
             }
-            redis::ErrorKind::MasterDown => {
+            redis::ErrorKind::Server(redis::ServerErrorKind::MasterDown) => {
                 "the shard's master is down and the command cannot be served".to_string()
             }
-            redis::ErrorKind::TryAgain => {
+            redis::ErrorKind::Server(redis::ServerErrorKind::TryAgain) => {
                 "the slot is mid-migration; the command should be retried".to_string()
             }
-            redis::ErrorKind::CrossSlot => {
+            redis::ErrorKind::Server(redis::ServerErrorKind::CrossSlot) => {
                 "the command's keys span more than one slot; they need a shared hash tag"
                     .to_string()
             }
@@ -814,7 +813,7 @@ impl Category for redis::RedisError {
                 "no connection to the node that owns this slot".to_string()
             }
 
-            redis::ErrorKind::ResponseError => {
+            redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError) => {
                 self.detail().unwrap_or("the server rejected the command").to_string()
             }
             _ => self.detail().unwrap_or("the command failed").to_string(),
@@ -933,14 +932,17 @@ mod tests {
         let rendered = format!("{:?}", settings.manager_config(reconnect));
 
         assert!(rendered.contains("number_of_retries: 3"), "{rendered}");
-        assert!(rendered.contains("max_delay: Some(1500)"), "{rendered}");
+        assert!(rendered.contains("max_delay: Some(1.5s)"), "{rendered}");
         assert!(rendered.contains("connection_timeout: Some(2s)"), "{rendered}");
         assert!(rendered.contains("response_timeout: Some(250ms)"), "{rendered}");
     }
 
     #[test]
     fn an_undeclared_setting_is_left_at_the_clients_default_rather_than_ours() {
-        // A second set of numbers kept here is a second set to drift.
+        // A second set of numbers kept here is a second set to drift — except
+        // the two timeouts, which are passed as `None` on purpose: redis 1.x
+        // defaults them to 500ms/1s where 0.27 had none, and an application
+        // that never declared a timeout must not acquire one in an upgrade.
         let rendered = format!("{:?}", RedisSettings::new().manager_config(Reconnect::new()));
 
         assert!(rendered.contains("max_delay: None"), "{rendered}");
@@ -1258,7 +1260,7 @@ mod tests {
         // was promoted, and the cluster kept assigning it the slots while
         // forgetting its address — so it answered `MOVED 11221 :0`, which is
         // a redirect nothing can follow.
-        let err = server_error(redis::ErrorKind::Moved, "11221 :0");
+        let err = server_error(redis::ErrorKind::Server(redis::ServerErrorKind::Moved), "11221 :0");
 
         let message = err.message();
         assert!(message.contains("slot 11221"), "{message}");
@@ -1270,8 +1272,12 @@ mod tests {
     fn an_addressless_redirect_is_not_reported_as_an_ordinary_move() {
         // The two are a world apart operationally — one resolves itself in
         // milliseconds, the other never does — so they must not read alike.
-        let stranded = server_error(redis::ErrorKind::Moved, "11221 :0");
-        let ordinary = server_error(redis::ErrorKind::Moved, "11221 10.42.1.126:6379");
+        let stranded =
+            server_error(redis::ErrorKind::Server(redis::ServerErrorKind::Moved), "11221 :0");
+        let ordinary = server_error(
+            redis::ErrorKind::Server(redis::ServerErrorKind::Moved),
+            "11221 10.42.1.126:6379",
+        );
 
         assert!(
             ordinary.message().contains("has moved to 10.42.1.126:6379"),
@@ -1286,7 +1292,7 @@ mod tests {
     fn a_bare_slot_and_port_zero_never_reaches_the_log_on_its_own() {
         // What this whole arm replaces: `Redis: 11221 :0` was the entire
         // message, and it named neither Redis Cluster nor a downed shard.
-        let err = server_error(redis::ErrorKind::Moved, "11221 :0");
+        let err = server_error(redis::ErrorKind::Server(redis::ServerErrorKind::Moved), "11221 :0");
 
         assert_ne!(err.message(), "Redis: 11221 :0");
         assert!(err.message().len() > "Redis: 11221 :0".len(), "{}", err.message());
@@ -1295,10 +1301,10 @@ mod tests {
     #[test]
     fn the_other_cluster_kinds_are_said_rather_than_echoed() {
         for (kind, expected) in [
-            (redis::ErrorKind::ClusterDown, "the cluster is down"),
-            (redis::ErrorKind::MasterDown, "master is down"),
-            (redis::ErrorKind::TryAgain, "mid-migration"),
-            (redis::ErrorKind::CrossSlot, "shared hash tag"),
+            (redis::ErrorKind::Server(redis::ServerErrorKind::ClusterDown), "the cluster is down"),
+            (redis::ErrorKind::Server(redis::ServerErrorKind::MasterDown), "master is down"),
+            (redis::ErrorKind::Server(redis::ServerErrorKind::TryAgain), "mid-migration"),
+            (redis::ErrorKind::Server(redis::ServerErrorKind::CrossSlot), "shared hash tag"),
         ] {
             let message = server_error(kind, "raw server text").message().to_string();
             assert!(message.contains(expected), "{kind:?}: {message}");
@@ -1309,15 +1315,24 @@ mod tests {
     #[test]
     fn a_cluster_failure_is_a_503_like_every_other_dependency_failure() {
         // It is the shard being unavailable, not the request being wrong.
-        assert_eq!(server_error(redis::ErrorKind::Moved, "11221 :0").status(), 503);
-        assert_eq!(server_error(redis::ErrorKind::ClusterDown, "").status(), 503);
+        assert_eq!(
+            server_error(redis::ErrorKind::Server(redis::ServerErrorKind::Moved), "11221 :0")
+                .status(),
+            503
+        );
+        assert_eq!(
+            server_error(redis::ErrorKind::Server(redis::ServerErrorKind::ClusterDown), "")
+                .status(),
+            503
+        );
     }
 
     #[test]
     fn an_unreadable_redirect_still_says_it_was_a_redirect() {
         // `detail()` is the server's, and a server that sends something else
         // must not produce a message that claims a slot number it never saw.
-        let err = server_error(redis::ErrorKind::Moved, "not-a-slot");
+        let err =
+            server_error(redis::ErrorKind::Server(redis::ServerErrorKind::Moved), "not-a-slot");
 
         assert!(err.message().contains("could not be read"), "{}", err.message());
     }

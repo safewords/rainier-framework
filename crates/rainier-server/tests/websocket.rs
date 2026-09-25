@@ -155,7 +155,7 @@ async fn next_text(client: &mut Client) -> String {
         .expect("the frame should be readable");
 
     match frame {
-        WsMessage::Text(text) => text,
+        WsMessage::Text(text) => text.to_string(),
         other => panic!("expected text, got {other:?}"),
     }
 }
@@ -194,10 +194,14 @@ async fn binary_frames_survive_the_round_trip() {
     let mut client = connect(server.port, "/ws/echo").await;
     let _ = next_text(&mut client).await;
 
-    client.send(WsMessage::Binary(vec![0, 159, 146, 150])).await.expect("send");
+    client.send(WsMessage::Binary(vec![0, 159, 146, 150].into())).await.expect("send");
 
     let frame = client.next().await.expect("open").expect("readable");
-    assert_eq!(frame, WsMessage::Binary(vec![0, 159, 146, 150]), "not valid UTF-8, on purpose");
+    assert_eq!(
+        frame,
+        WsMessage::Binary(vec![0, 159, 146, 150].into()),
+        "not valid UTF-8, on purpose"
+    );
 }
 
 #[tokio::test]

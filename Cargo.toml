@@ -98,11 +98,11 @@ http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
-tokio-tungstenite = "0.24"
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "trace"] }
-tracing-opentelemetry = "0.28"
+tokio-tungstenite = "0.30"
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.34"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -139,7 +139,12 @@ rust_decimal = { version = "1", default-features = false }
 aes = "0.9"
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
 rsa = { version = "0.9", features = ["getrandom"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "charset", "http2"] }
+# `rustls-no-provider`, not `rustls`: 0.13's `rustls` feature turns on aws-lc-rs
+# for the whole rustls 0.23 in the graph, and with ring also enabled rustls
+# refuses to pick a default provider. The transport installs ring explicitly —
+# see `rainier_http_client::install_tls_provider`. Roots come from the OS store
+# (rustls-platform-verifier), which every runtime image here provides.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "charset", "http2"] }
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 cbc = { version = "0.2", features = ["alloc"] }
 aes-gcm = "0.11"
@@ -153,7 +158,7 @@ x25519-dalek = { version = "3", features = ["static_secrets"] }
 # every command for the life of the process. Opt-in per connection — see
 # `RedisSettings::reconnect` — so a build that declares nothing behaves as it
 # did before the feature was here.
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "aio", "connection-manager"] }
+redis = { version = "1", default-features = false, features = ["tokio-comp", "aio", "connection-manager"] }
 hmac = "0.13"
 sha2 = "0.11"
 subtle = "2"

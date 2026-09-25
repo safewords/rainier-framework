@@ -23,6 +23,9 @@ tokio = { version = "1", default-features = false, features = ["time", "rt"] }
 # The transport. Optional: a test suite that only uses `Http::fake()` should
 # not compile a TLS stack.
 reqwest = { workspace = true, optional = true }
+# Only to install ring as the process-level provider before reqwest builds a
+# client — see `install_tls_provider`.
+rustls = { workspace = true, optional = true }
 
 [features]
 # Nothing by default, deliberately. `reqwest` brings a TLS stack, an HTTP/2
@@ -31,7 +34,7 @@ reqwest = { workspace = true, optional = true }
 # argument — should not pay for any of it.
 default = []
 # A real transport, over reqwest with rustls.
-reqwest-transport = ["dep:reqwest"]
+reqwest-transport = ["dep:reqwest", "dep:rustls"]
 
 [dev-dependencies]
 tokio = { workspace = true }

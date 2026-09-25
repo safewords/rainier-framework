@@ -232,8 +232,8 @@ async fn run<S>(
 
 fn to_tungstenite(message: Message) -> WsMessage {
     match message {
-        Message::Text(text) => WsMessage::Text(text),
-        Message::Binary(bytes) => WsMessage::Binary(bytes),
+        Message::Text(text) => WsMessage::Text(text.into()),
+        Message::Binary(bytes) => WsMessage::Binary(bytes.into()),
         Message::Close(reason) => WsMessage::Close(
             reason.map(|reason| CloseFrame { code: CloseCode::Normal, reason: reason.into() }),
         ),
@@ -243,8 +243,8 @@ fn to_tungstenite(message: Message) -> WsMessage {
 /// `None` for the frames a handler should never see.
 fn from_tungstenite(message: WsMessage) -> Option<Message> {
     match message {
-        WsMessage::Text(text) => Some(Message::Text(text)),
-        WsMessage::Binary(bytes) => Some(Message::Binary(bytes)),
+        WsMessage::Text(text) => Some(Message::Text(text.to_string())),
+        WsMessage::Binary(bytes) => Some(Message::Binary(bytes.to_vec())),
         WsMessage::Close(frame) => {
             Some(Message::Close(frame.map(|frame| frame.reason.to_string())))
         }
@@ -317,8 +317,8 @@ mod tests {
 
     #[test]
     fn keep_alive_frames_never_reach_a_handler() {
-        assert_eq!(from_tungstenite(WsMessage::Ping(vec![])), None);
-        assert_eq!(from_tungstenite(WsMessage::Pong(vec![])), None);
+        assert_eq!(from_tungstenite(WsMessage::Ping(Default::default())), None);
+        assert_eq!(from_tungstenite(WsMessage::Pong(Default::default())), None);
     }
 
     #[test]

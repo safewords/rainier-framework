@@ -4,12 +4,13 @@
 //! application that only wants [trace headers propagated](crate::Trace) should
 //! not pay for it.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 
 use rainier_support::{Error, Result};
@@ -80,7 +81,7 @@ impl Otlp {
     /// Batched rather than one span per request: a span per network round trip
     /// would add the collector's latency to every request, which is the
     /// classic way tracing gets switched off in production.
-    pub fn build(&self) -> Result<TracerProvider> {
+    pub fn build(&self) -> Result<SdkTracerProvider> {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .with_endpoint(&self.endpoint)
@@ -108,10 +109,12 @@ impl Otlp {
             ))
         };
 
-        Ok(TracerProvider::builder()
-            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        // `builder_empty`: exactly these attributes, as `Resource::new` gave
+        // before 0.28 — not the SDK's detected defaults merged in.
+        Ok(SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
             .with_sampler(sampler)
-            .with_resource(Resource::new(attributes))
+            .with_resource(Resource::builder_empty().with_attributes(attributes).build())
             .build())
     }
 
@@ -137,8 +140,10 @@ impl Otlp {
         let provider = self.build()?;
         let tracer = provider.tracer(self.service_name.clone());
 
-        // Registered globally so `shutdown` can flush it, and so anything else
-        // in the process that asks for a tracer gets this one.
+        // Registered globally so anything else in the process that asks for a
+        // tracer gets this one, and kept here so `shutdown` can flush it: the
+        // global registry no longer has a shutdown of its own.
+        let _ = PROVIDER.set(provider.clone());
         opentelemetry::global::set_tracer_provider(provider);
 
         Ok(tracing_opentelemetry::layer().with_tracer(tracer))
@@ -151,8 +156,15 @@ impl Otlp {
 /// seconds by design, and without this the last few seconds of a shutdown —
 /// which is often the part you wanted to see — never leave.
 pub fn shutdown() {
-    opentelemetry::global::shutdown_tracer_provider();
+    if let Some(provider) = PROVIDER.get() {
+        if let Err(e) = provider.shutdown() {
+            tracing::warn!(error = %e, "the OTLP exporter did not flush cleanly");
+        }
+    }
 }
+
+/// The provider [`Otlp::layer`] installed, for [`shutdown`] to flush.
+static PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 #[cfg(test)]
 mod tests {

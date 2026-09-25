@@ -75,4 +75,4 @@ pub use retry::Backoff;
 pub use transport::Transport;
 
 #[cfg(feature = "reqwest-transport")]
-pub use transport::ReqwestTransport;
+pub use transport::{install_tls_provider, ReqwestTransport};

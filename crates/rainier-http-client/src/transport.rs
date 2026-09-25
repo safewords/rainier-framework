@@ -78,6 +78,21 @@ mod real {
     use super::*;
     use rainier_support::Error;
 
+    /// Make ring the process-level rustls provider, if nothing has chosen one.
+    ///
+    /// reqwest is built with `rustls-no-provider`, so a client uses whatever
+    /// provider the process has installed — and fails to build if there is
+    /// none. Ring, like the SMTP and Kafka drivers: with the AWS SDK in the
+    /// same binary aws-lc is also compiled in, and rustls will not guess
+    /// between two. Idempotent; if something already installed a provider,
+    /// that one stands.
+    ///
+    /// Call it before building your own `reqwest::Client` to hand to
+    /// [`ReqwestTransport::with_client`].
+    pub fn install_tls_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     /// The real one, over `reqwest` with rustls.
     pub struct ReqwestTransport {
         client: reqwest::Client,
@@ -91,12 +106,17 @@ mod real {
         /// If the TLS backend cannot be initialised, which is a build problem
         /// rather than a runtime one.
         pub fn new() -> Self {
+            install_tls_provider();
             Self { client: reqwest::Client::new() }
         }
 
         /// A transport over a client you configured — a proxy, a custom root
         /// store, a connection pool sized for your traffic.
+        ///
+        /// Build that client after [`install_tls_provider`], or it has no
+        /// crypto provider to build with.
         pub fn with_client(client: reqwest::Client) -> Self {
+            install_tls_provider();
             Self { client }
         }
 
@@ -167,7 +187,7 @@ mod real {
 }
 
 #[cfg(feature = "reqwest-transport")]
-pub use real::ReqwestTransport;
+pub use real::{install_tls_provider, ReqwestTransport};
 
 #[cfg(test)]
 mod tests {
