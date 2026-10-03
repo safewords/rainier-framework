@@ -207,6 +207,9 @@ mod dispatcher {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use k8s_openapi::api::authorization::v1::{
+        ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
+    };
     use k8s_openapi::api::batch::v1::{Job as K8sJob, JobSpec};
     use k8s_openapi::api::core::v1::{
         Container, EmptyDirVolumeSource, EnvVar, PodSpec, PodTemplateSpec, ResourceRequirements,
@@ -303,6 +306,106 @@ mod dispatcher {
             &self.inner.default_namespace
         }
 
+        /// Ask the API what the current pod's ServiceAccount is actually
+        /// allowed to do with `batch/v1 Jobs` in [`default_namespace`](
+        /// Self::default_namespace), via `SelfSubjectAccessReview`. The
+        /// returned [`RbacReport`] names each verb and whether it was
+        /// granted so the application can decide how strict to be — a
+        /// cheap boot-time check beats a surprise 403 at the first
+        /// dispatch.
+        ///
+        /// SSAR is a dry run: it asks the API server's authorizer, it
+        /// does not actually create or list anything. Safe to call on
+        /// every boot even without the `create` permission.
+        ///
+        /// The dispatcher's own permissions are what this checks, which
+        /// is `create jobs` for dispatch, `get`/`list` for post-dispatch
+        /// observation. The per-job `ServiceAccount` on the pod
+        /// ([`KubernetesJobSpec::with_service_account`]) is a different
+        /// identity and can't be checked here without impersonation;
+        /// an opt-in job that references a missing SA will fail at pod
+        /// creation (the API refuses) — that is a sharper error than
+        /// an SSAR could offer anyway.
+        ///
+        /// Returns `Err` only when the SSAR call itself fails (network,
+        /// authentication). A granted/denied verdict is an `Ok`, with
+        /// `allowed = false` on each denied verb.
+        pub async fn verify_rbac(&self) -> Result<RbacReport> {
+            let api: Api<SelfSubjectAccessReview> = Api::all(self.inner.client.clone());
+            let namespace = self.inner.default_namespace.clone();
+
+            let can_create = check_verb(&api, &namespace, "create").await?;
+            let can_get = check_verb(&api, &namespace, "get").await?;
+            let can_list = check_verb(&api, &namespace, "list").await?;
+
+            Ok(RbacReport { namespace, can_create, can_get, can_list })
+        }
+    }
+
+    async fn check_verb(
+        api: &Api<SelfSubjectAccessReview>,
+        namespace: &str,
+        verb: &str,
+    ) -> Result<bool> {
+        let review = SelfSubjectAccessReview {
+            spec: SelfSubjectAccessReviewSpec {
+                resource_attributes: Some(ResourceAttributes {
+                    namespace: Some(namespace.to_string()),
+                    verb: Some(verb.to_string()),
+                    group: Some("batch".to_string()),
+                    resource: Some("jobs".to_string()),
+                    ..ResourceAttributes::default()
+                }),
+                non_resource_attributes: None,
+            },
+            ..SelfSubjectAccessReview::default()
+        };
+        let answer = api
+            .create(&PostParams::default(), &review)
+            .await
+            .map_err(|e| Error::internal(format!("SelfSubjectAccessReview for `{verb}`: {e}")))?;
+        Ok(answer.status.map(|s| s.allowed).unwrap_or(false))
+    }
+
+    /// What `batch/v1 Jobs` operations the dispatcher's current
+    /// credentials may perform in [`KubernetesDispatcher::default_namespace`].
+    /// Returned by [`KubernetesDispatcher::verify_rbac`]; the application
+    /// decides what to do with it (warn, hard-fail, continue).
+    #[derive(Debug, Clone)]
+    pub struct RbacReport {
+        /// The namespace the checks were made against.
+        pub namespace: String,
+        /// Required to dispatch any Kubernetes job. Without this,
+        /// [`KubernetesDispatcher::dispatch`] errors on every call.
+        pub can_create: bool,
+        /// Optional; required by any future surface that reads a single
+        /// Job's status.
+        pub can_get: bool,
+        /// Optional; required by any future surface that enumerates
+        /// outstanding Jobs (an admin dashboard, a cleanup sweeper).
+        pub can_list: bool,
+    }
+
+    impl RbacReport {
+        /// Whether the minimum needed to dispatch is present.
+        pub fn is_dispatch_ready(&self) -> bool {
+            self.can_create
+        }
+
+        /// Short human-readable summary suitable for a boot-time log line.
+        pub fn summary(&self) -> String {
+            let ok = |b: bool| if b { "ok" } else { "MISSING" };
+            format!(
+                "namespace={} create={} get={} list={}",
+                self.namespace,
+                ok(self.can_create),
+                ok(self.can_get),
+                ok(self.can_list),
+            )
+        }
+    }
+
+    impl KubernetesDispatcher {
         /// Dispatch `job` as a `batch/v1 Job`. The job must have
         /// [`Job::kubernetes`] returning `Some`; a `None` here is a
         /// contract break (the application dispatched a queue-only job
@@ -548,7 +651,7 @@ mod dispatcher {
 }
 
 #[cfg(feature = "kubernetes")]
-pub use dispatcher::{KubernetesDispatcher, QueueLike};
+pub use dispatcher::{KubernetesDispatcher, QueueLike, RbacReport};
 
 /// Run a single serialised job and return. The pod-side entry point for
 /// a job dispatched via [`KubernetesDispatcher`].

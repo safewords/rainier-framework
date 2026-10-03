@@ -114,7 +114,7 @@ pub use kubernetes::{
     run_single_job, KubernetesJobSpec, JOB_NAME_ENV, PAYLOAD_ENV, SINGLE_JOB_SUBCOMMAND,
 };
 #[cfg(feature = "kubernetes")]
-pub use kubernetes::{KubernetesDispatcher, QueueLike};
+pub use kubernetes::{KubernetesDispatcher, QueueLike, RbacReport};
 pub use manager::{PendingDispatch, QueueManager, SyncQueue};
 pub use queue::{FailedJob, MemoryQueue, Queue};
 #[cfg(feature = "redis")]
