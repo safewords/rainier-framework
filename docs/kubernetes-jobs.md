@@ -138,12 +138,42 @@ which is not implemented yet.
 ### 1. Bind the dispatcher at boot
 
 ```rust
-match rainier_framework::queue::KubernetesDispatcher::try_in_cluster().await {
+use rainier_framework::queue::KubernetesDispatcher;
+
+match KubernetesDispatcher::try_in_cluster().await {
     Ok(Some(dispatcher)) => {
         tracing::info!(
             namespace = dispatcher.default_namespace(),
             "KubernetesDispatcher bound"
         );
+
+        // Optional but recommended: a boot-time RBAC check.
+        // SelfSubjectAccessReview asks the API server what the current
+        // pod's SA is allowed to do with `batch/v1 Jobs`; it does not
+        // actually create anything. Cheap, and catches a misconfigured
+        // cluster at startup rather than at the first dispatch.
+        match dispatcher.verify_rbac().await {
+            Ok(report) if report.is_dispatch_ready() => {
+                tracing::info!(summary = %report.summary(), "k8s RBAC check ok");
+            }
+            Ok(report) => {
+                // Choose your strictness: warn and continue (the
+                // dispatcher will fail at the first dispatch), or
+                // return Err here to hard-fail boot.
+                tracing::warn!(
+                    summary = %report.summary(),
+                    "k8s dispatcher bound but current SA cannot `create jobs.batch` — \
+                     opt-in Kubernetes jobs will error on dispatch; the ordinary queue \
+                     path is unaffected"
+                );
+            }
+            Err(e) => tracing::warn!(
+                error = %e.message(),
+                "k8s RBAC check failed to reach the API; opt-in Kubernetes dispatch \
+                 may error at use"
+            ),
+        }
+
         builder = builder.with_instance_arc(Arc::new(dispatcher));
     }
     Ok(None) => tracing::debug!("not in a cluster; k8s jobs fall back to the queue"),
@@ -154,6 +184,29 @@ match rainier_framework::queue::KubernetesDispatcher::try_in_cluster().await {
 `try_in_cluster` returns `Ok(None)` outside Kubernetes (`KUBERNETES_SERVICE_HOST`
 unset), so local dev, CI, and non-k8s deployments work unchanged — the
 dispatcher is just not bound and every job takes the queue path.
+
+#### What `verify_rbac` checks (and doesn't)
+
+The check runs `SelfSubjectAccessReview` for three verbs against
+`batch/v1 Jobs` in the dispatcher's default namespace:
+
+| Verb | Required for | Returned on |
+|---|---|---|
+| `create` | Any Kubernetes dispatch at all | `RbacReport.can_create` |
+| `get` | Reading a single Job's status | `RbacReport.can_get` |
+| `list` | Enumerating outstanding Jobs | `RbacReport.can_list` |
+
+`is_dispatch_ready()` is sugar for `can_create` — the only hard
+requirement. The others are optional and only matter if the
+application grows a Jobs admin surface.
+
+**What it can't check** is the per-job `ServiceAccount` named on each
+`KubernetesJobSpec`. That's a different identity from the dispatcher's,
+and SSAR can't impersonate without the dispatcher itself having
+`impersonate` on `serviceaccounts` (which it almost certainly doesn't
+and shouldn't). A dispatch to a job that references a missing SA will
+fail at pod creation with a sharper error than SSAR could offer; the
+warn-log at that dispatch is the right surface.
 
 ### 2. The CLI pre-check in `main`
 
