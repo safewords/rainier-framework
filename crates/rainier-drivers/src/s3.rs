@@ -345,6 +345,48 @@ impl S3Client {
             Err(e) => Err(sdk_error(&format!("S3 copy_object `{from}`"), e)),
         }
     }
+
+    /// Copy an object **server-side** from another bucket.
+    ///
+    /// Same reason as [`copy`](Self::copy): the alternative is reading the
+    /// whole object into the calling process and writing it back, which
+    /// for a multi-gigabyte CSAM artifact is a worker-pod OOM waiting to
+    /// happen.
+    ///
+    /// The current client's credentials must have `s3:GetObject` on
+    /// `source_bucket/source_key` — i.e. the two buckets live in the same
+    /// account, or cross-account read is explicitly granted. Across
+    /// different providers (R2 ↔ AWS, for instance) this reliably fails
+    /// at the API with an access error, which is the signal the caller
+    /// uses to fall back to a client-mediated copy.
+    ///
+    /// `false` if the source did not exist.
+    pub async fn copy_from(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        dest_key: &str,
+    ) -> Result<bool> {
+        match self
+            .client
+            .copy_object()
+            .bucket(&self.bucket)
+            .key(dest_key)
+            .copy_source(format!("{source_bucket}/{source_key}"))
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if is_not_found(&e) => Ok(false),
+            Err(e) => Err(sdk_error(
+                &format!(
+                    "S3 copy_object from `{source_bucket}/{source_key}` into `{}/{dest_key}`",
+                    self.bucket
+                ),
+                e,
+            )),
+        }
+    }
 }
 
 impl std::fmt::Debug for S3Client {

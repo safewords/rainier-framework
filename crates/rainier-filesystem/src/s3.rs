@@ -233,6 +233,34 @@ impl Filesystem for S3Filesystem {
     }
 }
 
+impl S3Filesystem {
+    /// Copy `source_key` from `source` into `dest_key` on this disk
+    /// **server-side**. Returns `Ok(false)` when the source does not
+    /// exist.
+    ///
+    /// This is a cross-bucket CopyObject with this filesystem's own
+    /// credentials, so it succeeds only when those credentials have
+    /// `s3:GetObject` on `source.bucket()` — same account, or cross-account
+    /// read explicitly granted. Call sites that straddle providers (R2 ↔
+    /// AWS) should treat a failure here as the signal to fall back to a
+    /// client-mediated copy, not as a hard error.
+    ///
+    /// Why bother: an alternative to the whole-object-in-memory copy that
+    /// `source.get(key).await?` + `dest.put(key, bytes).await?` performs
+    /// — which for a multi-gigabyte artifact is a worker-pod OOM waiting
+    /// to happen. The bytes stay inside the object store.
+    pub async fn copy_from(
+        &self,
+        source: &S3Filesystem,
+        source_key: &str,
+        dest_key: &str,
+    ) -> Result<bool> {
+        let src = normalise_path(source_key)?;
+        let dst = normalise_path(dest_key)?;
+        self.client.copy_from(source.bucket(), &src, &dst).await
+    }
+}
+
 impl std::fmt::Debug for S3Filesystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3Filesystem").field("bucket", &self.bucket()).finish()
