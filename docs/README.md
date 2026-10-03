@@ -23,6 +23,7 @@ rights in their names or marks.
 
 ## Getting Started
 
+
 | Page | What it covers |
 |---|---|
 | [Installation](installation.md) | Cloning the starter, prerequisites, and the two dependency rules that bite everyone once |
@@ -69,6 +70,7 @@ rights in their names or marks.
 | [Kafka](kafka.md) | A partitioned log behind broadcasting, sockets and the queue — and where it disagrees with each |
 | [Scenarios](scenarios.md) | Worked designs composing the pages above — starting with a Twitter-shaped feed |
 | [Queues](queues.md) | Jobs, drivers, the worker, retries, and the reservation protocol |
+| [Kubernetes jobs](kubernetes-jobs.md) | The opt-in path for jobs that need per-job resource sizing and isolation — one-shot `batch/v1 Job` pods |
 | [Cache](cache.md) | The cache port, Redis, Redis Cluster, Memcached, Workers KV, atomic locks |
 | [Filesystem](filesystem.md) | The storage port, declaring disks, signed URLs, and registering a driver |
 | [Task Scheduling](scheduling.md) | Cron expressions, `without_overlapping`, `on_one_server` |
