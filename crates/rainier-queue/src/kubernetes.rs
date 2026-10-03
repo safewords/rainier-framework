@@ -262,6 +262,7 @@ mod dispatcher {
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use kube::api::{Api, DeleteParams, ListParams, LogParams, PostParams};
+    use kube::runtime::wait::{await_condition, Condition};
     use kube::Client;
     use rainier_support::{Error, Result};
 
@@ -277,11 +278,6 @@ mod dispatcher {
     /// Label carrying the queue row's id, so a Kubernetes Job can be
     /// traced back to the `jobs` row that produced it.
     const LABEL_QUEUED_ID: &str = "rainier.job/queued-id";
-    /// How often the watcher polls the Job's status. A poll is cheap on
-    /// a cached kube client; a longer interval reduces API load for
-    /// long-running Jobs. Three seconds strikes the balance NCMEC
-    /// cares about (a <1 minute upload wants prompt feedback).
-    const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(3);
     /// How many lines of the pod's log to include in the failure error.
     /// A whole log can be hundreds of MiB; the tail is what diagnoses
     /// the failure and `kubectl logs` is still there for the rest.
@@ -526,56 +522,88 @@ mod dispatcher {
         }
     }
 
+    /// A `kube::runtime::wait::Condition` matching a Kubernetes Job that
+    /// has reached `Complete` **or** `Failed` with `status: "True"`.
+    ///
+    /// Both conditions are terminal, so `await_condition` returns on
+    /// either. The caller then inspects the delivered Job to tell
+    /// Complete from Failed.
+    fn job_terminal() -> impl Condition<K8sJob> {
+        |obj: Option<&K8sJob>| -> bool {
+            obj.and_then(|j| j.status.as_ref())
+                .and_then(|s| s.conditions.as_ref())
+                .map(|cs| {
+                    cs.iter().any(|c| {
+                        c.status == "True" && (c.type_ == "Complete" || c.type_ == "Failed")
+                    })
+                })
+                .unwrap_or(false)
+        }
+    }
+
     /// Watch `k8s_name` until it reaches a terminal condition. Returns
     /// `Ok(())` on `Complete`, `Err(…)` with the pod's log tail on
     /// `Failed`.
+    ///
+    /// Uses `kube::runtime::wait::await_condition`, which holds a
+    /// long-lived `watch` connection and reacts to the Job's state
+    /// change as the API server emits it — no polling tick, so a Job
+    /// that completes in 400 ms doesn't sit for the rest of the poll
+    /// interval before the worker notices. On the API end this is one
+    /// resourceVersion-tracked watch per in-flight Job rather than
+    /// one `get` every three seconds, which also keeps the API server
+    /// load flat as more pods come online.
     async fn watch_to_terminal(
         jobs_api: &Api<K8sJob>,
         client: &Client,
         namespace: &str,
         k8s_name: &str,
     ) -> Result<()> {
-        loop {
-            let job = jobs_api.get(k8s_name).await.map_err(|e| {
-                Error::internal(format!("reading kubernetes job `{k8s_name}`: {e}"))
-            })?;
+        // `await_condition` returns Ok(Some(obj)) when the condition
+        // becomes true, Ok(None) only when the object is deleted
+        // before terminating (treat as a failure — somebody removed
+        // the Job out from under us), or Err on an unrecoverable
+        // watch failure.
+        let final_state = await_condition(jobs_api.clone(), k8s_name, job_terminal())
+            .await
+            .map_err(|e| Error::internal(format!("watching kubernetes job `{k8s_name}`: {e}")))?;
 
-            if let Some(status) = &job.status {
-                if let Some(conditions) = &status.conditions {
-                    for condition in conditions {
-                        if condition.status != "True" {
-                            continue;
-                        }
-                        match condition.type_.as_str() {
-                            "Complete" => return Ok(()),
-                            "Failed" => {
-                                let logs = fetch_pod_log_tail(client, namespace, k8s_name).await;
-                                let reason = condition
-                                    .reason
-                                    .clone()
-                                    .unwrap_or_else(|| "unspecified".into());
-                                let message = condition
-                                    .message
-                                    .clone()
-                                    .unwrap_or_else(|| "no message".into());
-                                return Err(Error::internal(format!(
-                                    "kubernetes job `{k8s_name}` failed \
-                                     ({reason}: {message}){}",
-                                    if logs.is_empty() {
-                                        String::new()
-                                    } else {
-                                        format!("\n--- pod log tail ---\n{logs}")
-                                    }
-                                )));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
+        let Some(job) = final_state else {
+            return Err(Error::internal(format!(
+                "kubernetes job `{k8s_name}` was deleted before it reached a terminal state"
+            )));
+        };
 
-            tokio::time::sleep(WATCH_POLL_INTERVAL).await;
+        // Which terminal condition fired. `job_terminal` only returned
+        // true if one of them is `status: "True"`, so this always finds
+        // the matching entry.
+        let Some(condition) =
+            job.status.as_ref().and_then(|s| s.conditions.as_ref()).and_then(|cs| {
+                cs.iter()
+                    .find(|c| c.status == "True" && (c.type_ == "Complete" || c.type_ == "Failed"))
+            })
+        else {
+            return Err(Error::internal(format!(
+                "kubernetes job `{k8s_name}` was reported terminal by the watch, but no \
+                 Complete or Failed condition was `True` on inspection — the API server \
+                 appears to have raced its own status update"
+            )));
+        };
+
+        if condition.type_ == "Complete" {
+            return Ok(());
         }
+
+        // Failed. Capture the pod's log tail for the failed_jobs record;
+        // the clone is cheap and keeps the condition's borrows separate
+        // from the async-boundary that fetch_pod_log_tail crosses.
+        let reason = condition.reason.clone().unwrap_or_else(|| "unspecified".into());
+        let message = condition.message.clone().unwrap_or_else(|| "no message".into());
+        let logs = fetch_pod_log_tail(client, namespace, k8s_name).await;
+        Err(Error::internal(format!(
+            "kubernetes job `{k8s_name}` failed ({reason}: {message}){}",
+            if logs.is_empty() { String::new() } else { format!("\n--- pod log tail ---\n{logs}") }
+        )))
     }
 
     /// Best-effort log fetch for a failed Job's pod. Returns the empty

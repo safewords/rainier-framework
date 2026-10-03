@@ -27,7 +27,7 @@ tracing = { workspace = true }
 # so a service that doesn't use the k8s path doesn't pull k8s-openapi.
 # `KubernetesJobSpec` + `Job::kubernetes()` + `run_single_job` are
 # always available; only the dispatcher is behind the feature.
-kube = { version = "0.95", default-features = false, features = ["client", "rustls-tls"], optional = true }
+kube = { version = "0.95", default-features = false, features = ["client", "rustls-tls", "runtime"], optional = true }
 k8s-openapi = { version = "0.23", features = ["latest"], optional = true }
 
 [features]

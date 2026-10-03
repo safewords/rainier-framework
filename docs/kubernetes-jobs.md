@@ -161,16 +161,19 @@ compute-bound).
    - POSTs a `batch/v1 Job` to the API with that name, resources,
      service account, node selector, tmpfs, and env (job name, payload,
      queue row id, attempt);
-   - polls the Job's status until it reaches `Complete` or `Failed`,
-     subject to the worker's effective timeout for this job (the usual
-     four-level resolution: operator override → `Job::TIMEOUT` →
-     queue timeout → worker default);
+   - watches the Job via `kube::runtime::wait::await_condition` — a
+     long-lived watch connection that fires on the Job's own state
+     change rather than a poll tick, so a sub-second job doesn't sit
+     out any poll interval before being noticed. Subject to the
+     worker's effective timeout for this job (the usual four-level
+     resolution: operator override → `Job::TIMEOUT` → queue timeout
+     → worker default);
    - on `Complete` → returns `Ok(())`;
    - on `Failed` → fetches the pod's log tail and returns `Err`
      carrying it;
    - on timeout → deletes the Job and returns an `Err`;
    - on 409 Conflict at create (reattach — see next section) → skips
-     straight to the watch loop.
+     straight to the watch.
 5. The worker then runs its normal success/failure/retry/`failed_jobs`
    logic against that `Result<()>`. From the queue's point of view, a
    failed Kubernetes Job is indistinguishable from a failing in-process
