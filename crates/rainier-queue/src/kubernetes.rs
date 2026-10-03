@@ -340,6 +340,15 @@ mod dispatcher {
             if std::env::var("KUBERNETES_SERVICE_HOST").is_err() {
                 return Ok(None);
             }
+            // rustls 0.23 requires a process-level CryptoProvider before any
+            // TLS handshake, and kube-rs does not install one itself —
+            // `Client::try_default()` would panic on first use otherwise.
+            // `install_default` returns Err if a provider is already
+            // installed (an application that uses rainier-http-client's
+            // `install_tls_provider` will have beaten us to it, and both
+            // call `ring::default_provider()` so the second call is a no-op
+            // on the same provider).
+            let _ = rustls::crypto::ring::default_provider().install_default();
             let client = Client::try_default()
                 .await
                 .map_err(|e| Error::internal(format!("building in-cluster kube client: {e}")))?;

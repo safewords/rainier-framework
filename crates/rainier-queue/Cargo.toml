@@ -29,6 +29,12 @@ tracing = { workspace = true }
 # always available; only the dispatcher is behind the feature.
 kube = { version = "0.95", default-features = false, features = ["client", "rustls-tls", "runtime"], optional = true }
 k8s-openapi = { version = "0.23", features = ["latest"], optional = true }
+# rustls 0.23 requires a process-level `CryptoProvider` to be installed
+# before any TLS handshake. kube does not install one itself; the
+# dispatcher installs ring from `try_in_cluster` so the kube Client's
+# first HTTPS to the API server does not panic. Pinned to the same
+# version kube pulls in to keep one rustls in the graph.
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
 
 [features]
 default = []
@@ -46,7 +52,7 @@ kafka = ["dep:rainier-drivers", "rainier-drivers/kafka"]
 # Kubernetes `batch/v1 Job` dispatcher. The `KubernetesJobSpec` type and
 # the `Job::kubernetes()` method are always compiled; this feature adds
 # the actual dispatcher + its kube-rs dependency.
-kubernetes = ["dep:kube", "dep:k8s-openapi"]
+kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:rustls"]
 
 [lints]
 workspace = true

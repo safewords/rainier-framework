@@ -4205,6 +4205,7 @@ dependencies = [
  "rainier-events",
  "rainier-orm",
  "rainier-support",
+ "rustls 0.23.45",
  "serde",
  "serde_json",
  "tokio",
