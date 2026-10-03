@@ -104,6 +104,12 @@ mail-sendgrid = ["rainier-mail/sendgrid", "http-client"]
 mail-resend = ["rainier-mail/resend", "http-client"]
 # Amazon SQS, for a queue somebody else operates.
 sqs = ["rainier-queue/sqs"]
+# Dispatch opt-in jobs to Kubernetes as `batch/v1 Job` pods. See
+# `rainier_queue::kubernetes` — jobs that implement `Job::kubernetes()`
+# with a `KubernetesJobSpec` get a one-shot pod sized to their
+# requirements; jobs that don't still take the ordinary queue path.
+# Pulls kube-rs + k8s-openapi.
+kubernetes = ["rainier-queue/kubernetes"]
 # Hold the browsers' Pusher-protocol sockets in this process, instead of running
 # soketi or Laravel Reverb beside it. Implies `redis`: replicas share
 # subscriptions through the same Redis the publish side already writes to.
