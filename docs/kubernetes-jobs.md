@@ -133,7 +133,14 @@ use is passing identifiers (match ids, upload ids — tens of bytes); for
 larger payloads the dispatcher would need a ConfigMap-based variant,
 which is not implemented yet.
 
-## Application plumbing — three pieces
+## Application plumbing — two pieces
+
+The dispatch call sites don't change. `Queue::instance().dispatch(job)`
+transparently routes a Kubernetes-eligible job (one whose `kubernetes()`
+returns `Some`) to the dispatcher when one is bound, and to the queue
+otherwise. A reader at the call site doesn't need to know which path
+this job takes — the job's own `impl Job` block is the single source of
+truth.
 
 ### 1. Bind the dispatcher at boot
 
@@ -262,28 +269,35 @@ The pod runs the single job to completion and exits 0 (or non-zero on
 error, which Kubernetes retries up to `backoffLimit` — default 1 since
 the queue's retry is the primary mechanism).
 
-### 3. The dispatch site
-
-Where you'd ordinarily write
-`Queue::instance().dispatch_on(queue_name, job).await?`, use
-`KubernetesDispatcher::dispatch_or_queue` to route per-job:
+### 3. Dispatch sites don't change
 
 ```rust
-use rainier_framework::queue::KubernetesDispatcher;
-
-let k8s = rainier_framework::container::try_facade_application()
-    .and_then(|app| app.container().resolve::<KubernetesDispatcher>().ok());
-
-if let (Some(k8s), true) = (k8s.as_deref(), job.kubernetes().is_some()) {
-    k8s.dispatch(&job).await?;
-} else {
-    Queue::instance().dispatch_on(job.queue(), job).await?;
-}
+Queue::instance().dispatch(job).await?;              // or
+Queue::instance().dispatch_on("notifications", job).await?;
 ```
 
-A job that didn't opt in (`kubernetes()` is `None`) and a deployment
-not in a cluster (dispatcher unbound) both take the queue path. Only
-when *both* conditions align does the pod spawn.
+That's the whole dispatch surface. `QueueManager::dispatch` and
+`dispatch_on` both route internally: if the feature is enabled, the
+job declared a spec, and a dispatcher is bound in the facade
+container, the job runs as a one-shot pod. Otherwise it rides the
+queue. A reader doesn't branch here; a reviewer sees the dispatch
+once at the trait impl.
+
+`dispatch_after(delay, job)` is the exception: `batch/v1 Jobs` have
+no delayed-start primitive, so a k8s-eligible job dispatched this way
+logs a warn and takes the queue path (where the delay is actually
+honored). Wrap it in a scheduled job if you need both.
+
+For code that holds a `KubernetesDispatcher` directly (test harnesses,
+custom runners that bypass the facade), two lower-level primitives
+remain available:
+
+- `KubernetesDispatcher::dispatch(&job)` — unconditional k8s dispatch
+  of a job that declared a spec.
+- `KubernetesDispatcher::dispatch_or_queue(Some(&k8s), &queue, job)` —
+  the raw router. The `QueueLike` trait is a one-method shim your
+  queue type implements. `QueueManager::dispatch` is this primitive
+  internally.
 
 ## Infrastructure prerequisites
 
