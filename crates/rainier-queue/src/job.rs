@@ -227,6 +227,25 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// The safety net for a worker that dies mid-job: without it, one crash
     /// would block that job's id forever. Set it longer than the job takes.
     const UNIQUE_FOR: Duration = Duration::from_secs(3600);
+
+    /// Opt-in: dispatch this job as a one-shot Kubernetes `batch/v1 Job`
+    /// pod instead of as a queue message.
+    ///
+    /// `None` (the default) is the queue path — the right answer for the
+    /// vast majority of work. `Some` is for jobs whose resource profile
+    /// doesn't fit on a shared worker: an uploader that reads a
+    /// multi-gigabyte file, a model-training job, anything with
+    /// requirements that would make the general pool overprovision. See
+    /// [`kubernetes`](crate::kubernetes) for the dispatcher and the
+    /// pod-side entry point.
+    ///
+    /// Falls back to the queue when the application isn't running in a
+    /// cluster (local dev, CI, services not deployed via Kubernetes) —
+    /// a job that returns `Some` here still runs correctly without a
+    /// cluster, it just runs through the ordinary worker.
+    fn kubernetes(&self) -> Option<crate::kubernetes::KubernetesJobSpec> {
+        None
+    }
 }
 
 /// A job serialised for the queue.

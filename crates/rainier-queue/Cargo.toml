@@ -23,6 +23,13 @@ tokio = { workspace = true }
 futures-util = { workspace = true, features = ["alloc"] }
 tracing = { workspace = true }
 
+# Kubernetes dispatcher: `batch/v1 Job` creation via kube-rs. Feature-gated
+# so a service that doesn't use the k8s path doesn't pull k8s-openapi.
+# `KubernetesJobSpec` + `Job::kubernetes()` + `run_single_job` are
+# always available; only the dispatcher is behind the feature.
+kube = { version = "0.95", default-features = false, features = ["client", "rustls-tls"], optional = true }
+k8s-openapi = { version = "0.23", features = ["latest"], optional = true }
+
 [features]
 default = []
 # Jobs on Amazon SQS.
@@ -36,6 +43,10 @@ redis-cluster = ["redis", "rainier-drivers/redis-cluster"]
 # Jobs on a Kafka topic. Read the `kafka` module docs first — a log is not a
 # queue, and the differences are the kind that cost money.
 kafka = ["dep:rainier-drivers", "rainier-drivers/kafka"]
+# Kubernetes `batch/v1 Job` dispatcher. The `KubernetesJobSpec` type and
+# the `Job::kubernetes()` method are always compiled; this feature adds
+# the actual dispatcher + its kube-rs dependency.
+kubernetes = ["dep:kube", "dep:k8s-openapi"]
 
 [lints]
 workspace = true
