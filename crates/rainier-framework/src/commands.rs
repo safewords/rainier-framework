@@ -579,6 +579,20 @@ impl Command for QueueWorkCommand {
                 worker = worker.with_events(events);
             }
 
+            // Opt-in Kubernetes job runner. If the application bound a
+            // `KubernetesDispatcher` in the container at boot — see
+            // `rainier_queue::KubernetesDispatcher::try_in_cluster` — the
+            // worker consults it after reserving each job. Jobs whose
+            // `Job::kubernetes()` returns `Some(spec)` run as one-shot
+            // `batch/v1 Job` pods; everything else runs in-process.
+            //
+            // A missing binding is the right default outside a cluster —
+            // the worker just doesn't check, and every job runs in-process.
+            #[cfg(feature = "kubernetes")]
+            if let Ok(dispatcher) = app.resolve::<rainier_queue::KubernetesDispatcher>() {
+                worker = worker.with_kubernetes(dispatcher);
+            }
+
             // Says how many at once, and any narrower per-queue ceiling.
             //
             // Printed because there is otherwise no way to tell from outside
