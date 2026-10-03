@@ -409,6 +409,16 @@ fn generate_id() -> String {
 type Runner =
     Arc<dyn Fn(serde_json::Value, Arc<JobContext>) -> BoxedFuture<Result<()>> + Send + Sync>;
 
+/// Extracts a [`KubernetesJobSpec`](crate::kubernetes::KubernetesJobSpec)
+/// from a job's serialised payload — the type-erased mirror of
+/// [`Job::kubernetes`](Job::kubernetes).
+///
+/// The worker only has the queued row's wire form; this gives it a way
+/// to ask "would this job rather run as a Kubernetes pod?" without
+/// knowing the concrete type.
+type SpecExtractor =
+    Arc<dyn Fn(&serde_json::Value) -> Option<crate::kubernetes::KubernetesJobSpec> + Send + Sync>;
+
 /// Maps a job's wire name back to code that can run it.
 ///
 /// A worker reads `{"name": "mail.welcome", …}` and has no idea what type that
@@ -423,6 +433,13 @@ pub struct JobRegistry {
     /// the type: without this the trait's constant would be unreachable from
     /// the only place that could act on it.
     timeouts: HashMap<String, Duration>,
+    /// Each job's Kubernetes spec extractor. Only present for job types
+    /// whose [`Job::kubernetes`](Job::kubernetes) ever returned `Some` on
+    /// a sample payload during registration (see
+    /// [`JobRegistry::register`]); jobs that never opt in skip the entry
+    /// entirely, so the lookup for the common queue path is a single
+    /// hashmap miss.
+    spec_extractors: HashMap<String, SpecExtractor>,
     /// The queues the registered jobs declare, in registration order.
     ///
     /// Kept because a worker draining a queue no registered job uses is doing
@@ -471,6 +488,15 @@ impl JobRegistry {
             self.timeouts.insert(J::NAME.to_string(), timeout);
         }
 
+        // Record a spec extractor so the worker can ask, by name, whether
+        // this job wants a Kubernetes pod. Each extractor deserialises the
+        // payload and asks the typed job; the worker never has to touch J.
+        let extractor: SpecExtractor = Arc::new(|payload| {
+            let job: J = serde_json::from_value(payload.clone()).ok()?;
+            job.kubernetes()
+        });
+        self.spec_extractors.insert(J::NAME.to_string(), extractor);
+
         // `J::QUEUE` is a compile-time constant, so this cannot disagree with
         // where the job is actually dispatched. Two jobs sharing a queue
         // record it once.
@@ -492,6 +518,24 @@ impl JobRegistry {
     /// `None` means the job did not state one and the worker's limit applies.
     pub fn timeout_for(&self, name: &str) -> Option<Duration> {
         self.timeouts.get(name).copied()
+    }
+
+    /// The Kubernetes spec `name` returns for `payload`, if it opts in.
+    ///
+    /// `None` means the job didn't declare a spec for this payload — the
+    /// vast majority of jobs — and the worker runs it in-process on the
+    /// ordinary queue path. `Some(spec)` means the worker should hand this
+    /// one to the Kubernetes runner.
+    ///
+    /// Returns `None` if `name` is unregistered too, because the worker
+    /// handles that case in its own run loop with a clearer error than
+    /// anything this could produce.
+    pub fn kubernetes_spec_for(
+        &self,
+        name: &str,
+        payload: &serde_json::Value,
+    ) -> Option<crate::kubernetes::KubernetesJobSpec> {
+        self.spec_extractors.get(name).and_then(|extract| extract(payload))
     }
 
     /// Whether `name` is registered.

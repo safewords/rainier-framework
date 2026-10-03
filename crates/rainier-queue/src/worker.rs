@@ -421,6 +421,18 @@ pub struct Worker {
     /// simply keeps its lock until `UNIQUE_FOR` expires — degraded rather than
     /// broken.
     locks: Option<LockManager>,
+    /// Hands off a reserved job to a Kubernetes `batch/v1 Job` pod when
+    /// its [`Job::kubernetes`](crate::Job::kubernetes) returns `Some`.
+    ///
+    /// `None` means every reserved job runs in-process on the worker,
+    /// even if it opts in — the right fallback for local dev, CI, and
+    /// non-Kubernetes runtimes. Set this on a cluster-deployed worker
+    /// via [`with_kubernetes`](Self::with_kubernetes) and the dispatcher
+    /// is consulted ONCE per reservation, before `handle()`, with no cost
+    /// on the ordinary queue path (jobs that don't opt in skip the
+    /// extractor entirely in the registry).
+    #[cfg(feature = "kubernetes")]
+    k8s_runner: Option<Arc<crate::kubernetes::KubernetesDispatcher>>,
 }
 
 impl Worker {
@@ -447,7 +459,26 @@ impl Worker {
             locks: None,
             options: WorkerOptions::default(),
             stopping: AtomicBool::new(false),
+            #[cfg(feature = "kubernetes")]
+            k8s_runner: None,
         }
+    }
+
+    /// Launch jobs whose [`Job::kubernetes`](crate::Job::kubernetes) returns
+    /// `Some` as one-shot `batch/v1 Job` pods via `runner`, and watch them
+    /// to their terminal state inside the worker's own concurrency slot.
+    ///
+    /// Dispatching is unchanged — jobs still land in the ordinary queue
+    /// backend, `jobs` rows still get written, `failed_jobs` still records
+    /// terminal failures. What this adds is: the worker, having reserved
+    /// a job, chooses between running it in-process (ordinary) or
+    /// launching + watching a pod (opt-in). The queue's retries, timeouts,
+    /// and bookkeeping cover both paths equally, because the pod watch
+    /// returns success/failure the way `handle()` does.
+    #[cfg(feature = "kubernetes")]
+    pub fn with_kubernetes(mut self, runner: Arc<crate::kubernetes::KubernetesDispatcher>) -> Self {
+        self.k8s_runner = Some(runner);
+        self
     }
 
     /// Fire lifecycle events through `events`.
@@ -706,26 +737,7 @@ impl Worker {
                 .or(self.options.timeout),
         };
 
-        // Guarded, so a panic fails this job rather than the worker — see
-        // [`CatchPanic`].
-        let run = CatchPanic(self.registry.run(&job, Arc::clone(&context)));
-
-        let outcome = match timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, run).await {
-                Ok(result) => result,
-                Err(_) => {
-                    Ok(Err(Error::internal(format!("the job exceeded its {timeout:?} timeout"))))
-                }
-            },
-            None => run.await,
-        };
-
-        let outcome = match outcome {
-            Ok(result) => result,
-            Err(panic) => {
-                Err(Error::internal(format!("the job panicked: {}", panic_message(panic.as_ref()))))
-            }
-        };
+        let outcome = self.run_handler(&job, &context, timeout).await;
 
         match outcome {
             Ok(()) => {
@@ -738,6 +750,62 @@ impl Worker {
                 Ok(Outcome::Processed)
             }
             Err(error) => self.handle_failure(job, error).await,
+        }
+    }
+
+    /// Run `job`'s handler, choosing between the in-process queue runner
+    /// and the Kubernetes `batch/v1 Job` runner based on whether the
+    /// job's [`Job::kubernetes`](crate::Job::kubernetes) returns `Some`
+    /// AND this worker has a dispatcher configured.
+    ///
+    /// Returns the same `Result<()>` shape regardless of path, so the
+    /// caller's success / failure / retry / `failed_jobs` logic is
+    /// identical for both.
+    async fn run_handler(
+        &self,
+        job: &QueuedJob,
+        context: &Arc<JobContext>,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        #[cfg(feature = "kubernetes")]
+        {
+            if let (Some(runner), Some(spec)) = (
+                self.k8s_runner.as_ref(),
+                self.registry.kubernetes_spec_for(&job.name, &job.payload),
+            ) {
+                tracing::info!(
+                    job = %job.name,
+                    id = %job.id,
+                    attempt = job.attempts,
+                    "routing job to kubernetes runner"
+                );
+                // The attempt the queue reserved is pre-increment; add
+                // one so the Kubernetes Job's name reflects the attempt
+                // the pod will actually run.
+                let attempt = job.attempts.saturating_add(1);
+                return runner
+                    .run_and_watch(&job.name, &job.payload, &spec, &job.id, attempt, timeout)
+                    .await;
+            }
+        }
+
+        // Guarded, so a panic fails this job rather than the worker — see
+        // [`CatchPanic`].
+        let run = CatchPanic(self.registry.run(job, Arc::clone(context)));
+        let outcome = match timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, run).await {
+                Ok(result) => result,
+                Err(_) => {
+                    Ok(Err(Error::internal(format!("the job exceeded its {timeout:?} timeout"))))
+                }
+            },
+            None => run.await,
+        };
+        match outcome {
+            Ok(result) => result,
+            Err(panic) => {
+                Err(Error::internal(format!("the job panicked: {}", panic_message(panic.as_ref()))))
+            }
         }
     }
 

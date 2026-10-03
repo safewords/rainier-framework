@@ -449,64 +449,15 @@ impl QueueManager {
 
     /// Queue `job` with its declared defaults.
     ///
-    /// # Kubernetes routing
-    ///
-    /// When the `kubernetes` feature is enabled and the job's
-    /// [`Job::kubernetes`](crate::Job::kubernetes) returns `Some`, this
-    /// method tries to route to a
-    /// [`KubernetesDispatcher`](crate::KubernetesDispatcher) bound in
-    /// the facade application's container. If one is bound, the job
-    /// dispatches as a `batch/v1 Job` pod and `Ok(None)` is returned —
-    /// Kubernetes assigns the resource name, there is no queue handle
-    /// to return.
-    ///
-    /// If a job declared `kubernetes()` but no dispatcher is bound, a
-    /// `warn!` is logged and the job falls through to the ordinary
-    /// queue — a deployment that lacks the dispatcher (local dev, CI,
-    /// non-k8s runtimes) runs the queue path unchanged. The warn
-    /// surfaces the latent misconfiguration without taking the dispatch
-    /// out.
-    ///
-    /// This routing is transparent to the call site: everywhere that
-    /// calls `Queue::instance().dispatch(job)` already does the right
-    /// thing without branching, and whether a given job rides k8s is a
-    /// property of the job's own impl rather than of the dispatch site.
+    /// Dispatch is always through the queue backend, regardless of
+    /// whether the job opts into Kubernetes via
+    /// [`Job::kubernetes`](crate::Job::kubernetes). The queue row is
+    /// written, retries, timeouts, uniqueness, and `failed_jobs`
+    /// bookkeeping are the same for every job. What a Kubernetes-opted
+    /// job gets is a different *execution* path on the worker side —
+    /// see [`crate::kubernetes::KubernetesDispatcher`].
     pub async fn dispatch<J: Job>(&self, job: J) -> Result<Option<String>> {
-        #[cfg(feature = "kubernetes")]
-        if let Some(result) = self.try_dispatch_kubernetes(&job).await {
-            return result;
-        }
         self.pending(job)?.send().await
-    }
-
-    /// Resolve a [`KubernetesDispatcher`](crate::KubernetesDispatcher)
-    /// from the facade application and dispatch `job` through it, if
-    /// the job declared [`Job::kubernetes`](crate::Job::kubernetes).
-    ///
-    /// Returns `None` for the "no k8s routing happened, fall through to
-    /// the queue" case — either the job didn't declare a spec, or no
-    /// dispatcher is bound (with a warn in that second case). The outer
-    /// `Option<Result>` keeps the two "fell through" cases cheap at the
-    /// caller.
-    #[cfg(feature = "kubernetes")]
-    async fn try_dispatch_kubernetes<J: Job>(&self, job: &J) -> Option<Result<Option<String>>> {
-        // `?` propagates None through the outer Option, which is exactly
-        // the "job didn't opt in" fall-through case this method models.
-        let _spec = job.kubernetes()?;
-        let dispatcher = rainier_container::try_facade_application().and_then(|app| {
-            app.container().resolve::<crate::kubernetes::KubernetesDispatcher>().ok()
-        });
-        let Some(dispatcher) = dispatcher else {
-            tracing::warn!(
-                job = J::NAME,
-                "job declared Job::kubernetes() but no KubernetesDispatcher is bound in the \
-                 facade container — falling back to the ordinary queue path. Bind the \
-                 dispatcher (see `rainier_queue::KubernetesDispatcher::try_in_cluster`) or \
-                 remove the Job::kubernetes impl if this deployment never runs it on k8s."
-            );
-            return None;
-        };
-        Some(dispatcher.dispatch(job).await.map(|()| None))
     }
 
     /// The uniqueness key for `job`, if it wants one and this manager can
@@ -568,42 +519,16 @@ impl QueueManager {
     }
 
     /// Queue `job` on a named queue.
-    ///
-    /// A job that opts into Kubernetes via
-    /// [`Job::kubernetes`](crate::Job::kubernetes) still dispatches to
-    /// Kubernetes when a dispatcher is bound — see [`dispatch`](Self::dispatch).
-    /// The `queue` argument only applies to the fallback queue path.
     pub async fn dispatch_on<J: Job>(
         &self,
         queue: impl Into<String>,
         job: J,
     ) -> Result<Option<String>> {
-        #[cfg(feature = "kubernetes")]
-        if let Some(result) = self.try_dispatch_kubernetes(&job).await {
-            return result;
-        }
         self.pending(job)?.on_queue(queue).send().await
     }
 
     /// Queue `job`, held back for `delay`.
-    ///
-    /// Kubernetes dispatch does not honor `delay` — `batch/v1 Jobs`
-    /// have no built-in delayed-start primitive. A job that declared
-    /// [`Job::kubernetes`](crate::Job::kubernetes) and is dispatched
-    /// through this method logs a warn and takes the queue path so
-    /// the delay is actually honored. If a k8s-eligible job needs to
-    /// be delayed, run it through the queue explicitly or wrap it in a
-    /// scheduled queue job that dispatches the real one.
     pub async fn dispatch_after<J: Job>(&self, delay: Duration, job: J) -> Result<Option<String>> {
-        #[cfg(feature = "kubernetes")]
-        if job.kubernetes().is_some() {
-            tracing::warn!(
-                job = J::NAME,
-                delay_ms = delay.as_millis() as u64,
-                "dispatch_after on a Kubernetes-eligible job falls back to the queue path — \
-                 batch/v1 Jobs have no delayed-start primitive"
-            );
-        }
         self.pending(job)?.delay(delay).send().await
     }
 

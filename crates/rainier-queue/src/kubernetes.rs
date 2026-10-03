@@ -1,5 +1,5 @@
-//! Dispatch a job as a Kubernetes `batch/v1 Job` instead of as a queue
-//! message.
+//! Run a reserved job in a Kubernetes `batch/v1 Job` pod instead of in
+//! the worker process.
 //!
 //! The regular [`Queue`](crate::Queue) path is the right default: cheap,
 //! batched, and perfect for the thousands of small deferred actions a web
@@ -12,29 +12,49 @@
 //! out every unrelated job it was draining. On a one-shot pod with a
 //! memory request matched to the file, it finishes and the pod dies.
 //!
-//! A job opts in by implementing [`Job::kubernetes`] and returning a
-//! [`KubernetesJobSpec`] with its resource requirements. A
-//! [`KubernetesDispatcher`] (built from an in-cluster `kube::Client`)
-//! translates one of those jobs into a `batch/v1 Job` and submits it to
-//! the Kubernetes API. The pod runs the SAME binary in a single-job
-//! mode (see [`run_single_job`]) with the job name and payload passed
-//! as arguments; it executes the job and exits.
+//! # The queue is still the authority
 //!
-//! # Not every job
+//! Dispatching is **unchanged**: `QueueManager::dispatch` writes to the
+//! ordinary queue backend regardless of whether the job will eventually
+//! run on Kubernetes. `jobs` and `failed_jobs` records are produced the
+//! same way, retries are owned by [`WorkerOptions::tries`](
+//! crate::WorkerOptions::tries), and `QueueManager::fake` captures the
+//! dispatch for tests without any Kubernetes machinery.
 //!
-//! Default [`Job::kubernetes`] returns `None` — the trait method is
-//! additive and backward-compatible. A job that doesn't declare a spec
-//! runs on the regular queue, which is still the right answer for the
-//! vast majority of work. A job that does declare one still falls back
-//! to the queue if the application isn't running in a cluster (local
-//! dev, CI, a service that happens to not be deployed via Kubernetes);
-//! see [`KubernetesDispatcher::try_in_cluster`].
+//! What changes is who executes the handler. When the [`Worker`](
+//! crate::Worker) reserves a job whose
+//! [`Job::kubernetes`](crate::Job::kubernetes) returns `Some(spec)`
+//! **and** the worker has a [`KubernetesDispatcher`] configured, the
+//! worker launches a one-shot `batch/v1 Job` from the spec, watches it,
+//! and translates its terminal state back into its own
+//! [`Outcome`](crate::Outcome):
+//!
+//! * `Complete` → `Ok(())` and the queue row is acknowledged.
+//! * `Failed`   → `Err(…)` carrying the pod's last log line, which the
+//!   worker's existing retry logic treats like any other failure —
+//!   released for retry, then moved to `failed_jobs` on the final try.
+//!
+//! The worker's slot is held for the pod's lifetime, so the queue's own
+//! per-queue concurrency ceilings still cap how many Kubernetes Jobs can
+//! be in flight at once. The job's `backoff_limit` on the Kubernetes
+//! side is deliberately `0` by default: retries are the queue's job.
+//!
+//! # Reattach on worker restart
+//!
+//! The one-shot Job's name is derived deterministically from the queue
+//! job id and the attempt number. If a worker crashes while watching a
+//! Job, another worker that reserves the same queue row (after
+//! `retry_after`) computes the same name and reattaches to the existing
+//! Job's watch rather than launching a duplicate pod. The underlying
+//! guarantee is Kubernetes': `metadata.name` on a `batch/v1 Job` is a
+//! unique key in the namespace, so a `create` with the same name returns
+//! `AlreadyExists`.
 //!
 //! # Feature-gated
 //!
 //! The [`KubernetesJobSpec`] type is always available (every `Job` has a
-//! [`kubernetes`](Job::kubernetes) method, feature or no feature). The
-//! [`KubernetesDispatcher`] and the [`run_single_job`] helper live
+//! [`kubernetes`](crate::Job::kubernetes) method, feature or no feature).
+//! The [`KubernetesDispatcher`] and [`run_single_job`] helper live
 //! behind the `kubernetes` feature so a consumer that doesn't need them
 //! doesn't pull `kube-rs` + `k8s-openapi`.
 
@@ -93,10 +113,14 @@ pub struct KubernetesJobSpec {
     pub ttl_seconds_after_finished: i32,
 
     /// `spec.backoffLimit` — how many times Kubernetes retries a failed
-    /// pod before marking the Job failed. The application's own
-    /// [`Job::TRIES`] still applies inside the pod; this is a second
-    /// safety net for pod-level crashes (OOM-kill, node preemption).
-    /// Default `1` because the queue's retry is the primary path.
+    /// pod before marking the Job failed.
+    ///
+    /// **Default `0`.** Retries are the queue worker's responsibility
+    /// ([`Job::TRIES`], released + reserved again), so a pod failure
+    /// should fail the Job once and come straight back to the worker.
+    /// Raising this to `1` or above gives Kubernetes a second attempt
+    /// at the pod before the worker ever sees the failure, which is
+    /// usually not what the application wants.
     #[serde(default = "default_backoff_limit")]
     pub backoff_limit: i32,
 
@@ -113,7 +137,7 @@ const fn default_ttl_seconds_after_finished() -> i32 {
     60
 }
 const fn default_backoff_limit() -> i32 {
-    1
+    0
 }
 
 impl KubernetesJobSpec {
@@ -178,6 +202,13 @@ impl KubernetesJobSpec {
         self.tmpfs_scratch = true;
         self
     }
+
+    /// Builder: Kubernetes-side retry count. Prefer leaving this at `0`
+    /// (the default) — the queue worker owns retries.
+    pub fn with_backoff_limit(mut self, limit: i32) -> Self {
+        self.backoff_limit = limit;
+        self
+    }
 }
 
 /// The CLI argument the dispatcher sets on the pod's container so the
@@ -199,6 +230,18 @@ pub const PAYLOAD_ENV: &str = "RAINIER_JOB_PAYLOAD";
 /// [`JobRegistry`](crate::JobRegistry).
 pub const JOB_NAME_ENV: &str = "RAINIER_JOB_NAME";
 
+/// Env var the dispatcher sets carrying the queue row's id, so the pod's
+/// `JobContext` reports the same id the worker reserved and the queue's
+/// `jobs` row references. Lets a single confirmed-CSAM artifact be
+/// correlated across the queue row, the Kubernetes Job, and the pod's
+/// own log lines.
+pub const QUEUED_ID_ENV: &str = "RAINIER_QUEUED_JOB_ID";
+
+/// Env var the dispatcher sets carrying the attempt number this worker
+/// invocation is on. Starts at `1` and increments each time the queue
+/// worker releases and re-reserves this row.
+pub const ATTEMPT_ENV: &str = "RAINIER_JOB_ATTEMPT";
+
 #[cfg(feature = "kubernetes")]
 mod dispatcher {
     //! The `kube-rs` + `k8s-openapi` half of the module. Only compiled
@@ -206,32 +249,53 @@ mod dispatcher {
 
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use k8s_openapi::api::authorization::v1::{
         ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
     };
     use k8s_openapi::api::batch::v1::{Job as K8sJob, JobSpec};
     use k8s_openapi::api::core::v1::{
-        Container, EmptyDirVolumeSource, EnvVar, PodSpec, PodTemplateSpec, ResourceRequirements,
-        Volume, VolumeMount,
+        Container, EmptyDirVolumeSource, EnvVar, Pod, PodSpec, PodTemplateSpec,
+        ResourceRequirements, Volume, VolumeMount,
     };
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-    use kube::api::{Api, PostParams};
+    use kube::api::{Api, DeleteParams, ListParams, LogParams, PostParams};
     use kube::Client;
     use rainier_support::{Error, Result};
 
-    use super::{KubernetesJobSpec, JOB_NAME_ENV, PAYLOAD_ENV, SINGLE_JOB_SUBCOMMAND};
-    use crate::job::Job;
+    use super::{
+        KubernetesJobSpec, ATTEMPT_ENV, JOB_NAME_ENV, PAYLOAD_ENV, QUEUED_ID_ENV,
+        SINGLE_JOB_SUBCOMMAND,
+    };
 
-    /// Dispatches a [`Job`] to Kubernetes as a `batch/v1 Job` resource.
+    /// Label the dispatcher stamps on every Job it creates. The
+    /// orchestrator-side watch loop filters by this when looking up a
+    /// Job's pod for log capture.
+    const LABEL_JOB_NAME: &str = "rainier.job/name";
+    /// Label carrying the queue row's id, so a Kubernetes Job can be
+    /// traced back to the `jobs` row that produced it.
+    const LABEL_QUEUED_ID: &str = "rainier.job/queued-id";
+    /// How often the watcher polls the Job's status. A poll is cheap on
+    /// a cached kube client; a longer interval reduces API load for
+    /// long-running Jobs. Three seconds strikes the balance NCMEC
+    /// cares about (a <1 minute upload wants prompt feedback).
+    const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(3);
+    /// How many lines of the pod's log to include in the failure error.
+    /// A whole log can be hundreds of MiB; the tail is what diagnoses
+    /// the failure and `kubectl logs` is still there for the rest.
+    const FAILURE_LOG_TAIL_LINES: i64 = 100;
+
+    /// Runs a reserved queue job as a Kubernetes `batch/v1 Job` pod and
+    /// watches it to completion.
     ///
-    /// The dispatcher knows the current pod's image, namespace, and
-    /// default service account; a [`KubernetesJobSpec`] may override any
-    /// of them per-job. The resulting pod runs the same binary with the
-    /// [`SINGLE_JOB_SUBCOMMAND`] argument and the job name + payload in
-    /// env vars, which the application's CLI resolves to a single call
-    /// to [`super::run_single_job`].
+    /// Not a dispatcher of queue messages — the ordinary queue is still
+    /// the dispatch surface. This is a *runner* the [`Worker`](
+    /// crate::Worker) consults for jobs whose
+    /// [`Job::kubernetes`](crate::Job::kubernetes) returns `Some`. The
+    /// type name is kept for backward compatibility; the shape it
+    /// implements is a runner.
     #[derive(Clone)]
     pub struct KubernetesDispatcher {
         inner: Arc<Inner>,
@@ -307,9 +371,9 @@ mod dispatcher {
         }
 
         /// Ask the API what the current pod's ServiceAccount is actually
-        /// allowed to do with `batch/v1 Jobs` in [`default_namespace`](
-        /// Self::default_namespace), via `SelfSubjectAccessReview`. The
-        /// returned [`RbacReport`] names each verb and whether it was
+        /// allowed to do with `batch/v1 Jobs` and `pods/log` in the
+        /// dispatcher's default namespace, via `SelfSubjectAccessReview`.
+        /// The returned [`RbacReport`] names each verb and whether it was
         /// granted so the application can decide how strict to be — a
         /// cheap boot-time check beats a surprise 403 at the first
         /// dispatch.
@@ -317,34 +381,255 @@ mod dispatcher {
         /// SSAR is a dry run: it asks the API server's authorizer, it
         /// does not actually create or list anything. Safe to call on
         /// every boot even without the `create` permission.
-        ///
-        /// The dispatcher's own permissions are what this checks, which
-        /// is `create jobs` for dispatch, `get`/`list` for post-dispatch
-        /// observation. The per-job `ServiceAccount` on the pod
-        /// ([`KubernetesJobSpec::with_service_account`]) is a different
-        /// identity and can't be checked here without impersonation;
-        /// an opt-in job that references a missing SA will fail at pod
-        /// creation (the API refuses) — that is a sharper error than
-        /// an SSAR could offer anyway.
-        ///
-        /// Returns `Err` only when the SSAR call itself fails (network,
-        /// authentication). A granted/denied verdict is an `Ok`, with
-        /// `allowed = false` on each denied verb.
         pub async fn verify_rbac(&self) -> Result<RbacReport> {
             let api: Api<SelfSubjectAccessReview> = Api::all(self.inner.client.clone());
             let namespace = self.inner.default_namespace.clone();
 
-            let can_create = check_verb(&api, &namespace, "create").await?;
-            let can_get = check_verb(&api, &namespace, "get").await?;
-            let can_list = check_verb(&api, &namespace, "list").await?;
+            let can_create = check_verb(&api, &namespace, "batch", "jobs", "create").await?;
+            let can_get = check_verb(&api, &namespace, "batch", "jobs", "get").await?;
+            let can_watch = check_verb(&api, &namespace, "batch", "jobs", "watch").await?;
+            let can_read_pod_logs = check_verb(&api, &namespace, "", "pods/log", "get").await?;
 
-            Ok(RbacReport { namespace, can_create, can_get, can_list })
+            Ok(RbacReport { namespace, can_create, can_get, can_watch, can_read_pod_logs })
+        }
+
+        /// Launch a Kubernetes Job for a reserved queue row and watch it
+        /// to a terminal state. Called by the worker in place of running
+        /// the job's `handle()` in-process.
+        ///
+        /// `job_name` is [`Job::NAME`](crate::Job::NAME) — the wire name
+        /// the pod uses to look the job up in its own `JobRegistry`.
+        /// `queued_id` is the queue row's id, used as the stable half of
+        /// the Kubernetes Job's name so a worker that restarts
+        /// mid-watch reattaches to the running Job rather than
+        /// launching a duplicate. `attempt` participates in the name
+        /// too, because the worker's retry logic produces a fresh
+        /// attempt and a fresh Job per failure.
+        ///
+        /// Returns:
+        /// * `Ok(())` when the Kubernetes Job reaches `Complete`.
+        /// * `Err` with the pod's log tail when it reaches `Failed`.
+        /// * `Err("timed out …")` when `timeout` elapses — the Job is
+        ///   deleted so the kubelet terminates the pod.
+        pub async fn run_and_watch(
+            &self,
+            job_name: &str,
+            payload: &serde_json::Value,
+            spec: &KubernetesJobSpec,
+            queued_id: &str,
+            attempt: u32,
+            timeout: Option<Duration>,
+        ) -> Result<()> {
+            let namespace =
+                spec.namespace.clone().unwrap_or_else(|| self.inner.default_namespace.clone());
+            let image =
+                spec.image.clone().or_else(|| self.inner.default_image.clone()).ok_or_else(
+                    || {
+                        Error::internal(
+                            "no image to run the Kubernetes job in — set it on the spec or \
+                             configure RAINIER_K8S_DEFAULT_IMAGE on the dispatcher's pod",
+                        )
+                    },
+                )?;
+
+            let payload_str = serde_json::to_string(payload).map_err(|e| {
+                Error::internal(format!(
+                    "serialising job `{job_name}` payload for Kubernetes dispatch: {e}"
+                ))
+            })?;
+            if payload_str.len() > 900_000 {
+                return Err(Error::internal(format!(
+                    "job `{job_name}` payload is {} bytes; the Kubernetes dispatcher caps env-var \
+                     payloads at ~900 KiB. Switch this job to a ConfigMap payload (not yet \
+                     implemented) or shrink the payload.",
+                    payload_str.len()
+                )));
+            }
+
+            let k8s_name = kubernetes_name_for(job_name, queued_id, attempt);
+            let k8s_job = render_job(
+                job_name,
+                &k8s_name,
+                queued_id,
+                attempt,
+                spec,
+                &image,
+                &payload_str,
+                self.inner.default_service_account.as_deref(),
+            );
+
+            let jobs_api: Api<K8sJob> = Api::namespaced(self.inner.client.clone(), &namespace);
+            match jobs_api.create(&PostParams::default(), &k8s_job).await {
+                Ok(_) => tracing::info!(
+                    job_name,
+                    queued_id,
+                    attempt,
+                    namespace = %namespace,
+                    k8s_name = %k8s_name,
+                    "created kubernetes job"
+                ),
+                Err(kube::Error::Api(err)) if err.code == 409 => {
+                    tracing::info!(
+                        job_name,
+                        queued_id,
+                        attempt,
+                        namespace = %namespace,
+                        k8s_name = %k8s_name,
+                        "kubernetes job already exists — reattaching to its watch"
+                    );
+                }
+                Err(e) => {
+                    return Err(Error::internal(format!(
+                        "creating batch/v1 Job for `{job_name}` in namespace \
+                         `{namespace}`: {e}"
+                    )));
+                }
+            }
+
+            let outcome = match timeout {
+                Some(limit) => match tokio::time::timeout(
+                    limit,
+                    watch_to_terminal(&jobs_api, &self.inner.client, &namespace, &k8s_name),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!(
+                            job_name,
+                            queued_id,
+                            attempt,
+                            namespace = %namespace,
+                            k8s_name = %k8s_name,
+                            ?limit,
+                            "kubernetes job exceeded its timeout; deleting"
+                        );
+                        delete_job(&jobs_api, &k8s_name).await;
+                        Err(Error::internal(format!(
+                            "kubernetes job `{k8s_name}` exceeded its {limit:?} timeout"
+                        )))
+                    }
+                },
+                None => {
+                    watch_to_terminal(&jobs_api, &self.inner.client, &namespace, &k8s_name).await
+                }
+            };
+
+            if outcome.is_ok() && spec.ttl_seconds_after_finished == 0 {
+                // Succeeded with ttl=0 — delete the Job so the pod and
+                // its logs vanish immediately. Not an error if the TTL
+                // controller already reaped it.
+                delete_job(&jobs_api, &k8s_name).await;
+            }
+
+            outcome
+        }
+    }
+
+    /// Watch `k8s_name` until it reaches a terminal condition. Returns
+    /// `Ok(())` on `Complete`, `Err(…)` with the pod's log tail on
+    /// `Failed`.
+    async fn watch_to_terminal(
+        jobs_api: &Api<K8sJob>,
+        client: &Client,
+        namespace: &str,
+        k8s_name: &str,
+    ) -> Result<()> {
+        loop {
+            let job = jobs_api.get(k8s_name).await.map_err(|e| {
+                Error::internal(format!("reading kubernetes job `{k8s_name}`: {e}"))
+            })?;
+
+            if let Some(status) = &job.status {
+                if let Some(conditions) = &status.conditions {
+                    for condition in conditions {
+                        if condition.status != "True" {
+                            continue;
+                        }
+                        match condition.type_.as_str() {
+                            "Complete" => return Ok(()),
+                            "Failed" => {
+                                let logs = fetch_pod_log_tail(client, namespace, k8s_name).await;
+                                let reason = condition
+                                    .reason
+                                    .clone()
+                                    .unwrap_or_else(|| "unspecified".into());
+                                let message = condition
+                                    .message
+                                    .clone()
+                                    .unwrap_or_else(|| "no message".into());
+                                return Err(Error::internal(format!(
+                                    "kubernetes job `{k8s_name}` failed \
+                                     ({reason}: {message}){}",
+                                    if logs.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("\n--- pod log tail ---\n{logs}")
+                                    }
+                                )));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            tokio::time::sleep(WATCH_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Best-effort log fetch for a failed Job's pod. Returns the empty
+    /// string on any error — a missing log is not worth upgrading the
+    /// job's failure into a different one.
+    async fn fetch_pod_log_tail(client: &Client, namespace: &str, k8s_name: &str) -> String {
+        let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+        let selector = format!("job-name={k8s_name}");
+        let pods = match pods_api.list(&ListParams::default().labels(&selector)).await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(k8s_name, error = %e, "could not list pods for failed job");
+                return String::new();
+            }
+        };
+        let Some(pod) = pods.items.into_iter().next() else { return String::new() };
+        let Some(name) = pod.metadata.name else { return String::new() };
+        match pods_api
+            .logs(
+                &name,
+                &LogParams { tail_lines: Some(FAILURE_LOG_TAIL_LINES), ..LogParams::default() },
+            )
+            .await
+        {
+            Ok(logs) => logs,
+            Err(e) => {
+                tracing::warn!(pod = %name, error = %e, "could not read pod logs for failed job");
+                String::new()
+            }
+        }
+    }
+
+    async fn delete_job(jobs_api: &Api<K8sJob>, k8s_name: &str) {
+        // `propagation_policy: Background` so the GC sweeps the pods on
+        // its own. `Foreground` would make this call block until the
+        // pods are gone, which inside a worker's handler would hold the
+        // concurrency slot longer than necessary.
+        let params = DeleteParams {
+            propagation_policy: Some(kube::api::PropagationPolicy::Background),
+            ..DeleteParams::default()
+        };
+        if let Err(e) = jobs_api.delete(k8s_name, &params).await {
+            // 404 = already gone (ttl controller beat us), fine.
+            if !matches!(&e, kube::Error::Api(err) if err.code == 404) {
+                tracing::warn!(k8s_name, error = %e, "could not delete kubernetes job");
+            }
         }
     }
 
     async fn check_verb(
         api: &Api<SelfSubjectAccessReview>,
         namespace: &str,
+        group: &str,
+        resource: &str,
         verb: &str,
     ) -> Result<bool> {
         let review = SelfSubjectAccessReview {
@@ -352,18 +637,19 @@ mod dispatcher {
                 resource_attributes: Some(ResourceAttributes {
                     namespace: Some(namespace.to_string()),
                     verb: Some(verb.to_string()),
-                    group: Some("batch".to_string()),
-                    resource: Some("jobs".to_string()),
+                    group: Some(group.to_string()),
+                    resource: Some(resource.to_string()),
                     ..ResourceAttributes::default()
                 }),
                 non_resource_attributes: None,
             },
             ..SelfSubjectAccessReview::default()
         };
-        let answer = api
-            .create(&PostParams::default(), &review)
-            .await
-            .map_err(|e| Error::internal(format!("SelfSubjectAccessReview for `{verb}`: {e}")))?;
+        let answer = api.create(&PostParams::default(), &review).await.map_err(|e| {
+            Error::internal(format!(
+                "SelfSubjectAccessReview for `{verb}` on {group}/{resource}: {e}"
+            ))
+        })?;
         Ok(answer.status.map(|s| s.allowed).unwrap_or(false))
     }
 
@@ -375,148 +661,64 @@ mod dispatcher {
     pub struct RbacReport {
         /// The namespace the checks were made against.
         pub namespace: String,
-        /// Required to dispatch any Kubernetes job. Without this,
-        /// [`KubernetesDispatcher::dispatch`] errors on every call.
+        /// Required to launch any Kubernetes Job.
         pub can_create: bool,
-        /// Optional; required by any future surface that reads a single
-        /// Job's status.
+        /// Required by the watcher to poll the Job's status.
         pub can_get: bool,
-        /// Optional; required by any future surface that enumerates
-        /// outstanding Jobs (an admin dashboard, a cleanup sweeper).
-        pub can_list: bool,
+        /// Required by any future informer-based watch replacement.
+        pub can_watch: bool,
+        /// Required by the failure path's pod-log capture.
+        pub can_read_pod_logs: bool,
     }
 
     impl RbacReport {
-        /// Whether the minimum needed to dispatch is present.
+        /// Whether the minimum needed to run and watch a Job is present.
+        /// `can_read_pod_logs` is a quality-of-service bit — missing it
+        /// means failed Jobs come back without the pod's log tail — so
+        /// it is not required here.
         pub fn is_dispatch_ready(&self) -> bool {
-            self.can_create
+            self.can_create && self.can_get
         }
 
         /// Short human-readable summary suitable for a boot-time log line.
         pub fn summary(&self) -> String {
             let ok = |b: bool| if b { "ok" } else { "MISSING" };
             format!(
-                "namespace={} create={} get={} list={}",
+                "namespace={} create={} get={} watch={} pods/log:get={}",
                 self.namespace,
                 ok(self.can_create),
                 ok(self.can_get),
-                ok(self.can_list),
+                ok(self.can_watch),
+                ok(self.can_read_pod_logs),
             )
         }
     }
 
-    impl KubernetesDispatcher {
-        /// Dispatch `job` as a `batch/v1 Job`. The job must have
-        /// [`Job::kubernetes`] returning `Some`; a `None` here is a
-        /// contract break (the application dispatched a queue-only job
-        /// via the Kubernetes path).
-        pub async fn dispatch<J: Job>(&self, job: &J) -> Result<()> {
-            let spec = job.kubernetes().ok_or_else(|| {
-                Error::internal(format!(
-                    "job `{}` was dispatched to Kubernetes but did not declare a \
-                     KubernetesJobSpec; implement Job::kubernetes to opt in",
-                    J::NAME
-                ))
-            })?;
-
-            let payload = serde_json::to_string(job).map_err(|e| {
-                Error::internal(format!(
-                    "serialising job `{}` for Kubernetes dispatch: {e}",
-                    J::NAME
-                ))
-            })?;
-            if payload.len() > 900_000 {
-                // Env vars have a per-pod 1 MiB cap; staying under 900 KiB
-                // leaves room for the other env the pod carries.
-                return Err(Error::internal(format!(
-                    "job `{}` payload is {} bytes; the Kubernetes dispatcher caps env-var \
-                     payloads at ~900 KiB. Switch this job to a ConfigMap payload (not yet \
-                     implemented) or shrink the payload.",
-                    J::NAME,
-                    payload.len(),
-                )));
-            }
-
-            let namespace =
-                spec.namespace.clone().unwrap_or_else(|| self.inner.default_namespace.clone());
-            let image =
-                spec.image.clone().or_else(|| self.inner.default_image.clone()).ok_or_else(
-                    || {
-                        Error::internal(
-                            "no image to run the Kubernetes job in — set it on the spec or \
-                         configure RAINIER_K8S_DEFAULT_IMAGE on the dispatcher's pod",
-                        )
-                    },
-                )?;
-
-            let k8s_job = render_job::<J>(&spec, &image, &payload, &self.inner);
-
-            let api: Api<K8sJob> = Api::namespaced(self.inner.client.clone(), &namespace);
-            api.create(&PostParams::default(), &k8s_job).await.map_err(|e| {
-                Error::internal(format!(
-                    "creating batch/v1 Job for `{}` in namespace `{namespace}`: {e}",
-                    J::NAME
-                ))
-            })?;
-
-            tracing::info!(
-                job_name = J::NAME,
-                namespace = %namespace,
-                memory = %spec.memory_limit,
-                cpu = %spec.cpu_limit,
-                "dispatched job to Kubernetes"
-            );
-            Ok(())
-        }
-
-        /// Dispatch to Kubernetes when the job declares a spec; otherwise
-        /// fall back to `queue`. The ergonomic entry point for an
-        /// application that opts a few jobs in but doesn't want to
-        /// branch at every call site.
-        pub async fn dispatch_or_queue<J: Job, Q: QueueLike>(
-            k8s: Option<&Self>,
-            queue: &Q,
-            job: J,
-        ) -> Result<()> {
-            if let (Some(k8s), true) = (k8s, job.kubernetes().is_some()) {
-                return k8s.dispatch(&job).await;
-            }
-            queue.dispatch(job).await
-        }
-    }
-
-    /// The slice of a `Queue`/`QueueManager` [`dispatch_or_queue`](
-    /// KubernetesDispatcher::dispatch_or_queue) needs — kept to a method
-    /// name so this module doesn't drag in the concrete queue type.
-    #[async_trait::async_trait]
-    pub trait QueueLike {
-        /// Dispatch `job` to the ordinary queue — the fallback path when
-        /// Kubernetes is not available or the job did not declare a spec.
-        async fn dispatch<J: Job>(&self, job: J) -> Result<()>;
-    }
-
-    fn render_job<J: Job>(
+    #[allow(clippy::too_many_arguments)]
+    fn render_job(
+        job_name: &str,
+        k8s_name: &str,
+        queued_id: &str,
+        attempt: u32,
         spec: &KubernetesJobSpec,
         image: &str,
         payload: &str,
-        inner: &Inner,
+        default_service_account: Option<&str>,
     ) -> K8sJob {
         let service_account =
-            spec.service_account.clone().or_else(|| inner.default_service_account.clone());
+            spec.service_account.clone().or_else(|| default_service_account.map(|s| s.to_string()));
 
-        let name = pod_name_for::<J>();
-
-        let mut env = vec![
-            EnvVar { name: JOB_NAME_ENV.into(), value: Some(J::NAME.into()), value_from: None },
+        let env = vec![
+            EnvVar { name: JOB_NAME_ENV.into(), value: Some(job_name.into()), value_from: None },
             EnvVar { name: PAYLOAD_ENV.into(), value: Some(payload.into()), value_from: None },
+            EnvVar { name: QUEUED_ID_ENV.into(), value: Some(queued_id.into()), value_from: None },
+            EnvVar { name: ATTEMPT_ENV.into(), value: Some(attempt.to_string()), value_from: None },
+            EnvVar {
+                name: "RAINIER_K8S_JOB_NAME".into(),
+                value: Some(k8s_name.into()),
+                value_from: None,
+            },
         ];
-        // Make the pod's own name available to the application so logs can
-        // tie back to the Kubernetes resource.
-        env.push(EnvVar {
-            name: "RAINIER_K8S_JOB_NAME".into(),
-            value: Some(name.clone()),
-            value_from: None,
-        });
 
         let mut requests = BTreeMap::new();
         requests.insert("memory".to_string(), Quantity(spec.memory_request.clone()));
@@ -548,10 +750,6 @@ mod dispatcher {
         let container = Container {
             name: "job".into(),
             image: Some(image.to_string()),
-            // The pod's `command` is the application's binary (image
-            // ENTRYPOINT); we add the single-job subcommand so the CLI
-            // routes to [`run_single_job`] rather than starting a
-            // long-lived worker.
             args: Some(vec![SINGLE_JOB_SUBCOMMAND.into()]),
             env: Some(env),
             resources: Some(ResourceRequirements {
@@ -575,18 +773,17 @@ mod dispatcher {
             ..PodSpec::default()
         };
 
+        let labels = labels_for(job_name, k8s_name, queued_id);
+
         K8sJob {
             metadata: ObjectMeta {
-                generate_name: Some(format!("rainier-job-{}-", slugify(J::NAME))),
-                labels: Some(labels_for::<J>(&name)),
+                name: Some(k8s_name.into()),
+                labels: Some(labels.clone()),
                 ..ObjectMeta::default()
             },
             spec: Some(JobSpec {
                 template: PodTemplateSpec {
-                    metadata: Some(ObjectMeta {
-                        labels: Some(labels_for::<J>(&name)),
-                        ..ObjectMeta::default()
-                    }),
+                    metadata: Some(ObjectMeta { labels: Some(labels), ..ObjectMeta::default() }),
                     spec: Some(pod_spec),
                 },
                 ttl_seconds_after_finished: Some(spec.ttl_seconds_after_finished),
@@ -597,16 +794,43 @@ mod dispatcher {
         }
     }
 
-    fn pod_name_for<J: Job>() -> String {
-        format!("rainier-job-{}", slugify(J::NAME))
-    }
-
-    fn labels_for<J: Job>(name: &str) -> BTreeMap<String, String> {
+    fn labels_for(job_name: &str, k8s_name: &str, queued_id: &str) -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
         labels.insert("app.kubernetes.io/managed-by".into(), "rainier-queue".into());
-        labels.insert("rainier.job/name".into(), slugify(J::NAME));
-        labels.insert("rainier.job/instance".into(), name.into());
+        labels.insert(LABEL_JOB_NAME.into(), slugify(job_name));
+        labels.insert("rainier.job/instance".into(), k8s_name.into());
+        labels.insert(LABEL_QUEUED_ID.into(), label_safe(queued_id));
         labels
+    }
+
+    /// Deterministic Kubernetes Job name for a (queue job id, attempt)
+    /// pair. Kubernetes constrains `metadata.name` to DNS-1123 (lowercase
+    /// alphanumeric + `-`, max 63 chars) and uniqueness within the
+    /// namespace; both are what reattach-on-worker-restart needs.
+    fn kubernetes_name_for(job_name: &str, queued_id: &str, attempt: u32) -> String {
+        // 16 chars of slug (readable), 10 chars of hash (unique even if
+        // two queued ids slugify the same), 2-digit attempt. Keeps the
+        // name well under the 63-char DNS-1123 label limit.
+        let slug_short: String = slugify(job_name).chars().take(16).collect();
+        let hash = short_hash(queued_id);
+        format!("rainier-{slug_short}-{hash}-{attempt}")
+    }
+
+    /// A short, printable, deterministic digest of `id` for use inside a
+    /// DNS-1123 label. 10 lowercase hex chars = 40 bits, plenty for
+    /// distinguishing a single application's in-flight queue rows.
+    fn short_hash(id: &str) -> String {
+        // A FNV-1a 64 is enough: this needs collision resistance within
+        // the set of outstanding queue job ids, not cryptographic
+        // strength. Keeps the module from pulling a hash crate.
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut h = FNV_OFFSET;
+        for b in id.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        format!("{h:010x}").chars().take(10).collect()
     }
 
     /// Kubernetes names and labels are RFC 1123 (lowercase alphanumeric
@@ -624,9 +848,6 @@ mod dispatcher {
                     }
                 })
                 .collect();
-        // Trim leading/trailing dashes; collapse runs. 63 chars is the
-        // DNS-1123 label limit (names can be longer with multiple labels,
-        // but the simple path stays well under).
         let s: String = s
             .trim_matches('-')
             .chars()
@@ -648,20 +869,66 @@ mod dispatcher {
             s
         }
     }
+
+    /// Label values follow the same rules as names, with a 63-char cap.
+    fn label_safe(value: &str) -> String {
+        slugify(value).chars().take(63).collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn kubernetes_name_fits_within_the_dns1123_label_limit() {
+            let name = kubernetes_name_for(
+                "moderation.photodna-promote-to-radioactive-waste",
+                "abcdef0123456789",
+                1,
+            );
+            assert!(name.len() <= 63, "{name} is {} chars", name.len());
+            assert!(name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+            assert!(name.starts_with("rainier-"));
+        }
+
+        #[test]
+        fn kubernetes_name_is_deterministic_for_the_same_inputs() {
+            let a = kubernetes_name_for("mail.welcome", "17f1234-abcd", 1);
+            let b = kubernetes_name_for("mail.welcome", "17f1234-abcd", 1);
+            assert_eq!(a, b, "same (name, id, attempt) must yield the same k8s name");
+        }
+
+        #[test]
+        fn attempts_produce_distinct_names_so_a_retry_is_its_own_job() {
+            let first = kubernetes_name_for("mail.welcome", "17f1234", 1);
+            let second = kubernetes_name_for("mail.welcome", "17f1234", 2);
+            assert_ne!(first, second);
+        }
+
+        #[test]
+        fn different_queued_ids_produce_different_names() {
+            let a = kubernetes_name_for("mail.welcome", "17f1234", 1);
+            let b = kubernetes_name_for("mail.welcome", "17f1235", 1);
+            assert_ne!(a, b);
+        }
+    }
 }
 
 #[cfg(feature = "kubernetes")]
-pub use dispatcher::{KubernetesDispatcher, QueueLike, RbacReport};
+pub use dispatcher::{KubernetesDispatcher, RbacReport};
 
 /// Run a single serialised job and return. The pod-side entry point for
 /// a job dispatched via [`KubernetesDispatcher`].
 ///
 /// The application's CLI matches on [`SINGLE_JOB_SUBCOMMAND`], reads
-/// [`JOB_NAME_ENV`] + [`PAYLOAD_ENV`], and calls this with the
-/// framework-level [`JobRegistry`](crate::JobRegistry) + a built
-/// [`JobContext`](crate::JobContext). On success the process exits 0;
-/// on error the process exits non-zero and Kubernetes' `backoffLimit`
-/// decides whether to retry the pod.
+/// [`JOB_NAME_ENV`] + [`PAYLOAD_ENV`] + [`QUEUED_ID_ENV`] + [`ATTEMPT_ENV`],
+/// and calls this with the framework-level [`JobRegistry`](crate::JobRegistry)
+/// + a built [`JobContext`](crate::JobContext).
+///
+/// On success the process exits 0; on error the process exits non-zero
+/// and the queue worker watching on the orchestrator side treats that
+/// as a job failure (released for retry, then `failed_jobs` on the
+/// final attempt).
 ///
 /// Not feature-gated: a service that implements its own dispatcher (not
 /// via `kube-rs`) still wants this helper for the pod-side half.
@@ -711,5 +978,15 @@ mod tests {
             serde_json::to_string(&KubernetesJobSpec::new("1Gi", "2Gi", "100m", "500m")).unwrap();
         assert!(!s.contains("image"), "image should be absent when None: {s}");
         assert!(!s.contains("serviceAccount") && !s.contains("service_account"), "{s}");
+    }
+
+    #[test]
+    fn the_default_backoff_limit_is_zero_so_retries_live_in_the_queue_worker() {
+        // Load-bearing: raising this to one would let Kubernetes retry a
+        // failing pod before the queue worker ever sees the failure, so
+        // Job::TRIES stops being the authority on how many attempts the
+        // work gets.
+        let spec = KubernetesJobSpec::new("1Gi", "2Gi", "100m", "500m");
+        assert_eq!(spec.backoff_limit, 0);
     }
 }

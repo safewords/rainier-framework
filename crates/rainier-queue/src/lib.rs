@@ -111,10 +111,11 @@ pub use job::{Job, JobContext, JobRegistry, QueuedJob};
 #[cfg(feature = "kafka")]
 pub use kafka::{require_shared as require_shared_locks, KafkaQueue};
 pub use kubernetes::{
-    run_single_job, KubernetesJobSpec, JOB_NAME_ENV, PAYLOAD_ENV, SINGLE_JOB_SUBCOMMAND,
+    run_single_job, KubernetesJobSpec, ATTEMPT_ENV, JOB_NAME_ENV, PAYLOAD_ENV, QUEUED_ID_ENV,
+    SINGLE_JOB_SUBCOMMAND,
 };
 #[cfg(feature = "kubernetes")]
-pub use kubernetes::{KubernetesDispatcher, QueueLike, RbacReport};
+pub use kubernetes::{KubernetesDispatcher, RbacReport};
 pub use manager::{PendingDispatch, QueueManager, SyncQueue};
 pub use queue::{FailedJob, MemoryQueue, Queue};
 #[cfg(feature = "redis")]
