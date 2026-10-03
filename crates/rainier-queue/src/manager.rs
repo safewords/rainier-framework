@@ -451,7 +451,7 @@ impl QueueManager {
     ///
     /// Dispatch is always through the queue backend, regardless of
     /// whether the job opts into Kubernetes via
-    /// [`Job::kubernetes`](crate::Job::kubernetes). The queue row is
+    /// [`crate::Job::kubernetes`]. The queue row is
     /// written, retries, timeouts, uniqueness, and `failed_jobs`
     /// bookkeeping are the same for every job. What a Kubernetes-opted
     /// job gets is a different *execution* path on the worker side —

@@ -23,7 +23,7 @@
 //!
 //! What changes is who executes the handler. When the [`Worker`](
 //! crate::Worker) reserves a job whose
-//! [`Job::kubernetes`](crate::Job::kubernetes) returns `Some(spec)`
+//! [`crate::Job::kubernetes`] returns `Some(spec)`
 //! **and** the worker has a [`KubernetesDispatcher`] configured, the
 //! worker launches a one-shot `batch/v1 Job` from the spec, watches it,
 //! and translates its terminal state back into its own
@@ -116,7 +116,7 @@ pub struct KubernetesJobSpec {
     /// pod before marking the Job failed.
     ///
     /// **Default `0`.** Retries are the queue worker's responsibility
-    /// ([`Job::TRIES`], released + reserved again), so a pod failure
+    /// ([`crate::Job::TRIES`], released + reserved again), so a pod failure
     /// should fail the Job once and come straight back to the worker.
     /// Raising this to `1` or above gives Kubernetes a second attempt
     /// at the pod before the worker ever sees the failure, which is
@@ -289,7 +289,7 @@ mod dispatcher {
     /// Not a dispatcher of queue messages — the ordinary queue is still
     /// the dispatch surface. This is a *runner* the [`Worker`](
     /// crate::Worker) consults for jobs whose
-    /// [`Job::kubernetes`](crate::Job::kubernetes) returns `Some`. The
+    /// [`crate::Job::kubernetes`] returns `Some`. The
     /// type name is kept for backward compatibility; the shape it
     /// implements is a runner.
     #[derive(Clone)]

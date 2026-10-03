@@ -422,7 +422,7 @@ pub struct Worker {
     /// broken.
     locks: Option<LockManager>,
     /// Hands off a reserved job to a Kubernetes `batch/v1 Job` pod when
-    /// its [`Job::kubernetes`](crate::Job::kubernetes) returns `Some`.
+    /// its [`crate::Job::kubernetes`] returns `Some`.
     ///
     /// `None` means every reserved job runs in-process on the worker,
     /// even if it opts in — the right fallback for local dev, CI, and
@@ -464,7 +464,7 @@ impl Worker {
         }
     }
 
-    /// Launch jobs whose [`Job::kubernetes`](crate::Job::kubernetes) returns
+    /// Launch jobs whose [`crate::Job::kubernetes`] returns
     /// `Some` as one-shot `batch/v1 Job` pods via `runner`, and watch them
     /// to their terminal state inside the worker's own concurrency slot.
     ///
@@ -755,7 +755,7 @@ impl Worker {
 
     /// Run `job`'s handler, choosing between the in-process queue runner
     /// and the Kubernetes `batch/v1 Job` runner based on whether the
-    /// job's [`Job::kubernetes`](crate::Job::kubernetes) returns `Some`
+    /// job's [`crate::Job::kubernetes`] returns `Some`
     /// AND this worker has a dispatcher configured.
     ///
     /// Returns the same `Result<()>` shape regardless of path, so the
