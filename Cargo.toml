@@ -117,12 +117,28 @@ argon2 = "0.6"
 password-hash = { version = "0.6", features = ["alloc", "getrandom", "phc", "rand_core"] }
 bcrypt = "0.19"
 rand = "0.10"
+# Pinned feature-set per sdk crate: the `default` feature list on every
+# aws-sdk-* ships with BOTH `default-https-client` (the modern path through
+# `aws-smithy-runtime/default-https-client` → aws-lc-rs) AND `rustls` (the
+# legacy path through `aws-smithy-runtime/tls-rustls`, which drags in
+# `rustls 0.21` + `rustls-webpki 0.101` + `h2 0.3` + `hyper 0.14`). The
+# legacy copies are what GitHub Dependabot flags against this repo
+# (RUSTSEC-2026-0098, 0099, 0104 for rustls-webpki; RUSTSEC-2026-0258 for
+# h2). The modern stack is sufficient on its own — only the legacy
+# `.use_webpki_roots()` / `make_connector()` constructors need
+# `tls-rustls`, and nothing in this workspace calls them. Drop `rustls`
+# from each sdk crate's feature list and the legacy branch stops being
+# resolved.
+#
+# `aws-config` is left as `"1"` because its own `default` already excludes
+# the legacy feature (it has `default-https-client, rt-tokio,
+# credentials-process, sso` and no `rustls`).
 aws-config = "1"
 aws-credential-types = "1"
-aws-sdk-s3 = "1"
-aws-sdk-sqs = "1"
-aws-sdk-dynamodb = "1"
-aws-sdk-sesv2 = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-sdk-sqs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sesv2 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 # SMTP. Async over tokio, TLS over rustls — no native TLS, for the same reason
 # the Kafka client is pure Rust. No `pool`: a pooled transport's Drop wants a
 # tokio runtime and aborts without one, and a mailer's volume does not need a
