@@ -44,13 +44,29 @@ Each add-in is then reached through the framework's re-exports —
 `::oauth_server`, `::compat` — so an application has one dependency to keep
 in step, not ten.
 
-### Letting the build work it out
+### Sizing a build
 
-`cargo rainier features` reads your environment file and your source and
-prints the feature set the deployment needs — and it knows every add-in: a
-`use rainier_framework::billing::Stripe` asks for `billing-stripe`, a
-`compat::php::oauth` for `compat-php-oauth`, `TELEMETRY_ENABLED=true` for
-`telemetry`. See [`rainier-features`](../crates/rainier-features).
+`cargo rainier features` reads the deployment's environment file and prints
+the feature set to build with. Add-ins are **named**, not inferred, in
+`RAINIER_ADDINS`:
+
+```env
+# .env.build — read by the build, not by the running container
+RAINIER_ADDINS=accounts,two-factor,sso,billing-stripe
+```
+
+```sh
+cargo build --release --no-default-features --features "$(cargo rainier features --env .env.build --list)"
+```
+
+Why named: an application often keeps the code for an add-in behind its own
+`#[cfg(feature = ...)]`, so finding `billing::Stripe` in the source says
+nothing about whether this deployment bills. Inferring from text would build
+everything the repository *could* do — and an add-in that fails closed at boot
+without its keys, like the OAuth server without a signing key, would fail the
+deploy. An unknown name is reported rather than ignored. `TELEMETRY_ENABLED=true`
+still asks for `telemetry` on its own. See
+[`rainier-features`](../crates/rainier-features).
 
 ---
 

@@ -193,6 +193,26 @@ pub fn compute(env: &[(String, String)], sources: &str) -> Report {
         want(&mut report, "telemetry", "TELEMETRY_ENABLED=true".into());
     }
 
+    // The add-ins are named, never inferred. Each is a decision about what the
+    // product does — it bills, it issues tokens — and an application commonly
+    // keeps the code for one behind its own `#[cfg(feature = ...)]`, so the
+    // source mentioning an add-in says nothing about whether this deployment
+    // runs it. A text scan would switch on everything the repository could
+    // do, and an add-in that fails closed at boot without its keys (the OAuth
+    // server without a signing key, say) would then fail the deploy.
+    if let Some(list) = get("RAINIER_ADDINS") {
+        for name in list.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+            if ADDINS.contains(&name) {
+                want(&mut report, name, "RAINIER_ADDINS names it".into());
+            } else {
+                report.unforwarded.push(format!(
+                    "RAINIER_ADDINS names `{name}`, which is not an add-in — one of: {}",
+                    ADDINS.join(", ")
+                ));
+            }
+        }
+    }
+
     // --- compile-time choices, from the source -------------------------------
     //
     // Substring matches are crude and cheap, and a false positive costs one
@@ -213,56 +233,24 @@ pub fn compute(env: &[(String, String)], sources: &str) -> Report {
         want(&mut report, "http-client", "src/ uses the Http facade".into());
     }
 
-    // The add-ins. No variable selects them — an application either bills
-    // through Stripe or it does not — so the source is the only witness. The
-    // crate paths are the reliable signal; the type names catch a `use` that
-    // imported them through the framework's re-export.
-
-    if sources.contains("rainier_billing") || sources.contains("billing::Stripe") {
-        want(&mut report, "billing-stripe", "src/ uses the Stripe billing add-in".into());
-    }
-
-    if sources.contains("rainier_sso") || sources.contains("sso::") {
-        want(&mut report, "sso", "src/ uses the SSO add-in".into());
-    }
-
-    if sources.contains("rainier_accounts") || sources.contains("accounts::Accounts") {
-        want(&mut report, "accounts", "src/ mounts the accounts scaffolding".into());
-    }
-
-    if sources.contains("rainier_oauth_server") || sources.contains("oauth_server::") {
-        want(&mut report, "oauth-server", "src/ runs the OAuth server".into());
-    }
-
-    // Compat is per language, then per format: the narrower feature implies
-    // the wider one, so naming `php::oauth` is enough to get both.
-    if sources.contains("php::oauth") {
-        want(&mut report, "compat-php-oauth", "src/ reads a PHP OAuth server's tokens".into());
-    }
-    if sources.contains("php::webauthn") {
-        want(&mut report, "compat-php-webauthn", "src/ reads PHP-stored passkeys".into());
-    }
-    if sources.contains("rainier_compat") || sources.contains("compat::php") {
-        want(&mut report, "compat-php", "src/ reads formats a PHP application wrote".into());
-    }
-
-    if sources.contains("mfa::totp") || sources.contains("rainier_mfa::totp") {
-        want(&mut report, "two-factor", "src/ uses TOTP two-factor".into());
-    }
-    if sources.contains("mfa::webauthn") || sources.contains("rainier_mfa::webauthn") {
-        want(&mut report, "passkeys", "src/ uses passkeys".into());
-    }
-
-    if sources.contains("RequireCaptcha") || sources.contains("captcha::Captcha") {
-        want(&mut report, "captcha", "src/ verifies captcha tokens".into());
-    }
-
-    if sources.contains("DiscordChannel") {
-        want(&mut report, "notify-discord", "src/ notifies through Discord".into());
-    }
-
     report
 }
+
+/// The framework features `RAINIER_ADDINS` may name — the opt-in add-ins.
+pub const ADDINS: &[&str] = &[
+    "accounts",
+    "two-factor",
+    "passkeys",
+    "sso",
+    "billing-stripe",
+    "oauth-server",
+    "compat-php",
+    "compat-php-oauth",
+    "compat-php-webauthn",
+    "captcha",
+    "notify-discord",
+    "telemetry",
+];
 
 /// The environment file a sizing run should read — strictly.
 ///
@@ -393,41 +381,35 @@ mod tests {
     }
 
     #[test]
-    fn the_add_ins_are_found_in_the_source() {
-        let sources = [
-            "use rainier_framework::billing::Stripe;",
-            "use rainier_framework::sso::Sso;",
-            "accounts::Accounts::new(users)",
-            "use rainier_framework::oauth_server::AuthorizationServer;",
-            "use rainier_framework::compat::php::oauth::DefuseSealer;",
-            "use rainier_framework::compat::php::webauthn;",
-            "use rainier_framework::mfa::totp::Totp;",
-            "use rainier_framework::mfa::webauthn::RelyingParty;",
-            ".middleware(RequireCaptcha::new(captcha))",
-            "Channels::with::<DiscordChannel>()",
-        ]
-        .join(
-            "
-",
-        );
-        let report = compute(&[], &sources);
-
-        for feature in [
-            "billing-stripe",
-            "sso",
-            "accounts",
-            "oauth-server",
-            "compat-php",
-            "compat-php-oauth",
-            "compat-php-webauthn",
-            "two-factor",
-            "passkeys",
-            "captcha",
-            "notify-discord",
-        ] {
+    fn add_ins_come_from_the_environment_and_never_from_the_source() {
+        let report = compute(&env("RAINIER_ADDINS=accounts, two-factor,sso,,billing-stripe"), "");
+        for feature in ["accounts", "two-factor", "sso", "billing-stripe"] {
             assert!(report.features.contains(feature), "{feature} missing: {:?}", report.features);
         }
-        assert!(compute(&[], "fn main() {}").features.is_empty());
+
+        // Code an application keeps behind its own cfg names every add-in and
+        // must ask for none of them.
+        let gated = "#[cfg(feature = \"billing-stripe\")] use rainier_framework::billing::Stripe;
+                     #[cfg(feature = \"oauth-server\")] use rainier_framework::oauth_server::OAuthGuard;";
+        assert!(compute(&[], gated).features.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_add_in_is_named_rather_than_silently_dropped() {
+        let report = compute(&env("RAINIER_ADDINS=acounts"), "");
+        assert!(report.features.is_empty());
+        assert!(report.unforwarded[0].contains("`acounts`"), "{:?}", report.unforwarded);
+    }
+
+    #[test]
+    fn every_add_in_is_a_real_framework_feature() {
+        let manifest = include_str!("../../rainier-framework/Cargo.toml");
+        for name in ADDINS {
+            assert!(
+                manifest.lines().any(|line| line.starts_with(&format!("{name} = ["))),
+                "`{name}` is listed as an add-in but rainier-framework has no such feature"
+            );
+        }
     }
 
     #[test]

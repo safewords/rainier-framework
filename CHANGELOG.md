@@ -15,7 +15,7 @@ the release as a whole and names the crate it landed in.
 - **Add-ins: billing, single sign-on and account scaffolding**, three new
   optional crates, each behind one `rainier-framework` feature so an
   application that asks for none compiles none of them. `cargo rainier
-  features` finds each in an application's source.
+  features` builds the ones a deployment names in `RAINIER_ADDINS`.
   - **`rainier-billing`** (`billing-stripe`). A Stripe client over the
     framework's outbound HTTP port — customers, Checkout (payment,
     subscription and setup modes), the billing portal, subscriptions (swap,
