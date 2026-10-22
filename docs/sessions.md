@@ -125,10 +125,24 @@ let token = session.token();
 Minted on first use, then stable for the life of the session — rotating it per
 request would break every form a user has open in another tab.
 
-Rainier ships **no CSRF middleware**: a session app's strategy depends on how it
-renders forms, and the token-guard path does not need one. Put the token in a
-hidden field and compare it, or rely on
-[`SameSite`](responses.md#cookies), which is `Lax` by default.
+`VerifyCsrfToken` enforces it, after `StartSession`:
+
+```rust
+use rainier_session::csrf::VerifyCsrfToken;
+
+MiddlewareStack::new()
+    .push(StartSession::from_manager(&sessions))
+    .push(VerifyCsrfToken::new().except(["webhooks/*"]))
+```
+
+Reads (`GET`, `HEAD`, `OPTIONS`) pass. A write passes when the session's token
+matches the `_token` input, the `X-CSRF-TOKEN` header, or the `X-XSRF-TOKEN`
+header (the middleware sets an `XSRF-TOKEN` cookie for scripts to echo back),
+compared in constant time; a browser's `Sec-Fetch-Site: same-origin` also
+passes. Anything else is `419`, and so is a write with no session at all —
+failing closed when `StartSession` is missing. The token-guard path does not
+need any of this; [`SameSite`](responses.md#cookies) is `Lax` by default
+besides.
 
 ## Logging in
 

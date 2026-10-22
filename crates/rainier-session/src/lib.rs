@@ -89,6 +89,7 @@
 
 pub mod cache;
 pub mod cookie;
+pub mod csrf;
 pub mod database;
 pub mod driver;
 pub mod manager;
@@ -98,6 +99,7 @@ pub mod store;
 
 pub use cache::CacheSessionStore;
 pub use cookie::CookieSessionStore;
+pub use csrf::{PlainXsrf, VerifyCsrfToken, XsrfCodec};
 pub use database::{DatabaseSessionStore, SessionRow};
 pub use driver::SessionDriver;
 pub use manager::{SessionConfig, SessionManager};
