@@ -95,6 +95,12 @@ hyper.
 | `rainier-scheduler` | **cron** tasks, `without_overlapping`, `on_one_server` | container, cache |
 | `rainier-session` | session bag, stores, middleware | http, middleware, database, cache, crypt |
 | `rainier-orm` | one `#[derive(Entity)]` across SQLite, MySQL, Postgres and D1 | — |
+| `rainier-billing` | **Stripe**: customers, Checkout, subscriptions, verified **webhooks** — feature `billing-stripe` | http-client, events, cache |
+| `rainier-sso` | **OAuth 2.0 / OpenID Connect** sign-in, PKCE, ID-token verification — feature `sso` | http-client, session, auth, crypt |
+| `rainier-accounts` | **auth scaffolding**: register, login, reset, verify — feature `accounts` | auth, routing, mail, crypt |
+| `rainier-mfa` | **TOTP** two-factor, recovery codes, **WebAuthn passkeys** — features `two-factor`, `passkeys` | crypt |
+| `rainier-oauth-server` | an **OAuth 2.0 server**: grants, scopes, revocation, the guard — feature `oauth-server` | auth, session, crypt |
+| `rainier-compat` | **interop** with the stack you migrate from, by language — features `compat-php*` | session, cache, crypt |
 | `rainier-framework` | facades, bootstrap, built-in commands, the prelude | everything |
 
 A DAG with no cycles, and no component reaches sideways: `routing` does not know
@@ -391,6 +397,32 @@ cargo run -- migrate [--pretend]
 cargo run -- queue:work [--queue=mail] [--once]
 cargo run -- serve [--port=3000]
 ```
+
+## Add-ins
+
+Off unless you ask. Each is one feature, reached through the framework's
+re-exports, with a runnable example:
+
+```toml
+rainier-framework = { version = "2", features = ["accounts", "two-factor", "sso", "billing-stripe", "telemetry"] }
+```
+
+| Feature | What you get | Example |
+|---|---|---|
+| `accounts` | registration, login with lockout, password reset, email verification — routes you mount | `accounts` |
+| `two-factor`, `passkeys` | TOTP + recovery codes, WebAuthn; the login challenge when `accounts` is on | `two_factor` |
+| `sso` | sign in with GitHub, Google, Microsoft, GitLab, Discord, X or any OIDC issuer | `sso_login` |
+| `billing-stripe` | Stripe Checkout, portal, subscriptions, verified webhooks as events | `billing_stripe` |
+| `oauth-server` | issue OAuth 2.0 tokens; accept them with `OAuthGuard` | `oauth_server` |
+| `compat-php*` | run beside a PHP application: its sessions, cookies, cache, CSRF, OAuth tokens, passkeys | `compat_php` |
+| `telemetry` | a span for every request, query, job and cache call; queue metrics — zero code | `telemetry` |
+| `captcha`, `notify-discord` | server-side captcha checks; a Discord channel | `captcha`, `notify_discord` |
+
+```sh
+cargo run -p rainier-framework --example accounts --features accounts
+```
+
+[Choosing add-ins](docs/add-ins.md) has the whole table and how they compose.
 
 ## Design positions
 

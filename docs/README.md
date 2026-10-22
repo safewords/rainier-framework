@@ -86,6 +86,30 @@ rights in their names or marks.
 | [Hashing](hashing.md) | Argon2id, the timing side channel a login has, and reading hashes you inherited |
 | [Encryption](encryption.md) | `Crypt`, signing, key rotation, JWTs and a JWKS |
 | [Sessions](sessions.md) | The bag, flash data, drivers, and session fixation |
+| [Human Checks](captcha.md) | Turnstile, hCaptcha and reCAPTCHA tokens verified server-side; failing closed |
+
+## Add-ins
+
+Optional crates and modules, each behind a feature of `rainier-framework`. An
+application that does not ask for one compiles none of it. Start with
+[Choosing add-ins](add-ins.md) — one table of every feature, what it pulls in,
+and the runnable example for each.
+
+| Page | Feature | What it covers | Example |
+|---|---|---|---|
+| [Billing](billing.md) | `billing-stripe` | Stripe customers, Checkout, the billing portal, subscriptions, payment intents, refunds, verified webhooks on the event bus | `billing_stripe` |
+| [Single Sign-On](sso.md) | `sso` | "Sign in with …" — GitHub, Google, Microsoft, GitLab, Discord, X, any OpenID Connect issuer; PKCE, state, nonce, ID-token verification, account linking | `sso_login` |
+| [Accounts](accounts.md) | `accounts` | Registration, login with lockout, logout, password reset, email verification, password confirmation — routes you mount | `accounts` |
+| [Two-Factor and Passkeys](two-factor.md) | `two-factor`, `passkeys` | TOTP with replay protection and recovery codes; WebAuthn passkeys; the login challenge when `accounts` is on | `two_factor` |
+| [OAuth Server](oauth-server.md) | `oauth-server` | Issuing tokens: authorization code with PKCE, refresh rotation, client credentials, password, personal access tokens, scopes, revocation, and the guard that accepts them | `oauth_server` |
+| [Compatibility](compat.md) | `compat-php`, `compat-php-oauth`, `compat-php-webauthn` | Running beside the stack you are migrating from: its serialization, encrypted cookies, sessions, cache, CSRF tokens, OAuth tokens and passkeys | `compat_php` |
+| [Passive instrumentation](observability.md#passive-instrumentation) | `telemetry` | A span for every request, query, cache call, job, mail and event; queue wait and throughput metrics; trace context across HTTP and the queue — no application code | `telemetry` |
+| [Human Checks](captcha.md) | `captcha` | Turnstile, hCaptcha and reCAPTCHA tokens verified server-side | `captcha` |
+| [Notifications: Discord](notifications.md#discord) | `notify-discord` | A Discord channel, by webhook or bot | `notify_discord` |
+| [Impersonation](authentication.md#impersonation) | — | Acting as another user, with a policy, and routes it is refused on | `impersonation` |
+
+Run any example with `cargo run -p rainier-framework --example <name>
+--features <feature>`.
 
 ## Database
 
@@ -196,6 +220,10 @@ concept as you know it, and where it lives here.
 | a signed route | [`SignedUrls::route`](urls.md#signed-urls) |
 | validating a signed link | [`ValidateSignature::resolved()`](urls.md#signed-urls) |
 | password confirmation | [`ConfirmPassword::within(..)`](authentication.md#password-confirmation) |
+| subscription billing, a billable model, Stripe webhooks | [`rainier_billing`](billing.md) — feature `billing-stripe` |
+| "sign in with GitHub", a social login driver | [`Sso::driver("github")`](sso.md) — feature `sso` |
+| headless registration / login / reset routes | [`Accounts`](accounts.md) — feature `accounts` |
+| the `verified` middleware | [`EnsureEmailIsVerified`](accounts.md) |
 | token abilities | [`Abilities` + `RequireAbility`](authentication.md#token-abilities) |
 | throttling keyed by input | [`.keyed_by(..).named(..)`](middleware.md#throttlerequests) |
 | a model factory | [`User::factory()`](testing.md#factories) |
@@ -228,8 +256,7 @@ Deliberate gaps, so you do not go looking:
 | Lazy relationship loading | [not possible without `__get`](relationships.md#why-loading-is-a-call-and-not-a-property) |
 | `has_many_through`, polymorphic | [two loads and a `where_in`](relationships.md#what-is-not-here) |
 | Queued notifications | [queue the job that sends one](notifications.md#what-is-not-here) |
-| Password reset, email verification | build from [the auth pieces](authentication.md#what-is-not-here) |
-| CSRF middleware | [see the note](authentication.md#what-is-not-here) |
+| SAML single sign-on | not shipped — [OpenID Connect](sso.md) covers the same identity providers |
 | A fillable allow-list | falls out of the rules — [Validation](validation.md#mass-assignment) |
 
 ## Design positions

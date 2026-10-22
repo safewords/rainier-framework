@@ -12,6 +12,100 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Add-ins: billing, single sign-on and account scaffolding**, three new
+  optional crates, each behind one `rainier-framework` feature so an
+  application that asks for none compiles none of them. `cargo rainier
+  features` finds each in an application's source.
+  - **`rainier-billing`** (`billing-stripe`). A Stripe client over the
+    framework's outbound HTTP port — customers, Checkout (payment,
+    subscription and setup modes), the billing portal, subscriptions (swap,
+    quantity, cancel now or at period end, resume, pause), payment and setup
+    intents, refunds, invoices, prices and products, and auto-pagination.
+    Every POST carries an `Idempotency-Key`, every call a pinned
+    `Stripe-Version`; a refusal surfaces as a typed `StripeError`, with 429 and
+    5xx reported as retryable. Webhooks are verified (`Stripe-Signature`,
+    constant-time, tolerance checked after the signature, secret rotation),
+    deduplicated by event id through the cache, and dispatched onto the event
+    bus as `StripeEventReceived` plus eleven typed events; a failing listener
+    answers 500 and releases the claim, so Stripe's retry is processed.
+    `SubscriptionSnapshot` gives the subscription predicates (`valid`, `on_trial`,
+    `on_grace_period`, …) and `Billable` the customer helpers. Tested against
+    the HTTP fake; see `docs/billing.md`.
+  - **`rainier-sso`** (`sso`). OAuth 2.0 and OpenID Connect sign-in — GitHub
+    (and Enterprise), GitLab (self-hosted), Discord, Google, Microsoft Entra
+    ID, and any OIDC issuer by discovery. PKCE always, state and nonce held in
+    the session and spent on the first callback, ID tokens verified against
+    the issuer's JWKS (`iss`, `aud`, `azp`, `exp`, `nonce`, one refetch on an
+    unknown `kid`). `login_with` finds, links or creates the user and logs them
+    in, and refuses to link an existing account by email unless the provider
+    says the address is verified. Providers are declared in configuration and
+    resolved with `Sso::driver("github")`. See `docs/sso.md`.
+  - **`rainier-accounts`** (`accounts`). Registration, login, logout,
+    password reset, email verification, password confirmation and password
+    change, mounted with `accounts.routes(router)` and switched per flow by
+    `Features`. Login is throttled per address and IP and costs the same for
+    an unknown address as a wrong password; `/forgot-password` answers
+    identically for every address and delivers the link off the request so
+    its latency cannot be timed; reset tokens are stored hashed, single-use and
+    expire by cache TTL; verification links are signed and bound to the
+    address they were sent to. `EnsureEmailIsVerified` guards routes. Every
+    flow raises an event. See `docs/accounts.md`.
+- **More add-ins**, on the same terms — each behind its own feature, each with
+  a runnable example in `crates/rainier-framework/examples/`, and an overview
+  of all of them in `docs/add-ins.md`.
+  - **`rainier-oauth-server`** (`oauth-server`). An OAuth 2.0 authorization
+    server: authorization code with PKCE (required for public clients),
+    refresh with rotation, client credentials, password (opt-in), personal
+    access tokens, scopes, RFC 7009 revocation and purging. RS256 access
+    tokens; refresh tokens and codes sealed through a `TokenSealer` port
+    (Rainier's own encrypter by default). A code or refresh token is spent
+    before tokens are issued, so a raced request yields one set. `OAuthGuard`
+    accepts the tokens on API routes, with scopes arriving as `Abilities`.
+    See `docs/oauth-server.md`.
+  - **`rainier-mfa`** (`two-factor`, `passkeys`). RFC 6238 TOTP (SHA-1/256/512,
+    replay-protected, pinned by the RFC vectors), single-use recovery codes,
+    and a WebAuthn relying party in pure Rust — ES256, EdDSA and RS256, `none`
+    and `packed` attestation, sign-count regression refused — verified against
+    published browser vectors. With `accounts` on, the login gains the
+    two-factor challenge (throttled; each code step claimed atomically) and
+    enrolment, recovery and passkey routes. See `docs/two-factor.md`.
+  - **`rainier-compat`** (`compat-php`, `compat-php-oauth`,
+    `compat-php-webauthn`). Interoperating with the stack an application is
+    migrating from, grouped by language: PHP `serialize`/`unserialize` (never
+    instantiating anything), defuse ciphertexts, encrypted cookies, sessions
+    adopted on first touch or shared in coexist mode, cache values and tagged
+    keys, CSRF tokens, queue payloads, OAuth tokens and tables written by
+    league/oauth2-server, and passkey credentials written by
+    web-auth/webauthn-lib. Fixture tools export real values from the other
+    application, and an ignored test suite checks every reader against them.
+    See `docs/compat.md`.
+  - **Passive instrumentation** (`telemetry`). Every component gains a
+    `telemetry` feature; the framework's turns them all on with the OTLP
+    exporter, and `TELEMETRY_ENABLED=true` plus `OTEL_EXPORTER_OTLP_ENDPOINT`
+    is the whole configuration. Spans follow OpenTelemetry semantic
+    conventions for requests, outbound HTTP (injecting `traceparent`),
+    queries (statement text, never bound values), cache, storage, jobs, mail,
+    notifications, events, broadcasts, sockets, scheduled tasks, commands,
+    sessions, logins and views; the trace continues from a dispatch into the
+    worker that runs the job. Queue performance is first-class: wait time from
+    when a job became runnable, per-phase timings, outcomes, and
+    `queue_job_*` metrics with depth sampled off the hot path;
+    `WORKER_METRICS_ADDRESS` serves a worker's `/metrics`. With the feature
+    off, no span code is compiled. See `docs/observability.md`.
+  - **CSRF protection** (`rainier-session`). `VerifyCsrfToken`: the session
+    token against `_token`, `X-CSRF-TOKEN` or `X-XSRF-TOKEN`, `Sec-Fetch-Site`
+    honoured, an except-list, `419` on mismatch, and failing closed without a
+    session. See `docs/sessions.md#the-csrf-token`.
+  - **Impersonation** (`rainier-auth`). `Impersonation` with a mandatory
+    policy, refusing nested and self-impersonation, rotating the session on
+    both transitions, and `ForbidImpersonation` for routes it must not reach.
+  - **Captcha verification** (`captcha`). Turnstile, hCaptcha and reCAPTCHA
+    tokens verified server-side, failing closed, with `RequireCaptcha`
+    middleware. See `docs/captcha.md`.
+  - **A Discord notification channel** (`notify-discord`), by webhook or bot,
+    with embeds, mentions off by default, and routes validated before use.
+  - **X sign-in** (`sso`), as the `x` driver.
+
 - **General SQL expressions** (`rainier-database`). `expression::Expression`
   and `Predicate`: columns, bound values, portable functions (`LOWER`,
   `COALESCE`, `NULLIF`, `GREATEST`, `CONCAT`, …), arithmetic, `CAST`, `CASE`,
@@ -145,6 +239,21 @@ the release as a whole and names the crate it landed in.
   pinned in the tests.
 
 ### Changed
+
+- **`QueuedJob` gains `traceparent: Option<String>`** (`rainier-queue`), the
+  trace context a dispatch stamps for the worker to continue. Serialised only
+  when present and defaulted when absent, so envelopes written before it read
+  unchanged. Code that builds a `QueuedJob` with a struct literal — usually a
+  test helper — adds `traceparent: None`.
+- **The `Trace` middleware no longer holds its span across an `.await`**,
+  which could attribute one request's log lines to another; it instruments
+  the request future instead.
+- **Dependencies refreshed** (lockfile only): hyper 1.12, tokio 1.54,
+  rustls 0.23.46, rustls-webpki 0.103.16, opentelemetry 0.33.1, the
+  aws-smithy stack, and smaller ecosystem bumps. No manifest ranges changed.
+- **The authentication docs no longer list password reset, email
+  verification and OAuth as missing** — they are the `accounts` and `sso`
+  add-ins.
 
 - **The minimum supported Rust version is 1.89**, up from 1.88. `aes` 0.9,
   which the RustCrypto generation `rainier-crypt` now builds on, declares 1.89,

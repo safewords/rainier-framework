@@ -483,15 +483,90 @@ An authenticator app's code is derived from a shared secret and a clock, is
 never issued and is never consumed. That is a library — `totp-rs` is a good
 one — and not a framework concern.
 
+## Impersonation
+
+Support staff seeing exactly what a customer sees. For the duration, every
+request in that session **is** the customer to every guard and policy, so the
+defaults are conservative. No feature flag — it is part of `rainier-auth`.
+
+> **Run it:** `cargo run -p rainier-framework --example impersonation` — an
+> admin takes a customer's identity, `/billing` refuses, leaving restores the
+> admin, and the policy refuses the rest, through a real router and session
+> cookie ([`examples/impersonation.rs`](../crates/rainier-framework/examples/impersonation.rs)).
+
+The complete wiring:
+
+```rust
+use std::sync::Arc;
+use rainier_framework::auth::{
+    impersonator_id, ForbidImpersonation, Guard, Impersonation, SessionGuard,
+};
+
+// bootstrap.rs — the policy is the constructor's argument: admins only, and
+// never another admin. The hooks are the audit trail.
+let impersonation = Arc::new(
+    Impersonation::new(|staff: &User, target: &User| staff.is_admin && !target.is_admin)
+        .on_taken(|staff, target| tracing::warn!(staff, target, "impersonation started"))
+        .on_left(|staff, target| tracing::warn!(staff, target, "impersonation ended")),
+);
+
+// app/http/controllers/support.rs
+async fn impersonate(request: Req, Bound(target): Bound<User>) -> Result<Response> {
+    let staff = guard.user(&request).await?.ok_or_else(|| Error::unauthenticated("log in"))?;
+    impersonation.take(&request, &staff, &target)?;      // 403 / 409 / 401 on refusal
+    Ok(Redirect::see_other("/").into_response())
+}
+
+async fn leave(request: Req) -> Result<Response> {
+    impersonation.leave(&request)?;                       // back to the staff member
+    Ok(Redirect::see_other("/support").into_response())
+}
+
+// routes/web.rs — inside the group that runs StartSession and auth
+router.post("/support/users/{user}/impersonate", impersonate);
+router.post("/support/impersonation/leave", leave);
+
+// Anything acting *with* the customer's authority.
+router.put("/user/password", update_password).middleware(ForbidImpersonation);
+router.get("/billing", billing).middleware(ForbidImpersonation);
+
+// A layout's "you are viewing as …" banner.
+let banner = impersonator_id(&request).map(|staff| format!("Viewing as {} (staff {staff})", user.name));
+```
+
+- **There is no allow-everyone default** — the policy is the constructor's
+  argument.
+- **Refused:** impersonating yourself; nesting (a second identity on top of the
+  first would make `leave` restore the wrong person); taking it from a session
+  not logged in as the impersonator.
+- **The session id rotates** on taking and on leaving, as on login.
+- **It does not audit.** `on_taken` and `on_left` are where an application
+  records who looked at whose account — somebody will ask.
+- **`ForbidImpersonation`** answers 403 on routes that act *with* the
+  customer's authority: password and email changes, payment methods, API
+  tokens, deleting the account.
+
+`is_impersonating(&request)` and `impersonator_id(&request)` let a layout show
+the "you are viewing as …" banner.
+
 ## What is not here
 
-**No password reset flow, no email verification, no OAuth.** Those are
-application concerns built from these pieces — and 1.1.0 made the pieces the
-right size: a reset is a [signed link](urls.md#signed-urls) or a
-[challenge](#challenges), a verification is a signed link, and both used to
-mean a token table with a sweep job. What is left is the part that differs per
-application: the copy, the routes and the policy.
+**Password reset, email verification and OAuth are add-ins, not this crate.**
+They are built from these pieces — a reset is a hashed token in the cache, a
+verification is a [signed link](urls.md#signed-urls) — and they live in their
+own optional crates so an application that does neither compiles neither:
 
-**No CSRF middleware.** The token-guard path does not need it, and a session
-app's CSRF strategy depends on how it renders forms. `SameSite::Lax` is the
-[cookie default](responses.md#cookies), which handles the common case.
+- [Accounts](accounts.md) (`accounts` feature): registration, login with
+  lockout, logout, password reset, email verification, password confirmation.
+- [Single Sign-On](sso.md) (`sso` feature): OAuth 2.0 and OpenID Connect
+  providers, and linking a provider identity to a user.
+
+Use them, or build your own from the same pieces when your policy differs —
+nothing in this crate depends on them.
+
+**CSRF is a session concern, so it lives in `rainier-session`.**
+[`VerifyCsrfToken`](sessions.md) checks the session's `_token` against the
+`_token` input or the `X-CSRF-TOKEN` / `X-XSRF-TOKEN` headers, honours
+`Sec-Fetch-Site`, and answers `419` on a mismatch; the token-guard path does
+not need it. `SameSite::Lax` remains the [cookie default](responses.md#cookies).
+Accepting tokens a PHP application issued is [compat](compat.md).
