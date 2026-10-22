@@ -45,6 +45,7 @@ pub mod challenge;
 pub mod confirm;
 pub mod gate;
 pub mod guard;
+pub mod impersonate;
 pub mod middleware;
 pub mod session;
 pub mod user;
@@ -62,6 +63,9 @@ pub use challenge::Challenges;
 pub use confirm::{confirm_password, ConfirmPassword};
 pub use gate::{Actor, Gate};
 pub use guard::{AuthManager, Guard, GuardExt, SessionGuard, StatefulGuard, TokenGuard};
+pub use impersonate::{
+    impersonator_id, is_impersonating, ForbidImpersonation, Impersonation, IMPERSONATOR_KEY,
+};
 pub use middleware::{
     AbilitiesRequestExt, Authenticate, AuthenticatedUser, RedirectIfAuthenticated, RequireAbility,
     TokenAbilities,
