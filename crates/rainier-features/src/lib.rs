@@ -186,6 +186,13 @@ pub fn compute(env: &[(String, String)], sources: &str) -> Report {
         want(&mut report, "s3", "STORAGE_DRIVER=s3".into());
     }
 
+    // A deployment that asks for traces needs the spans compiled in: without
+    // the feature, `TELEMETRY_ENABLED` still propagates trace ids but no
+    // component opens a span and nothing reaches a collector.
+    if get("TELEMETRY_ENABLED").is_some_and(|on| on == "true" || on == "1") {
+        want(&mut report, "telemetry", "TELEMETRY_ENABLED=true".into());
+    }
+
     // --- compile-time choices, from the source -------------------------------
     //
     // Substring matches are crude and cheap, and a false positive costs one
@@ -204,6 +211,54 @@ pub fn compute(env: &[(String, String)], sources: &str) -> Report {
 
     if sources.contains("Http::") || sources.contains("ReqwestTransport") {
         want(&mut report, "http-client", "src/ uses the Http facade".into());
+    }
+
+    // The add-ins. No variable selects them — an application either bills
+    // through Stripe or it does not — so the source is the only witness. The
+    // crate paths are the reliable signal; the type names catch a `use` that
+    // imported them through the framework's re-export.
+
+    if sources.contains("rainier_billing") || sources.contains("billing::Stripe") {
+        want(&mut report, "billing-stripe", "src/ uses the Stripe billing add-in".into());
+    }
+
+    if sources.contains("rainier_sso") || sources.contains("sso::") {
+        want(&mut report, "sso", "src/ uses the SSO add-in".into());
+    }
+
+    if sources.contains("rainier_accounts") || sources.contains("accounts::Accounts") {
+        want(&mut report, "accounts", "src/ mounts the accounts scaffolding".into());
+    }
+
+    if sources.contains("rainier_oauth_server") || sources.contains("oauth_server::") {
+        want(&mut report, "oauth-server", "src/ runs the OAuth server".into());
+    }
+
+    // Compat is per language, then per format: the narrower feature implies
+    // the wider one, so naming `php::oauth` is enough to get both.
+    if sources.contains("php::oauth") {
+        want(&mut report, "compat-php-oauth", "src/ reads a PHP OAuth server's tokens".into());
+    }
+    if sources.contains("php::webauthn") {
+        want(&mut report, "compat-php-webauthn", "src/ reads PHP-stored passkeys".into());
+    }
+    if sources.contains("rainier_compat") || sources.contains("compat::php") {
+        want(&mut report, "compat-php", "src/ reads formats a PHP application wrote".into());
+    }
+
+    if sources.contains("mfa::totp") || sources.contains("rainier_mfa::totp") {
+        want(&mut report, "two-factor", "src/ uses TOTP two-factor".into());
+    }
+    if sources.contains("mfa::webauthn") || sources.contains("rainier_mfa::webauthn") {
+        want(&mut report, "passkeys", "src/ uses passkeys".into());
+    }
+
+    if sources.contains("RequireCaptcha") || sources.contains("captcha::Captcha") {
+        want(&mut report, "captcha", "src/ verifies captcha tokens".into());
+    }
+
+    if sources.contains("DiscordChannel") {
+        want(&mut report, "notify-discord", "src/ notifies through Discord".into());
     }
 
     report
@@ -328,6 +383,51 @@ mod tests {
 
         assert!(report.features.contains("jwt"));
         assert!(report.features.contains("http-client"));
+    }
+
+    #[test]
+    fn asking_for_traces_builds_the_spans_in() {
+        assert!(computed("TELEMETRY_ENABLED=true").features.contains("telemetry"));
+        assert!(computed("TELEMETRY_ENABLED=1").features.contains("telemetry"));
+        assert!(!computed("TELEMETRY_ENABLED=false").features.contains("telemetry"));
+    }
+
+    #[test]
+    fn the_add_ins_are_found_in_the_source() {
+        let sources = [
+            "use rainier_framework::billing::Stripe;",
+            "use rainier_framework::sso::Sso;",
+            "accounts::Accounts::new(users)",
+            "use rainier_framework::oauth_server::AuthorizationServer;",
+            "use rainier_framework::compat::php::oauth::DefuseSealer;",
+            "use rainier_framework::compat::php::webauthn;",
+            "use rainier_framework::mfa::totp::Totp;",
+            "use rainier_framework::mfa::webauthn::RelyingParty;",
+            ".middleware(RequireCaptcha::new(captcha))",
+            "Channels::with::<DiscordChannel>()",
+        ]
+        .join(
+            "
+",
+        );
+        let report = compute(&[], &sources);
+
+        for feature in [
+            "billing-stripe",
+            "sso",
+            "accounts",
+            "oauth-server",
+            "compat-php",
+            "compat-php-oauth",
+            "compat-php-webauthn",
+            "two-factor",
+            "passkeys",
+            "captcha",
+            "notify-discord",
+        ] {
+            assert!(report.features.contains(feature), "{feature} missing: {:?}", report.features);
+        }
+        assert!(compute(&[], "fn main() {}").features.is_empty());
     }
 
     #[test]
