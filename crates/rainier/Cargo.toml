@@ -31,6 +31,7 @@ sqs = ["rainier-framework/sqs"]
 telemetry = ["rainier-framework/telemetry"]
 billing-stripe = ["rainier-framework/billing-stripe"]
 sso = ["rainier-framework/sso"]
+accounts = ["rainier-framework/accounts"]
 two-factor = ["rainier-framework/two-factor"]
 passkeys = ["rainier-framework/passkeys"]
 

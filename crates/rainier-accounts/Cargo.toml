@@ -1,0 +1,57 @@
+[package]
+name = "rainier-accounts"
+description = "Authentication scaffolding for Rainier: registration, login, logout, password reset, email verification and password confirmation, as routes you mount."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["auth", "registration", "password-reset", "email-verification", "rainier"]
+categories = ["web-programming", "authentication"]
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-http = { workspace = true }
+rainier-routing = { workspace = true }
+rainier-middleware = { workspace = true }
+rainier-validation = { workspace = true }
+rainier-session = { workspace = true }
+rainier-auth = { workspace = true }
+rainier-cache = { workspace = true }
+rainier-crypt = { workspace = true }
+rainier-events = { workspace = true }
+rainier-mail = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+tracing = { workspace = true }
+# Only to put a reset link's delivery on a detached task — see
+# `Accounts::deliver_links_inline`.
+tokio = { version = "1", default-features = false, features = ["rt"] }
+# The second factor — TOTP and recovery codes, and passkeys — each behind its
+# own feature, so an application that turns neither on compiles neither.
+rainier-mfa = { workspace = true, optional = true }
+
+[features]
+default = []
+# A TOTP challenge after a right password, recovery codes, and the routes that
+# enable, confirm and disable it.
+two-factor = ["dep:rainier-mfa", "rainier-mfa/totp"]
+# Passkey sign-in and registration.
+passkeys = ["dep:rainier-mfa", "rainier-mfa/passkeys"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+# Compiling the routes into a router needs a container, and the fake mailer
+# needs a view engine — neither is something the crate itself holds.
+rainier-container = { workspace = true }
+rainier-view = { workspace = true }
+
+[lints]
+workspace = true

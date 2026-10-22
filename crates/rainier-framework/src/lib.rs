@@ -156,6 +156,8 @@ pub use testing::{TestApp, TestResponse};
 
 // --- the components, re-exported under short names -------------------------
 
+#[cfg(feature = "accounts")]
+pub use rainier_accounts as accounts;
 pub use rainier_auth as auth;
 #[cfg(feature = "billing-stripe")]
 pub use rainier_billing as billing;

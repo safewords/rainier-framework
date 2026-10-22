@@ -3713,6 +3713,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "rainier-accounts"
+version = "2.0.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "rainier-auth",
+ "rainier-cache",
+ "rainier-container",
+ "rainier-crypt",
+ "rainier-events",
+ "rainier-http",
+ "rainier-mail",
+ "rainier-mfa",
+ "rainier-middleware",
+ "rainier-routing",
+ "rainier-session",
+ "rainier-support",
+ "rainier-validation",
+ "rainier-view",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "subtle",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rainier-auth"
 version = "2.0.0"
 dependencies = [
@@ -3953,6 +3983,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "percent-encoding",
+ "rainier-accounts",
  "rainier-auth",
  "rainier-billing",
  "rainier-broadcast",
