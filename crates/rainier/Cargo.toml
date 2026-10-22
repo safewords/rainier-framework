@@ -38,6 +38,7 @@ compat-php-oauth = ["rainier-framework/compat-php-oauth"]
 compat-php-webauthn = ["rainier-framework/compat-php-webauthn"]
 two-factor = ["rainier-framework/two-factor"]
 passkeys = ["rainier-framework/passkeys"]
+captcha = ["rainier-framework/captcha"]
 notify-discord = ["rainier-framework/notify-discord"]
 
 [package.metadata.docs.rs]

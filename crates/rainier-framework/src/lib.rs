@@ -113,6 +113,8 @@
 pub mod binding;
 pub mod bootstrap;
 pub mod broadcasting;
+#[cfg(feature = "captcha")]
+pub mod captcha;
 pub mod commands;
 pub mod cors;
 pub mod facades;
@@ -140,6 +142,8 @@ pub mod signed;
 pub mod testing;
 
 pub use bootstrap::Rainier;
+#[cfg(feature = "captcha")]
+pub use captcha::{Captcha, CaptchaProvider, RequireCaptcha, Verdict};
 pub use commands::{
     console, KeyGenerateCommand, MigrateCommand, MigrateRollbackCommand, QueueWorkCommand,
     RouteListCommand, ServeCommand,

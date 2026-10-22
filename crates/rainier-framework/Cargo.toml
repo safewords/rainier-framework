@@ -193,6 +193,9 @@ compat-php-webauthn = ["compat-php", "passkeys", "rainier-compat/php-webauthn"]
 two-factor = ["dep:rainier-mfa", "rainier-mfa/totp", "rainier-accounts?/two-factor"]
 # WebAuthn passkeys.
 passkeys = ["dep:rainier-mfa", "rainier-mfa/passkeys", "rainier-accounts?/passkeys"]
+# Human checks on a form: Cloudflare Turnstile, hCaptcha or reCAPTCHA tokens
+# verified server-side, and the `RequireCaptcha` middleware. See `captcha`.
+captcha = ["http-client"]
 # Notifications posted to Discord, by webhook or as a bot.
 notify-discord = ["rainier-notify/discord", "http-client"]
 
