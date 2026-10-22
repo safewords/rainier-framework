@@ -31,6 +31,10 @@ rainier-server = { workspace = true }
 # crate also depends on, so there is no cycle.
 rainier-debug = { workspace = true, optional = true }
 rainier-console = { workspace = true }
+# The add-ins. Each is optional and behind its own feature, because "we bill
+# through Stripe" and "we let people sign in with GitHub" are facts about one
+# application, and every other application should compile none of it.
+rainier-billing = { workspace = true, optional = true }
 rainier-cache = { workspace = true }
 rainier-crypt = { workspace = true }
 rainier-drivers = { workspace = true }
@@ -153,6 +157,10 @@ telemetry = [
     "rainier-auth/telemetry",
     "rainier-view/telemetry",
 ]
+# Stripe: customers, Checkout, the billing portal, subscriptions, payment
+# intents and refunds over the framework's outbound client, plus verified,
+# deduplicated webhooks dispatched onto the event bus. See `rainier_billing`.
+billing-stripe = ["dep:rainier-billing", "http-client"]
 
 # docs.rs builds with default features, which for this crate is the wasm-safe
 # set — so half the API would be missing from the rendered documentation.

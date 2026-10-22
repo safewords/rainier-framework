@@ -157,6 +157,8 @@ pub use testing::{TestApp, TestResponse};
 // --- the components, re-exported under short names -------------------------
 
 pub use rainier_auth as auth;
+#[cfg(feature = "billing-stripe")]
+pub use rainier_billing as billing;
 pub use rainier_broadcast as broadcast;
 pub use rainier_cache as cache;
 pub use rainier_config as config;

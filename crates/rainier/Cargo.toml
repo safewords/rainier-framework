@@ -29,6 +29,7 @@ memcached = ["rainier-framework/memcached"]
 s3 = ["rainier-framework/s3"]
 sqs = ["rainier-framework/sqs"]
 telemetry = ["rainier-framework/telemetry"]
+billing-stripe = ["rainier-framework/billing-stripe"]
 
 [package.metadata.docs.rs]
 all-features = true

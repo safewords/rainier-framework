@@ -3735,6 +3735,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rainier-billing"
+version = "2.0.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "form_urlencoded",
+ "hmac 0.13.0",
+ "rainier-cache",
+ "rainier-events",
+ "rainier-http",
+ "rainier-http-client",
+ "rainier-support",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "subtle",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rainier-broadcast"
 version = "2.0.0"
 dependencies = [
@@ -3932,6 +3954,7 @@ dependencies = [
  "futures-util",
  "percent-encoding",
  "rainier-auth",
+ "rainier-billing",
  "rainier-broadcast",
  "rainier-cache",
  "rainier-config",

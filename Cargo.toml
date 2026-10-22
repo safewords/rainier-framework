@@ -35,6 +35,7 @@ members = [
     "crates/rainier-orm-macros",
     "crates/rainier-features",
     "crates/rainier-debug",
+    "crates/rainier-billing",
     "crates/cargo-rainier",
 ]
 
@@ -87,6 +88,7 @@ rainier-orm = { path = "crates/rainier-orm", version = "2.0.0" }
 rainier-orm-macros = { path = "crates/rainier-orm-macros", version = "2.0.0" }
 rainier-features = { path = "crates/rainier-features", version = "2.0.0" }
 rainier-framework = { path = "crates/rainier-framework", version = "2.0.0" }
+rainier-billing = { path = "crates/rainier-billing", version = "2.0.0" }
 
 # --- third party ------------------------------------------------------------
 anyhow = "1"

@@ -1,0 +1,37 @@
+[package]
+name = "rainier-billing"
+description = "Billing for Rainier: a Stripe client over the framework's HTTP port, verified webhooks, and subscription state."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["stripe", "billing", "subscriptions", "payments", "rainier"]
+categories = ["web-programming", "api-bindings"]
+
+[dependencies]
+rainier-support = { workspace = true }
+# The HTTP transport port and its fake — NOT the reqwest socket, which the
+# framework's `http-client` feature turns on. Every Stripe call is a request
+# shape, and a test asserts on the shape without a network.
+rainier-http-client = { workspace = true }
+rainier-http = { workspace = true }
+rainier-events = { workspace = true }
+rainier-cache = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+form_urlencoded = { workspace = true }
+hmac = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true
