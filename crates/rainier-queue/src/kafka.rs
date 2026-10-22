@@ -662,6 +662,7 @@ mod tests {
             created_at: Utc::now(),
             unique_key: None,
             delivery_handle: None,
+            traceparent: None,
         }
     }
 

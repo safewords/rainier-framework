@@ -48,6 +48,9 @@ postmark = ["dep:rainier-http-client"]
 mailgun = ["dep:rainier-http-client"]
 sendgrid = ["dep:rainier-http-client"]
 resend = ["dep:rainier-http-client"]
+# A `mail.send` span per delivery: the transport and how many recipients,
+# never who. See `Mailer::deliver`.
+telemetry = ["rainier-support/telemetry"]
 
 # docs.rs builds with default features, which would hide every real transport.
 [package.metadata.docs.rs]

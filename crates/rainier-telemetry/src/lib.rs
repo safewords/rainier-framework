@@ -37,6 +37,7 @@
 pub mod context;
 pub mod logging;
 pub mod middleware;
+pub mod propagation;
 
 #[cfg(feature = "otlp")]
 pub mod otlp;

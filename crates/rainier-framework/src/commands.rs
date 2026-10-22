@@ -579,6 +579,14 @@ impl Command for QueueWorkCommand {
                 worker = worker.with_events(events);
             }
 
+            // Job timings, wait, outcomes and sampled depth, into the
+            // application's registry — when it bound one.
+            #[cfg(feature = "telemetry")]
+            if let Ok(metrics) = app.resolve::<rainier_metrics::Metrics>() {
+                worker = worker
+                    .with_observer(Arc::new(crate::instrumentation::QueueMetrics::new(metrics)));
+            }
+
             // Opt-in Kubernetes job runner. If the application bound a
             // `KubernetesDispatcher` in the container at boot — see
             // `rainier_queue::KubernetesDispatcher::try_in_cluster` — the
@@ -636,6 +644,32 @@ impl Command for QueueWorkCommand {
         // **Every** pool is signalled, or a shutdown would stop one worker and
         // leave the others reserving — the pod would still sit out its grace
         // period, which is the failure this exists to prevent.
+        // A worker has no HTTP server, so nothing would ever scrape the
+        // registry its jobs are recorded into. `WORKER_METRICS_ADDRESS` gives
+        // it the one route it needs.
+        #[cfg(feature = "telemetry")]
+        let _scrape = match (
+            app.resolve::<rainier_config::Env>()
+                .ok()
+                .and_then(|env| env.get("WORKER_METRICS_ADDRESS"))
+                .and_then(|address| address.parse::<std::net::SocketAddr>().ok()),
+            app.resolve::<rainier_metrics::Metrics>(),
+        ) {
+            (Some(address), Ok(metrics)) => {
+                match crate::instrumentation::serve_metrics(address, metrics).await {
+                    Ok(task) => {
+                        println!("Serving metrics at http://{address}/metrics");
+                        Some(task)
+                    }
+                    Err(e) => {
+                        eprintln!("Could not serve metrics at {address}: {e}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         let signalled: Vec<Arc<Worker>> = workers.iter().map(Arc::clone).collect();
         tokio::spawn(async move {
             if let Some(signal) = stop_signal().await {
@@ -676,6 +710,11 @@ impl Command for QueueWorkCommand {
                 Err(e) => failure = failure.or(Some(e)),
             }
         }
+
+        // Whatever the batch exporter is still holding: the last jobs of a
+        // worker being shut down are the ones somebody will want to see.
+        #[cfg(feature = "telemetry")]
+        crate::instrumentation::shutdown();
 
         if let Some(e) = failure {
             return Err(e);

@@ -185,8 +185,24 @@ impl TemplateEngine {
 
 impl ViewEngine for TemplateEngine {
     fn render(&self, name: &str, data: &Value) -> Result<String> {
+        // The template's name — never the data it was given, which is
+        // whatever the page is about.
+        #[cfg(feature = "telemetry")]
+        let span = rainier_support::span!(
+            "view.render",
+            otel.name = %format!("render {name}"),
+            rainier.view.name = name,
+        );
+        #[cfg(feature = "telemetry")]
+        let _entered = span.enter();
+
         let mut renderer = Renderer { engine: self, depth: 0 };
-        renderer.render_named(name, data)
+        let rendered = renderer.render_named(name, data);
+
+        #[cfg(feature = "telemetry")]
+        let rendered = rainier_support::telemetry::record_result(&span, rendered);
+
+        rendered
     }
 
     fn exists(&self, name: &str) -> bool {
@@ -717,6 +733,22 @@ mod tests {
             std::fs::create_dir_all(parent).expect("parent dir");
         }
         std::fs::write(path, source).expect("write template");
+    }
+
+    #[test]
+    #[cfg(feature = "telemetry")]
+    fn a_render_is_a_span_named_by_its_template_and_not_its_data() {
+        use rainier_support::telemetry::testing::Recorder;
+
+        let root = temp_root("traced");
+        write(&root, "greeting", "Hi {{ name }}");
+        let engine = TemplateEngine::new(&root);
+
+        let recorder = Recorder::new();
+        recorder.record(|| engine.render("greeting", &json!({ "name": "Ada Lovelace" })).unwrap());
+
+        assert_eq!(recorder.span("view.render").field("rainier.view.name"), Some("greeting"));
+        assert!(!recorder.everything().contains("Ada Lovelace"));
     }
 
     #[test]

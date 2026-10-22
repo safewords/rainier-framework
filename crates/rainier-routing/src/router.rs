@@ -450,6 +450,23 @@ impl CompiledRouter {
             // pipeline runs, so middleware can read them — an authorisation
             // middleware needs `{post}` as much as the handler does.
             request.set_route_params(params);
+
+            // Onto the server's span, which declared these fields empty: the
+            // pattern, never the path, so `/posts/1` and `/posts/2` are one
+            // operation in a trace viewer rather than two.
+            #[cfg(feature = "telemetry")]
+            {
+                let span = tracing::Span::current();
+                span.record("http.route", compiled.route.uri());
+                span.record(
+                    "otel.name",
+                    format!("{} {}", request.method(), compiled.route.uri()).as_str(),
+                );
+                if let Some(name) = compiled.route.route_name() {
+                    span.record("rainier.route.name", name);
+                }
+            }
+
             request.extensions_mut().insert(MatchedRoute {
                 name: compiled.route.route_name().map(str::to_string),
                 uri: compiled.route.uri().to_string(),

@@ -66,6 +66,8 @@ pub mod fake;
 pub mod request;
 pub mod response;
 pub mod retry;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 pub mod transport;
 
 pub use fake::{FakeTransport, RecordedRequest};

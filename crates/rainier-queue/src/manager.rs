@@ -551,6 +551,44 @@ impl QueueManager {
     /// dispatch that lands nowhere, which is the failure the name check exists
     /// for.
     async fn push_to(&self, queue: &Arc<dyn Queue>, job: QueuedJob) -> Result<String> {
+        #[cfg(feature = "telemetry")]
+        {
+            let mut job = job;
+            let span = rainier_support::span!(
+                "queue.publish",
+                otel.name = %format!("publish {}", job.queue),
+                otel.kind = "producer",
+                messaging.system = crate::telemetry::messaging_system(queue.name()),
+                messaging.operation.type = "send",
+                messaging.destination.name = %job.queue,
+                messaging.message.id = %job.id,
+                rainier.job.name = %job.name,
+            );
+            // The publish span as the job's parent, so the worker's span hangs
+            // off the dispatch that caused it. A job that already carries one
+            // — re-dispatched from a worker, forwarded from elsewhere — keeps
+            // the trace it came with.
+            if job.traceparent.is_none() {
+                job.traceparent = rainier_telemetry::propagation::for_span(&span);
+            }
+            let traced = span.clone();
+            return tracing::Instrument::instrument(
+                async move {
+                    rainier_support::telemetry::record_result(
+                        &traced,
+                        self.push_untraced(queue, job).await,
+                    )
+                },
+                span,
+            )
+            .await;
+        }
+
+        #[cfg(not(feature = "telemetry"))]
+        self.push_untraced(queue, job).await
+    }
+
+    async fn push_untraced(&self, queue: &Arc<dyn Queue>, job: QueuedJob) -> Result<String> {
         if let Some(recorded) = &self.recorded {
             let id = job.id.clone();
             recorded.lock().expect("recorder lock poisoned").push(job);

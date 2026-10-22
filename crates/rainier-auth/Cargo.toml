@@ -30,6 +30,9 @@ tracing = { workspace = true }
 # The bcrypt driver and legacy verifier, forwarded to `rainier-crypt`.
 bcrypt = ["rainier-crypt/bcrypt"]
 
+# An `auth.attempt` span per login attempt — the guard and the outcome, never
+# the credentials.
+telemetry = ["rainier-support/telemetry"]
 [dev-dependencies]
 tokio = { workspace = true }
 

@@ -99,6 +99,8 @@ pub mod queue;
 pub mod redis;
 #[cfg(feature = "sqs")]
 pub mod sqs;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 pub mod worker;
 
 pub use connections::{
@@ -115,13 +117,15 @@ pub use kubernetes::{
     SINGLE_JOB_SUBCOMMAND,
 };
 #[cfg(feature = "kubernetes")]
-pub use kubernetes::{KubernetesDispatcher, RbacReport};
+pub use kubernetes::{KubernetesDispatcher, PodTiming, RbacReport};
 pub use manager::{PendingDispatch, QueueManager, SyncQueue};
 pub use queue::{FailedJob, MemoryQueue, Queue};
 #[cfg(feature = "redis")]
 pub use redis::{Keys as RedisQueueKeys, RedisQueue};
 #[cfg(feature = "sqs")]
 pub use sqs::SqsQueue;
+#[cfg(feature = "telemetry")]
+pub use telemetry::{JobOutcome, JobTiming, QueueObserver};
 pub use worker::{
     JobFailed, JobProcessed, JobProcessing, JobReleased, Outcome, Worker, WorkerOptions,
     WorkerStats,

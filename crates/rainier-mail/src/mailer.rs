@@ -247,6 +247,41 @@ impl Mailer {
         message: Message,
         transport: Arc<dyn Transport>,
     ) -> Result<Message> {
+        // How many recipients and attachments — never who, and never what. An
+        // address is personal data, and a subject line very often is too.
+        #[cfg(feature = "telemetry")]
+        {
+            let span = rainier_support::span!(
+                "mail.send",
+                otel.name = %format!("mail {}", transport.name()),
+                mail.transport = transport.name(),
+                mail.recipients = message.envelope.to.len()
+                    + message.envelope.cc.len()
+                    + message.envelope.bcc.len(),
+                mail.attachments = message.attachments.len(),
+            );
+            let traced = span.clone();
+            return tracing::Instrument::instrument(
+                async move {
+                    rainier_support::telemetry::record_result(
+                        &traced,
+                        self.deliver_untraced(message, transport).await,
+                    )
+                },
+                span,
+            )
+            .await;
+        }
+
+        #[cfg(not(feature = "telemetry"))]
+        self.deliver_untraced(message, transport).await
+    }
+
+    async fn deliver_untraced(
+        &self,
+        message: Message,
+        transport: Arc<dyn Transport>,
+    ) -> Result<Message> {
         let message = self.apply_defaults(message);
         message.validate()?;
 
@@ -367,6 +402,25 @@ mod deliver_defaults_tests {
         let mut message = Message::new(envelope);
         message.text = Some("body".into());
         message
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn a_delivery_is_a_span_that_counts_recipients_and_names_none() {
+        use rainier_support::telemetry::testing::Recorder;
+
+        let recorder = Recorder::new();
+        let _guard = recorder.install();
+        let mailer = Mailer::fake(Arc::new(MemoryEngine::new()))
+            .with_default_from(Address::new("noreply@example.com"));
+
+        mailer.deliver(message_to("ada@example.com")).await.unwrap();
+
+        let span = recorder.span("mail.send");
+        assert_eq!(span.field("mail.recipients"), Some("1"));
+        assert!(span.field("mail.transport").is_some());
+        assert!(!recorder.everything().contains("ada@example.com"));
+        assert!(!recorder.everything().contains("Subject"), "nor the subject line");
     }
 
     #[tokio::test]

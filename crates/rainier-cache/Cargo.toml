@@ -40,6 +40,9 @@ redis-cluster = ["redis-driver", "rainier-drivers/redis-cluster"]
 memcached = ["rainier-drivers/memcached"]
 # A cache in a DynamoDB table — no server to run.
 dynamodb = ["rainier-drivers/aws-dynamodb"]
+# A `cache.*` span per operation on every store a `CacheManager` holds — never
+# the key or the value. See `rainier_cache::telemetry`.
+telemetry = ["rainier-support/telemetry"]
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -140,6 +140,13 @@ pub trait Cache: Send + Sync + 'static {
     ///
     /// Also required, and for the same reason as [`add`](Self::add).
     fn forget_if<'a>(&'a self, key: &'a str, expected: &'a [u8]) -> BoxFuture<'a, Result<bool>>;
+
+    /// Whether this store already opens a span per call — the `telemetry`
+    /// feature's wrapper — so wrapping it again would trace everything twice.
+    #[doc(hidden)]
+    fn is_traced(&self) -> bool {
+        false
+    }
 }
 
 /// The typed conveniences every [`Cache`] gets.

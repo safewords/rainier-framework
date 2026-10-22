@@ -160,7 +160,17 @@ async fn run<S>(
 
     tracing::debug!(socket = %id, path, "socket opened");
 
-    if let Err(e) = handler.on_connect(&socket).await {
+    let connected = handler.on_connect(&socket);
+    // Connect at `INFO`; each message at `DEBUG`, because a chatty socket is
+    // hundreds of them a minute. Never the socket's path or a message's
+    // contents — the kind and the size.
+    #[cfg(feature = "telemetry")]
+    let connected = tracing::Instrument::instrument(
+        connected,
+        rainier_support::span!("websocket.connect", otel.name = "websocket connect"),
+    );
+
+    if let Err(e) = connected.await {
         tracing::warn!(socket = %id, path, error = %e, "on_connect failed; closing");
         handler.on_close(&socket).await;
         let _ = writer.close().await;
@@ -206,7 +216,25 @@ async fn run<S>(
                     None => continue,
                     Some(message) => {
                         let closing = message.is_close();
-                        if let Err(e) = handler.on_message(&socket, message).await {
+                        #[cfg(feature = "telemetry")]
+                        let span = tracing::debug_span!(
+                            "websocket.message",
+                            otel.name = "websocket message",
+                            rainier.websocket.kind = match &message {
+                                rainier_websocket::Message::Text(_) => "text",
+                                rainier_websocket::Message::Binary(_) => "binary",
+                                rainier_websocket::Message::Close(_) => "close",
+                            },
+                            rainier.websocket.bytes = match &message {
+                                rainier_websocket::Message::Text(text) => text.len(),
+                                rainier_websocket::Message::Binary(bytes) => bytes.len(),
+                                rainier_websocket::Message::Close(_) => 0,
+                            },
+                        );
+                        let handled = handler.on_message(&socket, message);
+                        #[cfg(feature = "telemetry")]
+                        let handled = tracing::Instrument::instrument(handled, span);
+                        if let Err(e) = handled.await {
                             // Not sent to the client: an error message is
                             // written for you, not for whoever is connected.
                             tracing::warn!(socket = %id, path, error = %e, "on_message failed; closing");

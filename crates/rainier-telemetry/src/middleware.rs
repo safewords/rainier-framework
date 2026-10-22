@@ -69,6 +69,9 @@ impl Middleware for Trace {
 
         let header = context.to_header();
         let trace_id = context.trace_id().to_string();
+        // What anything this request calls should name as its parent — this
+        // service's own span in the trace, not the caller's.
+        let outbound = crate::propagation::child_of(&context);
 
         // On the request, so a handler can propagate it to whatever it calls.
         request.extensions_mut().insert(context);
@@ -79,10 +82,27 @@ impl Middleware for Trace {
         // A span rather than a field on each event: everything logged inside
         // it inherits the id, including from code that knows nothing about
         // tracing contexts.
-        let span = tracing::info_span!("http.request", trace_id = %trace_id);
-        let _entered = span.enter();
+        //
+        // Unless the server already opened one. With the `telemetry` feature
+        // the kernel wraps every request in an `http.server.request` span that
+        // declares `trace_id`; a second span around the same work would only
+        // be a duplicate row in every trace, so the id goes onto that one.
+        let current = tracing::Span::current();
+        let span = if current.has_field("trace_id") {
+            current.record("trace_id", trace_id.as_str());
+            current
+        } else {
+            tracing::info_span!("http.request", trace_id = %trace_id)
+        };
 
-        let response = next.run(request).await;
+        // `instrument`, not `enter`: a guard held across an `.await` stays
+        // entered on whichever thread the future happens to be polled on, and
+        // attributes other requests' log lines to this one.
+        let response = tracing::Instrument::instrument(
+            crate::propagation::scope(Some(outbound), next.run(request)),
+            span,
+        )
+        .await;
 
         if self.respond_with_header {
             return response.with_header(TRACEPARENT, &header);
@@ -188,6 +208,25 @@ mod tests {
         let response = through(Trace::new().sampling(true), request).await;
 
         assert_eq!(response.header(TRACEPARENT), Some(unsampled));
+    }
+
+    #[tokio::test]
+    async fn the_trace_is_in_force_for_anything_the_handler_calls() {
+        let response = Pipeline::new()
+            .through(Trace::new())
+            .then(|_request: Request| {
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    Response::ok(crate::propagation::current().unwrap_or_default())
+                })
+            })
+            .run(Request::builder().header(TRACEPARENT, EXAMPLE).build())
+            .await;
+
+        let outbound = TraceContext::parse(&body_of(response).await).expect("a traceparent");
+        assert_eq!(outbound.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736", "the same trace");
+        assert_ne!(outbound.parent_id(), "00f067aa0ba902b7", "with this service as the parent");
+        assert_eq!(crate::propagation::current(), None, "and only for the request");
     }
 
     #[tokio::test]

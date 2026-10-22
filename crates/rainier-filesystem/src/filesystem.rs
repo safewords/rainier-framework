@@ -304,6 +304,13 @@ pub trait Filesystem: Send + Sync + 'static {
             ))
         })
     }
+
+    /// Whether this disk already opens a span per call — the `telemetry`
+    /// feature's wrapper — so wrapping it again would trace everything twice.
+    #[doc(hidden)]
+    fn is_traced(&self) -> bool {
+        false
+    }
 }
 
 /// The typed conveniences every [`Filesystem`] gets.

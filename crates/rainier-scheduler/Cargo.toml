@@ -15,6 +15,11 @@ rainier-support = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+default = []
+# A `schedule.task` span per due task, with its outcome.
+telemetry = ["rainier-support/telemetry"]
+
 [dev-dependencies]
 tokio = { workspace = true }
 

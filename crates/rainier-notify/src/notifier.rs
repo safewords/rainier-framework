@@ -100,6 +100,39 @@ impl Notifier {
         N: Notifiable + ?Sized,
         T: Notification<N> + ?Sized,
     {
+        // The notification's name and how many channels it went to — never
+        // the recipient, and never what it said.
+        #[cfg(feature = "telemetry")]
+        {
+            let span = rainier_support::span!(
+                "notification.send",
+                otel.name = %format!("notify {}", notification.notification_name()),
+                rainier.notification.name = notification.notification_name(),
+                rainier.notification.channels = tracing::field::Empty,
+            );
+            let traced = span.clone();
+            return tracing::Instrument::instrument(
+                async move {
+                    let result = self.send_untraced(to, notification).await;
+                    if let Ok(receipt) = &result {
+                        traced.record("rainier.notification.channels", receipt.outcomes.len());
+                    }
+                    rainier_support::telemetry::record_result(&traced, result)
+                },
+                span,
+            )
+            .await;
+        }
+
+        #[cfg(not(feature = "telemetry"))]
+        self.send_untraced(to, notification).await
+    }
+
+    async fn send_untraced<N, T>(&self, to: &N, notification: &T) -> Result<Receipt>
+    where
+        N: Notifiable + ?Sized,
+        T: Notification<N> + ?Sized,
+    {
         let channels = notification.via(to);
         if channels.is_empty() {
             tracing::debug!(

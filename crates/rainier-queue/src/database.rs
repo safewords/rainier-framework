@@ -121,6 +121,7 @@ impl JobRow {
             // The row *is* the reservation here — this driver marks it
             // reserved in place — so there is no separate handle to carry.
             delivery_handle: None,
+            traceparent: None,
         })
     }
 }

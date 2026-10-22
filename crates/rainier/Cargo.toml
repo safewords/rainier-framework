@@ -28,6 +28,7 @@ redis-cluster = ["rainier-framework/redis-cluster"]
 memcached = ["rainier-framework/memcached"]
 s3 = ["rainier-framework/s3"]
 sqs = ["rainier-framework/sqs"]
+telemetry = ["rainier-framework/telemetry"]
 
 [package.metadata.docs.rs]
 all-features = true

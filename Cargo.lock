@@ -3993,6 +3993,7 @@ version = "2.0.0"
 dependencies = [
  "async-trait",
  "rainier-support",
+ "rainier-telemetry",
  "reqwest",
  "rustls",
  "serde",
@@ -4119,6 +4120,7 @@ dependencies = [
  "rainier-events",
  "rainier-orm",
  "rainier-support",
+ "rainier-telemetry",
  "rustls",
  "serde",
  "serde_json",
@@ -4170,6 +4172,7 @@ dependencies = [
  "rainier-middleware",
  "rainier-routing",
  "rainier-support",
+ "rainier-telemetry",
  "rainier-websocket",
  "serde_json",
  "tokio",
@@ -4204,6 +4207,8 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "tracing",
+ "tracing-core",
 ]
 
 [[package]]
@@ -4245,6 +4250,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

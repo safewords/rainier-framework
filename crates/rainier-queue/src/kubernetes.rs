@@ -425,109 +425,268 @@ mod dispatcher {
             attempt: u32,
             timeout: Option<Duration>,
         ) -> Result<()> {
-            let namespace =
-                spec.namespace.clone().unwrap_or_else(|| self.inner.default_namespace.clone());
-            let image =
-                spec.image.clone().or_else(|| self.inner.default_image.clone()).ok_or_else(
-                    || {
-                        Error::internal(
-                            "no image to run the Kubernetes job in — set it on the spec or \
-                             configure RAINIER_K8S_DEFAULT_IMAGE on the dispatcher's pod",
-                        )
-                    },
-                )?;
+            self.run(job_name, payload, spec, queued_id, attempt, timeout, false).await.0
+        }
 
-            let payload_str = serde_json::to_string(payload).map_err(|e| {
-                Error::internal(format!(
-                    "serialising job `{job_name}` payload for Kubernetes dispatch: {e}"
-                ))
-            })?;
-            if payload_str.len() > 900_000 {
-                return Err(Error::internal(format!(
+        /// [`run_and_watch`](Self::run_and_watch), and how long the pod took
+        /// to start and to run.
+        ///
+        /// Costs one more API call than `run_and_watch` — a pod list, once
+        /// the Job is terminal and before it is deleted — which is why the
+        /// worker only uses it with the `telemetry` feature. A job that
+        /// timed out is deleted on the spot and reports no pod timings.
+        pub async fn run_and_watch_measured(
+            &self,
+            job_name: &str,
+            payload: &serde_json::Value,
+            spec: &KubernetesJobSpec,
+            queued_id: &str,
+            attempt: u32,
+            timeout: Option<Duration>,
+        ) -> (Result<()>, PodTiming) {
+            self.run(job_name, payload, spec, queued_id, attempt, timeout, true).await
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn run(
+            &self,
+            job_name: &str,
+            payload: &serde_json::Value,
+            spec: &KubernetesJobSpec,
+            queued_id: &str,
+            attempt: u32,
+            timeout: Option<Duration>,
+            measure: bool,
+        ) -> (Result<()>, PodTiming) {
+            let mut timing = PodTiming::default();
+            let dispatched = chrono::Utc::now();
+            let result: Result<()> = async {
+                let namespace =
+                    spec.namespace.clone().unwrap_or_else(|| self.inner.default_namespace.clone());
+                let image =
+                    spec.image.clone().or_else(|| self.inner.default_image.clone()).ok_or_else(
+                        || {
+                            Error::internal(
+                                "no image to run the Kubernetes job in — set it on the spec or \
+                             configure RAINIER_K8S_DEFAULT_IMAGE on the dispatcher's pod",
+                            )
+                        },
+                    )?;
+
+                let payload_str = serde_json::to_string(payload).map_err(|e| {
+                    Error::internal(format!(
+                        "serialising job `{job_name}` payload for Kubernetes dispatch: {e}"
+                    ))
+                })?;
+                if payload_str.len() > 900_000 {
+                    return Err(Error::internal(format!(
                     "job `{job_name}` payload is {} bytes; the Kubernetes dispatcher caps env-var \
                      payloads at ~900 KiB. Switch this job to a ConfigMap payload (not yet \
                      implemented) or shrink the payload.",
                     payload_str.len()
                 )));
-            }
+                }
 
-            let k8s_name = kubernetes_name_for(job_name, queued_id, attempt);
-            let k8s_job = render_job(
-                job_name,
-                &k8s_name,
-                queued_id,
-                attempt,
-                spec,
-                &image,
-                &payload_str,
-                self.inner.default_service_account.as_deref(),
-            );
-
-            let jobs_api: Api<K8sJob> = Api::namespaced(self.inner.client.clone(), &namespace);
-            match jobs_api.create(&PostParams::default(), &k8s_job).await {
-                Ok(_) => tracing::info!(
+                let k8s_name = kubernetes_name_for(job_name, queued_id, attempt);
+                let k8s_job = render_job(
                     job_name,
+                    &k8s_name,
                     queued_id,
                     attempt,
-                    namespace = %namespace,
-                    k8s_name = %k8s_name,
-                    "created kubernetes job"
-                ),
-                Err(kube::Error::Api(err)) if err.code == 409 => {
-                    tracing::info!(
+                    spec,
+                    &image,
+                    &payload_str,
+                    self.inner.default_service_account.as_deref(),
+                );
+
+                let jobs_api: Api<K8sJob> = Api::namespaced(self.inner.client.clone(), &namespace);
+                match jobs_api.create(&PostParams::default(), &k8s_job).await {
+                    Ok(_) => tracing::info!(
                         job_name,
                         queued_id,
                         attempt,
                         namespace = %namespace,
                         k8s_name = %k8s_name,
-                        "kubernetes job already exists — reattaching to its watch"
-                    );
-                }
-                Err(e) => {
-                    return Err(Error::internal(format!(
-                        "creating batch/v1 Job for `{job_name}` in namespace \
-                         `{namespace}`: {e}"
-                    )));
-                }
-            }
-
-            let outcome = match timeout {
-                Some(limit) => match tokio::time::timeout(
-                    limit,
-                    watch_to_terminal(&jobs_api, &self.inner.client, &namespace, &k8s_name),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        tracing::warn!(
+                        "created kubernetes job"
+                    ),
+                    Err(kube::Error::Api(err)) if err.code == 409 => {
+                        tracing::info!(
                             job_name,
                             queued_id,
                             attempt,
                             namespace = %namespace,
                             k8s_name = %k8s_name,
-                            ?limit,
-                            "kubernetes job exceeded its timeout; deleting"
+                            "kubernetes job already exists — reattaching to its watch"
                         );
-                        delete_job(&jobs_api, &k8s_name).await;
-                        Err(Error::internal(format!(
-                            "kubernetes job `{k8s_name}` exceeded its {limit:?} timeout"
-                        )))
                     }
-                },
-                None => {
-                    watch_to_terminal(&jobs_api, &self.inner.client, &namespace, &k8s_name).await
+                    Err(e) => {
+                        return Err(Error::internal(format!(
+                            "creating batch/v1 Job for `{job_name}` in namespace \
+                         `{namespace}`: {e}"
+                        )));
+                    }
                 }
-            };
 
-            if outcome.is_ok() && spec.ttl_seconds_after_finished == 0 {
-                // Succeeded with ttl=0 — delete the Job so the pod and
-                // its logs vanish immediately. Not an error if the TTL
-                // controller already reaped it.
-                delete_job(&jobs_api, &k8s_name).await;
+                let outcome = match timeout {
+                    Some(limit) => match tokio::time::timeout(
+                        limit,
+                        watch_to_terminal(&jobs_api, &self.inner.client, &namespace, &k8s_name),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            tracing::warn!(
+                                job_name,
+                                queued_id,
+                                attempt,
+                                namespace = %namespace,
+                                k8s_name = %k8s_name,
+                                ?limit,
+                                "kubernetes job exceeded its timeout; deleting"
+                            );
+                            delete_job(&jobs_api, &k8s_name).await;
+                            timing.timed_out = true;
+                            Err(Error::internal(format!(
+                                "kubernetes job `{k8s_name}` exceeded its {limit:?} timeout"
+                            )))
+                        }
+                    },
+                    None => {
+                        watch_to_terminal(&jobs_api, &self.inner.client, &namespace, &k8s_name)
+                            .await
+                    }
+                };
+
+                // Before the delete below, which takes the pod with it.
+                if measure && !timing.timed_out {
+                    let measured =
+                        measure_pod(&self.inner.client, &namespace, &k8s_name, dispatched).await;
+                    timing.start = measured.start;
+                    timing.run = measured.run;
+                }
+
+                if outcome.is_ok() && spec.ttl_seconds_after_finished == 0 {
+                    // Succeeded with ttl=0 — delete the Job so the pod and
+                    // its logs vanish immediately. Not an error if the TTL
+                    // controller already reaped it.
+                    delete_job(&jobs_api, &k8s_name).await;
+                }
+
+                outcome
             }
+            .await;
+            (result, timing)
+        }
+    }
 
-            outcome
+    /// How a Kubernetes job's pod spent its time — see
+    /// [`KubernetesDispatcher::run_and_watch_measured`].
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct PodTiming {
+        /// From creating the `batch/v1 Job` to its container starting:
+        /// scheduling, the image pull, init containers.
+        pub start: Option<Duration>,
+        /// From the container starting to it finishing.
+        pub run: Option<Duration>,
+        /// Whether the job was deleted for running past its timeout.
+        pub timed_out: bool,
+    }
+
+    /// Read a finished job's pod, best-effort: a pod that cannot be listed
+    /// costs the measurement, never the job.
+    async fn measure_pod(
+        client: &Client,
+        namespace: &str,
+        k8s_name: &str,
+        dispatched: chrono::DateTime<chrono::Utc>,
+    ) -> PodTiming {
+        let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+        let selector = format!("job-name={k8s_name}");
+        match pods_api.list(&ListParams::default().labels(&selector)).await {
+            Ok(list) => {
+                list.items.first().map(|pod| pod_timing(pod, dispatched)).unwrap_or_default()
+            }
+            Err(e) => {
+                tracing::debug!(k8s_name, error = %e, "could not list pods to time the job");
+                PodTiming::default()
+            }
+        }
+    }
+
+    /// The timings one pod's first container records.
+    pub(crate) fn pod_timing(pod: &Pod, dispatched: chrono::DateTime<chrono::Utc>) -> PodTiming {
+        let Some(state) = pod
+            .status
+            .as_ref()
+            .and_then(|status| status.container_statuses.as_ref())
+            .and_then(|statuses| statuses.first())
+            .and_then(|status| status.state.as_ref())
+        else {
+            return PodTiming::default();
+        };
+
+        let (started, finished) = match (&state.terminated, &state.running) {
+            (Some(terminated), _) => (
+                terminated.started_at.as_ref().map(|at| at.0),
+                terminated.finished_at.as_ref().map(|at| at.0),
+            ),
+            (None, Some(running)) => (running.started_at.as_ref().map(|at| at.0), None),
+            (None, None) => (None, None),
+        };
+
+        let span = |from: chrono::DateTime<chrono::Utc>, to: chrono::DateTime<chrono::Utc>| {
+            (to - from).to_std().ok()
+        };
+
+        PodTiming {
+            start: started.and_then(|started| span(dispatched, started)),
+            run: started.zip(finished).and_then(|(started, finished)| span(started, finished)),
+            timed_out: false,
+        }
+    }
+
+    #[cfg(test)]
+    mod timing_tests {
+        use super::*;
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStatus, PodStatus,
+        };
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+
+        fn finished_pod(started: &str, finished: &str) -> Pod {
+            Pod {
+                status: Some(PodStatus {
+                    container_statuses: Some(vec![ContainerStatus {
+                        state: Some(ContainerState {
+                            terminated: Some(ContainerStateTerminated {
+                                started_at: Some(Time(started.parse().unwrap())),
+                                finished_at: Some(Time(finished.parse().unwrap())),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn a_pod_reports_its_start_latency_and_its_run() {
+            let dispatched = "2026-10-21T10:00:00Z".parse().unwrap();
+            let pod = finished_pod("2026-10-21T10:00:12Z", "2026-10-21T10:01:12Z");
+
+            let timing = pod_timing(&pod, dispatched);
+            assert_eq!(timing.start, Some(Duration::from_secs(12)));
+            assert_eq!(timing.run, Some(Duration::from_secs(60)));
+        }
+
+        #[test]
+        fn a_pod_with_no_status_reports_nothing_rather_than_guessing() {
+            assert_eq!(pod_timing(&Pod::default(), chrono::Utc::now()), PodTiming::default());
         }
     }
 
@@ -952,7 +1111,7 @@ mod dispatcher {
 }
 
 #[cfg(feature = "kubernetes")]
-pub use dispatcher::{KubernetesDispatcher, RbacReport};
+pub use dispatcher::{KubernetesDispatcher, PodTiming, RbacReport};
 
 /// Run a single serialised job and return. The pod-side entry point for
 /// a job dispatched via [`KubernetesDispatcher`].
@@ -985,6 +1144,7 @@ pub async fn run_single_job(
         max_attempts: context.max_attempts(),
         unique_key: None,
         delivery_handle: None,
+        traceparent: None,
         available_at: chrono::Utc::now(),
         created_at: chrono::Utc::now(),
     };

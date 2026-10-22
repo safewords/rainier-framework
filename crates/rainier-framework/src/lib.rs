@@ -118,6 +118,8 @@ pub mod cors;
 pub mod facades;
 pub mod groups;
 pub mod health;
+#[cfg(feature = "telemetry")]
+pub mod instrumentation;
 #[cfg(feature = "jwt")]
 pub mod jwks;
 #[cfg(feature = "kafka")]

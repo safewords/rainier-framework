@@ -31,6 +31,9 @@ default = []
 sea-orm-executor = ["dep:rainier-drivers", "rainier-drivers/sea-orm-executor"]
 d1-http = ["dep:rainier-drivers", "rainier-drivers/d1-http"]
 libsql-http = ["dep:rainier-drivers", "rainier-drivers/libsql-http"]
+# A `db.query` span per statement, its SQL sanitised and its bound values
+# never recorded. See `rainier_database::telemetry`.
+telemetry = ["rainier-support/telemetry"]
 
 [dev-dependencies]
 tokio = { workspace = true }

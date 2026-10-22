@@ -18,5 +18,9 @@ tracing = { workspace = true }
 rainier-view = { workspace = true }
 tokio = { workspace = true }
 
+[features]
+default = []
+# A `notification.send` span per notification.
+telemetry = ["rainier-support/telemetry", "rainier-mail/telemetry"]
 [lints]
 workspace = true

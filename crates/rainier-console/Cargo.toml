@@ -17,6 +17,11 @@ tracing = { workspace = true }
 # echoes is worse than no `secret` at all.
 rpassword = { workspace = true }
 
+[features]
+default = []
+# A `console.command` span per command run, with its exit code.
+telemetry = ["rainier-support/telemetry"]
+
 [dev-dependencies]
 tokio = { workspace = true }
 

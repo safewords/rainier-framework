@@ -30,6 +30,9 @@ tracing = { workspace = true }
 default = []
 # S3, Cloudflare R2, MinIO, and anything else that speaks S3.
 s3 = ["rainier-drivers/aws-s3"]
+# A `storage.*` span per operation on every disk a `Storage` holds — never the
+# path or the contents. See `rainier_filesystem::telemetry`.
+telemetry = ["rainier-support/telemetry"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -35,6 +35,8 @@ pusher-server = ["redis", "dep:rainier-websocket", "dep:tokio"]
 # Publish to a Kafka topic, and relay it back to whoever holds the sockets.
 kafka = ["dep:rainier-drivers", "rainier-drivers/kafka", "dep:futures-util"]
 
+# A `broadcast.publish` span per broadcast — the event and a channel count.
+telemetry = ["rainier-support/telemetry"]
 [dev-dependencies]
 tokio = { workspace = true }
 chrono = { workspace = true }

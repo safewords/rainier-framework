@@ -175,6 +175,8 @@ pub mod memory;
 
 #[cfg(feature = "s3")]
 pub mod s3;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 pub mod upload_policy;
 
 pub use upload_policy::{
@@ -213,6 +215,10 @@ pub struct Storage {
 impl Storage {
     /// Wrap a filesystem as the default disk.
     pub fn new(disk: Arc<dyn Filesystem>) -> Self {
+        // Traced with the `telemetry` feature — see `crate::telemetry`.
+        #[cfg(feature = "telemetry")]
+        let disk = crate::telemetry::TracedFilesystem::wrap(disk);
+
         Self { disk, named: std::collections::HashMap::new() }
     }
 
@@ -232,6 +238,9 @@ impl Storage {
     /// the right bucket name pointed at the wrong service. [`Disks`] is the
     /// declarative form that cannot express that.
     pub fn with_disk(mut self, name: impl Into<String>, disk: Arc<dyn Filesystem>) -> Self {
+        #[cfg(feature = "telemetry")]
+        let disk = crate::telemetry::TracedFilesystem::wrap(disk);
+
         self.named.insert(name.into(), disk);
         self
     }

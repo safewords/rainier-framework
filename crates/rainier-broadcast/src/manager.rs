@@ -87,6 +87,33 @@ impl Broadcasting {
         if broadcast.is_empty() {
             return Ok(());
         }
+
+        // The event and how many channels — not the channels' names, which
+        // carry ids (`private-user.42`), and never the payload.
+        #[cfg(feature = "telemetry")]
+        {
+            let span = rainier_support::span!(
+                "broadcast.publish",
+                otel.name = %format!("broadcast {}", broadcast.event),
+                otel.kind = "producer",
+                rainier.broadcast.driver = self.driver.name(),
+                rainier.broadcast.event = %broadcast.event,
+                rainier.broadcast.channels = broadcast.channels.len(),
+            );
+            let traced = span.clone();
+            return tracing::Instrument::instrument(
+                async move {
+                    rainier_support::telemetry::record_result(
+                        &traced,
+                        self.driver.publish(&broadcast).await,
+                    )
+                },
+                span,
+            )
+            .await;
+        }
+
+        #[cfg(not(feature = "telemetry"))]
         self.driver.publish(&broadcast).await
     }
 }

@@ -164,6 +164,20 @@ impl Kernel {
     /// taking every later request with it — is not an acceptable failure mode
     /// for a web framework.
     pub async fn handle(&self, request: Request) -> Response {
+        #[cfg(feature = "telemetry")]
+        {
+            let span = server_span(&request);
+            let response =
+                tracing::Instrument::instrument(self.handle_untraced(request), span.clone()).await;
+            record_status(&span, response.status().as_u16());
+            response
+        }
+
+        #[cfg(not(feature = "telemetry"))]
+        self.handle_untraced(request).await
+    }
+
+    async fn handle_untraced(&self, request: Request) -> Response {
         let expects_json = request.expects_json();
         let path = request.path().to_string();
 
@@ -240,6 +254,58 @@ impl Kernel {
 
         let rendered = self.renderer.render(&stand_in, &error, self.debug);
         carry_over_headers(&response, rendered)
+    }
+}
+
+/// The span every request is handled inside, with the `telemetry` feature.
+///
+/// Named and attributed after the OpenTelemetry HTTP server conventions.
+/// `http.route` and the span's display name are left empty here and filled in
+/// by the router once it has matched — the **pattern**, `/posts/{post}`, never
+/// the path, because a span name is a dimension and `/posts/1` … `/posts/9999`
+/// would be ten thousand of them.
+///
+/// `url.path` is recorded; the query string is not. A query is where a client
+/// puts a token, an email address or a search somebody would rather keep.
+#[cfg(feature = "telemetry")]
+fn server_span(request: &Request) -> tracing::Span {
+    use tracing::field::Empty;
+
+    let method = request.method().as_str().to_string();
+    let span = rainier_support::span!(
+        "http.server.request",
+        otel.name = %method,
+        otel.kind = "server",
+        http.request.method = %method,
+        url.path = %request.path(),
+        url.scheme = "http",
+        user_agent.original = request.header("user-agent").unwrap_or_default(),
+        http.route = Empty,
+        rainier.route.name = Empty,
+        http.response.status_code = Empty,
+        trace_id = Empty,
+    );
+
+    // Before the span is first entered: OpenTelemetry fixes a span's parent
+    // when it starts, and an incoming `traceparent` is that parent.
+    if let Some(traceparent) = request.header("traceparent") {
+        rainier_telemetry::propagation::adopt(&span, traceparent);
+    }
+
+    span
+}
+
+/// The status, and the error marker for a 5xx.
+///
+/// A 4xx is the client's mistake and leaves the server span unmarked, which is
+/// the convention: an error rate full of 404s from scanners is an error rate
+/// nobody looks at.
+#[cfg(feature = "telemetry")]
+fn record_status(span: &tracing::Span, status: u16) {
+    span.record("http.response.status_code", status);
+    if status >= 500 {
+        span.record("otel.status_code", "ERROR");
+        span.record("error.type", status.to_string().as_str());
     }
 }
 
@@ -370,6 +436,44 @@ mod tests {
 
     fn api_get(uri: &str) -> Request {
         Request::builder().method(Method::GET).uri(uri).header("accept", "application/json").build()
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn every_request_is_a_server_span_named_by_its_route_pattern() {
+        use rainier_support::telemetry::testing::Recorder;
+
+        let mut router = Router::new();
+        router.get("/posts/{post}", || async { "post" }).name("posts.show");
+        router.get("/boom", || async {
+            Err::<Response, _>(rainier_support::Error::internal("db password is hunter2"))
+        });
+        let kernel = kernel_for(router);
+
+        let recorder = Recorder::new();
+        let _guard = recorder.install();
+        kernel.handle(get("/posts/42?token=secret")).await;
+        kernel.handle(get("/boom")).await;
+
+        let spans = recorder.named("http.server.request");
+        let ok = &spans[0];
+        assert_eq!(ok.field("otel.kind"), Some("server"));
+        assert_eq!(ok.field("http.request.method"), Some("GET"));
+        assert_eq!(ok.field("http.route"), Some("/posts/{post}"));
+        assert_eq!(ok.field("otel.name"), Some("GET /posts/{post}"));
+        assert_eq!(ok.field("rainier.route.name"), Some("posts.show"));
+        assert_eq!(ok.field("url.path"), Some("/posts/42"));
+        assert_eq!(ok.field("http.response.status_code"), Some("200"));
+        assert_eq!(ok.field("otel.status_code"), None);
+
+        let failed = &spans[1];
+        assert_eq!(failed.field("http.response.status_code"), Some("500"));
+        assert_eq!(failed.field("otel.status_code"), Some("ERROR"));
+        assert_eq!(failed.field("error.type"), Some("500"));
+
+        let everything = recorder.everything();
+        assert!(!everything.contains("token=secret"), "the query string is not recorded");
+        assert!(!everything.contains("hunter2"), "nor an error's message");
     }
 
     #[tokio::test]

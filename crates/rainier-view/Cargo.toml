@@ -11,6 +11,14 @@ repository.workspace = true
 rainier-support = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Only with `telemetry`.
+tracing = { workspace = true, optional = true }
+
+[features]
+default = []
+# A `view.render` span per template rendered — synchronous, so it is entered
+# rather than instrumented.
+telemetry = ["dep:tracing", "rainier-support/telemetry"]
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -24,6 +24,13 @@ futures-util = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Only for `propagation::adopt` — joining the span to an incoming trace.
+rainier-telemetry = { workspace = true, optional = true }
+
+[features]
+default = []
+# An `http.server.request` span around every request — see `Kernel::handle`.
+telemetry = ["rainier-support/telemetry", "rainier-routing/telemetry", "dep:rainier-telemetry"]
 
 [dev-dependencies]
 rainier-container = { workspace = true }

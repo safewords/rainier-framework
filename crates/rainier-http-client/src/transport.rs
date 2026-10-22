@@ -134,6 +134,20 @@ mod real {
 
     impl Transport for ReqwestTransport {
         fn send<'a>(&'a self, request: OutboundRequest) -> BoxFuture<'a, Result<RawResponse>> {
+            #[cfg(feature = "telemetry")]
+            return crate::telemetry::instrument(request, move |request| self.wire(request));
+
+            #[cfg(not(feature = "telemetry"))]
+            self.wire(request)
+        }
+
+        fn name(&self) -> &str {
+            "reqwest"
+        }
+    }
+
+    impl ReqwestTransport {
+        fn wire<'a>(&'a self, request: OutboundRequest) -> BoxFuture<'a, Result<RawResponse>> {
             Box::pin(async move {
                 let method =
                     reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|_| {
@@ -178,10 +192,6 @@ mod real {
 
                 Ok(RawResponse { status, headers, body })
             })
-        }
-
-        fn name(&self) -> &str {
-            "reqwest"
         }
     }
 }

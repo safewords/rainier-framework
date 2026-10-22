@@ -101,7 +101,28 @@ impl StartSession {
             return Loaded::attached(Session::restore(id, data));
         }
 
-        match self.store.read(&id).await {
+        // The store and whether a session was found — never the id, which
+        // is a bearer credential for as long as the session lives.
+        #[cfg(feature = "telemetry")]
+        let span = rainier_support::span!(
+            "session.load",
+            otel.name = "session load",
+            rainier.session.store = self.store.name(),
+            rainier.session.found = tracing::field::Empty,
+        );
+        let read = self.store.read(&id);
+        #[cfg(feature = "telemetry")]
+        let read = tracing::Instrument::instrument(read, span.clone());
+        let read = read.await;
+        #[cfg(feature = "telemetry")]
+        match &read {
+            Ok(found) => {
+                span.record("rainier.session.found", found.is_some());
+            }
+            Err(error) => rainier_support::telemetry::record_error(&span, error),
+        }
+
+        match read {
             Ok(Some(data)) => Loaded::attached(Session::restore(id, data)),
             // No such session. A fresh one, which may take a new id: there is
             // nothing on the other end of the old one to lose.
@@ -140,6 +161,31 @@ impl StartSession {
     /// Returns the cookie value to send, which for a client-side store *is* the
     /// session.
     async fn save(&self, session: &Session) -> Result<String> {
+        #[cfg(feature = "telemetry")]
+        {
+            let span = rainier_support::span!(
+                "session.save",
+                otel.name = "session save",
+                rainier.session.store = self.store.name(),
+            );
+            let traced = span.clone();
+            return tracing::Instrument::instrument(
+                async move {
+                    rainier_support::telemetry::record_result(
+                        &traced,
+                        self.save_untraced(session).await,
+                    )
+                },
+                span,
+            )
+            .await;
+        }
+
+        #[cfg(not(feature = "telemetry"))]
+        self.save_untraced(session).await
+    }
+
+    async fn save_untraced(&self, session: &Session) -> Result<String> {
         if !self.store.is_client_side() {
             for id in session.superseded_ids() {
                 self.store.destroy(&id).await?;

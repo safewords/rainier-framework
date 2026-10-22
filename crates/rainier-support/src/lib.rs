@@ -24,6 +24,8 @@ pub mod extensions;
 pub mod panic_backtrace;
 pub mod setting;
 pub mod str;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 
 pub use build_info::BuildInfo;
 pub use error::{Context, Error, ErrorKind, Result};

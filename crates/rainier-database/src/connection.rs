@@ -406,7 +406,19 @@ impl Database {
         prepared: Prepared,
         columns: Vec<ColumnRequest>,
     ) -> Result<Vec<OwnedRow>> {
-        self.read_connection().fetch(prepared.route, &prepared.sql, prepared.params, columns).await
+        let run =
+            self.read_connection().fetch(prepared.route, &prepared.sql, prepared.params, columns);
+
+        #[cfg(feature = "telemetry")]
+        return crate::telemetry::traced(
+            crate::telemetry::span(self.dialect(), &prepared.sql),
+            run,
+            |rows: &Vec<OwnedRow>| Some(rows.len()),
+        )
+        .await;
+
+        #[cfg(not(feature = "telemetry"))]
+        run.await
     }
 
     /// Run a prepared query and decode every row into `E`.
@@ -439,14 +451,28 @@ impl Database {
 
     /// Run a prepared write.
     pub async fn execute(&self, prepared: Prepared) -> Result<ExecOutcome> {
-        let outcomes =
-            self.write_connection().execute(prepared.route, &prepared.sql, prepared.params).await?;
+        let run = self.write_connection().execute(prepared.route, &prepared.sql, prepared.params);
+
+        #[cfg(feature = "telemetry")]
+        let run = crate::telemetry::traced(
+            crate::telemetry::span(self.dialect(), &prepared.sql),
+            run,
+            |_| None,
+        );
+
+        let outcomes = run.await?;
         Ok(outcomes.into_iter().next().unwrap_or_default())
     }
 
     /// Run a raw statement with no bindings — for DDL.
     pub async fn statement(&self, sql: &str) -> Result<ExecOutcome> {
-        let outcomes = self.write_connection().execute(ShardRoute::Global, sql, Vec::new()).await?;
+        let run = self.write_connection().execute(ShardRoute::Global, sql, Vec::new());
+
+        #[cfg(feature = "telemetry")]
+        let run =
+            crate::telemetry::traced(crate::telemetry::span(self.dialect(), sql), run, |_| None);
+
+        let outcomes = run.await?;
         Ok(outcomes.into_iter().next().unwrap_or_default())
     }
 }
@@ -594,16 +620,11 @@ impl Executor for Database {
         sql: &str,
         params: Vec<Value>,
     ) -> rainier_orm::Result<Vec<Box<dyn Row>>> {
-        self.read_connection().fetch_raw(ShardRoute::Global, sql, params).await.map_err(into_anyhow)
+        self.fetch_all_routed(ShardRoute::Global, sql, params).await
     }
 
     async fn execute(&self, sql: &str, params: Vec<Value>) -> rainier_orm::Result<ExecOutcome> {
-        let outcomes = self
-            .write_connection()
-            .execute(ShardRoute::Global, sql, params)
-            .await
-            .map_err(into_anyhow)?;
-        Ok(outcomes.into_iter().next().unwrap_or_default())
+        self.execute_routed(ShardRoute::Global, sql, params).await
     }
 
     async fn fetch_all_routed(
@@ -612,7 +633,16 @@ impl Executor for Database {
         sql: &str,
         params: Vec<Value>,
     ) -> rainier_orm::Result<Vec<Box<dyn Row>>> {
-        self.read_connection().fetch_raw(route, sql, params).await.map_err(into_anyhow)
+        let run = self.read_connection().fetch_raw(route, sql, params);
+
+        #[cfg(feature = "telemetry")]
+        let run = crate::telemetry::traced(
+            crate::telemetry::span(Executor::dialect(self), sql),
+            run,
+            |rows: &Vec<Box<dyn Row>>| Some(rows.len()),
+        );
+
+        run.await.map_err(into_anyhow)
     }
 
     async fn execute_routed(
@@ -621,8 +651,16 @@ impl Executor for Database {
         sql: &str,
         params: Vec<Value>,
     ) -> rainier_orm::Result<ExecOutcome> {
-        let outcomes =
-            self.write_connection().execute(route, sql, params).await.map_err(into_anyhow)?;
+        let run = self.write_connection().execute(route, sql, params);
+
+        #[cfg(feature = "telemetry")]
+        let run = crate::telemetry::traced(
+            crate::telemetry::span(Executor::dialect(self), sql),
+            run,
+            |_| None,
+        );
+
+        let outcomes = run.await.map_err(into_anyhow)?;
         Ok(outcomes.into_iter().next().unwrap_or_default())
     }
 }
@@ -1012,5 +1050,57 @@ mod tests {
         let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
 
         assert_eq!(writers[0].statement_count() + writers[1].statement_count(), 2);
+    }
+}
+
+#[cfg(all(test, feature = "telemetry"))]
+mod telemetry_tests {
+    use super::*;
+    use crate::statement;
+    use crate::testing::{fake_database, MemoryConnection};
+    use rainier_support::telemetry::testing::Recorder;
+
+    #[derive(rainier_orm::Entity, Clone, Debug, PartialEq)]
+    #[orm(table = "users")]
+    struct User {
+        #[orm(pk, auto_increment)]
+        id: u64,
+        email: String,
+    }
+
+    #[tokio::test]
+    async fn every_statement_is_a_span_with_its_sql_and_never_its_values() {
+        let recorder = Recorder::new();
+        let _guard = recorder.install();
+        let (db, _) = fake_database(
+            MemoryConnection::new(Dialect::Sqlite)
+                .returning([OwnedRow::new().with("id", 1_i64).with("email", "x")]),
+        );
+
+        let user = User { id: 0, email: "ada@example.com".into() };
+        db.execute(statement::insert(Dialect::Sqlite, &user, None)).await.unwrap();
+        let _: Vec<User> =
+            db.fetch_all(statement::select_all::<User>(Dialect::Sqlite)).await.unwrap();
+        db.statement("DELETE FROM sessions WHERE token = 'hunter2'").await.unwrap();
+
+        let spans = recorder.named("db.query");
+        assert_eq!(spans.len(), 3);
+
+        let insert = &spans[0];
+        assert_eq!(insert.field("db.system.name"), Some("sqlite"));
+        assert_eq!(insert.field("db.operation.name"), Some("INSERT"));
+        assert_eq!(insert.field("db.collection.name"), Some("users"));
+        assert_eq!(insert.field("otel.name"), Some("INSERT users"));
+
+        assert_eq!(spans[1].field("db.response.returned_rows"), Some("1"));
+        assert_eq!(
+            spans[2].field("db.query.text"),
+            Some("DELETE FROM sessions WHERE token = ?"),
+            "a raw statement's inline value is sanitised away"
+        );
+
+        let everything = recorder.everything();
+        assert!(!everything.contains("ada@example.com"), "a bound value never appears");
+        assert!(!everything.contains("hunter2"), "nor an inline one");
     }
 }

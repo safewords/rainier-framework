@@ -131,7 +131,32 @@ impl Console {
             return self.print_help(command.name());
         }
 
-        match command.handle(&args, app).await {
+        // The command's name and its exit code — not its arguments, which is
+        // where a console takes a password, a token or a customer's email.
+        #[cfg(feature = "telemetry")]
+        let span = rainier_support::span!(
+            "console.command",
+            otel.name = %format!("command {}", command.name()),
+            rainier.command.name = command.name(),
+            process.exit.code = tracing::field::Empty,
+        );
+        let handled = command.handle(&args, app);
+        #[cfg(feature = "telemetry")]
+        let handled = tracing::Instrument::instrument(handled, span.clone());
+        let handled = handled.await;
+
+        #[cfg(feature = "telemetry")]
+        match &handled {
+            Ok(code) => {
+                span.record("process.exit.code", *code);
+            }
+            Err(error) => {
+                span.record("process.exit.code", exit::FAILURE);
+                rainier_support::telemetry::record_error(&span, error);
+            }
+        }
+
+        match handled {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{}: {e}", command.name());
@@ -285,6 +310,23 @@ mod tests {
         async fn handle(&self, _: &Arguments, _: &Application) -> Result<i32> {
             Ok(3)
         }
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn a_command_is_a_span_with_its_exit_code_and_not_its_arguments() {
+        use rainier_support::telemetry::testing::Recorder;
+
+        let recorder = Recorder::new();
+        let _guard = recorder.install();
+        console().run_argv(&app(), ["check", "--password=hunter2"]).await;
+        console().run_argv(&app(), ["queue:work"]).await;
+
+        let spans = recorder.named("console.command");
+        assert_eq!(spans[0].field("rainier.command.name"), Some("check"));
+        assert_eq!(spans[0].field("process.exit.code"), Some("3"));
+        assert_eq!(spans[1].field("otel.status_code"), Some("ERROR"));
+        assert!(!recorder.everything().contains("hunter2"));
     }
 
     fn console() -> Console {

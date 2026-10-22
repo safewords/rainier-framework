@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use rainier_cache::LockManager;
 use rainier_container::Container;
 use rainier_events::Dispatcher;
@@ -94,6 +95,86 @@ fn tally(stats: &mut WorkerStats, outcome: Result<Outcome>) {
             tracing::warn!(error = %error.message(), "a job could not be processed");
             stats.errors += 1;
         }
+    }
+}
+
+/// When a job was reserved, and how long the driver took to hand it over.
+///
+/// Measured on every reservation — an `Instant` and a clock read — because the
+/// alternative is threading a feature flag through the run loop. Only the
+/// `telemetry` feature reads it.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(feature = "telemetry"), allow(dead_code))]
+struct Reservation {
+    at: DateTime<Utc>,
+    took: Duration,
+}
+
+/// What running one job measured, for the span and the observer.
+#[derive(Debug, Default)]
+#[cfg_attr(not(feature = "telemetry"), allow(dead_code))]
+struct Ran {
+    /// The handler, or the pod — not the acknowledgement.
+    handle: Duration,
+    /// The delay before the next attempt, when it was released.
+    backoff: Option<Duration>,
+    /// Whether it ran past its timeout.
+    timed_out: bool,
+    /// A Kubernetes job's create-to-running latency.
+    pod_start: Option<Duration>,
+    /// A Kubernetes job's container run time.
+    pod_run: Option<Duration>,
+}
+
+/// Run one driver call that settles a job — acknowledge, release, fail — in
+/// its own span with the `telemetry` feature, so a slow `XACK` or a contended
+/// `DELETE` is not mistaken for a slow handler.
+///
+/// A macro rather than a function because a span's name has to be a constant:
+/// it is baked into a static callsite.
+macro_rules! settle {
+    ($name:literal, $operation:literal, $call:expr) => {{
+        #[cfg(feature = "telemetry")]
+        {
+            let span = rainier_support::span!(
+                $name,
+                otel.name = $operation,
+                messaging.operation.type = "settle",
+                messaging.operation.name = $operation,
+            );
+            let traced = span.clone();
+            // Built here, so the `async move` takes the future — which only
+            // borrows the job — rather than the job itself.
+            let call = $call;
+            tracing::Instrument::instrument(
+                async move { rainier_support::telemetry::record_result(&traced, call.await) },
+                span,
+            )
+            .await
+        }
+
+        #[cfg(not(feature = "telemetry"))]
+        {
+            $call.await
+        }
+    }};
+}
+
+/// Whole milliseconds, as a span attribute records them.
+#[cfg(feature = "telemetry")]
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Aborts a background task when dropped — the depth sampler, which must not
+/// outlive the run that started it.
+#[cfg(feature = "telemetry")]
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+#[cfg(feature = "telemetry")]
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -433,6 +514,13 @@ pub struct Worker {
     /// extractor entirely in the registry).
     #[cfg(feature = "kubernetes")]
     k8s_runner: Option<Arc<crate::kubernetes::KubernetesDispatcher>>,
+    /// Where job timings and sampled depths are reported. See
+    /// [`with_observer`](Self::with_observer).
+    #[cfg(feature = "telemetry")]
+    observer: Option<Arc<dyn crate::telemetry::QueueObserver>>,
+    /// How often the depth of each queue is sampled, while an observer is set.
+    #[cfg(feature = "telemetry")]
+    depth_interval: Option<Duration>,
 }
 
 impl Worker {
@@ -461,7 +549,37 @@ impl Worker {
             stopping: AtomicBool::new(false),
             #[cfg(feature = "kubernetes")]
             k8s_runner: None,
+            #[cfg(feature = "telemetry")]
+            observer: None,
+            #[cfg(feature = "telemetry")]
+            depth_interval: Some(Duration::from_secs(15)),
         }
+    }
+
+    /// Report every job's timings, and each queue's sampled depth, to
+    /// `observer`.
+    ///
+    /// `queue:work` sets one over the application's `Metrics` registry when
+    /// one is bound — see `rainier_framework::observability`.
+    #[cfg(feature = "telemetry")]
+    pub fn with_observer(mut self, observer: Arc<dyn crate::telemetry::QueueObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// How often to sample each queue's depth while an observer is set —
+    /// fifteen seconds by default, `None` to not sample at all.
+    ///
+    /// A sample is one [`Queue::size`] call per queue,
+    /// on its own task and its own clock: never on a job's path, and never
+    /// once per job. Every worker replica samples, so the backlog is read
+    /// `replicas × queues` times per interval — cheap for Redis (`XLEN` +
+    /// `ZCARD`) and SQS (one attribute read), a `COUNT` for the database
+    /// driver, and an offset lookup per partition for Kafka.
+    #[cfg(feature = "telemetry")]
+    pub fn sample_depth_every(mut self, interval: Option<Duration>) -> Self {
+        self.depth_interval = interval.filter(|interval| !interval.is_zero());
+        self
     }
 
     /// Launch jobs whose [`crate::Job::kubernetes`] returns
@@ -506,7 +624,7 @@ impl Worker {
     /// Reserve and run one job from the first queue that has one.
     pub async fn run_next(&self) -> Result<Outcome> {
         match self.reserve_next().await? {
-            Some(job) => self.process(job).await,
+            Some((job, reservation)) => self.process(job, reservation).await,
             None => Ok(Outcome::Idle),
         }
     }
@@ -516,7 +634,7 @@ impl Worker {
     /// Split out from [`run_next`](Self::run_next) so the run loop can hold
     /// several jobs in flight: reserving and processing are one turn at
     /// `concurrency: 1` and separate ones above it.
-    async fn reserve_next(&self) -> Result<Option<QueuedJob>> {
+    async fn reserve_next(&self) -> Result<Option<(QueuedJob, Reservation)>> {
         self.reserve_within(&BTreeMap::new()).await
     }
 
@@ -531,7 +649,7 @@ impl Worker {
     async fn reserve_within(
         &self,
         in_flight: &BTreeMap<String, usize>,
-    ) -> Result<Option<QueuedJob>> {
+    ) -> Result<Option<(QueuedJob, Reservation)>> {
         for queue in &self.options.queues {
             if let Some(limit) = self.options.queue_limits.get(queue) {
                 if in_flight.get(queue).copied().unwrap_or(0) >= *limit {
@@ -539,11 +657,86 @@ impl Worker {
                 }
             }
 
-            if let Some(job) = self.queue.reserve(queue).await? {
-                return Ok(Some(job));
+            let started = std::time::Instant::now();
+            if let Some(job) = self.reserve_one(queue).await? {
+                let reservation = Reservation { at: Utc::now(), took: started.elapsed() };
+                return Ok(Some((job, reservation)));
             }
         }
         Ok(None)
+    }
+
+    /// One driver round-trip for one queue.
+    ///
+    /// Its span is at `DEBUG`, unlike every other queue span: an idle worker
+    /// polls several times a second, and a span per empty poll would bury the
+    /// jobs in noise under the default `info` filter. The time a reservation
+    /// that **found** a job took is on that job's `queue.process` span as
+    /// `rainier.queue.reserve_ms`, at the level everything else is.
+    async fn reserve_one(&self, queue: &str) -> Result<Option<QueuedJob>> {
+        #[cfg(feature = "telemetry")]
+        {
+            let span = tracing::debug_span!(
+                "queue.reserve",
+                otel.name = %format!("receive {queue}"),
+                otel.kind = "consumer",
+                messaging.system = crate::telemetry::messaging_system(self.queue.name()),
+                messaging.operation.type = "receive",
+                messaging.destination.name = %queue,
+                rainier.queue.found = tracing::field::Empty,
+                otel.status_code = tracing::field::Empty,
+                error.type = tracing::field::Empty,
+            );
+            let traced = span.clone();
+            return tracing::Instrument::instrument(
+                async move {
+                    let result = rainier_support::telemetry::record_result(
+                        &traced,
+                        self.queue.reserve(queue).await,
+                    );
+                    if let Ok(found) = &result {
+                        traced.record("rainier.queue.found", found.is_some());
+                    }
+                    result
+                },
+                span,
+            )
+            .await;
+        }
+
+        #[cfg(not(feature = "telemetry"))]
+        self.queue.reserve(queue).await
+    }
+
+    /// Sample each queue's depth on its own interval, until dropped.
+    #[cfg(feature = "telemetry")]
+    fn sample_depth(&self) -> Option<AbortOnDrop> {
+        let observer = Arc::clone(self.observer.as_ref()?);
+        let interval = self.depth_interval?;
+        let queue = Arc::clone(&self.queue);
+        let queues = self.options.queues.clone();
+
+        Some(AbortOnDrop(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // A sample that comes late is still a sample; a burst of them to
+            // catch up is three reads of the same backlog.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                for name in &queues {
+                    match queue.size(name).await {
+                        Ok(depth) => observer.depth(name, depth),
+                        // Debug, not warn: a driver that cannot answer
+                        // cheaply answers the same way every interval.
+                        Err(error) => tracing::debug!(
+                            queue = %name,
+                            error = %error.message(),
+                            "could not sample the queue's depth"
+                        ),
+                    }
+                }
+            }
+        })))
     }
 
     /// Run until stopped, drained, or the job limit is reached.
@@ -575,6 +768,11 @@ impl Worker {
         let mut stats = WorkerStats::default();
         let started = std::time::Instant::now();
         let mut consecutive_errors: u32 = 0;
+
+        // Off the job path entirely: its own task, its own clock, stopped when
+        // this run ends.
+        #[cfg(feature = "telemetry")]
+        let _sampler = self.sample_depth();
 
         let concurrency = self.options.concurrency.max(1);
         let mut in_flight = FuturesUnordered::new();
@@ -617,12 +815,12 @@ impl Worker {
             // with room does not sit on an idle socket while jobs queue up.
             if !finishing && in_flight.len() < concurrency {
                 match self.reserve_within(&running).await {
-                    Ok(Some(job)) => {
+                    Ok(Some((job, reservation))) => {
                         consecutive_errors = 0;
                         let queue = job.queue.clone();
                         *running.entry(queue.clone()).or_insert(0) += 1;
                         in_flight.push(async move {
-                            let outcome = self.process(job).await;
+                            let outcome = self.process(job, reservation).await;
                             (queue, outcome)
                         });
                         continue;
@@ -708,7 +906,112 @@ impl Worker {
         Ok(stats)
     }
 
-    async fn process(&self, job: QueuedJob) -> Result<Outcome> {
+    async fn process(&self, job: QueuedJob, reservation: Reservation) -> Result<Outcome> {
+        #[cfg(feature = "telemetry")]
+        return self.process_traced(job, reservation).await;
+
+        #[cfg(not(feature = "telemetry"))]
+        {
+            let _ = reservation;
+            self.process_untraced(job, &mut Ran::default()).await
+        }
+    }
+
+    /// [`process`](Self::process) inside a `queue.process` span, reporting to
+    /// the observer — see `rainier_queue::telemetry`.
+    #[cfg(feature = "telemetry")]
+    async fn process_traced(&self, job: QueuedJob, reservation: Reservation) -> Result<Outcome> {
+        use crate::telemetry::{wait_time, JobOutcome, JobTiming};
+        use tracing::field::Empty;
+
+        let driver = self.queue.name().to_string();
+        let wait = wait_time(&job, reservation.at);
+
+        let span = rainier_support::span!(
+            "queue.process",
+            otel.name = %format!("process {}", job.name),
+            otel.kind = "consumer",
+            messaging.system = crate::telemetry::messaging_system(&driver),
+            messaging.operation.type = "process",
+            messaging.destination.name = %job.queue,
+            messaging.message.id = %job.id,
+            rainier.job.name = %job.name,
+            rainier.job.attempt = job.attempts,
+            rainier.job.max_attempts = job.max_attempts,
+            rainier.queue.reserve_ms = duration_ms(reservation.took),
+            messaging.queue.wait_ms = Empty,
+            rainier.job.runner = Empty,
+            rainier.job.outcome = Empty,
+            rainier.job.backoff_ms = Empty,
+        );
+        if let Some(wait) = wait {
+            span.record("messaging.queue.wait_ms", duration_ms(wait));
+        }
+
+        // The dispatch that queued it is this span's parent — set before the
+        // span is first entered, which is when OpenTelemetry fixes it. And
+        // anything the job calls joins the same trace.
+        if let Some(parent) = &job.traceparent {
+            rainier_telemetry::propagation::adopt(&span, parent);
+        }
+        let outbound = job
+            .traceparent
+            .as_deref()
+            .and_then(|header| rainier_telemetry::TraceContext::parse(header).ok())
+            .map(|context| rainier_telemetry::propagation::child_of(&context));
+
+        let (queue, name, attempt) = (job.queue.clone(), job.name.clone(), job.attempts);
+        if let Some(observer) = &self.observer {
+            observer.started(&queue, &name);
+        }
+
+        let mut ran = Ran::default();
+        let result = tracing::Instrument::instrument(
+            rainier_telemetry::propagation::scope(outbound, self.process_untraced(job, &mut ran)),
+            span.clone(),
+        )
+        .await;
+
+        let outcome = match &result {
+            Err(_) => JobOutcome::Error,
+            Ok(Outcome::Released | Outcome::Failed) if ran.timed_out => JobOutcome::TimedOut,
+            Ok(Outcome::Released) => JobOutcome::Released,
+            Ok(Outcome::Failed) => JobOutcome::Failed,
+            Ok(Outcome::Processed | Outcome::Idle) => JobOutcome::Processed,
+        };
+        span.record("rainier.job.outcome", outcome.as_str());
+        if let Some(backoff) = ran.backoff {
+            span.record("rainier.job.backoff_ms", duration_ms(backoff));
+        }
+        match &result {
+            Err(error) => rainier_support::telemetry::record_error(&span, error),
+            Ok(Outcome::Released | Outcome::Failed) => {
+                span.record("otel.status_code", "ERROR");
+                span.record("error.type", if ran.timed_out { "timeout" } else { "job_failed" });
+            }
+            Ok(_) => {}
+        }
+
+        if let Some(observer) = &self.observer {
+            observer.finished(&JobTiming {
+                queue,
+                driver,
+                job: name,
+                attempt,
+                outcome,
+                wait,
+                reserve: reservation.took,
+                handle: ran.handle,
+                backoff: ran.backoff,
+                pod_start: ran.pod_start,
+                pod_run: ran.pod_run,
+            });
+        }
+
+        result
+    }
+
+    async fn process_untraced(&self, job: QueuedJob, ran: &mut Ran) -> Result<Outcome> {
         self.dispatch(JobProcessing { job: job.clone() }).await;
 
         let context = Arc::new(JobContext::new(
@@ -737,11 +1040,12 @@ impl Worker {
                 .or(self.options.timeout),
         };
 
-        let outcome = self.run_handler(&job, &context, timeout).await;
+        let outcome = self.run_handler(&job, &context, timeout, ran).await;
+        ran.handle = started.elapsed();
 
         match outcome {
             Ok(()) => {
-                self.queue.acknowledge(&job).await?;
+                settle!("queue.ack", "ack", self.queue.acknowledge(&job))?;
                 self.release_uniqueness(&job).await;
 
                 let duration = started.elapsed();
@@ -749,7 +1053,7 @@ impl Worker {
                 self.dispatch(JobProcessed { job, duration }).await;
                 Ok(Outcome::Processed)
             }
-            Err(error) => self.handle_failure(job, error).await,
+            Err(error) => self.handle_failure(job, error, ran).await,
         }
     }
 
@@ -766,6 +1070,7 @@ impl Worker {
         job: &QueuedJob,
         context: &Arc<JobContext>,
         timeout: Option<Duration>,
+        ran: &mut Ran,
     ) -> Result<()> {
         #[cfg(feature = "kubernetes")]
         {
@@ -783,11 +1088,51 @@ impl Worker {
                 // one so the Kubernetes Job's name reflects the attempt
                 // the pod will actually run.
                 let attempt = job.attempts.saturating_add(1);
+
+                #[cfg(feature = "telemetry")]
+                {
+                    tracing::Span::current().record("rainier.job.runner", "kubernetes");
+                    let span = rainier_support::span!(
+                        "queue.kubernetes",
+                        otel.name = %format!("kubernetes {}", job.name),
+                        rainier.job.name = %job.name,
+                        rainier.k8s.pod_start_ms = tracing::field::Empty,
+                        rainier.k8s.pod_run_ms = tracing::field::Empty,
+                    );
+                    let traced = span.clone();
+                    let (result, pod) = tracing::Instrument::instrument(
+                        runner.run_and_watch_measured(
+                            &job.name,
+                            &job.payload,
+                            &spec,
+                            &job.id,
+                            attempt,
+                            timeout,
+                        ),
+                        span,
+                    )
+                    .await;
+                    if let Some(start) = pod.start {
+                        traced.record("rainier.k8s.pod_start_ms", duration_ms(start));
+                    }
+                    if let Some(run) = pod.run {
+                        traced.record("rainier.k8s.pod_run_ms", duration_ms(run));
+                    }
+                    ran.timed_out = pod.timed_out;
+                    ran.pod_start = pod.start;
+                    ran.pod_run = pod.run;
+                    return rainier_support::telemetry::record_result(&traced, result);
+                }
+
+                #[cfg(not(feature = "telemetry"))]
                 return runner
                     .run_and_watch(&job.name, &job.payload, &spec, &job.id, attempt, timeout)
                     .await;
             }
         }
+
+        #[cfg(feature = "telemetry")]
+        tracing::Span::current().record("rainier.job.runner", "in_process");
 
         // Guarded, so a panic fails this job rather than the worker — see
         // [`CatchPanic`].
@@ -796,6 +1141,7 @@ impl Worker {
             Some(timeout) => match tokio::time::timeout(timeout, run).await {
                 Ok(result) => result,
                 Err(_) => {
+                    ran.timed_out = true;
                     Ok(Err(Error::internal(format!("the job exceeded its {timeout:?} timeout"))))
                 }
             },
@@ -834,11 +1180,11 @@ impl Worker {
         }
     }
 
-    async fn handle_failure(&self, job: QueuedJob, error: Error) -> Result<Outcome> {
+    async fn handle_failure(&self, job: QueuedJob, error: Error, ran: &mut Ran) -> Result<Outcome> {
         let message = error.to_string();
 
         if job.attempts >= self.options.attempts_for(job.max_attempts) {
-            self.queue.fail(&job, &message).await?;
+            settle!("queue.fail", "fail", self.queue.fail(&job, &message))?;
 
             // Released on final failure too. Holding the lock until
             // `UNIQUE_FOR` would mean one permanent failure blocks every later
@@ -853,7 +1199,8 @@ impl Worker {
         // `attempts` counts what has been tried, so the backoff for the *next*
         // attempt is indexed by it directly.
         let delay = backoff_for(job.attempts);
-        self.queue.release(&job, delay).await?;
+        ran.backoff = Some(delay);
+        settle!("queue.release", "release", self.queue.release(&job, delay))?;
         tracing::warn!(
             job = %job.name,
             id = %job.id,
@@ -1974,5 +2321,231 @@ mod tests {
         let stats = WorkerStats { errors: 500, ..WorkerStats::default() };
 
         assert_eq!(stats.total(), 0);
+    }
+}
+
+#[cfg(all(test, feature = "telemetry"))]
+mod telemetry_tests {
+    use std::sync::Mutex;
+
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+    use crate::job::Job;
+    use crate::queue::MemoryQueue;
+    use crate::telemetry::{JobOutcome, JobTiming, QueueObserver};
+    use rainier_support::telemetry::testing::Recorder;
+
+    const UPSTREAM: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    /// What the handler saw of the trace.
+    static SEEN_TRACE: Mutex<Option<String>> = Mutex::new(None);
+
+    #[derive(Serialize, Deserialize)]
+    struct Charge {
+        card_number: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Job for Charge {
+        const NAME: &'static str = "billing.charge";
+        const TRIES: u32 = 2;
+
+        async fn handle(&self, _: &JobContext) -> Result<()> {
+            if self.card_number == "traced" {
+                *SEEN_TRACE.lock().unwrap() = rainier_telemetry::propagation::current();
+            }
+            if self.card_number == "declined" {
+                return Err(Error::internal("card declined"));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Sluggish;
+
+    #[async_trait::async_trait]
+    impl Job for Sluggish {
+        const NAME: &'static str = "test.sluggish";
+        const TRIES: u32 = 1;
+        const TIMEOUT: Option<Duration> = Some(Duration::from_millis(5));
+
+        async fn handle(&self, _: &JobContext) -> Result<()> {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct Observed {
+        started: Mutex<Vec<(String, String)>>,
+        finished: Mutex<Vec<JobTiming>>,
+        depths: Mutex<Vec<(String, u64)>>,
+    }
+
+    impl QueueObserver for Observed {
+        fn started(&self, queue: &str, job: &str) {
+            self.started.lock().unwrap().push((queue.into(), job.into()));
+        }
+
+        fn finished(&self, timing: &JobTiming) {
+            self.finished.lock().unwrap().push(timing.clone());
+        }
+
+        fn depth(&self, queue: &str, depth: u64) {
+            self.depths.lock().unwrap().push((queue.into(), depth));
+        }
+    }
+
+    fn worker(queue: Arc<MemoryQueue>, observer: Arc<Observed>) -> Worker {
+        let registry = JobRegistry::new().with::<Charge>().with::<Sluggish>();
+        Worker::new(queue, Arc::new(registry), Arc::new(Container::new()))
+            .with_options(WorkerOptions::default().stop_when_empty())
+            .with_observer(observer)
+    }
+
+    fn charge(card: &str) -> QueuedJob {
+        QueuedJob::from_job(&Charge { card_number: card.into() }).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_processed_job_reports_its_wait_and_its_timings() {
+        let queue = Arc::new(MemoryQueue::new());
+        let observer = Arc::new(Observed::default());
+        let waited = charge("4242").available_at(Utc::now() - chrono::Duration::seconds(30));
+        queue.push(waited).await.unwrap();
+
+        let outcome = worker(Arc::clone(&queue), Arc::clone(&observer)).run_next().await.unwrap();
+        assert_eq!(outcome, Outcome::Processed);
+
+        let started = observer.started.lock().unwrap().clone();
+        assert_eq!(started, [("default".to_string(), "billing.charge".to_string())]);
+
+        let timing = observer.finished.lock().unwrap()[0].clone();
+        assert_eq!(timing.outcome, JobOutcome::Processed);
+        assert_eq!(timing.job, "billing.charge");
+        assert_eq!(timing.queue, "default");
+        assert_eq!(timing.driver, "memory");
+        assert_eq!(timing.attempt, 1);
+        assert_eq!(timing.backoff, None);
+        let wait = timing.wait.expect("a wait");
+        assert!(wait >= Duration::from_secs(30) && wait < Duration::from_secs(40), "{wait:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_released_with_its_backoff_then_failed() {
+        let queue = Arc::new(MemoryQueue::new());
+        let observer = Arc::new(Observed::default());
+        queue.push(charge("declined")).await.unwrap();
+        let worker = worker(Arc::clone(&queue), Arc::clone(&observer));
+
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Released);
+        // Released with a delay; make it due again rather than wait it out.
+        let retry = queue.pending("default").remove(0).available_at(Utc::now());
+        queue.clear("default").await.unwrap();
+        queue.push(retry).await.unwrap();
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Failed);
+
+        let finished = observer.finished.lock().unwrap().clone();
+        assert_eq!(finished[0].outcome, JobOutcome::Released);
+        assert_eq!(finished[0].backoff, Some(backoff_for(1)));
+        assert_eq!(finished[1].outcome, JobOutcome::Failed);
+        assert_eq!(finished[1].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn a_timeout_is_its_own_outcome() {
+        let queue = Arc::new(MemoryQueue::new());
+        let observer = Arc::new(Observed::default());
+        queue.push(QueuedJob::from_job(&Sluggish).unwrap()).await.unwrap();
+
+        assert_eq!(
+            worker(Arc::clone(&queue), Arc::clone(&observer)).run_next().await.unwrap(),
+            Outcome::Failed
+        );
+        assert_eq!(observer.finished.lock().unwrap()[0].outcome, JobOutcome::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn each_phase_is_its_own_span_and_the_payload_is_never_one_of_them() {
+        let recorder = Recorder::new();
+        let _guard = recorder.install();
+        let queue = Arc::new(MemoryQueue::new());
+        queue.push(charge("4111111111111111")).await.unwrap();
+
+        worker(queue, Arc::new(Observed::default())).run_next().await.unwrap();
+
+        let process = recorder.span("queue.process");
+        assert_eq!(process.field("otel.kind"), Some("consumer"));
+        assert_eq!(process.field("messaging.destination.name"), Some("default"));
+        assert_eq!(process.field("rainier.job.name"), Some("billing.charge"));
+        assert_eq!(process.field("rainier.job.attempt"), Some("1"));
+        assert_eq!(process.field("rainier.job.outcome"), Some("processed"));
+        assert_eq!(process.field("rainier.job.runner"), Some("in_process"));
+        assert!(process.field("messaging.queue.wait_ms").is_some());
+        assert!(process.field("rainier.queue.reserve_ms").is_some());
+
+        for child in ["queue.deserialize", "queue.handle", "queue.ack"] {
+            assert_eq!(recorder.span(child).parent, Some(process.id), "{child} under process");
+        }
+        assert!(
+            !recorder.everything().contains("4111111111111111"),
+            "the payload never reaches a span"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_dispatching_trace_crosses_the_queue() {
+        let queue = Arc::new(MemoryQueue::new());
+        let registry = Arc::new(JobRegistry::new().with::<Charge>());
+        let manager = crate::QueueManager::new(Arc::clone(&queue) as _, Arc::clone(&registry));
+
+        rainier_telemetry::propagation::scope(Some(UPSTREAM.to_string()), async {
+            manager.dispatch(Charge { card_number: "traced".into() }).await.unwrap();
+        })
+        .await;
+        assert_eq!(queue.pending("default")[0].traceparent.as_deref(), Some(UPSTREAM));
+
+        worker(queue, Arc::new(Observed::default())).run_next().await.unwrap();
+
+        let seen = SEEN_TRACE.lock().unwrap().clone().expect("the handler saw a trace");
+        let seen = rainier_telemetry::TraceContext::parse(&seen).unwrap();
+        assert_eq!(seen.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736", "the same trace");
+    }
+
+    #[tokio::test]
+    async fn the_depth_is_sampled_off_the_job_path() {
+        let queue = Arc::new(MemoryQueue::new());
+        let observer = Arc::new(Observed::default());
+        for _ in 0..5 {
+            queue.push(charge("4242")).await.unwrap();
+        }
+
+        // An hour-long interval whose first tick is immediate: one sample, on
+        // the sampler's own task.
+        let worker = worker(Arc::clone(&queue), Arc::clone(&observer))
+            .sample_depth_every(Some(Duration::from_secs(3600)));
+        let sampler = worker.sample_depth().expect("an observer, so a sampler");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(*observer.depths.lock().unwrap(), [("default".to_string(), 5)]);
+        drop(sampler);
+
+        // And processing five jobs adds no samples: depth is never per job.
+        worker.run().await.unwrap();
+        assert_eq!(observer.finished.lock().unwrap().len(), 5);
+        assert!(observer.depths.lock().unwrap().len() <= 2, "at most the run's own first tick");
+    }
+
+    #[tokio::test]
+    async fn without_an_observer_nothing_is_sampled_or_reported() {
+        let queue = Arc::new(MemoryQueue::new());
+        queue.push(charge("4242")).await.unwrap();
+        let registry = JobRegistry::new().with::<Charge>();
+        let worker = Worker::new(queue, Arc::new(registry), Arc::new(Container::new()))
+            .with_options(WorkerOptions::default().stop_when_empty());
+
+        assert!(worker.sample_depth().is_none());
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Processed);
     }
 }

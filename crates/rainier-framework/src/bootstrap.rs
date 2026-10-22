@@ -856,6 +856,18 @@ impl Rainier {
         // the route table that carries it instead.
         crate::cors::warn_if_cors_cannot_answer_a_preflight(&global, &compiled);
 
+        // Outermost of all, with the `telemetry` feature: every log line and
+        // every span below it — the timeout and compression included — joins
+        // the request's trace.
+        #[cfg(feature = "telemetry")]
+        crate::instrumentation::install_trace_middleware(
+            &mut global,
+            &crate::observability::TelemetrySettings::from_config_and_env(
+                app.resolve::<Config>()?.as_ref(),
+                app.resolve::<Env>()?.as_ref(),
+            ),
+        );
+
         let settings_for_kernel = app.resolve::<Config>()?;
         let debug = settings_for_kernel.get_or(keys::APP_DEBUG, false);
         let mut kernel = Kernel::from_shared(Arc::clone(&compiled), global).with_debug(debug);
@@ -1492,8 +1504,15 @@ fn install_tracing(env: &Env, config: &Config) {
 
     // A second subscriber would panic, and an application that installs its
     // own should keep it — so a failure here is expected and ignored.
+    #[cfg(not(feature = "telemetry"))]
     crate::observability::TelemetrySettings::from_config(config)
         .install_logging(&environment, &env.string("RUST_LOG", "info"));
+
+    // With the feature, the exporter rides along when an endpoint is set —
+    // from the configuration or from `OTEL_EXPORTER_OTLP_ENDPOINT`.
+    #[cfg(feature = "telemetry")]
+    crate::observability::TelemetrySettings::from_config_and_env(config, env)
+        .install(&environment, &env.string("RUST_LOG", "info"));
 }
 
 #[cfg(test)]

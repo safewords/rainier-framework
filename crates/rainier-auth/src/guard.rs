@@ -202,6 +202,55 @@ impl<U: Authenticatable> StatefulGuard<U> for SessionGuard<U> {
         request: &'a Request,
         credentials: &'a Credentials,
     ) -> BoxFuture<'a, Result<Option<U>>> {
+        let attempt = self.attempt_untraced(request, credentials);
+
+        // The guard and whether it worked — never the credentials, and never
+        // who: a failed attempt's username is somebody else's, as often as not.
+        #[cfg(feature = "telemetry")]
+        let attempt: BoxFuture<'a, Result<Option<U>>> = {
+            let span = rainier_support::span!(
+                "auth.attempt",
+                otel.name = "auth attempt",
+                rainier.auth.guard = %self.name,
+                rainier.auth.outcome = tracing::field::Empty,
+            );
+            let traced = span.clone();
+            Box::pin(tracing::Instrument::instrument(
+                async move {
+                    let result = attempt.await;
+                    match &result {
+                        Ok(user) => {
+                            traced.record(
+                                "rainier.auth.outcome",
+                                if user.is_some() { "success" } else { "failure" },
+                            );
+                        }
+                        Err(error) => rainier_support::telemetry::record_error(&traced, error),
+                    }
+                    result
+                },
+                span,
+            ))
+        };
+
+        attempt
+    }
+
+    fn login<'a>(&'a self, request: &'a Request, user: &'a U) -> BoxFuture<'a, Result<()>> {
+        self.login_untraced(request, user)
+    }
+
+    fn logout<'a>(&'a self, request: &'a Request) -> BoxFuture<'a, Result<()>> {
+        self.logout_untraced(request)
+    }
+}
+
+impl<U: Authenticatable> SessionGuard<U> {
+    fn attempt_untraced<'a>(
+        &'a self,
+        request: &'a Request,
+        credentials: &'a Credentials,
+    ) -> BoxFuture<'a, Result<Option<U>>> {
         Box::pin(async move {
             let Some(user) = self.provider.retrieve_by_credentials(credentials).await? else {
                 return Ok(None);
@@ -215,7 +264,11 @@ impl<U: Authenticatable> StatefulGuard<U> for SessionGuard<U> {
         })
     }
 
-    fn login<'a>(&'a self, request: &'a Request, user: &'a U) -> BoxFuture<'a, Result<()>> {
+    fn login_untraced<'a>(
+        &'a self,
+        request: &'a Request,
+        user: &'a U,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let session = request
                 .session()
@@ -230,7 +283,7 @@ impl<U: Authenticatable> StatefulGuard<U> for SessionGuard<U> {
         })
     }
 
-    fn logout<'a>(&'a self, request: &'a Request) -> BoxFuture<'a, Result<()>> {
+    fn logout_untraced<'a>(&'a self, request: &'a Request) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             if let Some(session) = request.session() {
                 // Everything, not just the auth key: a cart or a half-filled
@@ -491,8 +544,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_guard_rejects_a_wrong_password() {
+        #[cfg(feature = "telemetry")]
+        let recorder = rainier_support::telemetry::testing::Recorder::new();
+        #[cfg(feature = "telemetry")]
+        let _guard = recorder.install();
+
         let guard = session_guard();
         let request = with_session();
+
+        #[cfg(feature = "telemetry")]
+        {
+            guard
+                .attempt(&request, &Credentials::password("ada@example.com", "hunter2"))
+                .await
+                .unwrap();
+            let span = recorder.span("auth.attempt");
+            assert_eq!(span.field("rainier.auth.outcome"), Some("failure"));
+            assert!(span.field("rainier.auth.guard").is_some());
+            assert!(!recorder.everything().contains("hunter2"), "never the password");
+            assert!(!recorder.everything().contains("ada@example.com"), "nor who");
+        }
 
         assert!(guard
             .attempt(&request, &Credentials::password("ada@example.com", "wrong"))

@@ -35,6 +35,8 @@ k8s-openapi = { version = "0.23", features = ["latest"], optional = true }
 # first HTTPS to the API server does not panic. Pinned to the same
 # version kube pulls in to keep one rustls in the graph.
 rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+# Only with `telemetry`: the trace a dispatch belongs to, carried on the job.
+rainier-telemetry = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -53,6 +55,11 @@ kafka = ["dep:rainier-drivers", "rainier-drivers/kafka"]
 # the `Job::kubernetes()` method are always compiled; this feature adds
 # the actual dispatcher + its kube-rs dependency.
 kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:rustls"]
+# Job performance: a span per dispatch, a `queue.process` span per job with
+# its reserve / deserialize / handle / acknowledge children, wait time, the
+# trace carried across the queue, and the `QueueObserver` port metrics are
+# reported through. See `rainier_queue::telemetry`.
+telemetry = ["rainier-support/telemetry", "dep:rainier-telemetry"]
 
 [lints]
 workspace = true

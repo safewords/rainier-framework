@@ -124,6 +124,35 @@ kafka-tls = ["kafka", "rainier-drivers/kafka-tls"]
 s3 = ["rainier-filesystem/s3"]
 d1-http = ["rainier-database/d1-http"]
 libsql-http = ["rainier-database/libsql-http"]
+# Passive instrumentation of every component: a span, named and attributed
+# after the OpenTelemetry conventions, around each request, route match,
+# outbound call, query, cache and storage operation, dispatch, job (with its
+# reserve / decode / handle / acknowledge phases and its wait), mail,
+# notification, event, broadcast, socket, scheduled task, console command,
+# session load and save, login attempt and template render — and the OTLP
+# exporter, installed at boot from `TELEMETRY_ENABLED` and
+# `OTEL_EXPORTER_OTLP_ENDPOINT` with no code in the application. Off, none of
+# it is compiled. See `docs/observability.md#passive-instrumentation`.
+telemetry = [
+    "rainier-support/telemetry",
+    "rainier-telemetry/otlp",
+    "rainier-server/telemetry",
+    "rainier-routing/telemetry",
+    "rainier-http-client/telemetry",
+    "rainier-database/telemetry",
+    "rainier-cache/telemetry",
+    "rainier-queue/telemetry",
+    "rainier-mail/telemetry",
+    "rainier-notify/telemetry",
+    "rainier-events/telemetry",
+    "rainier-broadcast/telemetry",
+    "rainier-filesystem/telemetry",
+    "rainier-scheduler/telemetry",
+    "rainier-console/telemetry",
+    "rainier-session/telemetry",
+    "rainier-auth/telemetry",
+    "rainier-view/telemetry",
+]
 
 # docs.rs builds with default features, which for this crate is the wasm-safe
 # set — so half the API would be missing from the rendered documentation.

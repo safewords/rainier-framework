@@ -298,6 +298,18 @@ pub struct QueuedJob {
     /// to, so a driver stripping the key cannot know whether to restore `Null`.
     #[serde(skip)]
     pub delivery_handle: Option<String>,
+
+    /// The W3C `traceparent` of whatever dispatched this job, so the worker
+    /// that runs it joins the same trace.
+    ///
+    /// Written at dispatch by the `telemetry` feature and `None` otherwise.
+    /// `default` and skipped when absent, so an envelope written before this
+    /// field existed — or by a producer that has never heard of it — reads
+    /// exactly as it did, and one written with it reads in a worker built
+    /// without the feature. The database driver has no column for it; see
+    /// `rainier_queue::telemetry`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
 }
 
 impl QueuedJob {
@@ -315,6 +327,7 @@ impl QueuedJob {
             max_attempts: J::TRIES,
             unique_key: None,
             delivery_handle: None,
+            traceparent: None,
             available_at: now,
             created_at: now,
         })
@@ -356,6 +369,7 @@ impl QueuedJob {
             max_attempts: 1,
             unique_key: None,
             delivery_handle: None,
+            traceparent: None,
             available_at: now,
             created_at: now,
         }
@@ -464,21 +478,58 @@ impl JobRegistry {
     pub fn register<J: Job>(&mut self) -> &mut Self {
         let runner: Runner = Arc::new(|payload, context| {
             Box::pin(async move {
-                let job: J = serde_json::from_value(payload).map_err(|e| {
-                    Error::internal(format!(
-                        "could not deserialise a `{}` job — its payload and its type have \
-                         diverged: {e}",
-                        J::NAME
-                    ))
-                })?;
+                let decode = || {
+                    serde_json::from_value::<J>(payload).map_err(|e| {
+                        Error::internal(format!(
+                            "could not deserialise a `{}` job — its payload and its type have \
+                             diverged: {e}",
+                            J::NAME
+                        ))
+                    })
+                };
 
-                let outcome = job.handle(&context).await;
-                if let Err(error) = &outcome {
-                    if context.is_last_attempt() {
-                        job.failed(&context, error).await;
+                // Decoding and handling are separate spans, so a payload that
+                // takes a second to parse is not mistaken for a slow handler.
+                // Synchronous, so entering is safe: no await holds the guard.
+                #[cfg(feature = "telemetry")]
+                let job: J = {
+                    let span =
+                        rainier_support::span!("queue.deserialize", rainier.job.name = J::NAME);
+                    let _entered = span.enter();
+                    rainier_support::telemetry::record_result(&span, decode())?
+                };
+                #[cfg(not(feature = "telemetry"))]
+                let job: J = decode()?;
+
+                let handle = async {
+                    let outcome = job.handle(&context).await;
+                    if let Err(error) = &outcome {
+                        if context.is_last_attempt() {
+                            job.failed(&context, error).await;
+                        }
                     }
+                    outcome
+                };
+
+                #[cfg(feature = "telemetry")]
+                {
+                    let span = rainier_support::span!(
+                        "queue.handle",
+                        otel.name = %format!("handle {}", J::NAME),
+                        rainier.job.name = J::NAME,
+                    );
+                    let traced = span.clone();
+                    tracing::Instrument::instrument(
+                        async move {
+                            rainier_support::telemetry::record_result(&traced, handle.await)
+                        },
+                        span,
+                    )
+                    .await
                 }
-                outcome
+
+                #[cfg(not(feature = "telemetry"))]
+                handle.await
             })
         });
 

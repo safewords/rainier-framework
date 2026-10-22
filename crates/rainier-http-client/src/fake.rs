@@ -201,6 +201,20 @@ fn describe(recorded: &[RecordedRequest]) -> String {
 
 impl Transport for FakeTransport {
     fn send<'a>(&'a self, request: OutboundRequest) -> BoxFuture<'a, Result<RawResponse>> {
+        #[cfg(feature = "telemetry")]
+        return crate::telemetry::instrument(request, move |request| self.answer(request));
+
+        #[cfg(not(feature = "telemetry"))]
+        self.answer(request)
+    }
+
+    fn name(&self) -> &str {
+        "fake"
+    }
+}
+
+impl FakeTransport {
+    fn answer<'a>(&'a self, request: OutboundRequest) -> BoxFuture<'a, Result<RawResponse>> {
         Box::pin(async move {
             self.recorded
                 .lock()
@@ -224,10 +238,6 @@ impl Transport for FakeTransport {
 
             Ok(RawResponse { status: canned.status, headers: canned.headers, body: canned.body })
         })
-    }
-
-    fn name(&self) -> &str {
-        "fake"
     }
 }
 

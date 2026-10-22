@@ -270,6 +270,298 @@ request, which is how tracing gets switched off in production. Call
 An endpoint configured without the feature built in logs a warning at boot
 rather than silently exporting nothing.
 
+With `rainier-framework`'s `telemetry` feature none of this is needed — see
+[Passive instrumentation](#passive-instrumentation).
+
+---
+
+## Passive instrumentation
+
+### Quick start
+
+**1. Build with the feature.**
+
+```toml
+rainier-framework = { version = "2", features = ["telemetry"] }
+```
+
+**2. Set two variables.** No code: at boot the framework installs the OTLP
+exporter beside its log subscriber and puts `Trace` outermost in the global
+middleware.
+
+```env
+TELEMETRY_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+
+# Optional — the OpenTelemetry SDK's own names.
+OTEL_SERVICE_NAME=orders-api
+OTEL_TRACES_SAMPLER_ARG=0.25      # of traces this service starts
+```
+
+**3. Let workers be scraped.** A `queue:work` process has no HTTP server, so
+give it one route for its metrics — the registry it serves is the
+application's `Metrics`, bound as for the web process.
+
+```env
+WORKER_METRICS_ADDRESS=0.0.0.0:9100
+```
+
+**4. Run a collector.** It receives OTLP on 4317 and forwards to whatever
+stores traces — Tempo and Jaeger both accept OTLP directly:
+
+```yaml
+# otel-collector.yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls: { insecure: true }
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls: { insecure: true }
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo, otlp/jaeger]   # either, or both
+```
+
+and point Prometheus at the web process's metrics path and each worker's
+`WORKER_METRICS_ADDRESS`:
+
+```yaml
+scrape_configs:
+  - job_name: orders-api
+    metrics_path: /metrics
+    static_configs: [{ targets: ["orders-api:8080"] }]
+  - job_name: orders-worker
+    static_configs: [{ targets: ["orders-worker:9100"] }]
+```
+
+**5. Ask the questions.**
+
+```promql
+# How long jobs wait before a worker picks them up — p95, per queue.
+histogram_quantile(0.95,
+  sum by (queue, le) (rate(queue_job_wait_seconds_bucket[5m])))
+
+# What fraction of jobs fail or time out, per job type.
+sum by (job) (rate(queue_jobs_total{outcome=~"failed|timed_out"}[5m]))
+  /
+sum by (job) (rate(queue_jobs_total[5m]))
+
+# The backlog, and whether it is growing.
+max by (queue) (queue_depth)
+deriv(max by (queue) (queue_depth)[15m:1m]) > 0
+
+# Scheduled tasks turned away because the last run was still going.
+sum by (task) (increase(scheduler_task_runs_total{outcome="skipped_still_running"}[1h]))
+```
+
+**See it without any of that.** The `telemetry` example boots an
+application, serves one request that reads the cache, runs a query, calls
+another service and queues a job, processes the job, and prints every span
+and the queue metrics — no collector, no network:
+
+```sh
+cargo run -p rainier-framework --example telemetry --features telemetry
+```
+
+```text
+    cache.get  cache.hit=false cache.operation=get cache.store=memory …
+    db.query  db.operation.name=SELECT db.collection.name=orders db.query.text=SELECT id FROM orders WHERE id = ? …
+    http.client.request  server.address=carrier.example.com url.full=https://carrier.example.com/v1/rates …
+    queue.publish  messaging.destination.name=default rainier.job.name=orders.ship …
+  http.server.request  http.route=/orders/{order} http.response.status_code=200 trace_id=7098af80… …
+  [carrier] traceparent: 00-7098af80ed1c524fa32c207113cd192b-391aa6aff6b114f0-01
+  [queue] same trace as the request: true
+    queue.deserialize …
+    queue.handle …
+    queue.ack …
+  queue.process  messaging.queue.wait_ms=253 rainier.job.outcome=processed …
+  queue_jobs_total{job="orders.ship",outcome="processed",queue="default"} 1
+```
+
+### How it fits together
+
+With the `telemetry` feature every component opens
+its own spans at its real seams, and at boot the framework installs the OTLP
+exporter beside the log subscriber and puts `Trace` outermost in the global
+stack — no `config/telemetry.rs`, no layer to compose, no middleware to
+register. An application that already does any of those keeps what it did:
+a `telemetry.*` value set in configuration wins over the environment, a
+subscriber installed by the application is left alone (exporter and all), and
+a `Trace` it registered is not joined by a second.
+
+The variables are the OpenTelemetry SDK's own — `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_SERVICE_NAME`, `OTEL_TRACES_SAMPLER_ARG` — so a deployment configured for
+any other OpenTelemetry SDK is configured for this one.
+`cargo rainier features` turns the feature on for an environment that sets
+`TELEMETRY_ENABLED=true`.
+
+### Off is free
+
+Each crate has a `telemetry` feature of its own, and `rainier-framework`'s
+turns them all on. With it off, **no span is compiled** — not skipped at run
+time, absent from the binary. With it on, a span costs what a `tracing` span
+costs, and the levels are chosen so that an idle process makes none: the two
+operations that run on a timer whether or not there is work — a worker's
+empty poll, a socket's individual message — are at `DEBUG`, below the default
+`info` filter.
+
+### The catalogue
+
+Every span declares `otel.status_code` and `error.type`. A failure sets the
+first to `ERROR` and the second to a stable, low-cardinality kind
+(`internal`, `not_found`, `db_error`, a status code). **Never the error's
+message** — a driver's message is the one place a bound value leaks back out
+("Duplicate entry 'ada@example.com'…"), and a span goes to a system with other
+readers and other retention than the log line the message is still on.
+
+| Component | Span | Attributes | Deliberately not recorded |
+|---|---|---|---|
+| server | `http.server.request` | `http.request.method`, `url.path`, `http.route`, `rainier.route.name`, `http.response.status_code`, `user_agent.original`, `trace_id`; named `GET /posts/{post}` | the query string; a 4xx is not an error |
+| routing | records onto the server span | the matched **pattern**, never the path | — |
+| outbound HTTP | `http.client.request` (one per attempt) | `http.request.method`, `server.address`, `server.port`, `url.scheme`, `url.full`, `http.response.status_code` | the query string and any `user:pass@`; bodies; headers |
+| database | `db.query` | `db.system.name`, `db.operation.name`, `db.collection.name`, `db.query.text`, `db.response.returned_rows`; named `SELECT users` | bound values; literals in the text, which is sanitised to `?` |
+| cache | `cache.get` / `put` / `forget` / `has` / `add` / `increment` / `forget_if` / `flush` | `cache.store`, `cache.operation`, `cache.hit` | the key; the value |
+| storage | `storage.get` / `put` / `read` / `delete` / `list` / `copy` / `rename` / `sign` / … | `storage.driver`, `storage.operation`, `storage.bytes` | the path; the contents |
+| queue, dispatch | `queue.publish` | `messaging.system`, `messaging.destination.name`, `messaging.message.id`, `rainier.job.name` | the payload |
+| queue, worker | see [below](#queues) | | the payload |
+| mail | `mail.send` | `mail.transport`, `mail.recipients` (a count), `mail.attachments` (a count) | addresses; the subject; the body |
+| notifications | `notification.send` | `rainier.notification.name`, `rainier.notification.channels` | the recipient; the content |
+| events | `event.dispatch` — only when something listens | `rainier.event.name`, `rainier.event.listeners` | the event |
+| broadcasting | `broadcast.publish` | `rainier.broadcast.driver`, `rainier.broadcast.event`, `rainier.broadcast.channels` (a count) | channel names (`private-user.42`); the payload |
+| websockets | `websocket.connect`; `websocket.message` at `DEBUG` | `rainier.websocket.kind`, `rainier.websocket.bytes` | the socket's path; message contents |
+| scheduler | `schedule.task` | `rainier.task.name`, `rainier.task.outcome`, `rainier.task.skipped` (why) | — |
+| console | `console.command` | `rainier.command.name`, `process.exit.code` | the arguments, which is where a console takes a password |
+| sessions | `session.load`, `session.save` | `rainier.session.store`, `rainier.session.found` | the session id, which is a bearer credential |
+| authentication | `auth.attempt` | `rainier.auth.guard`, `rainier.auth.outcome` | the credentials; who — a failed attempt's username is as often somebody else's |
+| views | `view.render` | `rainier.view.name` | the data the template was given |
+
+### The trace crosses every boundary
+
+- **Into the process.** The server span adopts an incoming `traceparent` as
+  its parent, so this service's spans hang off the caller's.
+- **Out over HTTP.** Every outbound request — through the `Http` facade, a mail
+  API, a payment API, anything that reaches a transport — carries a
+  `traceparent` naming its own client span. A caller that set one keeps it.
+- **Through the queue.** A dispatch writes the `traceparent` in force onto the
+  job's envelope, and the worker's `queue.process` span adopts it: a job run
+  ten minutes later in another process is part of the request that queued it.
+  Anything the job calls joins the same trace.
+
+Without the exporter there are no span ids to cite, and what travels is the
+trace id the request arrived with plus an id this service mints for itself —
+one level shallower, the same trace, which is what keeps `grep <trace id>`
+working across services and queues with no collector at all.
+
+### Queues
+
+A slow job has four possible causes and a span per job cannot tell them apart.
+So a job is a tree:
+
+```text
+queue.process          the whole job; wait, reserve time, outcome, attempt
+├── queue.deserialize  decoding the payload into its type
+├── queue.handle       the handler (or queue.kubernetes, for a pod)
+└── queue.ack          or queue.release / queue.fail — the driver settling it
+```
+
+`queue.process` carries `messaging.system`, `messaging.destination.name`,
+`messaging.message.id`, `rainier.job.name`, `rainier.job.attempt`,
+`rainier.job.max_attempts`, `rainier.job.runner` (`in_process` or
+`kubernetes`), `rainier.queue.reserve_ms` (the driver round-trip that handed
+this job over), `messaging.queue.wait_ms`, `rainier.job.outcome` and, for a
+release, `rainier.job.backoff_ms`. The reserve itself is a `queue.reserve` span
+at `DEBUG`: an idle worker polls several times a second, and a span per empty
+poll would bury the jobs.
+
+**Wait time is measured from `available_at`, not from the push.** A job delayed
+by ten minutes was not waiting for ten minutes, and a released job was not
+waiting during its backoff. Every driver already writes the moment a job
+becomes runnable onto its envelope, so the wait is `reserved − available_at` —
+and it is on every envelope ever written, including the ones sitting in a
+queue across the deploy that turned this on. One exception: SQS releases a
+message by changing its visibility without rewriting it, so a retried SQS
+job's wait includes the backoff and the attempt before it. The database driver
+stores jobs as columns and has none for `traceparent`, so its jobs start
+traces of their own; their timings are unaffected.
+
+**Outcomes** are `processed`, `released`, `failed`, `timed_out` (a timeout,
+whether or not attempts remain — the fix is a different limit, not a code
+change) and `error` (the driver could not settle the job; it will be
+redelivered).
+
+With a `Metrics` registry bound, `queue:work` records:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `queue_job_duration_seconds` | histogram | queue, job, outcome |
+| `queue_job_wait_seconds` | histogram, to two hours | queue, job |
+| `queue_reserve_duration_seconds` | histogram | queue |
+| `queue_jobs_total` | counter | queue, job, outcome |
+| `queue_jobs_in_flight` | gauge | queue |
+| `queue_depth` | gauge, sampled | queue |
+| `queue_pod_start_seconds` | histogram — creating the Kubernetes Job to its container starting | queue, job |
+| `queue_pod_run_seconds` | histogram — the container's run | queue, job |
+
+`job` is the job's **type name**, never its id, so the series count is fixed
+by the code rather than by traffic.
+
+**Depth is sampled, never per job.** Each worker reads `Queue::size` for each
+of its queues on its own task every fifteen seconds
+(`Worker::sample_depth_every`). What that costs depends on the driver:
+
+| Driver | A sample is |
+|---|---|
+| Redis | `XLEN` + `ZCARD` — the ready stream and the delayed set |
+| SQS | one `ApproximateNumberOfMessages` read |
+| database | one `COUNT` of unreserved rows |
+| Kafka | the end offset and the consumer's cursor per partition — its lag |
+| memory | a length |
+
+Every replica samples, so a backlog is read `replicas × queues` times per
+interval; lengthen the interval, or pass `None`, if that matters for yours.
+
+**Pod timings** come from one extra API call per Kubernetes-dispatched job — a
+pod list once the Job is terminal and before it is deleted — made only with
+the feature on. A job that timed out is deleted on the spot and reports none.
+
+**A worker has no HTTP server**, so nothing would scrape what it records. Set
+`WORKER_METRICS_ADDRESS=0.0.0.0:9100` and `queue:work` serves the registry at
+`GET /metrics` on that address, and nothing else.
+
+### The scheduler
+
+With a registry bound, `schedule:run` and `schedule:work` record
+`scheduler_task_runs_total` and `scheduler_task_duration_seconds`, labelled by
+task and outcome — `ran`, `failed`, or `skipped_still_running`,
+`skipped_another_server`, `skipped_condition_false`. The first of those skips
+is the overlap guard turning a run away: the number to alert on when a task
+has started taking longer than its interval.
+
+### What it does not instrument
+
+**Individual middleware.** One span per stage on every request is a dozen spans
+that each take microseconds; the server span already covers them, and a slow
+middleware shows up as the gap before the route's work starts.
+
+**Below the `Database` handle.** A query is traced where every query passes —
+connection pooling and the drivers' own internals are not.
+
+**Socket paths and channel names.** Both carry identifiers.
+
 ---
 
 ## Logs

@@ -142,6 +142,18 @@ impl ScheduleExt for Schedule {
     }
 }
 
+/// Task timings into the application's metrics registry, with the
+/// `telemetry` feature and a registry bound; nothing otherwise.
+fn record(app: &Application, summary: &rainier_scheduler::RunSummary) {
+    #[cfg(feature = "telemetry")]
+    if let Ok(metrics) = app.resolve::<rainier_metrics::Metrics>() {
+        crate::instrumentation::record_schedule(&metrics, summary);
+    }
+
+    #[cfg(not(feature = "telemetry"))]
+    let _ = (app, summary);
+}
+
 /// `schedule:run` — run whatever is due this minute, then exit.
 ///
 /// What a system cron entry calls:
@@ -179,6 +191,7 @@ impl Command for ScheduleRunCommand {
         assert_locks_are_shared(app)?;
 
         let summary = schedule.run_due(app, &locks, Utc::now()).await;
+        record(app, &summary);
 
         if summary.considered() == 0 {
             println!("Nothing is due.");
@@ -234,6 +247,7 @@ impl Command for ScheduleWorkCommand {
 
         if args.flag("once") {
             let summary = schedule.run_due(app, &locks, Utc::now()).await;
+            record(app, &summary);
             return Ok(if summary.has_failures() { exit::FAILURE } else { exit::SUCCESS });
         }
 
@@ -248,6 +262,7 @@ impl Command for ScheduleWorkCommand {
             tokio::time::sleep(until_next_minute()).await;
 
             let summary = schedule.run_due(app, &locks, Utc::now()).await;
+            record(app, &summary);
             if summary.considered() > 0 {
                 tracing::info!(
                     ran = summary.ran.len(),

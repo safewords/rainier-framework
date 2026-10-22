@@ -226,13 +226,37 @@ impl Dispatcher {
             return Ok(());
         }
 
-        for handler in self.handlers_for::<E>() {
-            handler(Arc::clone(&payload)).await?;
+        let handlers = self.handlers_for::<E>();
+        let wildcards = self.wildcard_handlers();
+        #[cfg(feature = "telemetry")]
+        let listeners = handlers.len() + wildcards.len();
+        let deliver = async move {
+            for handler in handlers {
+                handler(Arc::clone(&payload)).await?;
+            }
+            for wildcard in wildcards {
+                wildcard.handle(name, Arc::clone(&payload)).await?;
+            }
+            Ok(())
+        };
+
+        // Only when somebody is listening: model hooks and the queue's
+        // lifecycle events fire constantly, and a span for an event nothing
+        // heard is noise in every trace.
+        #[cfg(feature = "telemetry")]
+        {
+            if listeners > 0 {
+                let span = event_span(name, listeners);
+                let traced = span.clone();
+                return tracing::Instrument::instrument(
+                    async move { rainier_support::telemetry::record_result(&traced, deliver.await) },
+                    span,
+                )
+                .await;
+            }
         }
-        for wildcard in self.wildcard_handlers() {
-            wildcard.handle(name, Arc::clone(&payload)).await?;
-        }
-        Ok(())
+
+        deliver.await
     }
 
     /// Dispatch to **every** listener regardless of failures, logging each
@@ -253,20 +277,46 @@ impl Dispatcher {
             return 0;
         }
 
-        let mut failures = 0;
-        for handler in self.handlers_for::<E>() {
-            if let Err(e) = handler(Arc::clone(&payload)).await {
-                tracing::error!(event = name, error = %e, "event listener failed");
-                failures += 1;
+        let handlers = self.handlers_for::<E>();
+        let wildcards = self.wildcard_handlers();
+        #[cfg(feature = "telemetry")]
+        let listeners = handlers.len() + wildcards.len();
+        let deliver = async move {
+            let mut failures = 0;
+            for handler in handlers {
+                if let Err(e) = handler(Arc::clone(&payload)).await {
+                    tracing::error!(event = name, error = %e, "event listener failed");
+                    failures += 1;
+                }
             }
-        }
-        for wildcard in self.wildcard_handlers() {
-            if let Err(e) = wildcard.handle(name, Arc::clone(&payload)).await {
-                tracing::error!(event = name, error = %e, "wildcard event listener failed");
-                failures += 1;
+            for wildcard in wildcards {
+                if let Err(e) = wildcard.handle(name, Arc::clone(&payload)).await {
+                    tracing::error!(event = name, error = %e, "wildcard event listener failed");
+                    failures += 1;
+                }
             }
+            failures
+        };
+
+        #[cfg(feature = "telemetry")]
+        if listeners > 0 {
+            let span = event_span(name, listeners);
+            let traced = span.clone();
+            return tracing::Instrument::instrument(
+                async move {
+                    let failures = deliver.await;
+                    if failures > 0 {
+                        traced.record("otel.status_code", "ERROR");
+                        traced.record("error.type", "listener_failed");
+                    }
+                    failures
+                },
+                span,
+            )
+            .await;
         }
-        failures
+
+        deliver.await
     }
 
     /// This event's handlers, highest priority first, snapshotted so the lock
@@ -370,6 +420,18 @@ impl Dispatcher {
              otherwise nothing is recorded and the assertion is meaningless"
         );
     }
+}
+
+/// The span one dispatch runs in — the event's name and how many listeners
+/// heard it. Never the event itself: it is application data.
+#[cfg(feature = "telemetry")]
+fn event_span(name: &'static str, listeners: usize) -> tracing::Span {
+    rainier_support::span!(
+        "event.dispatch",
+        otel.name = %format!("event {}", name.rsplit("::").next().unwrap_or(name)),
+        rainier.event.name = name,
+        rainier.event.listeners = listeners,
+    )
 }
 
 impl std::fmt::Debug for Dispatcher {
@@ -625,6 +687,27 @@ mod tests {
         events.dispatch(Shipped(1)).await.unwrap();
         // Would otherwise "pass" simply because nothing is ever recorded.
         events.assert_not_dispatched::<Shipped>();
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn a_heard_event_is_a_span_and_an_unheard_one_is_not() {
+        use rainier_support::telemetry::testing::Recorder;
+
+        let recorder = Recorder::new();
+        let _guard = recorder.install();
+        let events = Dispatcher::new();
+        events.listen(|_: Arc<Shipped>| async { Ok(()) });
+        events.listen(|_: Arc<Shipped>| async { Err(Error::internal("down")) });
+
+        events.dispatch_quietly(Shipped(1)).await;
+        events.dispatch(Cancelled).await.unwrap();
+
+        let spans = recorder.named("event.dispatch");
+        assert_eq!(spans.len(), 1, "nobody listens for Cancelled");
+        assert_eq!(spans[0].field("rainier.event.listeners"), Some("2"));
+        assert_eq!(spans[0].field("otel.name"), Some("event Shipped"));
+        assert_eq!(spans[0].field("error.type"), Some("listener_failed"));
     }
 
     #[tokio::test]

@@ -79,6 +79,8 @@ pub mod repository;
 pub mod row;
 pub mod statement;
 pub mod sticky;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 pub mod testing;
 
 pub use connection::{Connection, Database};

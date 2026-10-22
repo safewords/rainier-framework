@@ -89,6 +89,18 @@ pub enum Skipped {
     ConditionFalse,
 }
 
+impl Skipped {
+    /// A stable, low-cardinality label — `still_running`, `another_server`,
+    /// `condition_false` — for a metric or a span.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Skipped::StillRunning => "still_running",
+            Skipped::AnotherServer => "another_server",
+            Skipped::ConditionFalse => "condition_false",
+        }
+    }
+}
+
 impl std::fmt::Display for Skipped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {

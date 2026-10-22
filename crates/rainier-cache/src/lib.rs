@@ -129,6 +129,8 @@ pub mod memory;
 pub mod prefixed;
 pub mod rate_limit;
 pub mod stores;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
@@ -181,7 +183,13 @@ pub struct CacheManager {
 
 impl CacheManager {
     /// Wrap a cache.
+    ///
+    /// With the `telemetry` feature the store is traced — see
+    /// `rainier_cache::telemetry`.
     pub fn new(store: Arc<dyn Cache>) -> Self {
+        #[cfg(feature = "telemetry")]
+        let store = crate::telemetry::TracedCache::wrap(store);
+
         Self { store, stores: std::collections::BTreeMap::new() }
     }
 
@@ -196,6 +204,9 @@ impl CacheManager {
     /// does both, from one declaration, so the two are the same backend rather
     /// than two built from the same settings.
     pub fn with_store(mut self, name: impl Into<String>, store: Arc<dyn Cache>) -> Self {
+        #[cfg(feature = "telemetry")]
+        let store = crate::telemetry::TracedCache::wrap(store);
+
         self.stores.insert(name.into(), store);
         self
     }

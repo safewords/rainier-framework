@@ -11,6 +11,11 @@ repository.workspace = true
 rainier-support = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+default = []
+# An `event.dispatch` span per event somebody listens for.
+telemetry = ["rainier-support/telemetry"]
+
 [dev-dependencies]
 tokio = { workspace = true }
 

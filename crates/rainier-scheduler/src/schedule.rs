@@ -151,7 +151,41 @@ impl Schedule {
             let name = task.name();
             let started = std::time::Instant::now();
 
-            match task.run(app, locks, at).await {
+            let run = task.run(app, locks, at);
+
+            // One span per due task, with how it ended — including the runs
+            // that were skipped, since "the backup did not run because the
+            // last one was still going" is exactly what an operator is asking.
+            #[cfg(feature = "telemetry")]
+            let span = rainier_support::span!(
+                "schedule.task",
+                otel.name = %format!("schedule {name}"),
+                rainier.task.name = %name,
+                rainier.task.outcome = tracing::field::Empty,
+                rainier.task.skipped = tracing::field::Empty,
+            );
+            #[cfg(feature = "telemetry")]
+            let run = tracing::Instrument::instrument(run, span.clone());
+
+            let outcome = run.await;
+            summary.durations.push((name.clone(), started.elapsed()));
+
+            #[cfg(feature = "telemetry")]
+            match &outcome {
+                Outcome::Ran => {
+                    span.record("rainier.task.outcome", "ran");
+                }
+                Outcome::Failed(e) => {
+                    span.record("rainier.task.outcome", "failed");
+                    rainier_support::telemetry::record_error(&span, e);
+                }
+                Outcome::Skipped(why) => {
+                    span.record("rainier.task.outcome", "skipped");
+                    span.record("rainier.task.skipped", why.label());
+                }
+            }
+
+            match outcome {
                 Outcome::Ran => {
                     tracing::info!(task = %name, elapsed_ms = started.elapsed().as_millis() as u64, "scheduled task ran");
                     summary.ran.push(name);
@@ -186,6 +220,9 @@ pub struct RunSummary {
     pub failed: Vec<(String, String)>,
     /// Tasks that were due but did not run, and why.
     pub skipped: Vec<(String, Skipped)>,
+    /// How long each due task took, in the order they ran — including the
+    /// skipped ones, whose time is the lock check.
+    pub durations: Vec<(String, std::time::Duration)>,
 }
 
 impl RunSummary {
@@ -339,10 +376,24 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        #[cfg(feature = "telemetry")]
+        let recorder = rainier_support::telemetry::testing::Recorder::new();
+        #[cfg(feature = "telemetry")]
+        let _guard = recorder.install();
+
         let summary = schedule.run_due(&app, &locks, at(0, 0)).await;
 
         assert_eq!(summary.skipped, vec![("slow".to_string(), Skipped::StillRunning)]);
         assert!(summary.ran.is_empty());
+        assert_eq!(summary.durations.len(), 1, "a skipped task is still timed");
+
+        #[cfg(feature = "telemetry")]
+        {
+            let span = recorder.span("schedule.task");
+            assert_eq!(span.field("rainier.task.name"), Some("slow"));
+            assert_eq!(span.field("rainier.task.outcome"), Some("skipped"));
+            assert_eq!(span.field("rainier.task.skipped"), Some("still_running"));
+        }
     }
 
     #[tokio::test]
