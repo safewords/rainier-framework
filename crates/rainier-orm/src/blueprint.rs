@@ -303,7 +303,7 @@ impl Column {
         // which names neither column and reads as a malformed constraint
         // rather than a type mismatch. Caught by lewd.net's
         // `0001_create_help_questions` refusing to apply to a fresh MySQL
-        // database — the pairing was correct in the Laravel schema it was
+        // database — the pairing was correct in the PHP schema it was
         // transcribed from, because `$table->increments()` is UNSIGNED there.
         let kind = match (self.auto_increment, dialect, self.kind) {
             (true, Dialect::Postgres, ColumnKind::Basic(ColumnType::BigUint)) => {

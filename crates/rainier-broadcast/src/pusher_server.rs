@@ -2,7 +2,7 @@
 //!
 //! The other half of this crate. Everything else here publishes events for
 //! somebody else to deliver: [`RedisBroadcaster`](crate::RedisBroadcaster)
-//! writes to Redis and a separate relay — soketi, Pusher, Laravel Reverb —
+//! writes to Redis and a separate relay — soketi, Pusher —
 //! holds the browsers' sockets and fans them out. This is that relay, so an
 //! application can hold its own sockets and drop the second deployment.
 //!
@@ -10,7 +10,7 @@
 //!
 //! `rainier-websocket` is the better surface for a socket you are writing both
 //! ends of. This exists for the case where you are not: the browser is running
-//! Laravel Echo and `pusher-js`, which speak one protocol and will not be
+//! `pusher-js` or a wrapper over it, which speak one protocol and will not be
 //! talked out of it. Serving that protocol is what lets an existing SPA keep
 //! its client code.
 //!
@@ -230,7 +230,7 @@ impl PusherServer {
         let frame = Self::frame(event, Some(name), &data);
 
         // `socket` is the connection that caused the event, which has usually
-        // rendered it already — Laravel's `toOthers()`. It is an *identity*
+        // rendered it already — "to others", in broadcasting terms. It is an *identity*
         // string, so this asks the registry to skip it rather than parsing it
         // into a local id that may belong to a different replica's socket.
         match published.get("socket").and_then(Value::as_str) {

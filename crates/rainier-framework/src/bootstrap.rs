@@ -794,7 +794,7 @@ impl Rainier {
         //
         // Installed as the router's fallback, so a route always wins and a
         // file is only tried when nothing matched — see `crate::public` for
-        // why that is the opposite of Laravel's `try_files` and why it does
+        // why that is the opposite of a `try_files` web server and why it does
         // not matter in practice.
         //
         // Only when the directory exists, and only when the application has

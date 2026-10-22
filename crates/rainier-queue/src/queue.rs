@@ -30,8 +30,7 @@ pub trait Queue: Send + Sync + 'static {
     /// it has never heard of, and wrapping one is indistinguishable from
     /// corrupting it.
     ///
-    /// The counterpart of Laravel's `Queue::pushRaw`, and needed for the same
-    /// reason: an application that has to hand work to a foreign consumer
+    /// Needed because an application that has to hand work to a foreign consumer
     /// otherwise reaches past the queue abstraction into a driver-specific
     /// client, which is exactly the coupling the abstraction exists to prevent.
     ///

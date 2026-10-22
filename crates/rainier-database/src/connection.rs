@@ -538,7 +538,7 @@ impl Split {
 
     /// The next endpoint of a role, round the ring.
     ///
-    /// Round-robin rather than the random pick Laravel makes, because the
+    /// Round-robin rather than the random pick PHP frameworks make, because the
     /// endpoints were opened at boot and are therefore known: a counter spreads
     /// queries evenly, where a random choice is even only in expectation and
     /// will happily send a burst of six at one replica.

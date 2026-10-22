@@ -1,6 +1,6 @@
 //! The `public/` directory — files served as they sit on disk.
 //!
-//! Laravel has a document root: everything under `public/` is reachable at the
+//! A PHP application has a document root: everything under `public/` is reachable at the
 //! URL matching its path, and anything else on disk is not. `favicon.ico`,
 //! `robots.txt`, an image an editor uploaded, a built stylesheet. No route, no
 //! controller, no code.
@@ -8,7 +8,7 @@
 //! Rainier is its own server, so there is no nginx in front deciding this. This
 //! is that decision.
 //!
-//! # It is a fallback, which Laravel's is not
+//! # It is a fallback, which a PHP document root is not
 //!
 //! Under nginx the file wins: `try_files $uri /index.php` looks on disk first
 //! and only then reaches the application. Here it is the router's fallback, so

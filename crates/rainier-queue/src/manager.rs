@@ -347,9 +347,9 @@ impl QueueManager {
 
     /// The connection declared as `name`, or `None`.
     ///
-    /// `None` rather than the default, which is the whole point: Laravel's
-    /// `Queue::connection('sqs')` on a name nobody declared is a job accepted
-    /// into a backend no worker drains, and that raises nothing, retries
+    /// `None` rather than the default, which is the whole point: falling
+    /// back for a connection nobody declared accepts a job into a backend no
+    /// worker drains, and that raises nothing, retries
     /// nothing and leaves no failed row. An `Option` makes the caller say what
     /// happens instead.
     pub fn connection(&self, name: &str) -> Option<&Arc<dyn Queue>> {

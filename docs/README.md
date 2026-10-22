@@ -2,8 +2,7 @@
 
 Rainier is an MVC framework for Rust: a service container, providers that
 wire it, a router with named routes and middleware groups, form requests,
-guards, jobs, mailables, facades, events. It is designed to provide a smooth
-transition for developers familiar with Laravel — each piece sits where an
+guards, jobs, mailables, facades, events. Each piece sits where an
 MVC developer expects to find it.
 
 These pages assume you have used an MVC framework before and are new to

@@ -45,7 +45,7 @@
 //!
 //! | | Where the sockets live | When |
 //! |---|---|---|
-//! | A relay | another process — soketi, Pusher, Laravel Reverb | the connections should not be held by your web server, or something else already runs one |
+//! | A relay | another process — soketi, Pusher | the connections should not be held by your web server, or something else already runs one |
 //! | [`PusherServer`](pusher_server::PusherServer) | this process, behind the `pusher-server` feature | one less deployment, and the connection count is one your process can carry |
 //!
 //! Both consume the same publish, so moving between them changes no
@@ -59,7 +59,7 @@
 //!
 //! That crate is for a socket **you write both ends of** — your own message
 //! shapes, two-way, no protocol to conform to. This one speaks the Pusher
-//! protocol because the client is `pusher-js` or Laravel Echo and will not be
+//! protocol because the client is `pusher-js` or a wrapper over it and will not be
 //! talked out of it. See its docs for the comparison in full.
 
 #![forbid(unsafe_code)]

@@ -80,7 +80,7 @@
 //!
 //! ## Settings this framework cannot honour
 //!
-//! A section written against Laravel's `config/queue.php` carries several more.
+//! A section ported from a PHP application's queue configuration carries several more.
 //! Every one of them is **refused by name**, with what the framework does
 //! instead, because the alternative is the failure this whole module is built
 //! to avoid wearing a different hat: a setting that is read, understood by the
@@ -790,7 +790,7 @@ impl std::fmt::Debug for QueueResources {
 ///
 /// # There is no connection-level `queue`
 ///
-/// Laravel's equivalent section carries one, where it is a **fallback**: the
+/// A PHP application's equivalent section carries one, where it is a **fallback**: the
 /// queue a job lands on when the job itself did not name one. That reading is
 /// the sensible one, and it is precisely the one this framework cannot express
 /// — because "the job did not name one" is not a state a
@@ -826,7 +826,7 @@ impl std::fmt::Debug for QueueResources {
 /// Dispatching inside a transaction that later rolls back leaves a job holding
 /// an id for a row that does not exist. The job then fails — or, once that id
 /// has been handed to some later row, quietly acts on the **wrong record**.
-/// Laravel's answer is `after_commit`, which holds the dispatch until the
+/// The usual answer is `after_commit`, which holds the dispatch until the
 /// surrounding transaction commits.
 ///
 /// This framework has no transaction API for that to hook into: nothing in it
@@ -869,7 +869,7 @@ impl std::fmt::Debug for QueueResources {
 ///
 /// # `prefix` and `suffix` are refused on `sqs`
 ///
-/// In Laravel they are not decoration: a queue's URL is composed as
+/// In a PHP application they are not decoration: a queue's URL is composed as
 /// `prefix + queue + suffix`, which is how one deployment addresses
 /// per-environment queues from one configuration file. An
 /// [`SqsConnection`] is given the whole `queue_url` instead, and with no
@@ -881,8 +881,8 @@ impl std::fmt::Debug for QueueResources {
 ///
 /// # `connection` is refused on `redis`
 ///
-/// It is a cross-section reference: in a Laravel application it names an entry
-/// in `config/database.php`'s `redis` block, and naming a *dedicated* one there
+/// It is a cross-section reference: in a PHP application it names an entry
+/// in the database configuration's `redis` block, and naming a *dedicated* one there
 /// matters more than it looks. The queue wants its own database index,
 /// deliberately not the cache's, because flushing the cache flushes that index
 /// — and every job waiting in it goes with it.
@@ -2059,7 +2059,7 @@ struct RawConnection {
     driver: QueueDriver,
 
     /// Declared by nobody, and present only to be refused with a reason — see
-    /// [`ConnectionConfig`]. Without it, a section ported from Laravel fails
+    /// [`ConnectionConfig`]. Without it, a section ported from PHP fails
     /// with `unknown field \`queue\``, which explains nothing about why the
     /// framework does not have one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2076,8 +2076,8 @@ struct RawConnection {
     /// so the fix is one edit rather than an afternoon.
     ///
     /// `retry_after` is the odd one out: it is not missing, it is
-    /// [`reservation`](DatabaseConnection::reservation) under the name Laravel
-    /// gives it, and the error says so rather than implying a gap.
+    /// [`reservation`](DatabaseConnection::reservation) under the name PHP
+    /// configurations give it, and the error says so rather than implying a gap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retry_after: Option<u64>,
 
@@ -3039,7 +3039,7 @@ mod tests {
 
     #[test]
     fn a_connection_level_queue_is_refused_with_the_reason() {
-        // The Laravel section has one. This does not, because a name here could
+        // The PHP section has one. This does not, because a name here could
         // only be ignored or override the queue the worker is draining — and
         // `unknown field` would explain neither.
         for declaration in [

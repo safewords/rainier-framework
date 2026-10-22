@@ -66,10 +66,10 @@
 //! | Who holds the socket | a relay, **or** your process with `pusher-server` | your process |
 //! | Direction | out only | both ways |
 //! | Scales across instances | yes, through Redis | one instance per socket |
-//! | Client | `pusher-js`, Laravel Echo | anything that speaks WebSocket |
+//! | Client | `pusher-js` and its wrappers | anything that speaks WebSocket |
 //!
 //! The deciding question is **who writes the client**. A browser already
-//! running Laravel Echo speaks one protocol and will not be talked out of it,
+//! running a `pusher-js` client speaks one protocol and will not be talked out of it,
 //! so that is broadcasting whether or not the sockets end up in your process —
 //! `rainier-broadcast`'s `pusher-server` feature holds them here and still fans
 //! out over Redis. Reach for this crate when both ends are yours: a bespoke

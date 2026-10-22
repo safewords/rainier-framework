@@ -77,7 +77,7 @@
 //! builder method that silently did nothing would be the same silent-ignoring
 //! failure this module exists to refuse, one level up.
 //!
-//! What is *not* supported is both at once. Laravel lets a `url` win over the
+//! What is *not* supported is both at once. The common resolution lets a `url` win over the
 //! rest, and that is the resolution this refuses: the setting that loses is
 //! still sitting there being read by whoever changes it next, and a connection
 //! whose visible `host` is not the host it uses is a change that appears to
@@ -337,10 +337,10 @@ setting_enum! {
     /// assert_eq!(DatabaseDriver::parse("mysql").unwrap(), DatabaseDriver::MySql);
     /// ```
     ///
-    /// These are the three the shipped executors support. Laravel spells the
+    /// These are the three the shipped executors support. PHP configurations spell the
     /// third `pgsql` after the PHP extension; this spells it `postgres` after
     /// the engine, matching [`Dialect::Postgres`] and the `postgres://` scheme
-    /// the rest of the ecosystem uses. A section ported from Laravel fails on
+    /// the rest of the ecosystem uses. A section ported from PHP fails on
     /// the name rather than silently choosing something else.
     pub enum DatabaseDriver: "database driver" {
         /// SQLite — a file on this machine, or `:memory:`.
@@ -2892,7 +2892,7 @@ impl RawDatabase {
 
     /// Refuse a `url` written down beside the fields it already contains.
     ///
-    /// Laravel resolves this by letting the URL win. That is the resolution
+    /// The common resolution lets the URL win. That is the resolution
     /// refused here: the loser is still in the file being read by whoever
     /// changes it next, so pointing a connection at a new host by editing the
     /// visible `host` is a change that reviews cleanly, deploys cleanly and

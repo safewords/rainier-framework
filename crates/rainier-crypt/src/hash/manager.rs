@@ -15,8 +15,8 @@
 //! declaration — is what [`hash`](Hasher::hash) writes, and **verification
 //! never consults the selection at all**. A stored hash names its own
 //! algorithm in its own prefix, so `verify` dispatches to whichever driver
-//! recognises it — exactly the contract PHP's `password_verify` and
-//! Laravel's `Hash::check` honour, and the property that makes changing the
+//! recognises it — exactly the contract PHP's `password_verify` and every
+//! framework built on it honour, and the property that makes changing the
 //! driver a deploy rather than a migration.
 //!
 //! # Changing algorithm is the same block it always was
@@ -91,7 +91,7 @@ pub struct BcryptHasher {
 #[cfg(feature = "bcrypt")]
 impl Default for BcryptHasher {
     fn default() -> Self {
-        // What Laravel ships as `bcrypt.rounds` today. PHP's own default is
+        // What PHP applications commonly configure today. PHP's own default is
         // still 10; 12 is where OWASP puts the floor.
         Self { cost: 12 }
     }
@@ -398,9 +398,9 @@ mod tests {
         // PHP writes `$2y$`; the crate writes `$2b$`. A ported table is full
         // of the former.
         let manager = manager();
-        let php_style = bcrypt::hash("laravel-legacy", 4).unwrap().replacen("$2b$", "$2y$", 1);
+        let php_style = bcrypt::hash("php-legacy", 4).unwrap().replacen("$2b$", "$2y$", 1);
 
-        assert!(manager.verify("laravel-legacy", &php_style));
+        assert!(manager.verify("php-legacy", &php_style));
         assert!(manager.needs_rehash(&php_style));
     }
 

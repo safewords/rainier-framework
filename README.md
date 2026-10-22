@@ -16,8 +16,8 @@
 
 The structures an MVC application is made of — container, providers, router,
 form requests, guards, jobs, mailables, facades, events — each given a native
-Rust shape. Designed to provide a smooth transition for developers familiar
-with Laravel.
+Rust shape — each piece where a developer who has built MVC applications
+expects to find it.
 
 **📚 [Documentation](docs/)** · [Concept map](docs/README.md#the-concept-map) · [Starter app](https://github.com/safewords/rainier-sample-project)
 
@@ -516,13 +516,6 @@ whose warnings land fixed in the next one.
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. Every crate in
 the workspace shares one version, so an entry there applies to the release as a
 whole.
-
-## Trademarks
-
-Rainier is an independent project. It is not affiliated with, sponsored by, or
-endorsed by the Laravel project or its trademark holders, and it claims no
-rights in the Laravel name or marks. The name appears in this repository only
-to identify the framework whose developers Rainier aims to make at home.
 
 ## Licence
 

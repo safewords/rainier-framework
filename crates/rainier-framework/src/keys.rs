@@ -469,9 +469,8 @@ config_keys! {
     /// Which queues a `queue:work` process drains, comma-separated and in
     /// priority order — `queue.queues`.
     ///
-    /// The counterpart of `config/horizon.php`'s `supervisor-*.queue`, not of
-    /// `config/queue.php`'s `connections.*.queue`. Which queue a job goes *to*
-    /// is the job's ([`Job::QUEUE`](crate::queue::Job::QUEUE)); this is which
+    /// A worker's queue list, not a connection's `queue`. Which queue a job
+    /// goes *to* is the job's ([`Job::QUEUE`](crate::queue::Job::QUEUE)); this is which
     /// queues a worker takes *from*.
     ///
     /// Unset is the ordinary case: a worker then drains
