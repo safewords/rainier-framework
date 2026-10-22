@@ -36,6 +36,7 @@ rainier-console = { workspace = true }
 # application, and every other application should compile none of it.
 rainier-billing = { workspace = true, optional = true }
 rainier-sso = { workspace = true, optional = true }
+rainier-mfa = { workspace = true, optional = true }
 rainier-cache = { workspace = true }
 rainier-crypt = { workspace = true }
 rainier-drivers = { workspace = true }
@@ -166,6 +167,11 @@ billing-stripe = ["dep:rainier-billing", "http-client"]
 # Microsoft, GitLab, Discord, and any OIDC issuer by discovery — with PKCE,
 # state, nonce, and ID tokens verified against the issuer's JWKS.
 sso = ["dep:rainier-sso", "http-client", "jwt"]
+# TOTP two-factor with recovery codes. With `accounts` also on, the login
+# flow gains the challenge and the enrolment routes.
+two-factor = ["dep:rainier-mfa", "rainier-mfa/totp"]
+# WebAuthn passkeys.
+passkeys = ["dep:rainier-mfa", "rainier-mfa/passkeys"]
 
 # docs.rs builds with default features, which for this crate is the wasm-safe
 # set — so half the API would be missing from the rendered documentation.

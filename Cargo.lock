@@ -3970,6 +3970,7 @@ dependencies = [
  "rainier-http-client",
  "rainier-mail",
  "rainier-metrics",
+ "rainier-mfa",
  "rainier-middleware",
  "rainier-notify",
  "rainier-openapi",
@@ -4060,6 +4061,25 @@ dependencies = [
  "rainier-support",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rainier-mfa"
+version = "2.0.0"
+dependencies = [
+ "base64 0.23.1",
+ "ed25519-dalek 3.0.0",
+ "hmac 0.13.0",
+ "p256 0.14.0",
+ "rainier-support",
+ "rand 0.10.3",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "subtle",
+ "tokio",
 ]
 
 [[package]]

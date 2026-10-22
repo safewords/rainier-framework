@@ -31,6 +31,8 @@ sqs = ["rainier-framework/sqs"]
 telemetry = ["rainier-framework/telemetry"]
 billing-stripe = ["rainier-framework/billing-stripe"]
 sso = ["rainier-framework/sso"]
+two-factor = ["rainier-framework/two-factor"]
+passkeys = ["rainier-framework/passkeys"]
 
 [package.metadata.docs.rs]
 all-features = true

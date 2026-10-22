@@ -172,6 +172,8 @@ pub use rainier_filesystem as filesystem;
 pub use rainier_http as http;
 pub use rainier_http_client as http_client;
 pub use rainier_metrics as metrics;
+#[cfg(any(feature = "two-factor", feature = "passkeys"))]
+pub use rainier_mfa as mfa;
 pub use rainier_middleware as middleware;
 pub use rainier_notify as notify;
 pub use rainier_openapi as openapi;

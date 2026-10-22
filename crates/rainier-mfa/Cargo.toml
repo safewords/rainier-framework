@@ -1,0 +1,48 @@
+[package]
+name = "rainier-mfa"
+description = "Multi-factor authentication for Rainier: TOTP with recovery codes, and WebAuthn passkeys."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["totp", "2fa", "webauthn", "passkeys", "rainier"]
+categories = ["authentication", "web-programming"]
+
+[dependencies]
+rainier-support = { workspace = true }
+base64 = { workspace = true }
+hmac = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+# HMAC-SHA1 is what every authenticator app computes by default (RFC 6238's
+# own default, and the only algorithm Google Authenticator honoured for years).
+# 0.11, the digest-0.11 generation `hmac` 0.13 and `sha2` 0.11 are built on.
+sha1 = { version = "0.11", default-features = false }
+# The three signature algorithms a passkey can carry — ES256, EdDSA and RS256.
+# Pure Rust, so the crate builds wherever the rest of the framework does.
+p256 = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+# `sha2` for the PKCS#1 v1.5 DigestInfo prefix: rsa 0.9 is on digest 0.10, so
+# it names its own SHA-256 rather than the workspace's.
+rsa = { workspace = true, optional = true, features = ["sha2"] }
+
+[features]
+default = ["totp"]
+# RFC 6238 one-time passwords and single-use recovery codes.
+totp = []
+# WebAuthn registration and assertion verification, in pure Rust.
+passkeys = ["dep:p256", "dep:rsa", "dep:ed25519-dalek"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
