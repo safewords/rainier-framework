@@ -199,6 +199,50 @@ captcha = ["http-client"]
 # Notifications posted to Discord, by webhook or as a bot.
 notify-discord = ["rainier-notify/discord", "http-client"]
 
+# One runnable example per add-in: `cargo run -p rainier-framework --example
+# <name> --features <feature>`. `required-features` keeps a default build from
+# compiling them, and CI's `--all-targets --all-features` clippy run compiles
+# every one, so an example cannot drift from the API it demonstrates.
+
+[[example]]
+name = "billing_stripe"
+required-features = ["billing-stripe"]
+
+[[example]]
+name = "sso_login"
+required-features = ["sso"]
+
+[[example]]
+name = "accounts"
+required-features = ["accounts"]
+
+[[example]]
+name = "two_factor"
+required-features = ["accounts", "two-factor", "passkeys"]
+
+[[example]]
+name = "oauth_server"
+required-features = ["oauth-server"]
+
+[[example]]
+name = "compat_php"
+required-features = ["compat-php-oauth", "compat-php-webauthn"]
+
+[[example]]
+name = "telemetry"
+required-features = ["telemetry"]
+
+[[example]]
+name = "captcha"
+required-features = ["captcha"]
+
+[[example]]
+name = "notify_discord"
+required-features = ["notify-discord"]
+
+[[example]]
+name = "impersonation"
+
 # docs.rs builds with default features, which for this crate is the wasm-safe
 # set — so half the API would be missing from the rendered documentation.
 [package.metadata.docs.rs]
