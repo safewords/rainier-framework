@@ -1,0 +1,36 @@
+[package]
+name = "rainier-sso"
+description = "Single sign-on for Rainier: OAuth 2.0 and OpenID Connect providers with PKCE, state, nonce and ID-token verification."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["oauth", "oidc", "sso", "socialite", "rainier"]
+categories = ["web-programming", "authentication"]
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-http = { workspace = true }
+rainier-http-client = { workspace = true }
+rainier-session = { workspace = true }
+rainier-auth = { workspace = true }
+# ID tokens are verified against the issuer's JWKS — `Jwt` and `JwtKeyRing`.
+rainier-crypt = { workspace = true, features = ["jwt"] }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+form_urlencoded = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

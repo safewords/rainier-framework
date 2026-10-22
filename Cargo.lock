@@ -3979,6 +3979,7 @@ dependencies = [
  "rainier-scheduler",
  "rainier-server",
  "rainier-session",
+ "rainier-sso",
  "rainier-support",
  "rainier-telemetry",
  "rainier-validation",
@@ -4221,6 +4222,28 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rainier-sso"
+version = "2.0.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "form_urlencoded",
+ "rainier-auth",
+ "rainier-crypt",
+ "rainier-http",
+ "rainier-http-client",
+ "rainier-session",
+ "rainier-support",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "subtle",
+ "tokio",
 ]
 
 [[package]]

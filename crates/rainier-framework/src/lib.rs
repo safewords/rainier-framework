@@ -180,6 +180,8 @@ pub use rainier_routing as routing;
 pub use rainier_scheduler as scheduler;
 pub use rainier_server as server;
 pub use rainier_session as session;
+#[cfg(feature = "sso")]
+pub use rainier_sso as sso;
 pub use rainier_support as support;
 pub use rainier_telemetry as telemetry;
 pub use rainier_validation as validation;

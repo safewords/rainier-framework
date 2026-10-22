@@ -35,6 +35,7 @@ rainier-console = { workspace = true }
 # through Stripe" and "we let people sign in with GitHub" are facts about one
 # application, and every other application should compile none of it.
 rainier-billing = { workspace = true, optional = true }
+rainier-sso = { workspace = true, optional = true }
 rainier-cache = { workspace = true }
 rainier-crypt = { workspace = true }
 rainier-drivers = { workspace = true }
@@ -161,6 +162,10 @@ telemetry = [
 # intents and refunds over the framework's outbound client, plus verified,
 # deduplicated webhooks dispatched onto the event bus. See `rainier_billing`.
 billing-stripe = ["dep:rainier-billing", "http-client"]
+# "Sign in with …": OAuth 2.0 and OpenID Connect providers — GitHub, Google,
+# Microsoft, GitLab, Discord, and any OIDC issuer by discovery — with PKCE,
+# state, nonce, and ID tokens verified against the issuer's JWKS.
+sso = ["dep:rainier-sso", "http-client", "jwt"]
 
 # docs.rs builds with default features, which for this crate is the wasm-safe
 # set — so half the API would be missing from the rendered documentation.
