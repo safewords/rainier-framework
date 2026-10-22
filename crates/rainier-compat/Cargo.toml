@@ -1,0 +1,65 @@
+[package]
+name = "rainier-compat"
+description = "Interoperability with the stack you are migrating from, grouped by language: PHP serialization, defuse ciphertexts, encrypted cookies, sessions, cache values, CSRF tokens, OAuth tokens and passkey credentials."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+rainier-support = { workspace = true }
+# Adapters for the generic add-ins, each behind its compat feature.
+rainier-oauth-server = { workspace = true, optional = true }
+# The OAuth store reads and writes the PHP server's tables.
+rainier-database = { workspace = true, optional = true }
+rainier-orm = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+rainier-mfa = { workspace = true, optional = true, features = ["passkeys"] }
+rainier-http = { workspace = true }
+rainier-middleware = { workspace = true }
+rainier-session = { workspace = true }
+rainier-cache = { workspace = true }
+rainier-crypt = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+hmac = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+tracing = { workspace = true }
+# The encrypted-cookie value prefix is an HMAC-SHA1, so reading one means
+# computing one. Already in the graph through the websocket handshake.
+sha1 = { version = "0.11", optional = true }
+# defuse/php-encryption v2: PBKDF2-SHA256 and HKDF-SHA256 for the keys,
+# AES-256-CTR for the body. RustCrypto, pure Rust, on the same digest
+# generation as the workspace's hmac and sha2.
+aes = { workspace = true, optional = true }
+ctr = { version = "0.10", optional = true }
+hkdf = { workspace = true, optional = true }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
+rand = { workspace = true, optional = true }
+
+[features]
+default = []
+# PHP: `serialize`/`unserialize`, defuse/php-encryption ciphertexts, and the
+# encrypted-cookie, session, cache, CSRF and queue-payload formats a PHP
+# application writes beside you.
+php = ["dep:sha1", "dep:aes", "dep:ctr", "dep:hkdf", "dep:pbkdf2", "dep:rand"]
+# OAuth tokens and tables written by league/oauth2-server, as an
+# `rainier-oauth-server` store and token codec.
+php-oauth = ["php", "dep:rainier-oauth-server", "dep:rainier-database", "dep:rainier-orm", "dep:chrono"]
+# Passkey credentials written by web-auth/webauthn-lib, for `rainier-mfa`.
+php-webauthn = ["php", "dep:rainier-mfa"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+# A throwaway RSA key for the OAuth adapter's end-to-end test.
+rsa = { workspace = true }
+# Only to pin `php::session::RAINIER_AUTH_KEY` to the guard's own constant.
+rainier-auth = { workspace = true }
+
+[lints]
+workspace = true

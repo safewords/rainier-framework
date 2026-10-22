@@ -38,6 +38,7 @@ rainier-billing = { workspace = true, optional = true }
 rainier-sso = { workspace = true, optional = true }
 rainier-accounts = { workspace = true, optional = true }
 rainier-oauth-server = { workspace = true, optional = true }
+rainier-compat = { workspace = true, optional = true }
 rainier-mfa = { workspace = true, optional = true }
 rainier-cache = { workspace = true }
 rainier-crypt = { workspace = true }
@@ -177,6 +178,16 @@ accounts = ["dep:rainier-accounts"]
 # client credentials, password and personal access tokens, scopes, and a guard
 # that accepts what it issues. See `rainier_oauth_server`.
 oauth-server = ["dep:rainier-oauth-server"]
+# Interoperability with the stack an application is migrating from, sharing
+# its database, cache and keys — grouped by language, one feature each, so a
+# migration from one stack compiles nothing about another. For migrating, not
+# for staying.
+compat-php = ["dep:rainier-compat", "rainier-compat/php"]
+# OAuth tokens and tables a PHP authorization server (league/oauth2-server)
+# wrote, behind the OAuth server — its access and refresh tokens stay valid.
+compat-php-oauth = ["compat-php", "oauth-server", "rainier-compat/php-oauth"]
+# Passkey credentials a PHP application (web-auth/webauthn-lib) stored.
+compat-php-webauthn = ["compat-php", "passkeys", "rainier-compat/php-webauthn"]
 # TOTP two-factor with recovery codes. With `accounts` also on, the login
 # flow gains the challenge and the enrolment routes.
 two-factor = ["dep:rainier-mfa", "rainier-mfa/totp", "rainier-accounts?/two-factor"]

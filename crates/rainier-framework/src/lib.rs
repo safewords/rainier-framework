@@ -163,6 +163,8 @@ pub use rainier_auth as auth;
 pub use rainier_billing as billing;
 pub use rainier_broadcast as broadcast;
 pub use rainier_cache as cache;
+#[cfg(feature = "compat-php")]
+pub use rainier_compat as compat;
 pub use rainier_config as config;
 pub use rainier_console as console_kernel;
 pub use rainier_container as container;
