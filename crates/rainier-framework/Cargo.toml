@@ -193,6 +193,8 @@ compat-php-webauthn = ["compat-php", "passkeys", "rainier-compat/php-webauthn"]
 two-factor = ["dep:rainier-mfa", "rainier-mfa/totp", "rainier-accounts?/two-factor"]
 # WebAuthn passkeys.
 passkeys = ["dep:rainier-mfa", "rainier-mfa/passkeys", "rainier-accounts?/passkeys"]
+# Notifications posted to Discord, by webhook or as a bot.
+notify-discord = ["rainier-notify/discord", "http-client"]
 
 # docs.rs builds with default features, which for this crate is the wasm-safe
 # set — so half the API would be missing from the rendered documentation.

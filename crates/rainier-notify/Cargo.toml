@@ -13,6 +13,9 @@ rainier-support = { workspace = true }
 
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The HTTP transport port, for the Discord channel — not the socket, which the
+# framework's `http-client` feature turns on.
+rainier-http-client = { workspace = true, optional = true }
 
 [dev-dependencies]
 rainier-view = { workspace = true }
@@ -20,7 +23,13 @@ tokio = { workspace = true }
 
 [features]
 default = []
+# Post notifications to Discord, by webhook or as a bot.
+discord = ["dep:rainier-http-client"]
 # A `notification.send` span per notification.
 telemetry = ["rainier-support/telemetry", "rainier-mail/telemetry"]
+
+[package.metadata.docs.rs]
+all-features = true
+
 [lints]
 workspace = true

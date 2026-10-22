@@ -104,9 +104,14 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod channel;
+#[cfg(feature = "discord")]
+pub mod discord;
 pub mod notification;
 pub mod notifier;
 
 pub use channel::{Channel, LogChannel, MailChannel, MemoryChannel, Recorded};
 pub use notification::{Channels, Delivery, Notifiable, Notification, Receipt, Sent};
 pub use notifier::Notifier;
+
+#[cfg(feature = "discord")]
+pub use discord::{DiscordChannel, DiscordEmbed, DiscordMessage};

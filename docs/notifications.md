@@ -329,6 +329,87 @@ A notifications table grows forever. `prune_read` is worth
 
 ---
 
+## Discord
+
+Behind the `notify-discord` feature. Two modes, because Discord has two:
+a **webhook** per recipient (a club or a team pasted one into its settings),
+or a **bot** the application runs, posting into channels it was invited to.
+
+> **Run it:** `cargo run -p rainier-framework --example notify_discord --features notify-discord`
+> — both modes, an embed, the exact JSON sent, and a rate limit, offline
+> ([`examples/notify_discord.rs`](../crates/rainier-framework/examples/notify_discord.rs)).
+
+The complete wiring:
+
+```rust
+use std::sync::Arc;
+use rainier_framework::http_client::{ReqwestTransport, Transport};
+use rainier_framework::notify::{
+    Channels, DiscordChannel, DiscordEmbed, DiscordMessage, Notifiable, Notification, Notifier,
+};
+use serde_json::Value;
+
+// 1. The recipient says where it is reached.
+impl Notifiable for Club {
+    fn notifiable_id(&self) -> String { self.id.to_string() }
+    fn notifiable_type(&self) -> &'static str { "Club" }
+    fn route_for(&self, channel: &str) -> Option<String> {
+        match channel {
+            "discord" => self.discord_webhook.clone(), // or a channel id, in bot mode
+            _ => None,
+        }
+    }
+}
+
+// 2. The notification selects the channel and renders a message.
+impl Notification<Club> for ChargeFinished {
+    fn notification_name(&self) -> &'static str { "club.charge-finished" }
+    fn via(&self, _: &Club) -> Channels { Channels::new().with::<DiscordChannel>() }
+    fn to_data(&self, _: &Club) -> Option<Value> {
+        Some(DiscordMessage::new()
+            .content(format!("{} finished charging", self.vehicle))
+            .embed(DiscordEmbed::new().title(&self.vehicle).color(0x2E7D32)
+                .field("Added", format!("{:.1} kWh", self.kwh), true))
+            .into_data())
+    }
+}
+
+// 3. At boot: one channel on the notifier.
+let http: Arc<dyn Transport> = Arc::new(ReqwestTransport::new());
+let notifier = Notifier::new().with(DiscordChannel::webhooks(http));
+// or: DiscordChannel::bot(http, env.string("DISCORD_BOT_TOKEN", "")?)
+
+// 4. Anywhere: send it.
+notifier.send(&club, &ChargeFinished { vehicle: "Model 3".into(), kwh: 42.0 }).await?;
+```
+
+The recipient answers `route_for("discord")`; the notification renders either
+text, or a `DiscordMessage` under a `discord` key of its data — so one
+`to_data` can carry the database channel's row beside it:
+
+```rust
+fn to_data(&self, _: &Team) -> Option<Value> {
+    Some(DiscordMessage::new()
+        .content("Charging finished")
+        .embed(DiscordEmbed::new().title("Model 3").color(0xC75232)
+            .field("Added", "42 kWh", true))
+        .into_data())
+}
+```
+
+Three things it does on purpose:
+
+- **Mentions are off** (`allowed_mentions: {"parse": []}`) unless the message
+  opts specific users in with `allow_user_mentions`. Content that interpolates
+  a name a user chose is otherwise one `@everyone` from pinging a server.
+- **A webhook route must be a `https://discord.com/api/webhooks/…` URL.** It
+  usually came from a settings form, and a channel that POSTs to any URL a user
+  typed is a server-side request forgery primitive. A bot route must be a
+  numeric channel id.
+- **A `429` is retryable** (`ServiceUnavailable`) with Discord's `retry_after`,
+  in seconds, in the error's details — so the queued job sending it can back
+  off by exactly that much.
+
 ## Testing
 
 ```rust
