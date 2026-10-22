@@ -178,6 +178,8 @@ pub use rainier_metrics as metrics;
 pub use rainier_mfa as mfa;
 pub use rainier_middleware as middleware;
 pub use rainier_notify as notify;
+#[cfg(feature = "oauth-server")]
+pub use rainier_oauth_server as oauth_server;
 pub use rainier_openapi as openapi;
 pub use rainier_queue as queue;
 pub use rainier_routing as routing;

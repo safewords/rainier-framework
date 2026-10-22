@@ -37,6 +37,7 @@ rainier-console = { workspace = true }
 rainier-billing = { workspace = true, optional = true }
 rainier-sso = { workspace = true, optional = true }
 rainier-accounts = { workspace = true, optional = true }
+rainier-oauth-server = { workspace = true, optional = true }
 rainier-mfa = { workspace = true, optional = true }
 rainier-cache = { workspace = true }
 rainier-crypt = { workspace = true }
@@ -172,6 +173,10 @@ sso = ["dep:rainier-sso", "http-client", "jwt"]
 # email verification and password confirmation, as routes an application
 # mounts and actions it overrides. See `rainier_accounts`.
 accounts = ["dep:rainier-accounts"]
+# An OAuth 2.0 authorization server: authorization code with PKCE, refresh,
+# client credentials, password and personal access tokens, scopes, and a guard
+# that accepts what it issues. See `rainier_oauth_server`.
+oauth-server = ["dep:rainier-oauth-server"]
 # TOTP two-factor with recovery codes. With `accounts` also on, the login
 # flow gains the challenge and the enrolment routes.
 two-factor = ["dep:rainier-mfa", "rainier-mfa/totp", "rainier-accounts?/two-factor"]

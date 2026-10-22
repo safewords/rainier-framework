@@ -4004,6 +4004,7 @@ dependencies = [
  "rainier-mfa",
  "rainier-middleware",
  "rainier-notify",
+ "rainier-oauth-server",
  "rainier-openapi",
  "rainier-orm",
  "rainier-queue",
@@ -4137,6 +4138,28 @@ dependencies = [
  "rainier-support",
  "rainier-view",
  "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rainier-oauth-server"
+version = "2.0.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "rainier-auth",
+ "rainier-crypt",
+ "rainier-http",
+ "rainier-session",
+ "rainier-support",
+ "rand 0.10.3",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "subtle",
  "tokio",
  "tracing",
 ]

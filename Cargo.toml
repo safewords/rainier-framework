@@ -38,6 +38,7 @@ members = [
     "crates/rainier-billing",
     "crates/rainier-sso",
     "crates/rainier-accounts",
+    "crates/rainier-oauth-server",
     "crates/rainier-mfa",
     "crates/cargo-rainier",
 ]
@@ -94,6 +95,7 @@ rainier-framework = { path = "crates/rainier-framework", version = "2.0.0" }
 rainier-billing = { path = "crates/rainier-billing", version = "2.0.0" }
 rainier-sso = { path = "crates/rainier-sso", version = "2.0.0" }
 rainier-accounts = { path = "crates/rainier-accounts", version = "2.0.0" }
+rainier-oauth-server = { path = "crates/rainier-oauth-server", version = "2.0.0" }
 rainier-mfa = { path = "crates/rainier-mfa", version = "2.0.0", default-features = false }
 
 # --- third party ------------------------------------------------------------

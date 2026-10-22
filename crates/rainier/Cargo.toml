@@ -32,6 +32,7 @@ telemetry = ["rainier-framework/telemetry"]
 billing-stripe = ["rainier-framework/billing-stripe"]
 sso = ["rainier-framework/sso"]
 accounts = ["rainier-framework/accounts"]
+oauth-server = ["rainier-framework/oauth-server"]
 two-factor = ["rainier-framework/two-factor"]
 passkeys = ["rainier-framework/passkeys"]
 

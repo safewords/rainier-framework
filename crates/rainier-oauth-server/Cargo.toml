@@ -1,0 +1,36 @@
+[package]
+name = "rainier-oauth-server"
+description = "An OAuth 2.0 authorization server for Rainier: authorization code with PKCE, refresh, client credentials, password and personal access tokens, scopes, and the guard that accepts them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-http = { workspace = true }
+rainier-auth = { workspace = true }
+rainier-session = { workspace = true }
+rainier-crypt = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+# RS256 access tokens, signed and verified here rather than through
+# `rainier_crypt::Jwt`: a token issued by another server may carry no `kid`
+# and fractional timestamps, and both have to verify. `sha2` is rsa's own
+# (digest 0.10) re-export, not the workspace's 0.11.
+rsa = { workspace = true, features = ["sha2"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true
