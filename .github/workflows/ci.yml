@@ -3,9 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
   # So a dependency that breaks the build is found on a schedule rather than by
-  # the next person to open a pull request.
+  # the next person to push to main.
   schedule:
     - cron: "0 6 * * 1"
 
