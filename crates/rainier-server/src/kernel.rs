@@ -381,15 +381,17 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 /// The limit is the only thing standing between the server and a client that
 /// streams gigabytes at it, because request bodies are buffered (see
 /// [`rainier_http::body`]).
+///
+/// A declared `Content-Length` over the cap is rejected before any read. A
+/// chunked body has no trustworthy length, so the read itself stops at
+/// `limit` instead of buffering the stream and checking afterwards.
 pub async fn read_body<B>(body: B, limit: usize) -> Result<bytes::Bytes>
 where
     B: hyper::body::Body,
-    B::Error: std::fmt::Display,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     use http_body_util::BodyExt;
 
-    // Refuse up front when the sender declared a size over the limit, rather
-    // than reading it all to find out.
     let hint = body.size_hint();
     if hint.lower() > limit as u64 {
         return Err(Error::new(
@@ -398,20 +400,17 @@ where
         ));
     }
 
-    let collected = body
-        .collect()
-        .await
-        .map_err(|e| Error::bad_request(format!("could not read the request body: {e}")))?;
-    let bytes = collected.to_bytes();
-
-    // And again after reading: a chunked body can lie about its size.
-    if bytes.len() > limit {
-        return Err(Error::new(
-            rainier_support::ErrorKind::PayloadTooLarge,
-            format!("the request body exceeds the {limit}-byte limit"),
-        ));
-    }
-    Ok(bytes)
+    let collected = http_body_util::Limited::new(body, limit).collect().await.map_err(|e| {
+        if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+            Error::new(
+                rainier_support::ErrorKind::PayloadTooLarge,
+                format!("the request body exceeds the {limit}-byte limit"),
+            )
+        } else {
+            Error::bad_request(format!("could not read the request body: {e}"))
+        }
+    })?;
+    Ok(collected.to_bytes())
 }
 
 #[cfg(test)]
