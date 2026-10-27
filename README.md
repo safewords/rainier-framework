@@ -498,17 +498,17 @@ of a recording one.
 
 See [Testing](docs/testing.md).
 
-Both gates also run as a committed pre-commit hook, so a failing lint is
-caught where the fix is cheapest — enable it once per clone:
+Both gates also run as a committed pre-commit hook, and the hook refuses
+the commit rather than rewriting the tree. It runs `cargo fmt --all --check`,
+then `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+the clippy invocation CI fails on. In a devenv checkout, `make rust-hooks`
+points git at it. A standalone clone:
 
 ```sh
 git config core.hooksPath .githooks
 ```
 
-The hook formats the staged files (and re-stages them) and runs the same
-clippy invocation CI does. `git commit --no-verify` bypasses it once;
-`SKIP_CLIPPY=1 git commit …` skips only the lint, for mid-refactor commits
-whose warnings land fixed in the next one.
+`git commit --no-verify` bypasses it once.
 
 ## Changelog
 
