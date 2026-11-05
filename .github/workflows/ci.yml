@@ -10,6 +10,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Link with mold, as the org's other Rust builds do. Since Rust 1.90
+  # linux-gnu links with the bundled rust-lld; `linker-features=-lld` turns
+  # that off and `-fuse-ld=mold` has cc hand the link to mold.
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C linker-features=-lld -C link-arg=-fuse-ld=mold"
   # A backtrace on a failing test is the difference between a re-run and a fix.
   RUST_BACKTRACE: 1
 
@@ -74,6 +78,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: clippy
+      - uses: rui314/setup-mold@v1
+        with:
+          mold-version: 3.0.0
+          make-default: false
       - uses: Swatinem/rust-cache@v2
 
       # `--all-features` because a lint only fires in code that is compiled,
@@ -164,6 +172,10 @@ jobs:
       # The ARC runner image has no C toolchain; see the action.
       - uses: ./.github/actions/system-deps
       - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: rui314/setup-mold@v1
+        with:
+          mold-version: 3.0.0
+          make-default: false
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}
@@ -192,6 +204,10 @@ jobs:
       # The ARC runner image has no C toolchain; see the action.
       - uses: ./.github/actions/system-deps
       - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: rui314/setup-mold@v1
+        with:
+          mold-version: 3.0.0
+          make-default: false
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
@@ -221,6 +237,10 @@ jobs:
       # The ARC runner image has no C toolchain; see the action.
       - uses: ./.github/actions/system-deps
       - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: rui314/setup-mold@v1
+        with:
+          mold-version: 3.0.0
+          make-default: false
       - uses: Swatinem/rust-cache@v2
 
       # Every crate denies `rustdoc::broken_intra_doc_links`, so a stale link
@@ -253,6 +273,10 @@ jobs:
       # The ARC runner image has no C toolchain; see the action.
       - uses: ./.github/actions/system-deps
       - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: rui314/setup-mold@v1
+        with:
+          mold-version: 3.0.0
+          make-default: false
       - uses: Swatinem/rust-cache@v2
         with:
           key: all features
@@ -287,6 +311,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: wasm32-unknown-unknown
+      - uses: rui314/setup-mold@v1
+        with:
+          mold-version: 3.0.0
+          make-default: false
       - uses: Swatinem/rust-cache@v2
         with:
           key: wasm
