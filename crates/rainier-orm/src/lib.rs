@@ -109,6 +109,7 @@ pub mod schema;
 pub mod shard;
 pub mod sharding;
 pub mod string_column;
+pub mod timestamps;
 pub mod trash;
 pub mod upsert;
 
@@ -136,6 +137,7 @@ pub use query::Query;
 pub use row::{FromColumn, Row, ToColumn};
 pub use sharding::{IdAllocator, ShardingSettings};
 pub use string_column::StringColumn;
+pub use timestamps::stamp_insert_timestamps;
 pub use trash::{scope_predicate, SoftDeletes, TrashScope};
 pub use upsert::{Upsert, UpsertAction};
 

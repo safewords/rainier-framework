@@ -420,7 +420,11 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
             fn insert_values(&self)
                 -> ::std::vec::Vec<(&'static str, ::rainier_orm::sea_query::Value)>
             {
-                ::std::vec![ #(#insert_vals),* ]
+                // NULL `created_at` / `updated_at` become now; see
+                // `rainier_orm::timestamps`.
+                let mut values = ::std::vec![ #(#insert_vals),* ];
+                ::rainier_orm::stamp_insert_timestamps::<Self>(&mut values);
+                values
             }
             fn update_values(&self)
                 -> ::std::vec::Vec<(&'static str, ::rainier_orm::sea_query::Value)>
