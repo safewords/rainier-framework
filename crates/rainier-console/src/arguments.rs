@@ -6,7 +6,7 @@
 //! | Form | Meaning |
 //! |---|---|
 //! | `word` | a positional argument |
-//! | `--name=value` | an option |
+//! | `--name=value` | an option; repeat it for several values |
 //! | `--name` | a flag |
 //! | `-abc` | the flags `a`, `b` and `c` |
 //! | `--` | everything after this is positional |
@@ -23,6 +23,10 @@ pub struct Arguments {
     command: String,
     positional: Vec<String>,
     options: HashMap<String, String>,
+    /// Every `--name=value` in the order given, repeats included. `options`
+    /// keeps only the last value per name, which is right for `option()` and
+    /// silently wrong for a repeatable one; see [`Arguments::option_values`].
+    ordered: Vec<(String, String)>,
     flags: HashSet<String>,
 }
 
@@ -55,6 +59,7 @@ impl Arguments {
                 match rest.split_once('=') {
                     Some((name, value)) => {
                         parsed.options.insert(name.to_string(), value.to_string());
+                        parsed.ordered.push((name.to_string(), value.to_string()));
                     }
                     None => {
                         parsed.flags.insert(rest.to_string());
@@ -130,6 +135,20 @@ impl Arguments {
         value
     }
 
+    /// Every value given for a repeatable option, in order.
+    ///
+    /// `--grant-type=a --grant-type=b` is two values. [`option`](Self::option)
+    /// and [`options`](Self::options) keep the last one only, which is what
+    /// identity's `client:register` read for its repeatable flags, so a client
+    /// registered with two grant types got one (found 2026-11-06).
+    pub fn option_values(&self, name: &str) -> Vec<&str> {
+        self.ordered
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+
     /// An option's value, or `default`.
     pub fn option_or<'a>(&'a self, name: &str, default: &'a str) -> &'a str {
         self.option(name).unwrap_or(default)
@@ -175,6 +194,17 @@ mod tests {
 
     fn parse(line: &str) -> Arguments {
         Arguments::parse(line.split_whitespace())
+    }
+
+    #[test]
+    fn a_repeated_option_keeps_every_value_in_order() {
+        let args = parse("client:register --grant-type=a --grant-type=b --name=x --grant-type=c");
+
+        assert_eq!(args.option_values("grant-type"), vec!["a", "b", "c"]);
+        assert_eq!(args.option_values("name"), vec!["x"]);
+        assert!(args.option_values("absent").is_empty());
+        // The single-value view is unchanged: the last one wins.
+        assert_eq!(args.option("grant-type"), Some("c"));
     }
 
     #[test]
