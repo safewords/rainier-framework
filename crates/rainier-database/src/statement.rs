@@ -32,13 +32,13 @@ use rainier_orm::sea_query::{
     Query as SqQuery, SelectStatement, SimpleExpr, SubQueryStatement, Value,
 };
 use rainier_orm::{
-    key_condition, key_route, row_key_condition, ColumnType, Dialect, Entity, Error, Result,
-    ShardRoute, SingleKey, TrashScope, Upsert,
+    key_condition, key_route, row_key_condition, ChangeKind, ColumnType, Dialect, Entity, Error,
+    Result, RowChange, ShardRoute, SingleKey, TrashScope, Upsert,
 };
 
 use crate::criteria::{
-    AggregateFn, Assignment, Comparison, Criteria, DatePart, Derived, JoinKind, Operand, Operator,
-    Projection, Subquery, SubqueryPredicate,
+    AggregateFn, Assignment, Comparison, Constraint, Criteria, DatePart, Derived, JoinKind,
+    Operand, Operator, Projection, Subquery, SubqueryPredicate,
 };
 use crate::expression::{
     predicate_condition, render_expression, render_sub_select, Expression, SubSelect,
@@ -55,6 +55,55 @@ pub struct Prepared {
     pub params: Vec<Value>,
     /// The shard this operation targets. Ignored by single-database backends.
     pub route: ShardRoute,
+    /// For a write, which rows it changes — handed to
+    /// [`Database::on_change`](crate::Database::on_change) subscribers once
+    /// [`Database::execute`](crate::Database::execute) succeeds. `None` for a
+    /// read, and for a write built by hand that nothing needs to hear about.
+    /// See [`RowChange`].
+    pub change: Option<RowChange>,
+}
+
+impl Prepared {
+    /// This statement, reporting `change` when it runs.
+    pub fn changing(mut self, change: RowChange) -> Self {
+        self.change = Some(change);
+        self
+    }
+}
+
+/// The primary-key values `criteria` pins the rows of `E` to: an equality or
+/// `IN` on its single-column key among the `AND`-ed constraints. `None` when
+/// nothing pins them — any row may match.
+///
+/// Every other part of a criteria (more constraints, `OR` groups, subqueries)
+/// is `AND`-ed with these, so it can only narrow the set, never widen it.
+pub fn pinned_keys<E: Entity>(criteria: &Criteria) -> Option<Vec<Value>> {
+    let pk = E::primary_key_columns();
+    if pk.len() != 1 {
+        return None;
+    }
+    let named = |column: &str| {
+        column == pk[0]
+            || column.rsplit_once('.').is_some_and(|(table, c)| table == E::table() && c == pk[0])
+    };
+    let mut pinned: Option<Vec<Value>> = None;
+    for constraint in criteria.constraints() {
+        let values: Vec<Value> = match constraint {
+            Constraint::Eq(column, value) if named(column) => vec![value.clone()],
+            Constraint::In(column, values) if named(column) => values.clone(),
+            _ => continue,
+        };
+        pinned = Some(match pinned {
+            None => values,
+            Some(already) => already.into_iter().filter(|v| values.contains(v)).collect(),
+        });
+    }
+    pinned
+}
+
+/// What a write of `E` restricted by `criteria` changes.
+fn criteria_change<E: Entity>(kind: ChangeKind, criteria: &Criteria) -> RowChange {
+    RowChange::of_keys::<E>(kind, pinned_keys::<E>(criteria).as_deref())
 }
 
 /// Reduce a bound value to a `u64` routing key.
@@ -173,7 +222,7 @@ pub fn select_all<E: Entity>(dialect: Dialect) -> Prepared {
     scope_select::<E>(&mut stmt, TrashScope::Active);
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route: ShardRoute::Global }
+    Prepared { sql, params: params.0, route: ShardRoute::Global, change: None }
 }
 
 /// `SELECT … WHERE pk = ? LIMIT 1`.
@@ -187,7 +236,7 @@ pub fn select_by_pk<E: Entity + SingleKey>(dialect: Dialect, key: Value) -> Prep
     scope_select::<E>(&mut stmt, TrashScope::Active);
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route }
+    Prepared { sql, params: params.0, route, change: None }
 }
 
 /// `SELECT … WHERE a = ? AND b = ? LIMIT 1` — the composite counterpart of
@@ -202,7 +251,7 @@ pub fn select_by_keys<E: Entity>(dialect: Dialect, keys: &[Value]) -> Result<Pre
     scope_select::<E>(&mut stmt, TrashScope::Active);
 
     let (sql, params) = dialect.build_query(&stmt);
-    Ok(Prepared { sql, params: params.0, route })
+    Ok(Prepared { sql, params: params.0, route, change: None })
 }
 
 /// `SELECT … WHERE column = ?`, optionally limited.
@@ -221,7 +270,7 @@ pub fn select_by_column<E: Entity>(
     }
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route }
+    Prepared { sql, params: params.0, route, change: None }
 }
 
 /// Render a [`Projection`] against the outer query's own table.
@@ -651,7 +700,7 @@ pub fn select_aggregate<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Pre
     }
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route }
+    Prepared { sql, params: params.0, route, change: None }
 }
 
 /// `SELECT <model columns>` under a [`Criteria`]'s filters, joins and paging.
@@ -660,7 +709,7 @@ pub fn select_matching<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Prep
     let route = apply_criteria::<E>(dialect, &mut stmt, criteria, true);
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route }
+    Prepared { sql, params: params.0, route, change: None }
 }
 
 /// `SELECT COUNT(*) AS cnt` under a [`Criteria`]'s filters and joins only.
@@ -674,7 +723,7 @@ pub fn count_matching<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Prepa
     stmt.expr_as(Func::count(Expr::col(Asterisk)), alias("cnt"));
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route }
+    Prepared { sql, params: params.0, route, change: None }
 }
 
 /// `SELECT column, COUNT(*) AS cnt … GROUP BY column`.
@@ -691,7 +740,7 @@ pub fn count_grouped<E: Entity>(dialect: Dialect, column: &str, criteria: &Crite
     stmt.add_group_by(vec![SimpleExpr::Column(column_ref::<E>(column))]);
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route }
+    Prepared { sql, params: params.0, route, change: None }
 }
 
 /// `SELECT parent, related FROM pivot WHERE parent IN (…)`.
@@ -708,7 +757,7 @@ pub fn select_pivot(dialect: Dialect, query: &crate::relation::PivotQuery) -> Pr
     stmt.and_where(Expr::col(alias(&query.parent_column)).is_in(query.parent_keys.iter().cloned()));
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route: ShardRoute::Global }
+    Prepared { sql, params: params.0, route: ShardRoute::Global, change: None }
 }
 
 /// Apply a criteria to a select. Returns the route the filters imply.
@@ -814,7 +863,12 @@ pub fn insert<E: Entity>(dialect: Dialect, entity: &E, assigned_id: Option<u64>)
     stmt.values_panic(pairs.into_iter().map(|(_, value)| SimpleExpr::from(Expr::val(value))));
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route }
+    Prepared {
+        sql,
+        params: params.0,
+        route,
+        change: Some(RowChange::of_rows(ChangeKind::Insert, [entity])),
+    }
 }
 
 /// Whether `E` needs a connector-minted primary key for this row, and the
@@ -878,7 +932,12 @@ pub fn upsert<E: Entity>(
     stmt.on_conflict(on_conflict);
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route }
+    Prepared {
+        sql,
+        params: params.0,
+        route,
+        change: Some(RowChange::of_rows(ChangeKind::Upsert, [entity])),
+    }
 }
 
 /// `INSERT … ON CONFLICT (…) DO UPDATE` from an [`Upsert`] plan.
@@ -910,7 +969,12 @@ pub fn upsert_with<E: Entity>(dialect: Dialect, entity: &E, plan: &Upsert) -> Re
     stmt.on_conflict(on_conflict);
 
     let (sql, params) = dialect.build_query(&stmt);
-    Ok(Prepared { sql, params: params.0, route })
+    Ok(Prepared {
+        sql,
+        params: params.0,
+        route,
+        change: Some(RowChange::of_rows(ChangeKind::Upsert, [entity])),
+    })
 }
 
 /// [`upsert_with`] for many rows in one statement: `INSERT … VALUES (…), (…)
@@ -959,7 +1023,12 @@ pub fn upsert_many_with<E: Entity>(
     stmt.on_conflict(on_conflict);
 
     let (sql, params) = dialect.build_query(&stmt);
-    Ok(Prepared { sql, params: params.0, route })
+    Ok(Prepared {
+        sql,
+        params: params.0,
+        route,
+        change: Some(RowChange::of_rows(ChangeKind::Upsert, rows)),
+    })
 }
 
 /// `INSERT` with the primary key written as the entity holds it, auto-increment
@@ -987,7 +1056,12 @@ pub fn insert_with_key<E: Entity>(dialect: Dialect, entity: &E) -> Prepared {
     stmt.values_panic(pairs.into_iter().map(|(_, value)| SimpleExpr::from(Expr::val(value))));
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route }
+    Prepared {
+        sql,
+        params: params.0,
+        route,
+        change: Some(RowChange::of_rows(ChangeKind::Insert, [entity])),
+    }
 }
 
 /// `INSERT INTO table (…) VALUES (…), (…), …` — many rows, one statement.
@@ -1026,7 +1100,12 @@ pub fn insert_many<E: Entity>(dialect: Dialect, rows: &[E]) -> Result<Prepared> 
     }
 
     let (sql, params) = dialect.build_query(&stmt);
-    Ok(Prepared { sql, params: params.0, route })
+    Ok(Prepared {
+        sql,
+        params: params.0,
+        route,
+        change: Some(RowChange::of_rows(ChangeKind::Insert, rows)),
+    })
 }
 
 /// `SELECT …` from a [`SubSelect`] — a query that is not one entity's rows:
@@ -1037,7 +1116,7 @@ pub fn insert_many<E: Entity>(dialect: Dialect, rows: &[E]) -> Result<Prepared> 
 /// so a `deleted_at IS NULL` it needs is written into it.
 pub fn select(dialect: Dialect, source: &SubSelect) -> Prepared {
     let (sql, params) = dialect.build_query(&render_sub_select(dialect, source));
-    Prepared { sql, params: params.0, route: ShardRoute::Global }
+    Prepared { sql, params: params.0, route: ShardRoute::Global, change: None }
 }
 
 /// `INSERT INTO table (columns…) SELECT …` — rows computed by the database
@@ -1060,7 +1139,12 @@ pub fn insert_select<E: Entity>(
 ) -> Result<Prepared> {
     let stmt = insert_select_statement::<E>(dialect, columns, source)?;
     let (sql, params) = dialect.build_query(&stmt);
-    Ok(Prepared { sql, params: params.0, route: ShardRoute::Global })
+    Ok(Prepared {
+        sql,
+        params: params.0,
+        route: ShardRoute::Global,
+        change: Some(RowChange::unknown(E::table(), ChangeKind::Insert)),
+    })
 }
 
 /// [`insert_select`], and on a key conflict update the stored row instead:
@@ -1125,7 +1209,12 @@ pub fn upsert_select<E: Entity>(
     stmt.on_conflict(on_conflict);
 
     let (sql, params) = dialect.build_query(&stmt);
-    Ok(Prepared { sql, params: params.0, route: ShardRoute::Global })
+    Ok(Prepared {
+        sql,
+        params: params.0,
+        route: ShardRoute::Global,
+        change: Some(RowChange::unknown(E::table(), ChangeKind::Upsert)),
+    })
 }
 
 fn insert_select_statement<E: Entity>(
@@ -1190,7 +1279,12 @@ pub fn update<E: Entity>(dialect: Dialect, entity: &E) -> Prepared {
     stmt.cond_where(row_key_condition(entity));
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route }
+    Prepared {
+        sql,
+        params: params.0,
+        route,
+        change: Some(RowChange::of_rows(ChangeKind::Update, [entity])),
+    }
 }
 
 /// `UPDATE table SET … WHERE <criteria>` — only the named columns.
@@ -1303,7 +1397,12 @@ pub fn update_matching_with<E: Entity>(
     stmt.cond_where(condition);
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route }
+    Prepared {
+        sql,
+        params: params.0,
+        route,
+        change: Some(criteria_change::<E>(ChangeKind::Update, criteria)),
+    }
 }
 
 /// `DELETE FROM table WHERE pk = ?`.
@@ -1311,13 +1410,14 @@ pub fn update_matching_with<E: Entity>(
 /// Bounded on [`SingleKey`]; see [`delete_by_keys`].
 pub fn delete_by_pk<E: Entity + SingleKey>(dialect: Dialect, key: Value) -> Prepared {
     let route = route_for::<E>(E::primary_key(), &key);
+    let change = RowChange::of_keys::<E>(ChangeKind::Delete, Some(std::slice::from_ref(&key)));
 
     let mut stmt = SqQuery::delete();
     stmt.from_table(alias(E::table()));
     stmt.and_where(Expr::col(alias(E::primary_key())).eq(key));
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route }
+    Prepared { sql, params: params.0, route, change: Some(change) }
 }
 
 /// `DELETE FROM table WHERE a = ? AND b = ?` — the composite counterpart of
@@ -1334,7 +1434,12 @@ pub fn delete_by_keys<E: Entity>(dialect: Dialect, keys: &[Value]) -> Result<Pre
     stmt.cond_where(key_condition::<E>(keys)?);
 
     let (sql, params) = dialect.build_query(&stmt);
-    Ok(Prepared { sql, params: params.0, route })
+    Ok(Prepared {
+        sql,
+        params: params.0,
+        route,
+        change: Some(RowChange::of_keys::<E>(ChangeKind::Delete, Some(keys))),
+    })
 }
 
 /// `DELETE FROM table WHERE <criteria>`.
@@ -1346,7 +1451,12 @@ pub fn delete_matching<E: Entity>(dialect: Dialect, criteria: &Criteria) -> Prep
     stmt.cond_where(condition);
 
     let (sql, params) = dialect.build_query(&stmt);
-    Prepared { sql, params: params.0, route }
+    Prepared {
+        sql,
+        params: params.0,
+        route,
+        change: Some(criteria_change::<E>(ChangeKind::Delete, criteria)),
+    }
 }
 
 #[cfg(test)]

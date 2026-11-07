@@ -581,6 +581,7 @@ impl Migrator {
             sql: format!("SELECT name, batch FROM {LEDGER}"),
             params: Vec::new(),
             route: rainier_orm::ShardRoute::Global,
+            change: None,
         };
         let columns = vec![
             crate::row::ColumnRequest::new("name", rainier_orm::ColumnType::Text),
@@ -620,6 +621,7 @@ impl Migrator {
             sql: format!("INSERT INTO {LEDGER} (name, batch) VALUES {values}"),
             params: vec![name.into(), batch.into()],
             route: rainier_orm::ShardRoute::Global,
+            change: None,
         };
 
         db.execute(prepared).await?;
@@ -632,6 +634,7 @@ impl Migrator {
             sql: format!("DELETE FROM {LEDGER} WHERE name = {placeholder}"),
             params: vec![name.into()],
             route: rainier_orm::ShardRoute::Global,
+            change: None,
         };
 
         db.execute(prepared).await?;

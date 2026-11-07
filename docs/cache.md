@@ -431,6 +431,41 @@ static BUMP: LazyLock<RedisScript> = LazyLock::new(|| RedisScript::new(
 let _: i64 = redis.eval(&BUMP, &["{stats:7}:today"], &["views", "3600"]).await?;
 ```
 
+## Hot rows: `ModelCache`
+
+`ModelCache<M>` keeps the rows of one model that are being read often, and only
+those, in the application's cache, and drops each the moment it is written:
+
+```rust
+use rainier_framework::model_cache::ModelCache;
+
+let posts: ModelCache<Post> = ModelCache::new(Cache::instance().store(), &db);
+let post = posts.get(&id.to_string(), || async { repo.find(id.into()).await }).await?;
+// by another column, through a checked index:
+let profile = profiles
+    .get_by("username", &name, |p| p.id.to_string(), |p| p.username == name, || load(&name))
+    .await?;
+```
+
+- **Hot only.** Each process counts reads per key over a window (default: 3
+  reads in 10 s, this window or the last). A cold key costs nothing beyond its
+  database read; a hot one is one cache `GET`.
+- **Invalidated by the write.** It subscribes through `Database::on_change`, so
+  every builder and `repo` write — including bulk updates and counter
+  increments — reaches it, before the write returns. A write that names its rows
+  tombstones them for a few seconds, so a reader that loaded the old row just
+  before cannot put it back (repopulation is an atomic set-if-absent). A write
+  that does not name them advances the table's generation, retiring every
+  cached row; other replicas see it within a second.
+- **A TTL as the backstop** (five minutes) for SQL written as a string, which
+  nothing hears.
+- **Never fails a read.** An unreachable cache, or an entry that does not
+  decode, is a miss.
+
+Use a shared store (Redis) in production: the tombstones and generation are
+what every replica agrees on. `ModelCacheConfig` sets the threshold, window and
+lifetimes; `stats()` counts hits, misses and invalidations.
+
 ### Atomic add, for locks
 
 ```rust

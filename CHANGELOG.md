@@ -12,6 +12,21 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Row-change notification** (`rainier-orm`, `rainier-database`). Every write a
+  statement builder or `rainier_orm::repo` / `Query` makes now reports a
+  `RowChange` — table, kind, and the primary keys it touched when it names
+  them — and `Database::on_change` subscribes to them, awaited before the write
+  returns. Covers bulk updates and counter increments, which lifecycle hooks
+  never did. `Prepared` gains a `change` field (`Prepared::changing`),
+  `Executor` a `rows_changed` method with a no-op default, and
+  `statement::pinned_keys` reads the keys a criteria pins. See
+  `docs/repositories.md`.
+- **`ModelCache`** (`rainier-framework`). A cache of a model's hot rows only —
+  counted per process over a rolling window — kept in the application's cache
+  and invalidated by `Database::on_change` the moment the row is written:
+  tombstones for named rows, a generation bump for unnamed ones, atomic
+  set-if-absent so a racing read cannot restore a stale row, and a checked
+  index for lookups by another column. See `docs/cache.md`.
 - **`SharedRedis`, a self-healing handle to the application's Redis**
   (`rainier-drivers`, reached through `rainier-cache`'s
   `StoreConfig::shared_redis()`, `RedisStore::shared()` and

@@ -71,6 +71,11 @@ pub struct Query<E> {
     /// entirely by an entity with no tombstone column, and by the write
     /// terminals — see [`with_trashed`](Self::with_trashed).
     trash: TrashScope,
+    /// The primary-key values the filters pin the rows to, when an equality
+    /// or `IN` on a single-column key has been added — what a write reports
+    /// as the rows it changed ([`RowChange`](crate::RowChange)). Every filter
+    /// is `AND`-ed, so the set only narrows.
+    keys: Option<Vec<Value>>,
     _entity: PhantomData<E>,
 }
 
@@ -91,8 +96,22 @@ impl<E: Entity> Query<E> {
             offset: None,
             route: ShardRoute::Global,
             trash: TrashScope::Active,
+            keys: None,
             _entity: PhantomData,
         }
+    }
+
+    /// Narrow [`keys`](Self::keys) when `column` is the single-column primary
+    /// key: the first pin sets it, a later one keeps only what both allow.
+    fn pin_keys(&mut self, column: &str, values: &[Value]) {
+        let pk = E::primary_key_columns();
+        if pk.len() != 1 || pk[0] != column {
+            return;
+        }
+        self.keys = Some(match self.keys.take() {
+            None => values.to_vec(),
+            Some(pinned) => pinned.into_iter().filter(|k| values.contains(k)).collect(),
+        });
     }
 
     fn add(mut self, expr: SimpleExpr) -> Self {
@@ -112,6 +131,7 @@ impl<E: Entity> Query<E> {
         if matches!(self.route, ShardRoute::Global) {
             self.route = route_for::<E>(column, &val);
         }
+        self.pin_keys(column, std::slice::from_ref(&val));
         self.add(Expr::col(col_ref::<E>(column)).eq(val))
     }
 
@@ -152,11 +172,12 @@ impl<E: Entity> Query<E> {
 
     /// `column IN (values)`. An empty set matches nothing.
     pub fn where_in<V: Into<Value>>(
-        self,
+        mut self,
         column: &str,
         values: impl IntoIterator<Item = V>,
     ) -> Self {
         let vals: Vec<Value> = values.into_iter().map(Into::into).collect();
+        self.pin_keys(column, &vals);
         self.add(Expr::col(col_ref::<E>(column)).is_in(vals))
     }
 
@@ -473,8 +494,14 @@ impl<E: Entity> Query<E> {
         exec: &'a X,
         set: Vec<(&str, Value)>,
     ) -> impl Future<Output = Result<u64>> + 'a {
+        let change =
+            crate::RowChange::of_keys::<E>(crate::ChangeKind::Update, self.keys.as_deref());
         let (route, sql, params) = self.render_update(exec.dialect(), set);
-        async move { Ok(exec.execute_routed(route, &sql, params).await?.rows_affected) }
+        async move {
+            let affected = exec.execute_routed(route, &sql, params).await?.rows_affected;
+            exec.rows_changed(change).await;
+            Ok(affected)
+        }
     }
 
     /// Atomically add `by` to `column` (`SET column = column + by`) on every
@@ -486,8 +513,14 @@ impl<E: Entity> Query<E> {
         column: &str,
         by: i64,
     ) -> impl Future<Output = Result<u64>> + 'a {
+        let change =
+            crate::RowChange::of_keys::<E>(crate::ChangeKind::Update, self.keys.as_deref());
         let (route, sql, params) = self.render_increment(exec.dialect(), column, by);
-        async move { Ok(exec.execute_routed(route, &sql, params).await?.rows_affected) }
+        async move {
+            let affected = exec.execute_routed(route, &sql, params).await?.rows_affected;
+            exec.rows_changed(change).await;
+            Ok(affected)
+        }
     }
 
     /// `DELETE` every row matching the filters. Joins are ignored (portable
@@ -499,8 +532,14 @@ impl<E: Entity> Query<E> {
     /// precisely, and a scope would leave it matching nothing forever with
     /// nothing to say so.
     pub fn delete<'a, X: Executor>(self, exec: &'a X) -> impl Future<Output = Result<u64>> + 'a {
+        let change =
+            crate::RowChange::of_keys::<E>(crate::ChangeKind::Delete, self.keys.as_deref());
         let (route, sql, params) = self.render_delete(exec.dialect());
-        async move { Ok(exec.execute_routed(route, &sql, params).await?.rows_affected) }
+        async move {
+            let affected = exec.execute_routed(route, &sql, params).await?.rows_affected;
+            exec.rows_changed(change).await;
+            Ok(affected)
+        }
     }
 
     /// Return the first match, or insert `default` and return it. Not atomic —

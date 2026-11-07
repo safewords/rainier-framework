@@ -83,7 +83,7 @@ pub mod sticky;
 pub mod telemetry;
 pub mod testing;
 
-pub use connection::{Connection, Database};
+pub use connection::{ChangeSubscriber, Connection, Database};
 pub use criteria::{
     AggregateFn, Assignment, Comparison, Constraint, Criteria, DatePart, Derived, JoinKind,
     Operand, Operator, OrGroup, Projection, Subquery, SubqueryDraft, SubqueryPredicate,
@@ -98,6 +98,7 @@ pub use manager::DatabaseManager;
 pub use migrator::{Down, Migration, Migrator, Step};
 pub use model::{Created, Creating, Deleted, Deleting, Model, Updated, Updating};
 pub use pagination::Paginated;
+pub use rainier_orm::{ChangeKind, ChangedKeys, RowChange};
 pub use raw::RawQuery;
 pub use relation::{
     BelongsTo, BelongsToMany, HasMany, HasOne, PivotQuery, Related, RelatedCounts, Relation,

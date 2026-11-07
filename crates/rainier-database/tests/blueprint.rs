@@ -116,6 +116,7 @@ async fn a_cascade_takes_the_children_with_it() {
                 sql: "SELECT COUNT(*) AS cnt FROM posts".into(),
                 params: Vec::new(),
                 route: rainier_orm::ShardRoute::Global,
+                change: None,
             },
             vec![rainier_database::ColumnRequest::new("cnt", rainier_orm::ColumnType::BigInt)],
         )
@@ -160,6 +161,7 @@ async fn a_default_backfills_a_column_the_insert_omits() {
                 sql: "SELECT logins AS cnt FROM users".into(),
                 params: Vec::new(),
                 route: rainier_orm::ShardRoute::Global,
+                change: None,
             },
             vec![rainier_database::ColumnRequest::new("cnt", rainier_orm::ColumnType::BigInt)],
         )

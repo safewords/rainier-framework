@@ -58,7 +58,7 @@
 use crate::key::{key_condition, key_route, row_key_condition};
 use crate::route::route_for;
 use crate::trash::{scope_predicate, SoftDeletes, TrashScope};
-use crate::{Entity, Executor, Result, ShardRoute, SingleKey};
+use crate::{ChangeKind, Entity, Executor, Result, RowChange, ShardRoute, SingleKey};
 use core::future::Future;
 use sea_query::ExprTrait as _;
 use sea_query::{
@@ -178,6 +178,7 @@ where
     };
 
     let outcome = exec.execute_routed(route, &sql, params).await?;
+    exec.rows_changed(RowChange::of_rows(ChangeKind::Insert, [entity])).await;
     // The assigned id is the truth when we minted one (the DB has no
     // auto-increment to report for an app-assigned key).
     Ok(assigned.map(|i| i as i64).unwrap_or(outcome.last_insert_id))
@@ -229,7 +230,9 @@ where
         (route, sql, into_vec(params))
     };
 
-    Ok(exec.execute_routed(route, &sql, params).await?.rows_affected)
+    let affected = exec.execute_routed(route, &sql, params).await?.rows_affected;
+    exec.rows_changed(RowChange::of_rows(ChangeKind::Upsert, [entity])).await;
+    Ok(affected)
 }
 
 /// Insert `entity`, resolving a collision with an [`Upsert`](crate::Upsert) plan.
@@ -285,9 +288,13 @@ where
         })
     };
 
+    let change = RowChange::of_rows(ChangeKind::Upsert, [entity]);
+
     async move {
         let (route, sql, params) = rendered?;
-        Ok(exec.execute_routed(route, &sql, params).await?.rows_affected)
+        let affected = exec.execute_routed(route, &sql, params).await?.rows_affected;
+        exec.rows_changed(change).await;
+        Ok(affected)
     }
 }
 
@@ -330,6 +337,7 @@ where
         // Rendered before the await, as in `upsert_with`.
         let (route, sql, params) = render_upsert_many(exec.dialect(), chunk, plan)?;
         affected += exec.execute_routed(route, &sql, params).await?.rows_affected;
+        exec.rows_changed(RowChange::of_rows(ChangeKind::Upsert, chunk)).await;
     }
     Ok(affected)
 }
@@ -542,6 +550,7 @@ where
     };
 
     let outcome = exec.execute_routed(route, &sql, params).await?;
+    exec.rows_changed(RowChange::of_rows(ChangeKind::Update, [entity])).await;
     Ok(outcome.rows_affected)
 }
 
@@ -554,8 +563,9 @@ where
     X: Executor,
     V: Into<Value>,
 {
+    let pk_val: Value = pk.into();
+    let change = RowChange::of_keys::<E>(ChangeKind::Delete, Some(std::slice::from_ref(&pk_val)));
     let (route, sql, params) = {
-        let pk_val: Value = pk.into();
         let route = route_for::<E>(E::primary_key(), &pk_val);
         let mut stmt = Query::delete();
         stmt.from_table(col(E::table())).and_where(Expr::col(col(E::primary_key())).eq(pk_val));
@@ -565,6 +575,7 @@ where
     };
 
     let outcome = exec.execute_routed(route, &sql, params).await?;
+    exec.rows_changed(change).await;
     Ok(outcome.rows_affected)
 }
 
@@ -578,6 +589,7 @@ where
     E: Entity,
     X: Executor,
 {
+    let change = RowChange::of_keys::<E>(ChangeKind::Delete, Some(&keys));
     let (route, sql, params) = {
         let route = key_route::<E>(&keys);
         let condition = key_condition::<E>(&keys)?;
@@ -589,6 +601,7 @@ where
     };
 
     let outcome = exec.execute_routed(route, &sql, params).await?;
+    exec.rows_changed(change).await;
     Ok(outcome.rows_affected)
 }
 

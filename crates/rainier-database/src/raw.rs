@@ -162,7 +162,7 @@ impl<'a> RawQuery<'a> {
             self.sql
         };
 
-        Prepared { sql, params: self.params, route: self.route }
+        Prepared { sql, params: self.params, route: self.route, change: None }
     }
 
     // --- running it --------------------------------------------------------

@@ -544,6 +544,26 @@ second time"). For an increment, sum duplicates first. Each chunk is atomic;
 the batch is not. `statement::upsert_many_with(dialect, &rows, &plan)` is the
 one-statement form, for a caller who chunks.
 
+## Hearing about writes
+
+`db.on_change(|change: RowChange| async move { … })` subscribes to every write
+made through that `Database` — or any clone of it, or a handle derived from it
+— once the statement succeeds. Every statement builder and every
+`rainier_orm::repo` / `Query` write reports one: inserts, upserts, updates by
+row or by criteria, counter increments, deletes. Lifecycle hooks (`Updated<M>`)
+fire only for a repository built `with_events` and never for a bulk write; this
+does not depend on how the write was made.
+
+A `RowChange` names its `table`, its `kind`, and its `keys`: the primary keys
+it touched when the write names them — a row written by key, or criteria
+pinning the key (`id = ?`, `id IN (…)`) — and `ChangedKeys::Unknown` otherwise.
+Subscribers are awaited before the write's own future completes, so a caller
+that writes and then reads sees what the subscriber did. SQL passed as a string
+(`Executor::execute`, `Database::statement`) reports nothing.
+
+This is what `rainier_framework::model_cache::ModelCache` invalidates by; see
+[Cache](cache.md#hot-rows-modelcache).
+
 ## Named queries
 
 `EntityRepository<M>` already does CRUD for every model, so an

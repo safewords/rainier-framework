@@ -101,4 +101,13 @@ pub trait Executor {
     ) -> Result<ExecOutcome> {
         self.execute(sql, params).await
     }
+
+    /// Rows were written: `change` says which. Called by every write this
+    /// crate builds, after it succeeds — see [`RowChange`](crate::RowChange).
+    ///
+    /// The default does nothing. An executor that keeps subscribers (a cache of
+    /// rows that must drop a stale copy) passes it on; awaiting them here, before
+    /// the write's own future completes, is what lets a caller read its own
+    /// write.
+    async fn rows_changed(&self, _change: crate::RowChange) {}
 }

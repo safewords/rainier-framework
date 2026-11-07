@@ -63,7 +63,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 
 use rainier_orm::sea_query::Value;
-use rainier_orm::{Dialect, ExecOutcome, Executor, Row, ShardRoute};
+use rainier_orm::{Dialect, ExecOutcome, Executor, Row, RowChange, ShardRoute};
 use rainier_support::{BoxFuture, Error, Result};
 
 use crate::row::{ColumnRequest, OwnedRow};
@@ -257,6 +257,23 @@ pub struct Database {
 
     /// This handle sends its reads to the writer — see [`Database::writer`].
     to_the_writer: bool,
+
+    /// Who hears about writes — see [`Database::on_change`]. Shared by every
+    /// clone and every handle derived from this one ([`writer`](Self::writer)),
+    /// so a write through any of them reaches the same subscribers.
+    subscribers: Arc<Subscribers>,
+}
+
+/// A subscriber to row changes. See [`Database::on_change`].
+pub type ChangeSubscriber = Arc<dyn Fn(RowChange) -> BoxFuture<'static, ()> + Send + Sync>;
+
+#[derive(Default)]
+struct Subscribers(std::sync::RwLock<Vec<ChangeSubscriber>>);
+
+impl Subscribers {
+    fn snapshot(&self) -> Vec<ChangeSubscriber> {
+        self.0.read().map(|list| list.clone()).unwrap_or_default()
+    }
 }
 
 impl Database {
@@ -267,7 +284,7 @@ impl Database {
 
     /// Wrap an already-shared connection.
     pub fn from_arc(connection: Arc<dyn Connection>) -> Self {
-        Self { connection, split: None, to_the_writer: false }
+        Self { connection, split: None, to_the_writer: false, subscribers: Arc::default() }
     }
 
     /// A handle over separate write and read endpoints.
@@ -321,6 +338,7 @@ impl Database {
                 unscoped: Once::new(),
             })),
             to_the_writer: false,
+            subscribers: Arc::default(),
         })
     }
 
@@ -449,19 +467,61 @@ impl Database {
         Ok(count.max(0) as u64)
     }
 
-    /// Run a prepared write.
+    /// Run a prepared write, then tell [`on_change`](Self::on_change)
+    /// subscribers which rows it changed, when the statement says
+    /// ([`Prepared::change`]). They have all finished when this returns.
     pub async fn execute(&self, prepared: Prepared) -> Result<ExecOutcome> {
-        let run = self.write_connection().execute(prepared.route, &prepared.sql, prepared.params);
+        let Prepared { sql, params, route, change } = prepared;
+        let run = self.write_connection().execute(route, &sql, params);
 
         #[cfg(feature = "telemetry")]
-        let run = crate::telemetry::traced(
-            crate::telemetry::span(self.dialect(), &prepared.sql),
-            run,
-            |_| None,
-        );
+        let run =
+            crate::telemetry::traced(crate::telemetry::span(self.dialect(), &sql), run, |_| None);
 
         let outcomes = run.await?;
+        if let Some(change) = change {
+            self.notify(change).await;
+        }
         Ok(outcomes.into_iter().next().unwrap_or_default())
+    }
+
+    /// Hear about every write a builder makes through this handle — or any
+    /// clone of it, or any handle derived from it — once it succeeds.
+    ///
+    /// The subscriber is awaited before the write's own future completes, so
+    /// a caller that writes and then reads sees whatever the subscriber did
+    /// (a cache dropping its stale copy) already done. Keep it quick, and
+    /// infallible: a write has succeeded by the time it runs, and nothing it
+    /// does can undo that.
+    ///
+    /// What is reported, and what is not, is [`RowChange`]'s module docs: every
+    /// statement builder and `rainier_orm::repo` write, including bulk updates
+    /// and counter increments; not SQL passed as a string.
+    ///
+    /// ```ignore
+    /// db.on_change(|change: RowChange| async move {
+    ///     if change.table == "posts" { /* drop cached posts */ }
+    /// });
+    /// ```
+    pub fn on_change<F, Fut>(&self, subscriber: F)
+    where
+        F: Fn(RowChange) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let subscriber: ChangeSubscriber = Arc::new(move |change| Box::pin(subscriber(change)));
+        if let Ok(mut list) = self.subscribers.0.write() {
+            list.push(subscriber);
+        }
+    }
+
+    /// Hand `change` to every subscriber, in the order they subscribed.
+    pub async fn notify(&self, change: RowChange) {
+        let subscribers = self.subscribers.snapshot();
+        let Some((last, rest)) = subscribers.split_last() else { return };
+        for subscriber in rest {
+            subscriber(change.clone()).await;
+        }
+        last(change).await;
     }
 
     /// Run a raw statement with no bindings — for DDL.
@@ -662,6 +722,12 @@ impl Executor for Database {
 
         let outcomes = run.await.map_err(into_anyhow)?;
         Ok(outcomes.into_iter().next().unwrap_or_default())
+    }
+
+    /// `rainier_orm::repo` and `Query` writes report here — passed to
+    /// [`Database::on_change`] subscribers like a builder's.
+    async fn rows_changed(&self, change: RowChange) {
+        self.notify(change).await;
     }
 }
 
