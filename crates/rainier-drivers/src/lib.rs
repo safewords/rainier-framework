@@ -143,6 +143,10 @@ pub mod memcached;
 #[cfg(feature = "redis-driver")]
 pub mod redis;
 #[cfg(feature = "redis-driver")]
+pub mod redis_script;
+#[cfg(feature = "redis-driver")]
+pub mod redis_shared;
+#[cfg(feature = "redis-driver")]
 pub mod redis_streams;
 #[cfg(feature = "aws-s3")]
 pub mod s3;
@@ -171,6 +175,10 @@ pub use redis::{
     PublishedMessage, Reconnect, RedisClient, RedisConnection, RedisConnector, RedisSettings,
     RedisSubscription,
 };
+#[cfg(feature = "redis-driver")]
+pub use redis_script::{check_one_slot, hash_slot, RedisScript, HASH_SLOTS};
+#[cfg(feature = "redis-driver")]
+pub use redis_shared::SharedRedis;
 #[cfg(feature = "redis-driver")]
 pub use redis_streams::StreamEntry;
 #[cfg(feature = "aws-s3")]

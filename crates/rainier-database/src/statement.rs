@@ -913,6 +913,55 @@ pub fn upsert_with<E: Entity>(dialect: Dialect, entity: &E, plan: &Upsert) -> Re
     Ok(Prepared { sql, params: params.0, route })
 }
 
+/// [`upsert_with`] for many rows in one statement: `INSERT … VALUES (…), (…)
+/// ON CONFLICT …`.
+///
+/// One statement, so the caller chunks: `rows × columns` must stay under the
+/// dialect's placeholder cap (SQLite 32,766; MySQL and Postgres 65,535).
+/// [`rainier_orm::repo::upsert_many_with`] chunks for you.
+///
+/// Give each conflict key once: Postgres refuses a statement that affects one
+/// row twice, where MySQL and SQLite apply the rows in order.
+///
+/// # Errors
+///
+/// If `rows` is empty, if the rows route to different shards, or if the plan
+/// cannot be rendered — see [`Upsert::to_on_conflict`].
+pub fn upsert_many_with<E: Entity>(
+    dialect: Dialect,
+    rows: &[E],
+    plan: &Upsert,
+) -> Result<Prepared> {
+    let Some(first) = rows.first() else {
+        return Err(Error::msg(format!(
+            "upsert_many_with into `{}` was given no rows",
+            E::table()
+        )));
+    };
+    let pairs = first.insert_values();
+    let route = route_from_pairs::<E>(&pairs);
+    let columns: Vec<&str> = pairs.iter().map(|(column, _)| *column).collect();
+    let on_conflict = plan.to_on_conflict(dialect, E::table(), &columns)?;
+
+    let mut stmt = SqQuery::insert();
+    stmt.into_table(alias(E::table()));
+    stmt.columns(columns.iter().map(|c| alias(c)));
+    for row in rows {
+        let pairs = row.insert_values();
+        if route_from_pairs::<E>(&pairs) != route {
+            return Err(Error::msg(format!(
+                "upsert_many_with into `{}` spans shards; one statement reaches one",
+                E::table()
+            )));
+        }
+        stmt.values_panic(pairs.into_iter().map(|(_, value)| SimpleExpr::from(Expr::val(value))));
+    }
+    stmt.on_conflict(on_conflict);
+
+    let (sql, params) = dialect.build_query(&stmt);
+    Ok(Prepared { sql, params: params.0, route })
+}
+
 /// `INSERT` with the primary key written as the entity holds it, auto-increment
 /// or not.
 ///

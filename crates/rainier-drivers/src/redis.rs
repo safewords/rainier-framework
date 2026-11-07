@@ -403,14 +403,65 @@ impl RedisConnection {
     /// connection rather than sharing one behind a lock, which is what makes
     /// concurrent use possible at all.
     pub async fn query<T: FromRedisValue>(&mut self, command: &Cmd) -> Result<T> {
-        let outcome = match self {
+        self.query_raw(command).await.map_err(redis_error)
+    }
+
+    /// [`query`](Self::query), with the client's own error — for a caller in
+    /// this crate that has to tell a lost connection from a refused command.
+    pub(crate) async fn query_raw<T: FromRedisValue>(
+        &mut self,
+        command: &Cmd,
+    ) -> redis::RedisResult<T> {
+        match self {
             RedisConnection::Single(connection) => command.query_async(connection).await,
             RedisConnection::Reconnecting(connection) => command.query_async(connection).await,
             #[cfg(feature = "redis-cluster")]
             RedisConnection::Cluster(connection) => command.query_async(connection).await,
-        };
+        }
+    }
 
-        outcome.map_err(redis_error)
+    /// Run `script` with `keys` and `args`: by its hash, falling back to its
+    /// source when the server has not seen it.
+    ///
+    /// # Errors
+    ///
+    /// Before anything is sent, when `keys` span more than one hash slot — see
+    /// [`RedisScript`](crate::RedisScript) — and otherwise as
+    /// [`query`](Self::query).
+    pub async fn eval<T, K, A>(
+        &mut self,
+        script: &crate::RedisScript,
+        keys: &[K],
+        args: &[A],
+    ) -> Result<T>
+    where
+        T: FromRedisValue,
+        K: AsRef<str>,
+        A: redis::ToRedisArgs,
+    {
+        self.eval_raw(script, keys, args).await?.map_err(redis_error)
+    }
+
+    /// [`eval`](Self::eval), with the client's own error. The outer `Result` is
+    /// the slot check.
+    pub(crate) async fn eval_raw<T, K, A>(
+        &mut self,
+        script: &crate::RedisScript,
+        keys: &[K],
+        args: &[A],
+    ) -> Result<redis::RedisResult<T>>
+    where
+        T: FromRedisValue,
+        K: AsRef<str>,
+        A: redis::ToRedisArgs,
+    {
+        let invocation = script.invocation(keys, args)?;
+        Ok(match self {
+            RedisConnection::Single(connection) => invocation.invoke_async(connection).await,
+            RedisConnection::Reconnecting(connection) => invocation.invoke_async(connection).await,
+            #[cfg(feature = "redis-cluster")]
+            RedisConnection::Cluster(connection) => invocation.invoke_async(connection).await,
+        })
     }
 
     /// Run a command, ignoring its reply.
@@ -753,7 +804,7 @@ impl std::fmt::Debug for RedisConnector {
 /// Everything is `ServiceUnavailable` rather than `Internal`, because a cache
 /// or queue being unreachable is a dependency outage: it is retryable, it is
 /// somebody's to page about, and it is not a bug in the request that hit it.
-fn redis_error(error: redis::RedisError) -> Error {
+pub(crate) fn redis_error(error: redis::RedisError) -> Error {
     Error::new(
         rainier_support::ErrorKind::ServiceUnavailable,
         format!("Redis: {}", error.category_message()),

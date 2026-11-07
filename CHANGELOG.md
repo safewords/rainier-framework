@@ -12,6 +12,25 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **`SharedRedis`, a self-healing handle to the application's Redis**
+  (`rainier-drivers`, reached through `rainier-cache`'s
+  `StoreConfig::shared_redis()`, `RedisStore::shared()` and
+  `RedisClusterStore::shared()`). Opens lazily; a connection failure drops the
+  connection so the next call opens a fresh one, and a failed open backs off
+  instead of dialling on every call. For commands the cache does not wrap,
+  against the server the cache already declares. See `docs/cache.md`.
+- **`RedisScript` and `hash_slot`** (`rainier-drivers`). A Lua script that
+  computes each declared key's cluster hash slot on the client and refuses a
+  call spanning more than one — on any server, so a test against a single
+  node catches the `CROSSSLOT` a cluster would raise — and runs by `EVALSHA`
+  with a fallback to the source. `RedisConnection::eval` and
+  `SharedRedis::eval`. Enables the `redis` crate's `script` feature.
+- **Batched upserts** (`rainier-orm`, `rainier-database`).
+  `repo::upsert_many_with` folds a slice of rows into a table with one
+  `INSERT … VALUES (…), (…) ON CONFLICT` per chunk, chunked under every
+  dialect's placeholder cap, with every `Upsert` action including
+  `increment`; `statement::upsert_many_with` is the one-statement form. See
+  `docs/repositories.md`.
 - **Add-ins: billing, single sign-on and account scaffolding**, three new
   optional crates, each behind one `rainier-framework` feature so an
   application that asks for none compiles none of them. `cargo rainier

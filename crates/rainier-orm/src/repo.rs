@@ -291,6 +291,79 @@ where
     }
 }
 
+/// How many bound values one batched statement may carry. Under every
+/// dialect's cap (SQLite 32,766, MySQL and Postgres 65,535), with room.
+const MAX_BOUND_VALUES: usize = 30_000;
+
+/// [`upsert_with`] for many rows: `INSERT … VALUES (…), (…), … ON CONFLICT`,
+/// one statement per chunk instead of one per row.
+///
+/// For folding a batch of counters into a table — the round trip is paid once
+/// per few thousand rows rather than once per row. Rows are chunked so no
+/// statement exceeds a dialect's placeholder cap; each chunk is atomic on its
+/// own, the batch as a whole is not.
+///
+/// **Give each conflict key once per call.** MySQL and SQLite apply two rows
+/// with the same key one after the other; Postgres refuses the statement
+/// ("cannot affect row a second time"). Aggregate first — for an
+/// `increment`, sum them.
+///
+/// Returns rows affected, as the database counts them (MySQL counts an
+/// update as two). No rows is no statement and `0`.
+///
+/// # Errors
+///
+/// If the plan cannot be rendered — see
+/// [`Upsert::to_on_conflict`](crate::Upsert::to_on_conflict) — or the rows
+/// route to different shards.
+pub async fn upsert_many_with<E, X>(exec: &X, rows: &[E], plan: &crate::Upsert) -> Result<u64>
+where
+    E: Entity,
+    X: Executor,
+{
+    let Some(first) = rows.first() else { return Ok(0) };
+    let columns = first.insert_values().len().max(1);
+    let per_statement = (MAX_BOUND_VALUES / columns).max(1);
+
+    let mut affected = 0;
+    for chunk in rows.chunks(per_statement) {
+        // Rendered before the await, as in `upsert_with`.
+        let (route, sql, params) = render_upsert_many(exec.dialect(), chunk, plan)?;
+        affected += exec.execute_routed(route, &sql, params).await?.rows_affected;
+    }
+    Ok(affected)
+}
+
+fn render_upsert_many<E: Entity>(
+    dialect: crate::Dialect,
+    rows: &[E],
+    plan: &crate::Upsert,
+) -> Result<(ShardRoute, String, Vec<sea_query::Value>)> {
+    let first = rows.first().expect("render_upsert_many is given rows");
+    let pairs = first.insert_values();
+    let route = route_from_pairs::<E>(&pairs);
+    let columns: Vec<&str> = pairs.iter().map(|(c, _)| *c).collect();
+    let on_conflict = plan.to_on_conflict(dialect, E::table(), &columns)?;
+
+    let mut stmt = Query::insert();
+    stmt.into_table(col(E::table()));
+    stmt.columns(columns.iter().map(|c| col(c)));
+    for row in rows {
+        let pairs = row.insert_values();
+        if route_from_pairs::<E>(&pairs) != route {
+            return Err(crate::Error::msg(format!(
+                "upsert_many_with into `{}` spans shards; one statement reaches one",
+                E::table()
+            )));
+        }
+        stmt.values_panic(pairs.into_iter().map(|(_, v)| SimpleExpr::from(Expr::val(v))));
+    }
+    stmt.on_conflict(on_conflict);
+
+    let (sql, params) = dialect.build_query(&stmt);
+    Ok((route, sql, into_vec(params)))
+}
+
 /// Find the row whose primary key equals `pk`, decoded into `E`. `None` if no
 /// row matches.
 ///

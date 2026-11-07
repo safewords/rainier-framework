@@ -288,3 +288,79 @@ async fn replacing_and_incrementing_in_one_plan_do_each_their_own_thing() {
     assert_eq!(rows[0].note, "second", "replaced with the incoming value");
     assert_eq!(rows[0].total, 12, "accumulated, in the same statement");
 }
+
+fn tallies(bucket: &str, slots: std::ops::Range<i64>, total: i64) -> Vec<Tally> {
+    slots.map(|slot| Tally { bucket: bucket.into(), slot, total }).collect()
+}
+
+#[tokio::test]
+async fn a_batch_adds_into_existing_rows_and_inserts_the_rest() {
+    let exec = world().await;
+    let plan = Upsert::on(["bucket", "slot"]).increment(["total"]);
+
+    repo::upsert_many_with(&exec, &tallies("b", 0..3, 5), &plan).await.expect("first batch");
+    // Two of these exist; one is new.
+    repo::upsert_many_with(&exec, &tallies("b", 1..4, 7), &plan).await.expect("second batch");
+
+    let totals: Vec<i64> = {
+        let mut out = Vec::new();
+        for slot in 0..4 {
+            out.push(tally(&exec, "b", slot).await.expect("row").total);
+        }
+        out
+    };
+    assert_eq!(totals, vec![5, 12, 12, 7]);
+}
+
+#[tokio::test]
+async fn a_batch_past_the_placeholder_cap_is_split_and_every_row_lands() {
+    // Three columns each: 30,000 values per statement is 10,000 rows, so
+    // 25,000 rows is three statements — and SQLite would refuse one.
+    let exec = world().await;
+    let plan = Upsert::on(["bucket", "slot"]).increment(["total"]);
+    let rows = tallies("big", 0..25_000, 1);
+
+    repo::upsert_many_with(&exec, &rows, &plan).await.expect("first pass");
+    repo::upsert_many_with(&exec, &rows, &plan).await.expect("second pass");
+
+    assert_eq!(tally(&exec, "big", 0).await.expect("first").total, 2);
+    assert_eq!(tally(&exec, "big", 24_999).await.expect("last").total, 2);
+}
+
+#[tokio::test]
+async fn a_batch_with_no_actions_keeps_every_stored_row() {
+    let exec = world().await;
+    let ignore = Upsert::on(["bucket", "slot"]);
+    repo::upsert_many_with(&exec, &tallies("i", 0..2, 1), &ignore).await.expect("insert");
+    repo::upsert_many_with(&exec, &tallies("i", 0..3, 9), &ignore).await.expect("ignore");
+
+    assert_eq!(tally(&exec, "i", 0).await.expect("kept").total, 1);
+    assert_eq!(tally(&exec, "i", 2).await.expect("inserted").total, 9);
+}
+
+#[tokio::test]
+async fn an_empty_batch_is_no_statement() {
+    let exec = world().await;
+    let plan = Upsert::on(["bucket", "slot"]).increment(["total"]);
+    assert_eq!(repo::upsert_many_with(&exec, &Vec::<Tally>::new(), &plan).await.expect("ok"), 0);
+
+    // The one-statement form has nothing to render, and says so.
+    assert!(rainier_database::statement::upsert_many_with::<Tally>(Dialect::Sqlite, &[], &plan)
+        .is_err());
+}
+
+#[test]
+fn the_batched_statement_renders_every_row_and_one_conflict_clause() {
+    let plan = Upsert::on(["bucket", "slot"]).increment(["total"]);
+    let rows = tallies("r", 0..3, 1);
+
+    let mysql =
+        rainier_database::statement::upsert_many_with(Dialect::MySql, &rows, &plan).expect("mysql");
+    assert_eq!(mysql.sql.matches("(?, ?, ?)").count(), 3, "{}", mysql.sql);
+    assert!(mysql.sql.contains("ON DUPLICATE KEY UPDATE"), "{}", mysql.sql);
+    assert_eq!(mysql.params.len(), 9);
+
+    let sqlite = rainier_database::statement::upsert_many_with(Dialect::Sqlite, &rows, &plan)
+        .expect("sqlite");
+    assert!(sqlite.sql.contains("ON CONFLICT"), "{}", sqlite.sql);
+}

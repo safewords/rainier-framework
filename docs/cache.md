@@ -394,6 +394,43 @@ Connect **once** and share the result. The connection multiplexes, so concurrent
 commands share one socket per node; connecting per operation will exhaust the
 server's connection limit under load.
 
+### Your Redis, for commands the cache does not wrap
+
+Counters, HyperLogLogs, sets, Lua — an application that wants them should use
+the Redis its cache already names rather than composing a second URL that can
+drift from it. `StoreConfig::shared_redis()` (or `RedisStore::shared()` /
+`RedisClusterStore::shared()`) gives a `SharedRedis` to that server or cluster:
+
+```rust
+use rainier_framework::drivers::{redis_client as redis, RedisScript, SharedRedis};
+
+let redis: SharedRedis = store_config.shared_redis().expect("a Redis store")?;
+let mut incr = redis::cmd("HINCRBY");
+incr.arg("{stats:7}:today").arg("views").arg(1);
+redis.run(&incr).await?;
+```
+
+`SharedRedis` opens lazily and is cheap to clone. A command that fails
+**because of the connection** — I/O, a refused or dropped socket, a timeout, an
+unreachable cluster node — drops it, and the next call opens a fresh one; a
+failed open backs off (five seconds by default) instead of dialling on every
+call. A command the server merely refused keeps the connection. It does not
+apply the cache's key prefix: name your keys so they cannot collide.
+
+On a cluster a Lua script runs on one node, so every key it touches must be
+declared in `KEYS` and share a hash slot — and neither mistake shows on the
+single server tests run against. `RedisScript` computes each key's slot on the
+client (`hash_slot`, the cluster's own CRC16 with `{hash tags}`) and refuses a
+call whose keys disagree, on any server; it then runs by `EVALSHA`, sending the
+source only when the server has not seen it:
+
+```rust
+static BUMP: LazyLock<RedisScript> = LazyLock::new(|| RedisScript::new(
+    "redis.call('HINCRBY', KEYS[1], ARGV[1], 1) return redis.call('EXPIRE', KEYS[1], ARGV[2])",
+));
+let _: i64 = redis.eval(&BUMP, &["{stats:7}:today"], &["views", "3600"]).await?;
+```
+
 ### Atomic add, for locks
 
 ```rust

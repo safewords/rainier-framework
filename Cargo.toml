@@ -192,7 +192,7 @@ x25519-dalek = { version = "3", features = ["static_secrets"] }
 # every command for the life of the process. Opt-in per connection — see
 # `RedisSettings::reconnect` — so a build that declares nothing behaves as it
 # did before the feature was here.
-redis = { version = "1", default-features = false, features = ["tokio-comp", "aio", "connection-manager"] }
+redis = { version = "1", default-features = false, features = ["tokio-comp", "aio", "connection-manager", "script"] }
 hmac = "0.13"
 sha2 = "0.11"
 subtle = "2"

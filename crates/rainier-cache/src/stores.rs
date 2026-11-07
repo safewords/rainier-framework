@@ -354,6 +354,27 @@ pub enum StoreConfig {
 }
 
 impl StoreConfig {
+    /// A [`SharedRedis`](rainier_drivers::SharedRedis) to this store's Redis —
+    /// the server or cluster an application already declared for its cache —
+    /// or `None` when the store is not Redis. See [`RedisStore::shared`].
+    ///
+    /// This is how an application reaches *its* Redis for commands the cache
+    /// does not wrap, without composing a second URL that could drift from the
+    /// cache's.
+    #[cfg(feature = "redis-driver")]
+    pub fn shared_redis(&self) -> Option<Result<rainier_drivers::SharedRedis>> {
+        match self {
+            Self::Redis(store) => Some(store.shared()),
+            #[cfg(feature = "redis-cluster")]
+            Self::RedisCluster(store) => Some(store.shared()),
+            #[cfg(not(feature = "redis-cluster"))]
+            Self::RedisCluster(_) => Some(Err(Error::internal(
+                "the cache store is a Redis cluster, but this build lacks the `redis-cluster`                  feature that can route to one",
+            ))),
+            _ => None,
+        }
+    }
+
     /// Values in this process's memory. The shorthand.
     pub fn memory() -> Self {
         Self::Memory(MemoryStore::default())
@@ -681,6 +702,26 @@ impl RedisStore {
         let connector = RedisConnector::open_with(&self.url, self.connection.driver_settings())?;
         crate::redis::RedisCache::connect(&connector).await
     }
+
+    /// A [`SharedRedis`](rainier_drivers::SharedRedis) to this store's server,
+    /// with its connection settings, for commands the cache does not wrap —
+    /// counters, HyperLogLogs, scripts.
+    ///
+    /// The **same server, not the same keyspace rules**: the store's key
+    /// prefix is not applied, so name keys so they cannot collide with the
+    /// cache's. Opened lazily; nothing is dialled here.
+    ///
+    /// # Errors
+    ///
+    /// When a setting cannot be honoured or the URL cannot be parsed.
+    #[cfg(feature = "redis-driver")]
+    pub fn shared(&self) -> Result<rainier_drivers::SharedRedis> {
+        self.connection.validate()?;
+        Ok(rainier_drivers::SharedRedis::new(rainier_drivers::RedisConnector::open_with(
+            &self.url,
+            self.connection.driver_settings(),
+        )?))
+    }
 }
 
 /// Names the server and never the password.
@@ -824,6 +865,22 @@ impl RedisClusterStore {
             self.connection.driver_settings(),
         )?;
         crate::redis::RedisCache::connect(&connector).await
+    }
+
+    /// A [`SharedRedis`](rainier_drivers::SharedRedis) to this store's
+    /// cluster — see [`RedisStore::shared`]. On a cluster, a script's keys must
+    /// share a hash slot; [`RedisScript`](rainier_drivers::RedisScript) checks.
+    ///
+    /// # Errors
+    ///
+    /// When there are no seeds, or a setting cannot be honoured.
+    #[cfg(feature = "redis-cluster")]
+    pub fn shared(&self) -> Result<rainier_drivers::SharedRedis> {
+        self.validate()?;
+        Ok(rainier_drivers::SharedRedis::new(rainier_drivers::RedisConnector::open_cluster_with(
+            self.seeds.clone(),
+            self.connection.driver_settings(),
+        )?))
     }
 }
 
@@ -2165,5 +2222,30 @@ mod tests {
         } else {
             assert!(err.message().contains("`cloudflare-kv` feature"), "{}", err.message());
         }
+    }
+}
+
+#[cfg(all(test, feature = "redis-driver"))]
+mod shared_redis_tests {
+    use super::*;
+
+    #[test]
+    fn a_redis_store_gives_its_server_and_others_give_none() {
+        let redis: StoreConfig = RedisStore::new("redis://127.0.0.1:6379/3").into();
+        let shared = redis.shared_redis().expect("a Redis store").expect("builds");
+        // Lazily: nothing was dialled.
+        assert!(!shared.is_connected());
+        assert!(!shared.is_cluster());
+
+        assert!(StoreConfig::memory().shared_redis().is_none());
+    }
+
+    #[cfg(feature = "redis-cluster")]
+    #[test]
+    fn a_cluster_store_gives_a_cluster() {
+        let cluster: StoreConfig =
+            RedisClusterStore::new(["redis://10.0.0.1:6379", "redis://10.0.0.2:6379"]).into();
+        let shared = cluster.shared_redis().expect("a Redis store").expect("builds");
+        assert!(shared.is_cluster());
     }
 }

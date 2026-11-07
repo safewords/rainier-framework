@@ -526,6 +526,24 @@ auto-increment key is still the database's. Every database caps the
 placeholders in one statement (MySQL 65,535, SQLite 32,766): chunk so that
 rows × columns stays under it.
 
+Upserts batch the same way. `repo::upsert_many_with(&db, &rows, &plan)` is
+`upsert_with` for a slice — one `INSERT … VALUES (…), (…) ON CONFLICT` per few
+thousand rows, chunked under every dialect's cap for you — which is how a
+batch of counters is folded into a table without a round trip per counter:
+
+```rust
+use rainier_orm::{repo, Upsert};
+
+// Each row adds its `total` to the stored one, or is inserted.
+repo::upsert_many_with(&db, &tallies, &Upsert::on(["day", "key"]).increment(["total"])).await?;
+```
+
+Give each conflict key **once** per call: MySQL and SQLite apply two rows with
+the same key in order, but Postgres refuses the statement ("cannot affect row a
+second time"). For an increment, sum duplicates first. Each chunk is atomic;
+the batch is not. `statement::upsert_many_with(dialect, &rows, &plan)` is the
+one-statement form, for a caller who chunks.
+
 ## Named queries
 
 `EntityRepository<M>` already does CRUD for every model, so an
