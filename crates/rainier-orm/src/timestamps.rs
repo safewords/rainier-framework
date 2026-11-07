@@ -18,7 +18,7 @@
 //! value is never replaced, so a backfill or an import that sets its own time
 //! keeps it. Both columns get the same instant.
 //!
-//! It runs inside the derived [`Entity::insert_values`](crate::Entity::insert_values),
+//! It runs inside the derived [`Entity::insert_values`],
 //! which is what every insert path builds from: `repo::insert`, upserts, bulk
 //! inserts and `insert_select`. An upsert's update half therefore stamps too:
 //! `updated_at` gets the time of the write, which is what it means.
