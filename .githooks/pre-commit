@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Pre-commit gate. Same two commands as the GitHub Actions clippy job and
 # the fmt check CI fails closed on (main self-heals only after the push).
-# Output matches scripts/identity-ci-push.sh: step, then the command, then ok.
+# Output: step, then the command, then ok.
 # This file does not rewrite the tree.
 #
 # Git runs it only when core.hooksPath is .githooks. In the devenv checkout,
@@ -28,6 +28,27 @@ done <<< "$diff_out"
 
 if [[ ${#files[@]} -eq 0 ]]; then
 	exit 0
+fi
+
+# Toolchain. A plain `git commit` has none of the Makefile's environment: the
+# first `cargo` on PATH may be Homebrew's, which ignores rustup, and rustup's
+# default may be older than this project's `rust-version`. Either stops both
+# checks at "requires rustc X" on a tree that is fine. So prefer rustup's
+# cargo, and when nothing has chosen a toolchain (no RUSTUP_TOOLCHAIN, no
+# rust-toolchain file) and the default is too old, use the newest installed
+# one that matches `rust-version`.
+if [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
+	PATH="${HOME}/.cargo/bin:${PATH}"
+fi
+if [[ -z "${RUSTUP_TOOLCHAIN:-}" && ! -f rust-toolchain.toml && ! -f rust-toolchain ]] \
+	&& command -v rustup >/dev/null 2>&1 && [[ -f Cargo.toml ]]; then
+	want="$(sed -n 's/^rust-version *= *"\([0-9.]*\)".*/\1/p' Cargo.toml | head -n 1)"
+	have="$(cargo --version 2>/dev/null | awk '{print $2}')"
+	if [[ -n "$want" && -n "$have" && "$(printf '%s\n%s\n' "$want" "$have" | sort -V | head -n 1)" != "$want" ]]; then
+		pick="$(rustup toolchain list | awk '{print $1}' | grep -E "^${want//./\\.}(\.[0-9]+)?-" | sort -V | tail -n 1 || true)"
+		[[ -n "$pick" ]] || die "this project needs Rust ${want} and rustup has only ${have}: rustup toolchain install ${want} --component clippy rustfmt"
+		export RUSTUP_TOOLCHAIN="$pick"
+	fi
 fi
 
 command -v cargo >/dev/null 2>&1 || die "missing required command: cargo"
