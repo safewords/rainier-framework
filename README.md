@@ -508,6 +508,12 @@ points git at it. A standalone clone:
 git config core.hooksPath .githooks
 ```
 
+An unused dependency is a build error, not a warning: the workspace sets
+Cargo's `unused_dependencies` lint to `deny`, and it is judged per build, so
+`cargo check -p <crate> --features <one>` fails if a dependency is only used
+by some other feature. A dependency a feature needs is declared `optional` and
+enabled by that feature with `dep:<name>`.
+
 `git commit --no-verify` bypasses it once.
 
 ## Changelog

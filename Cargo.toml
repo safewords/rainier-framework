@@ -204,6 +204,15 @@ syn = { version = "3", features = ["full"] }
 # error of such a call, and it is used deliberately throughout the tests.
 err_expect = "allow"
 
+[workspace.lints.cargo]
+# A dependency a crate declares and, in the configuration being built, never
+# names. Deny, so one that is only needed behind a feature gets made optional
+# and enabled by that feature instead of being compiled into every build.
+# What it cannot see: a dependency that another crate in the graph already
+# pulls in is not reported, so a clean build is not proof that every line is
+# used — removing one unused dependency can surface the next.
+unused_dependencies = "deny"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

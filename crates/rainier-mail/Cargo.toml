@@ -11,9 +11,8 @@ repository.workspace = true
 rainier-support = { workspace = true }
 # The Cloudflare Email endpoint lives with the other connectors; this crate
 # turns one into an SMTP transport rather than restating where it is. Only
-# `smtp` compiles that module, so cargo's `unused_dependencies` lint reports
-# this in a build without it.
-rainier-drivers = { workspace = true }
+# `smtp` compiles that module, so only `smtp` compiles this.
+rainier-drivers = { workspace = true, optional = true }
 rainier-view = { workspace = true }
 rainier-events = { workspace = true }
 # The HTTP transport port and its fake — NOT the reqwest socket, which the
@@ -24,10 +23,9 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# The library itself uses it only with `ses` (the client's `OnceCell`); the
-# tests always do. Cargo's `unused_dependencies` lint reports it for the
-# library when `ses` is off.
-tokio = { workspace = true }
+# The library uses it only with `ses`, for the client's `OnceCell`. The tests
+# always do, which is why it is a dev-dependency as well.
+tokio = { workspace = true, optional = true }
 tracing = { workspace = true }
 lettre = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
@@ -36,16 +34,17 @@ aws-sdk-sesv2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tokio = { workspace = true }
 reqwest = { workspace = true, features = ["query"] }
 
 [features]
 default = []
 # A real SMTP server, over lettre with rustls. The direct rustls dependency
 # exists to install the ring provider explicitly — see `SmtpBuilder::build`.
-smtp = ["dep:lettre", "dep:rustls"]
+smtp = ["dep:lettre", "dep:rustls", "dep:rainier-drivers"]
 # Amazon SES, authenticated the way every other AWS driver is: the default
 # credential chain — environment, profile, IMDS.
-ses = ["dep:aws-config", "dep:aws-sdk-sesv2"]
+ses = ["dep:aws-config", "dep:aws-sdk-sesv2", "dep:tokio"]
 # The HTTP APIs. Each is one request shape over the framework's own HTTP
 # transport port, so the fake records it and a test asserts on it.
 postmark = ["dep:rainier-http-client"]

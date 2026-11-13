@@ -9,7 +9,25 @@ repository.workspace = true
 readme = "README.md"
 
 [dependencies]
-rainier-support = { workspace = true }
+# Every format here belongs to one language's feature, and the crate is empty
+# without one — so every dependency is optional, and the feature that reads the
+# format is what compiles it. A build with no feature compiles nothing.
+#
+# What `php` uses: the formats themselves.
+rainier-support = { workspace = true, optional = true }
+rainier-http = { workspace = true, optional = true }
+rainier-middleware = { workspace = true, optional = true }
+rainier-session = { workspace = true, optional = true }
+rainier-cache = { workspace = true, optional = true }
+rainier-crypt = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 # Adapters for the generic add-ins, each behind its compat feature.
 rainier-oauth-server = { workspace = true, optional = true }
 # The OAuth store reads and writes the PHP server's tables.
@@ -17,21 +35,6 @@ rainier-database = { workspace = true, optional = true }
 rainier-orm = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 rainier-mfa = { workspace = true, optional = true, features = ["passkeys"] }
-rainier-http = { workspace = true }
-rainier-middleware = { workspace = true }
-# Only `php` uses it (the XSRF cookie codec), so cargo's `unused_dependencies`
-# lint reports it for the library when that feature is off.
-rainier-session = { workspace = true }
-rainier-cache = { workspace = true }
-rainier-crypt = { workspace = true }
-async-trait = { workspace = true }
-base64 = { workspace = true }
-hmac = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-subtle = { workspace = true }
-tracing = { workspace = true }
 # The encrypted-cookie value prefix is an HMAC-SHA1, so reading one means
 # computing one. Already in the graph through the websocket handshake.
 sha1 = { version = "0.11", optional = true }
@@ -49,7 +52,28 @@ default = []
 # PHP: `serialize`/`unserialize`, defuse/php-encryption ciphertexts, and the
 # encrypted-cookie, session, cache, CSRF and queue-payload formats a PHP
 # application writes beside you.
-php = ["dep:sha1", "dep:aes", "dep:ctr", "dep:hkdf", "dep:pbkdf2", "dep:rand"]
+php = [
+    "dep:rainier-support",
+    "dep:rainier-http",
+    "dep:rainier-middleware",
+    "dep:rainier-session",
+    "dep:rainier-cache",
+    "dep:rainier-crypt",
+    "dep:async-trait",
+    "dep:base64",
+    "dep:hmac",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:subtle",
+    "dep:tracing",
+    "dep:sha1",
+    "dep:aes",
+    "dep:ctr",
+    "dep:hkdf",
+    "dep:pbkdf2",
+    "dep:rand",
+]
 # OAuth tokens and tables written by league/oauth2-server, as an
 # `rainier-oauth-server` store and token codec.
 php-oauth = ["php", "dep:rainier-oauth-server", "dep:rainier-database", "dep:rainier-orm", "dep:chrono"]

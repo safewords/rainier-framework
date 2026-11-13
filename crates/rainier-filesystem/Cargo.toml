@@ -9,9 +9,8 @@ description = "File storage for Rainier: a Filesystem port with local, in-memory
 
 [dependencies]
 rainier-support = { workspace = true }
-# Only the `s3` disk uses it, so cargo's `unused_dependencies` lint reports it
-# in a build without that feature.
-rainier-drivers = { workspace = true }
+# The AWS connector behind the `s3` disk. Compiled only with that feature.
+rainier-drivers = { workspace = true, optional = true }
 
 async-trait = { workspace = true }
 bytes = { workspace = true }
@@ -25,18 +24,17 @@ serde = { workspace = true }
 # already, so this is the shape they arrive in rather than a second one.
 serde_json = { workspace = true }
 tokio = { workspace = true }
-# Only the `telemetry` spans use it, so `unused_dependencies` reports it in a
-# build without that feature.
-tracing = { workspace = true }
+# The `telemetry` spans, and nothing else.
+tracing = { workspace = true, optional = true }
 
 
 [features]
 default = []
 # S3, Cloudflare R2, MinIO, and anything else that speaks S3.
-s3 = ["rainier-drivers/aws-s3"]
+s3 = ["dep:rainier-drivers", "rainier-drivers/aws-s3"]
 # A `storage.*` span per operation on every disk a `Storage` holds — never the
 # path or the contents. See `rainier_filesystem::telemetry`.
-telemetry = ["rainier-support/telemetry"]
+telemetry = ["rainier-support/telemetry", "dep:tracing"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

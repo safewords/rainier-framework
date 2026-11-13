@@ -10,7 +10,9 @@ description = "Shared connectors for Rainier: Redis, Redis Cluster, Memcached, K
 [dependencies]
 rainier-support = { workspace = true }
 
-anyhow = { workspace = true }
+# Every dependency below is optional: a build with no driver compiles none of
+# them, and each feature names exactly what its own module uses.
+anyhow = { workspace = true, optional = true }
 
 aws-config = { workspace = true, optional = true }
 aws-credential-types = { workspace = true, optional = true }
@@ -37,7 +39,6 @@ sea-orm = { workspace = true, optional = true, features = [
 ] }
 rust_decimal = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
@@ -45,7 +46,7 @@ tokio = { workspace = true, optional = true }
 [features]
 default = []
 # A single Redis server, or a Sentinel-fronted primary.
-redis-driver = ["dep:redis", "dep:tokio", "dep:futures-util"]
+redis-driver = ["dep:redis", "dep:tokio", "dep:futures-util", "dep:anyhow"]
 # A sharded Redis Cluster. Implies `redis-driver`.
 redis-cluster = ["redis-driver", "redis/cluster-async"]
 # Memcached over its text protocol.
@@ -66,14 +67,15 @@ aws-sqs = ["aws", "dep:aws-sdk-sqs"]
 aws-dynamodb = ["aws", "dep:aws-sdk-dynamodb"]
 
 # --- SQL executors ----------------------------------------------------------
-# Shared by every SQL driver: the Executor port and the value plumbing.
-sql = ["dep:rainier-orm", "dep:chrono", "dep:serde", "dep:serde_json", "dep:base64"]
+# The `sql` module itself, which every SQL driver turns on. It compiles nothing
+# without one of them, so it brings no dependency: each executor names its own.
+sql = []
 # Native MySQL / Postgres / SQLite. Not available on wasm32.
-sea-orm-executor = ["sql", "dep:sea-orm", "dep:rust_decimal"]
+sea-orm-executor = ["sql", "dep:rainier-orm", "dep:chrono", "dep:sea-orm", "dep:rust_decimal"]
 # Cloudflare D1 over the HTTP /query API.
-d1-http = ["sql"]
-# Turso / libSQL over the Hrana HTTP /v2/pipeline API.
-libsql-http = ["sql"]
+d1-http = ["sql", "dep:rainier-orm", "dep:chrono", "dep:serde_json"]
+# Turso / libSQL over the Hrana HTTP /v2/pipeline API. Blobs travel as base64.
+libsql-http = ["sql", "dep:rainier-orm", "dep:chrono", "dep:serde_json", "dep:base64"]
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -13,9 +13,9 @@ rainier-support = { workspace = true }
 # implements it over the cache, which keeps `rainier-middleware` depending on
 # `rainier-http` and nothing else.
 rainier-middleware = { workspace = true }
-# Only the `redis-driver`, `memcached` and `dynamodb` stores use it, so
-# cargo's `unused_dependencies` lint reports it in a build with none of them.
-rainier-drivers = { workspace = true }
+# The connectors behind the `redis-driver`, `memcached` and `dynamodb` stores.
+# Compiled only when one of them is on.
+rainier-drivers = { workspace = true, optional = true }
 
 async-trait = { workspace = true }
 chrono = { workspace = true }
@@ -35,13 +35,13 @@ tracing = { workspace = true }
 cloudflare-kv = []
 default = []
 # A single Redis server, or a Sentinel-fronted primary.
-redis-driver = ["rainier-drivers/redis-driver"]
+redis-driver = ["dep:rainier-drivers", "rainier-drivers/redis-driver"]
 # A sharded Redis Cluster, where keys are distributed across nodes.
 redis-cluster = ["redis-driver", "rainier-drivers/redis-cluster"]
 # Memcached over its text protocol.
-memcached = ["rainier-drivers/memcached"]
+memcached = ["dep:rainier-drivers", "rainier-drivers/memcached"]
 # A cache in a DynamoDB table — no server to run.
-dynamodb = ["rainier-drivers/aws-dynamodb"]
+dynamodb = ["dep:rainier-drivers", "rainier-drivers/aws-dynamodb"]
 # A `cache.*` span per operation on every store a `CacheManager` holds — never
 # the key or the value. See `rainier_cache::telemetry`.
 telemetry = ["rainier-support/telemetry"]

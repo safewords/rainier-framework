@@ -286,6 +286,28 @@ the release as a whole and names the crate it landed in.
   and `rainier-websocket`, and `http-body-util` from `rainier-http`'s build
   (its one use is a test, so it is a dev-dependency now). The unused
   `thiserror` workspace entry and `authors` workspace field go with them.
+- **An unused dependency now fails the build**: `unused_dependencies = "deny"`
+  under `[workspace.lints.cargo]`, which every crate inherits. To get there,
+  each dependency that was only used behind a feature is now `optional` and
+  compiled by that feature alone:
+  - `rainier-cache`: `rainier-drivers`, by `redis-driver`, `memcached` and
+    `dynamodb`.
+  - `rainier-filesystem`: `rainier-drivers` by `s3`, `tracing` by `telemetry`.
+  - `rainier-mail`: `rainier-drivers` by `smtp`, `tokio` by `ses`.
+  - `rainier-mfa`: `hmac` and `sha1` by `totp`; `base64`, `serde` and
+    `serde_json` by `passkeys`; `rand`, `sha2` and `subtle` by either.
+  - `rainier-compat`: everything, by `php` — the crate is empty without it.
+  - `rainier-drivers`: `anyhow` by `redis-driver`, and the SQL executors'
+    dependencies by the executor that uses them (`sea-orm-executor`,
+    `d1-http`, `libsql-http`) rather than by the shared `sql` feature, which
+    now only gates the module. Its unused optional `serde` is gone.
+
+  No feature was added, removed or renamed, and every `rainier-framework`
+  feature compiles the same packages with the same features as before; a
+  crate used directly, without the facade, compiles the same or less. The
+  lint is silent about a dependency another crate in the graph already pulls
+  in, so it catches less than its name promises — see the comment beside it
+  in `Cargo.toml`.
 - **`QueuedJob` gains `traceparent: Option<String>`** (`rainier-queue`), the
   trace context a dispatch stamps for the worker to continue. Serialised only
   when present and defaulted when absent, so envelopes written before it read

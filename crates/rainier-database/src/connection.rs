@@ -239,6 +239,15 @@ macro_rules! bind_executor {
 #[cfg(feature = "sea-orm-executor")]
 crate::bind_executor!(rainier_drivers::sql::SeaOrmExecutor);
 
+// `d1-http` and `libsql-http` exist to turn the matching executor on in
+// `rainier-drivers` for whoever enables them here — the framework's features of
+// the same name forward through this crate. Nothing in this crate names those
+// executors, so with only one of them on the dependency is linked on purpose
+// and never referenced, which is what cargo's `unused_dependencies` lint
+// reports. This says the link is intended.
+#[cfg(any(feature = "d1-http", feature = "libsql-http"))]
+use rainier_drivers as _;
+
 /// A database handle: a shared [`Connection`], cheap to clone.
 ///
 /// Lives as a container singleton and is cloned into repositories, jobs and
