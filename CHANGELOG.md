@@ -308,6 +308,14 @@ the release as a whole and names the crate it landed in.
   lint is silent about a dependency another crate in the graph already pulls
   in, so it catches less than its name promises — see the comment beside it
   in `Cargo.toml`.
+- **Unused dependencies the lint cannot see are gone too** — each is pulled
+  in by another crate in the graph, which is what hides it: `base64` and
+  `chrono` from `rainier-accounts`, `chrono` from `rainier-auth`,
+  `rainier-support` and `tracing` from `rainier-metrics`, `rainier-support`
+  and `serde` from `rainier-openapi`, and `rainier-view`'s optional `tracing`
+  (its `telemetry` spans go through `rainier-support`). `async-trait` in
+  `rainier-server` and `serde_json` in `rainier-database` are used only by
+  tests and doc examples, and are dev-dependencies now.
 - **`QueuedJob` gains `traceparent: Option<String>`** (`rainier-queue`), the
   trace context a dispatch stamps for the worker to continue. Serialised only
   when present and defaulted when absent, so envelopes written before it read

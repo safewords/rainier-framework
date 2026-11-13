@@ -16,7 +16,6 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 # Only for `task_local!`, which is what a sticky scope hangs on — see `sticky`.
 # `default-features = false` because the default set carries `net`, which pulls
 # in mio and stops this crate compiling for wasm; `rainier-container` takes the
@@ -37,6 +36,8 @@ telemetry = ["rainier-support/telemetry"]
 
 [dev-dependencies]
 tokio = { workspace = true }
+# The tests and the doc examples build their configuration from JSON.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

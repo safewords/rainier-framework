@@ -3755,8 +3755,6 @@ name = "rainier-accounts"
 version = "2.0.0"
 dependencies = [
  "async-trait",
- "base64 0.23.1",
- "chrono",
  "rainier-auth",
  "rainier-cache",
  "rainier-container",
@@ -3785,7 +3783,6 @@ name = "rainier-auth"
 version = "2.0.0"
 dependencies = [
  "async-trait",
- "chrono",
  "rainier-cache",
  "rainier-crypt",
  "rainier-database",
@@ -4159,9 +4156,7 @@ dependencies = [
  "rainier-http",
  "rainier-middleware",
  "rainier-routing",
- "rainier-support",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -4241,9 +4236,7 @@ dependencies = [
  "rainier-container",
  "rainier-http",
  "rainier-routing",
- "rainier-support",
  "rainier-validation",
- "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -4440,7 +4433,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tracing",
 ]
 
 [[package]]

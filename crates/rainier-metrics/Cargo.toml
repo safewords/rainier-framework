@@ -8,13 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-rainier-support = { workspace = true }
 rainier-http = { workspace = true }
 rainier-middleware = { workspace = true }
 rainier-routing = { workspace = true }
 
 async-trait = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

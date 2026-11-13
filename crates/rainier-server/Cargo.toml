@@ -14,7 +14,6 @@ rainier-middleware = { workspace = true }
 rainier-routing = { workspace = true }
 rainier-container = { workspace = true }
 rainier-websocket = { workspace = true }
-async-trait = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
