@@ -132,7 +132,7 @@ pub fn parse(body: &Bytes, boundary: &str) -> Result<Multipart> {
         };
 
         // Each part's body is terminated by the CRLF preceding its delimiter.
-        let body = body.strip_suffix(b"\r\n".as_slice()).unwrap_or(body);
+        let body = body.trim_suffix(b"\r\n".as_slice());
 
         match header_param(disposition, "filename") {
             Some(file_name) => {
@@ -143,7 +143,7 @@ pub fn parse(body: &Bytes, boundary: &str) -> Result<Multipart> {
                     bytes: Bytes::copy_from_slice(body),
                 };
                 // `photos[]` and `photos` both collect under `photos`.
-                let key = field.strip_suffix("[]").unwrap_or(&field).to_string();
+                let key = field.trim_suffix("[]").to_string();
                 result.files.entry(key).or_default().push(file);
             }
             None => {

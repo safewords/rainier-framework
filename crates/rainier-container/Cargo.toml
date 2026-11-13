@@ -9,7 +9,6 @@ repository.workspace = true
 
 [dependencies]
 rainier-support = { workspace = true }
-async-trait = { workspace = true }
 # Only `rt`, for `task_local!` and `spawn`. Deliberately not the workspace's
 # tokio, which carries `net` and stops this crate compiling for wasm.
 tokio = { version = "1", default-features = false, features = ["rt"] }

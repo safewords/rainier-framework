@@ -244,7 +244,7 @@ impl S3Client {
 
             for common in page.common_prefixes() {
                 let Some(found) = common.prefix() else { continue };
-                out.push(found.strip_suffix('/').unwrap_or(found).to_string());
+                out.push(found.trim_suffix('/').to_string());
             }
         }
 

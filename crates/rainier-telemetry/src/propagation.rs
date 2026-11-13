@@ -36,6 +36,7 @@
 
 use std::cell::RefCell;
 use std::future::Future;
+use std::mem::DropGuard;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -124,14 +125,9 @@ impl<F: Future> Future for Scoped<F> {
 
         // Restored even if the inner future panics, so a caught panic does not
         // leave this trace in force for whatever the thread polls next.
-        struct Restore(Option<Arc<str>>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                let previous = self.0.take();
-                CURRENT.with(|current| *current.borrow_mut() = previous);
-            }
-        }
-        let _restore = Restore(previous);
+        let _restore = DropGuard::new(previous, |previous| {
+            CURRENT.with(|current| *current.borrow_mut() = previous);
+        });
 
         self.inner.as_mut().poll(cx)
     }

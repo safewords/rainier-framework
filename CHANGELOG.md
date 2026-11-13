@@ -274,6 +274,18 @@ the release as a whole and names the crate it landed in.
 
 ### Changed
 
+- **The minimum supported Rust version is 1.100**, up from 1.99: the
+  workspace `rust-version`, every toolchain pin in CI, and what
+  `docs/installation.md` and the README badge say (both still said 1.89).
+  Supersedes the 1.89 entry below. No public signature changed; internally
+  the code uses `str::trim_prefix` / `trim_suffix` and `mem::DropGuard` where
+  they replace a hand-written equivalent.
+- **Dependencies nothing used are gone**, found by Cargo 1.100's
+  `unused_dependencies` lint: `async-trait` from `rainier-container`,
+  `rainier-http-client` and `rainier-mail`, `tracing` from `rainier-drivers`
+  and `rainier-websocket`, and `http-body-util` from `rainier-http`'s build
+  (its one use is a test, so it is a dev-dependency now). The unused
+  `thiserror` workspace entry and `authors` workspace field go with them.
 - **`QueuedJob` gains `traceparent: Option<String>`** (`rainier-queue`), the
   trace context a dispatch stamps for the worker to continue. Serialised only
   when present and defaulted when absent, so envelopes written before it read

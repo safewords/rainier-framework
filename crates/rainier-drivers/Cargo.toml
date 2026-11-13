@@ -11,7 +11,6 @@ description = "Shared connectors for Rainier: Redis, Redis Cluster, Memcached, K
 rainier-support = { workspace = true }
 
 anyhow = { workspace = true }
-tracing = { workspace = true }
 
 aws-config = { workspace = true, optional = true }
 aws-credential-types = { workspace = true, optional = true }

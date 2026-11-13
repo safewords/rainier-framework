@@ -12,7 +12,6 @@ rainier-support = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 http-body = "1"
-http-body-util = { workspace = true }
 futures-core = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,6 +21,8 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# `BodyExt::collect`, to drive a `Body` the way hyper would.
+http-body-util = { workspace = true }
 futures-util = "0.3"
 
 [lints]

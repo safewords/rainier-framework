@@ -487,7 +487,7 @@ impl SealedBox {
 /// Decode 32 bytes of base64, with or without a `base64:` prefix.
 fn decode_32(encoded: &str, what: &str) -> Result<[u8; 32]> {
     let trimmed = encoded.trim();
-    let payload = trimmed.strip_prefix("base64:").unwrap_or(trimmed);
+    let payload = trimmed.trim_prefix("base64:");
 
     let decoded = BASE64
         .decode(payload)

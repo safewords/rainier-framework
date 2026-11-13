@@ -2,17 +2,10 @@
 
 ## Requirements
 
-- **Rust 1.89** or later. The workspace declares `rust-version = "1.89"`, which
-  is the floor for Rainier's own code and for the wasm-safe default build; some
-  drivers pull in third-party crates with higher ones.
-
-  | Features | Needs |
-  |---|---|
-  | default (no driver) | 1.89 |
-  | `sea-orm-executor`, `d1-http`, `libsql-http` | 1.89 |
-  | `http-client` | 1.89 |
-  | `kafka`, `kafka-tls` | 1.89 |
-  | `aws-s3`, `aws-sqs`, `aws-dynamodb` | 1.94 |
+- **Rust 1.100** or later. The workspace declares `rust-version = "1.100"`,
+  the toolchain CI builds with and the one every deployment runs, so that is
+  the floor for every feature. The third-party crates the drivers pull in all
+  ask for less (the highest is the AWS SDKs, at 1.94).
 
 - A database, or nothing at all — SQLite in memory is the default and needs no
   setup

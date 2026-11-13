@@ -53,10 +53,9 @@ exclude = ["dev-dependencies"]
 [workspace.package]
 version = "2.0.0"
 edition = "2021"
-rust-version = "1.99"
+rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/safewords/rainier-framework"
-authors = ["Rainier contributors"]
 
 [workspace.dependencies]
 # --- internal ---------------------------------------------------------------
@@ -102,7 +101,6 @@ rainier-mfa = { path = "crates/rainier-mfa", version = "2.0.0", default-features
 
 # --- third party ------------------------------------------------------------
 anyhow = "1"
-thiserror = "2"
 async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

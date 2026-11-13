@@ -10,7 +10,9 @@ repository.workspace = true
 [dependencies]
 rainier-support = { workspace = true }
 # The Cloudflare Email endpoint lives with the other connectors; this crate
-# turns one into an SMTP transport rather than restating where it is.
+# turns one into an SMTP transport rather than restating where it is. Only
+# `smtp` compiles that module, so cargo's `unused_dependencies` lint reports
+# this in a build without it.
 rainier-drivers = { workspace = true }
 rainier-view = { workspace = true }
 rainier-events = { workspace = true }
@@ -18,11 +20,13 @@ rainier-events = { workspace = true }
 # framework turns on. An API transport is a request shape; a test asserts on
 # the shape without a network.
 rainier-http-client = { workspace = true, optional = true }
-async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The library itself uses it only with `ses` (the client's `OnceCell`); the
+# tests always do. Cargo's `unused_dependencies` lint reports it for the
+# library when `ses` is off.
 tokio = { workspace = true }
 tracing = { workspace = true }
 lettre = { workspace = true, optional = true }

@@ -513,8 +513,7 @@ fn functions(source: &str) -> Vec<(String, String)> {
             continue;
         }
 
-        let signature = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
-        let signature = signature.strip_prefix("async ").unwrap_or(signature);
+        let signature = trimmed.trim_prefix("pub ").trim_prefix("async ");
 
         if let Some(rest) = signature.strip_prefix("fn ") {
             let name: String =

@@ -181,7 +181,7 @@ impl PusherServer {
     /// sockets received it, which is zero whenever no browser on *this* replica
     /// is subscribed and is the ordinary case rather than a fault.
     pub fn deliver_published(&self, channel: &str, body: &str) -> usize {
-        let name = channel.strip_prefix(&self.prefix).unwrap_or(channel);
+        let name = channel.trim_prefix(&self.prefix);
 
         // Nothing here is listening to it. Checked before parsing, because a
         // subscription wide enough to catch every channel this application

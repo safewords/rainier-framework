@@ -19,6 +19,8 @@ chrono = { workspace = true, optional = true }
 rainier-mfa = { workspace = true, optional = true, features = ["passkeys"] }
 rainier-http = { workspace = true }
 rainier-middleware = { workspace = true }
+# Only `php` uses it (the XSRF cookie codec), so cargo's `unused_dependencies`
+# lint reports it for the library when that feature is off.
 rainier-session = { workspace = true }
 rainier-cache = { workspace = true }
 rainier-crypt = { workspace = true }

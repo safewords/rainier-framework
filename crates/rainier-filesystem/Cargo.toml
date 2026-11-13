@@ -9,6 +9,8 @@ description = "File storage for Rainier: a Filesystem port with local, in-memory
 
 [dependencies]
 rainier-support = { workspace = true }
+# Only the `s3` disk uses it, so cargo's `unused_dependencies` lint reports it
+# in a build without that feature.
 rainier-drivers = { workspace = true }
 
 async-trait = { workspace = true }
@@ -23,6 +25,8 @@ serde = { workspace = true }
 # already, so this is the shape they arrive in rather than a second one.
 serde_json = { workspace = true }
 tokio = { workspace = true }
+# Only the `telemetry` spans use it, so `unused_dependencies` reports it in a
+# build without that feature.
 tracing = { workspace = true }
 
 

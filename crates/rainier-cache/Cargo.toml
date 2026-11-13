@@ -13,6 +13,8 @@ rainier-support = { workspace = true }
 # implements it over the cache, which keeps `rainier-middleware` depending on
 # `rainier-http` and nothing else.
 rainier-middleware = { workspace = true }
+# Only the `redis-driver`, `memcached` and `dynamodb` stores use it, so
+# cargo's `unused_dependencies` lint reports it in a build with none of them.
 rainier-drivers = { workspace = true }
 
 async-trait = { workspace = true }

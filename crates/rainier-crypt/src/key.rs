@@ -35,7 +35,7 @@ impl Key {
     /// side by side during a migration.
     pub fn from_base64(encoded: &str) -> Result<Self> {
         let trimmed = encoded.trim();
-        let payload = trimmed.strip_prefix("base64:").unwrap_or(trimmed);
+        let payload = trimmed.trim_prefix("base64:");
 
         let decoded = BASE64
             .decode(payload)

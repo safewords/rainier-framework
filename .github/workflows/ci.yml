@@ -37,7 +37,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt
 
@@ -75,7 +75,7 @@ jobs:
       - uses: actions/checkout@v4
       # The ARC runner image has no C toolchain; see the action.
       - uses: ./.github/actions/system-deps
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy
       - uses: rui314/setup-mold@v1
@@ -171,7 +171,7 @@ jobs:
       - uses: actions/checkout@v4
       # The ARC runner image has no C toolchain; see the action.
       - uses: ./.github/actions/system-deps
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: rui314/setup-mold@v1
         with:
           mold-version: 3.0.0
@@ -197,13 +197,13 @@ jobs:
           MAIL_SMTP_REQUIRED: ${{ matrix.name == 'all features' && '1' || '' }}
 
   msrv:
-    name: minimum supported Rust (1.99, default features)
+    name: minimum supported Rust (1.100, default features)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       # The ARC runner image has no C toolchain; see the action.
       - uses: ./.github/actions/system-deps
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: rui314/setup-mold@v1
         with:
           mold-version: 3.0.0
@@ -213,13 +213,13 @@ jobs:
           key: msrv
 
       # Default features only, and that is the honest scope of the claim.
-      # `rust-version = "1.99"` matches the toolchain CI's own build uses
+      # `rust-version = "1.100"` matches the toolchain CI's own build uses
       # and the one every downstream deployment pod runs — pinning the
       # workspace to anything older would be a decoy that compiles here
       # and fails there. Turning on a driver pulls in third-party crates
       # with their own floors, which this job deliberately does not check:
       #
-      #   default            1.99  (workspace floor; new 1.99 clippy lints
+      #   default            1.100 (workspace floor; new 1.100 clippy lints
       #                             surface here before downstreams see them)
       #   sea-orm-executor   1.89
       #   http-client        1.86  (via `reqwest` -> `url` -> `idna` -> `icu_*`)
@@ -236,7 +236,7 @@ jobs:
       - uses: actions/checkout@v4
       # The ARC runner image has no C toolchain; see the action.
       - uses: ./.github/actions/system-deps
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: rui314/setup-mold@v1
         with:
           mold-version: 3.0.0
@@ -272,7 +272,7 @@ jobs:
       - uses: actions/checkout@v4
       # The ARC runner image has no C toolchain; see the action.
       - uses: ./.github/actions/system-deps
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: rui314/setup-mold@v1
         with:
           mold-version: 3.0.0
@@ -308,7 +308,7 @@ jobs:
       - uses: actions/checkout@v4
       # The ARC runner image has no C toolchain; see the action.
       - uses: ./.github/actions/system-deps
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: wasm32-unknown-unknown
       - uses: rui314/setup-mold@v1

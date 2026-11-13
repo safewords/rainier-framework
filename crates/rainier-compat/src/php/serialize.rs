@@ -669,11 +669,11 @@ impl Parser<'_> {
 
 fn parse_int(digits: &[u8]) -> Option<i64> {
     let text = std::str::from_utf8(digits).ok()?;
-    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let unsigned = text.trim_prefix(['+', '-']);
     if unsigned.is_empty() || !unsigned.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    text.strip_prefix('+').unwrap_or(text).parse().ok()
+    text.trim_prefix('+').parse().ok()
 }
 
 fn parse_float(text: &[u8]) -> Option<f64> {

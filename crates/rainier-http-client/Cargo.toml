@@ -13,7 +13,6 @@ categories = ["web-programming::http-client", "web-programming"]
 
 [dependencies]
 rainier-support = { workspace = true }
-async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

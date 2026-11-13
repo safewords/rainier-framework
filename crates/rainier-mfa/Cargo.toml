@@ -12,6 +12,8 @@ categories = ["authentication", "web-programming"]
 
 [dependencies]
 rainier-support = { workspace = true }
+# Only `passkeys` uses it (WebAuthn is base64url on the wire), so cargo's
+# `unused_dependencies` lint reports it in a TOTP-only build.
 base64 = { workspace = true }
 hmac = { workspace = true }
 rand = { workspace = true }
