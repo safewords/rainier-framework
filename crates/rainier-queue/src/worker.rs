@@ -1,4 +1,82 @@
 //! The [`Worker`] loop, and the events it fires.
+//!
+//! # Events
+//!
+//! With [`with_events`](Worker::with_events), every job fires
+//! [`JobProcessing`] before it runs and then exactly one of
+//! [`JobProcessed`], [`JobReleased`] (failed, with attempts left) or
+//! [`JobFailed`] (failed on its last attempt). The two failure events carry
+//! the failure twice: [`error`](JobFailed::error), the `Display` form that is
+//! also what the queue stores, and [`exception`](JobFailed::exception), the
+//! structured [`Exception`] — kind, status, cause chain, backtrace, and
+//! whether it was a panic.
+//!
+//! # Exception reporting
+//!
+//! Every failed **attempt** — released or final — is reported as a
+//! [`JobAttemptFailed`] saying which job, its id, queue and connection, which
+//! attempt it was (counting from 1), and whether it was the last. It goes to
+//! the [`Reporter`] given with [`with_reporter`](Worker::with_reporter), or to
+//! the process-wide reporter ([`rainier_events::report::install`]) without
+//! one. Every way a job fails takes this path: an error returned from
+//! `handle`, a panic (reported with [`Exception::panic`] set, and the stack
+//! when the panic hook captured one), a timeout, a payload that no longer
+//! deserialises into its type, a job name nothing registered, and a
+//! Kubernetes pod that failed.
+//!
+//! The report is made before the job is settled with the broker, so a failure
+//! is still reported when the broker then refuses the release or the fail.
+//!
+//! The worker also reports, as a [`QueueOperationFailed`], each failure it
+//! would otherwise only log:
+//!
+//! | `operation` | What failed |
+//! |---|---|
+//! | `"ack"` | acknowledging a job that **succeeded** — it will run again |
+//! | `"release"` | putting a failed job back for a retry |
+//! | `"fail"` | recording a job that ran out of attempts |
+//! | `"reserve"` | reserving, when the worker rides the failure out and retries |
+//! | `"release_uniqueness"` | releasing a finished job's `unique_id` lock |
+//! | `"size"` | sampling a queue's depth, with the `telemetry` feature |
+//!
+//! A reserve failure that ends the run (see
+//! [`max_consecutive_errors`](WorkerOptions::max_consecutive_errors)) is not
+//! reported here: it is returned from [`run`](Worker::run), to whoever ran it.
+//!
+//! A reporting listener that fails is logged and ignored; it never changes
+//! what happens to the job.
+//!
+//! ## Jobs that run in a Kubernetes pod
+//!
+//! A job routed to [`with_kubernetes`](Worker::with_kubernetes) runs in a pod
+//! of its own, and the pod is usually the same binary booting the same
+//! application — with its own process-wide reporter. Whatever the pod
+//! reports, and what the worker reports about the same attempt, then reach
+//! the bus twice, from two processes. So the worker's [`JobAttemptFailed`]
+//! for such an attempt carries the Kubernetes Job's name in
+//! [`meta.extra`](rainier_events::ReportMeta::extra) under
+//! `"kubernetes_job"` — the same name the pod sees in its
+//! `RAINIER_K8S_JOB_NAME` environment variable and its `HOSTNAME` prefix — so
+//! a listener can tell the two apart, or drop one:
+//!
+//! ```
+//! # use rainier_events::report::JobAttemptFailed;
+//! # use std::sync::Arc;
+//! # let events = rainier_events::Dispatcher::new();
+//! events.listen(|failed: Arc<JobAttemptFailed>| async move {
+//!     if let Some(pod) = failed.meta.extra.get("kubernetes_job") {
+//!         // The worker's view of an attempt that ran in `pod`.
+//!         # let _ = pod;
+//!     }
+//!     Ok(())
+//! });
+//! ```
+//!
+//! [`run_single_job`](crate::run_single_job), the pod-side entry point,
+//! reports nothing itself: it returns the job's error for the pod's `main` to
+//! turn into an exit code. A pod reports the attempt's failure only if the
+//! application's own `main` does — for instance by running it as a console
+//! command, which reports a failed command.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +86,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use rainier_cache::LockManager;
 use rainier_container::Container;
-use rainier_events::Dispatcher;
+use rainier_events::report::{FailureEvent, JobAttemptFailed, QueueOperationFailed};
+use rainier_events::{Dispatcher, Exception, Reporter};
 use rainier_support::{Error, Result};
 
 use crate::job::{JobContext, JobRegistry, QueuedJob};
@@ -37,8 +116,14 @@ pub struct JobReleased {
     pub job: QueuedJob,
     /// How long before it may run again.
     pub delay: Duration,
-    /// Why it failed.
+    /// Why it failed, in its `Display` form — the same text the worker logs.
+    ///
+    /// Kept for compatibility; [`exception`](Self::exception) carries the
+    /// same failure with its kind, cause chain and backtrace.
     pub error: String,
+    /// Why it failed, structured. [`Exception::panic`] is set when the job
+    /// panicked rather than returned an error.
+    pub exception: Exception,
 }
 
 /// Fired when a job fails on its last attempt.
@@ -46,8 +131,49 @@ pub struct JobReleased {
 pub struct JobFailed {
     /// The job that gave up.
     pub job: QueuedJob,
-    /// Why it failed.
+    /// Why it failed, in its `Display` form — the same text the queue stores
+    /// as the failed job's error.
+    ///
+    /// Kept for compatibility; [`exception`](Self::exception) carries the
+    /// same failure with its kind, cause chain and backtrace.
     pub error: String,
+    /// Why it failed, structured. [`Exception::panic`] is set when the job
+    /// panicked rather than returned an error.
+    pub exception: Exception,
+}
+
+/// One failed attempt, in the two forms the failure path needs.
+#[derive(Debug)]
+struct JobFailure {
+    /// What the queue stores, the log prints, and the events'
+    /// `error` field carries. Unchanged from before reporting existed.
+    message: String,
+    /// What the reporter and the events' `exception` field carry.
+    exception: Exception,
+}
+
+impl JobFailure {
+    /// Boxed, because an [`Exception`] is large and this rides in the `Err`
+    /// of every handler's result.
+    fn boxed(cause: impl Into<Self>) -> Box<Self> {
+        Box::new(cause.into())
+    }
+}
+
+impl From<Error> for JobFailure {
+    fn from(error: Error) -> Self {
+        Self { message: error.to_string(), exception: Exception::from_error(error) }
+    }
+}
+
+impl From<CaughtPanic> for JobFailure {
+    fn from(panic: CaughtPanic) -> Self {
+        Self {
+            // The wording the failed-job record has always had.
+            message: format!("the job panicked: {}", panic.message),
+            exception: Exception::panic(panic.message, panic.backtrace),
+        }
+    }
 }
 
 /// What one turn of the loop did.
@@ -124,6 +250,9 @@ struct Ran {
     pod_start: Option<Duration>,
     /// A Kubernetes job's container run time.
     pod_run: Option<Duration>,
+    /// The Kubernetes Job's name, when the job ran in a pod — so the report
+    /// of a failed attempt can say which pod's report it duplicates.
+    kubernetes_job: Option<String>,
 }
 
 /// Run one driver call that settles a job — acknowledge, release, fail — in
@@ -493,6 +622,12 @@ pub struct Worker {
     registry: Arc<JobRegistry>,
     container: Arc<Container>,
     events: Option<Arc<Dispatcher>>,
+    /// Where failed attempts are reported. See
+    /// [`with_reporter`](Self::with_reporter).
+    reporter: Option<Reporter>,
+    /// The connection name reports carry. See
+    /// [`with_connection`](Self::with_connection).
+    connection: Option<String>,
     options: WorkerOptions,
     stopping: AtomicBool,
     /// Where a finished job's [`unique_id`](crate::Job::unique_id) lock is
@@ -544,6 +679,8 @@ impl Worker {
             registry,
             container,
             events: None,
+            reporter: None,
+            connection: None,
             locks: None,
             options: WorkerOptions::default(),
             stopping: AtomicBool::new(false),
@@ -603,6 +740,46 @@ impl Worker {
     pub fn with_events(mut self, events: Arc<Dispatcher>) -> Self {
         self.events = Some(events);
         self
+    }
+
+    /// Report every failure through `reporter`.
+    ///
+    /// Each failed attempt — released for a retry or failed for good — is
+    /// reported as a [`JobAttemptFailed`] naming the job, its id, queue and
+    /// connection, which attempt it was, and whether it was the last. Panics
+    /// are reported as panics, with the stack when the panic hook captured
+    /// one. A broker that refuses to settle a job is reported as a
+    /// [`QueueOperationFailed`]. See the [module docs](self).
+    ///
+    /// Without one, the same reports go to the process-wide reporter
+    /// ([`rainier_events::report::install`]), and nowhere when none is
+    /// installed. Independent of [`with_events`](Self::with_events): the
+    /// reporter dispatches on its own dispatcher.
+    pub fn with_reporter(mut self, reporter: Reporter) -> Self {
+        self.reporter = Some(reporter);
+        self
+    }
+
+    /// The reporter set with [`with_reporter`](Self::with_reporter), if one
+    /// was.
+    pub fn reporter(&self) -> Option<&Reporter> {
+        self.reporter.as_ref()
+    }
+
+    /// Name the connection this worker drains, for its reports.
+    ///
+    /// Without one, reports carry the driver's own label (`"redis"`, `"sqs"`,
+    /// `"database"`, …) — which cannot tell two connections on the same
+    /// driver apart.
+    pub fn with_connection(mut self, name: impl Into<String>) -> Self {
+        self.connection = Some(name.into());
+        self
+    }
+
+    /// The connection name reports carry: the one set with
+    /// [`with_connection`](Self::with_connection), else the driver's label.
+    pub fn connection(&self) -> &str {
+        self.connection.as_deref().unwrap_or_else(|| self.queue.name())
     }
 
     /// Configure the loop.
@@ -715,6 +892,8 @@ impl Worker {
         let interval = self.depth_interval?;
         let queue = Arc::clone(&self.queue);
         let queues = self.options.queues.clone();
+        let reporter = self.reporter.clone();
+        let connection = self.connection().to_string();
 
         Some(AbortOnDrop(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -728,11 +907,21 @@ impl Worker {
                         Ok(depth) => observer.depth(name, depth),
                         // Debug, not warn: a driver that cannot answer
                         // cheaply answers the same way every interval.
-                        Err(error) => tracing::debug!(
-                            queue = %name,
-                            error = %error.message(),
-                            "could not sample the queue's depth"
-                        ),
+                        Err(error) => {
+                            tracing::debug!(
+                                queue = %name,
+                                error = %error.message(),
+                                "could not sample the queue's depth"
+                            );
+                            let failure = QueueOperationFailed::new(
+                                crate::reporting::snapshot(&error),
+                                Some(connection.clone()),
+                                Some(name.clone()),
+                                "size",
+                                None,
+                            );
+                            crate::reporting::report_to(reporter.as_ref(), failure).await;
+                        }
                     }
                 }
             }
@@ -867,6 +1056,10 @@ impl Worker {
                             ?backoff,
                             "could not reserve a job; retrying after a backoff"
                         );
+                        // Ridden out, so nobody else hears of it. The one that
+                        // ends the run is returned instead, and not reported
+                        // here.
+                        self.report_operation("reserve", None, &error).await;
 
                         // A broker that cannot be reached does not stop the
                         // jobs already running, so the backoff waits alongside
@@ -1045,7 +1238,12 @@ impl Worker {
 
         match outcome {
             Ok(()) => {
-                settle!("queue.ack", "ack", self.queue.acknowledge(&job))?;
+                // The job succeeded and will run again: the one failure here
+                // that nobody would otherwise hear about until it did.
+                if let Err(error) = settle!("queue.ack", "ack", self.queue.acknowledge(&job)) {
+                    self.report_operation("ack", Some(&job), &error).await;
+                    return Err(error);
+                }
                 self.release_uniqueness(&job).await;
 
                 let duration = started.elapsed();
@@ -1053,7 +1251,7 @@ impl Worker {
                 self.dispatch(JobProcessed { job, duration }).await;
                 Ok(Outcome::Processed)
             }
-            Err(error) => self.handle_failure(job, error, ran).await,
+            Err(failure) => self.handle_failure(job, failure, ran).await,
         }
     }
 
@@ -1062,16 +1260,18 @@ impl Worker {
     /// job's [`crate::Job::kubernetes`] returns `Some`
     /// AND this worker has a dispatcher configured.
     ///
-    /// Returns the same `Result<()>` shape regardless of path, so the
-    /// caller's success / failure / retry / `failed_jobs` logic is
-    /// identical for both.
+    /// Returns the same shape regardless of path, so the caller's success /
+    /// failure / retry / `failed_jobs` / reporting logic is identical for
+    /// both. Every way an in-process job can fail — an error, a panic, a
+    /// timeout, an unknown name, a payload that will not deserialise — comes
+    /// out of here as a [`JobFailure`].
     async fn run_handler(
         &self,
         job: &QueuedJob,
         context: &Arc<JobContext>,
         timeout: Option<Duration>,
         ran: &mut Ran,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), Box<JobFailure>> {
         #[cfg(feature = "kubernetes")]
         {
             if let (Some(runner), Some(spec)) = (
@@ -1084,10 +1284,9 @@ impl Worker {
                     attempt = job.attempts,
                     "routing job to kubernetes runner"
                 );
-                // The attempt the queue reserved is pre-increment; add
-                // one so the Kubernetes Job's name reflects the attempt
-                // the pod will actually run.
-                let attempt = job.attempts.saturating_add(1);
+                let attempt = kubernetes_attempt(job);
+                ran.kubernetes_job =
+                    Some(crate::kubernetes::kubernetes_name_for(&job.name, &job.id, attempt));
 
                 #[cfg(feature = "telemetry")]
                 {
@@ -1121,13 +1320,15 @@ impl Worker {
                     ran.timed_out = pod.timed_out;
                     ran.pod_start = pod.start;
                     ran.pod_run = pod.run;
-                    return rainier_support::telemetry::record_result(&traced, result);
+                    return rainier_support::telemetry::record_result(&traced, result)
+                        .map_err(JobFailure::boxed);
                 }
 
                 #[cfg(not(feature = "telemetry"))]
                 return runner
                     .run_and_watch(&job.name, &job.payload, &spec, &job.id, attempt, timeout)
-                    .await;
+                    .await
+                    .map_err(JobFailure::boxed);
             }
         }
 
@@ -1148,10 +1349,8 @@ impl Worker {
             None => run.await,
         };
         match outcome {
-            Ok(result) => result,
-            Err(panic) => {
-                Err(Error::internal(format!("the job panicked: {}", panic_message(panic.as_ref()))))
-            }
+            Ok(result) => result.map_err(JobFailure::boxed),
+            Err(panic) => Err(JobFailure::boxed(panic)),
         }
     }
 
@@ -1177,14 +1376,30 @@ impl Worker {
                 error = %e.message(),
                 "could not release the uniqueness lock; it will expire on its TTL"
             );
+            // Until it does, every dispatch of this id is dropped as a
+            // duplicate.
+            self.report_operation("release_uniqueness", Some(job), &e).await;
         }
     }
 
-    async fn handle_failure(&self, job: QueuedJob, error: Error, ran: &mut Ran) -> Result<Outcome> {
-        let message = error.to_string();
+    async fn handle_failure(
+        &self,
+        job: QueuedJob,
+        failure: Box<JobFailure>,
+        ran: &mut Ran,
+    ) -> Result<Outcome> {
+        let JobFailure { message, exception } = *failure;
+        let final_attempt = job.attempts >= self.options.attempts_for(job.max_attempts);
 
-        if job.attempts >= self.options.attempts_for(job.max_attempts) {
-            settle!("queue.fail", "fail", self.queue.fail(&job, &message))?;
+        // Before settling, so a failure is reported even when the broker then
+        // refuses the release or the fail.
+        self.report_attempt(&job, &exception, final_attempt, ran).await;
+
+        if final_attempt {
+            if let Err(error) = settle!("queue.fail", "fail", self.queue.fail(&job, &message)) {
+                self.report_operation("fail", Some(&job), &error).await;
+                return Err(error);
+            }
 
             // Released on final failure too. Holding the lock until
             // `UNIQUE_FOR` would mean one permanent failure blocks every later
@@ -1192,7 +1407,7 @@ impl Worker {
             self.release_uniqueness(&job).await;
 
             tracing::error!(job = %job.name, id = %job.id, error = %message, "job failed");
-            self.dispatch(JobFailed { job, error: message }).await;
+            self.dispatch(JobFailed { job, error: message, exception }).await;
             return Ok(Outcome::Failed);
         }
 
@@ -1200,7 +1415,10 @@ impl Worker {
         // attempt is indexed by it directly.
         let delay = backoff_for(job.attempts);
         ran.backoff = Some(delay);
-        settle!("queue.release", "release", self.queue.release(&job, delay))?;
+        if let Err(error) = settle!("queue.release", "release", self.queue.release(&job, delay)) {
+            self.report_operation("release", Some(&job), &error).await;
+            return Err(error);
+        }
         tracing::warn!(
             job = %job.name,
             id = %job.id,
@@ -1210,8 +1428,48 @@ impl Worker {
             error = %message,
             "job failed; retrying"
         );
-        self.dispatch(JobReleased { job, delay, error: message }).await;
+        self.dispatch(JobReleased { job, delay, error: message, exception }).await;
         Ok(Outcome::Released)
+    }
+
+    /// Report one failed attempt.
+    ///
+    /// The reporter dispatches quietly, so nothing it or its listeners do can
+    /// change what happens to the job.
+    async fn report_attempt(
+        &self,
+        job: &QueuedJob,
+        exception: &Exception,
+        final_attempt: bool,
+        ran: &Ran,
+    ) {
+        let mut failure = JobAttemptFailed::new(
+            exception.clone(),
+            job.name.clone(),
+            job.id.clone(),
+            job.queue.clone(),
+            Some(self.connection().to_string()),
+            // Drivers count the attempt on reserve, so this is already the
+            // 1-based number of the attempt that just failed.
+            job.attempts,
+            final_attempt,
+        );
+        if let Some(pod) = &ran.kubernetes_job {
+            failure = failure.with_extra("kubernetes_job", pod.clone());
+        }
+        crate::reporting::report_to(self.reporter.as_ref(), failure).await;
+    }
+
+    /// Report a broker or lock operation that failed outside a job's own run.
+    async fn report_operation(&self, operation: &str, job: Option<&QueuedJob>, error: &Error) {
+        let failure = QueueOperationFailed::new(
+            crate::reporting::snapshot(error),
+            Some(self.connection().to_string()),
+            job.map(|job| job.queue.clone()),
+            operation,
+            job.map(|job| job.id.clone()),
+        );
+        crate::reporting::report_to(self.reporter.as_ref(), failure).await;
     }
 
     /// Worker events are informational, so a failing listener is logged and
@@ -1221,6 +1479,21 @@ impl Worker {
             events.dispatch_quietly(event).await;
         }
     }
+}
+
+/// The attempt number a Kubernetes Job is named for and told about
+/// (`RAINIER_JOB_ATTEMPT`).
+///
+/// Every driver counts the attempt **on reserve** — the first reservation of
+/// a job hands it over with `attempts == 1` — so this is already the number of
+/// the attempt the pod runs. It used to add one on the theory that the count
+/// was taken before the increment, which named the first attempt's pod `…-2`,
+/// told the pod it was on attempt 2 of 1, and left the worker's report and the
+/// pod's disagreeing about which attempt failed. Floored at one for a job
+/// that never went through a driver's reserve.
+#[cfg_attr(not(feature = "kubernetes"), allow(dead_code))]
+fn kubernetes_attempt(job: &QueuedJob) -> u32 {
+    job.attempts.max(1)
 }
 
 /// The retry delay after `attempts` failures: 1s, 2s, 4s, …, capped at 64s.
@@ -1256,10 +1529,21 @@ fn backoff_for(attempts: u32) -> Duration {
 /// schedule, lands in the failed-job table when its attempts run out, and the
 /// worker carries on. The panic itself is still printed by the default hook,
 /// so nothing is hidden.
+///
+/// What comes out is a [`CaughtPanic`] rather than the raw payload, so the
+/// failure path can report it *as* a panic, with its stack.
 struct CatchPanic<F>(F);
 
+/// A panic [`CatchPanic`] caught: its message, and the stack the panic hook
+/// recorded at the `panic!` site, if it recorded one.
+#[derive(Debug)]
+struct CaughtPanic {
+    message: String,
+    backtrace: Option<String>,
+}
+
 impl<F: std::future::Future> std::future::Future for CatchPanic<F> {
-    type Output = std::result::Result<F::Output, Box<dyn std::any::Any + Send>>;
+    type Output = std::result::Result<F::Output, CaughtPanic>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
@@ -1272,7 +1556,15 @@ impl<F: std::future::Future> std::future::Future for CatchPanic<F> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
             Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
             Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
-            Err(panic) => std::task::Poll::Ready(Err(panic)),
+            Err(panic) => std::task::Poll::Ready(Err(CaughtPanic {
+                message: panic_message(panic.as_ref()),
+                // Here, inside the same poll that caught it: the hook left the
+                // stack in a thread-local, and only this thread can read it.
+                // Any later and the task may have moved to another thread.
+                // See `rainier_support::panic_backtrace`.
+                backtrace: rainier_support::panic_backtrace::take_panic_backtrace()
+                    .map(|backtrace| backtrace.to_string()),
+            })),
         }
     }
 }
@@ -1298,6 +1590,8 @@ impl std::fmt::Debug for Worker {
             .field("queue", &self.queue.name())
             .field("queues", &self.options.queues)
             .field("stopping", &self.is_stopping())
+            .field("reporter", &self.reporter.is_some())
+            .field("connection", &self.connection())
             .finish()
     }
 }
@@ -2094,6 +2388,599 @@ mod tests {
 
         let outcome = worker(Arc::clone(&queue)).with_events(events).run_next().await.unwrap();
         assert_eq!(outcome, Outcome::Processed, "the job still succeeded");
+    }
+
+    // --- exception reporting ----------------------------------------------
+
+    use rainier_events::{ExceptionReported, Failure};
+
+    /// Fails with a cause chain, the way a failed query does.
+    #[derive(Serialize, Deserialize)]
+    struct Chained;
+
+    #[async_trait::async_trait]
+    impl Job for Chained {
+        const NAME: &'static str = "test.chained";
+        const TRIES: u32 = 1;
+
+        async fn handle(&self, _: &JobContext) -> Result<()> {
+            Err(Error::internal("query failed")
+                .with_source(std::io::Error::other("connection refused")))
+        }
+    }
+
+    /// A dispatcher that records every `ExceptionReported`, and the record.
+    fn reports() -> (Arc<Dispatcher>, Arc<Mutex<Vec<ExceptionReported>>>) {
+        let events = Arc::new(Dispatcher::new());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        events.listen(move |reported: Arc<ExceptionReported>| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push((*reported).clone());
+                Ok(())
+            }
+        });
+        (events, seen)
+    }
+
+    /// The job attempts among `seen`, in order.
+    fn attempts(seen: &[ExceptionReported]) -> Vec<JobAttemptFailed> {
+        seen.iter()
+            .filter_map(|reported| match &reported.failure {
+                Failure::JobAttempt(attempt) => Some(attempt.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Records every event of type `E` dispatched on `events`.
+    fn record<E: Clone + Send + Sync + 'static>(events: &Dispatcher) -> Arc<Mutex<Vec<E>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        events.listen(move |event: Arc<E>| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push((*event).clone());
+                Ok(())
+            }
+        });
+        seen
+    }
+
+    /// Make the job a release put back due now, rather than wait out its
+    /// backoff.
+    async fn make_due(queue: &MemoryQueue) {
+        let retry = queue.pending("default").remove(0).available_at(Utc::now());
+        queue.clear("default").await.unwrap();
+        queue.push(retry).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_failed_attempt_is_reported_as_a_job_attempt() {
+        let _serial = reset(99); // never succeeds
+        let queue = Arc::new(MemoryQueue::new());
+        let job = QueuedJob::from_job(&Flaky).unwrap();
+        let id = job.id.clone();
+        queue.push(job).await.unwrap();
+
+        let (reporting, seen) = reports();
+        let worker = worker(Arc::clone(&queue)).with_reporter(Reporter::new(reporting));
+        assert!(worker.reporter().is_some());
+
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Released);
+        make_due(&queue).await;
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Released);
+        make_due(&queue).await;
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Failed);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "one report per failed attempt, released or final");
+        let reported = attempts(&seen);
+        assert_eq!(reported.len(), 3, "each one a JobAttemptFailed");
+        for (index, failed) in reported.iter().enumerate() {
+            let attempt = index as u32 + 1;
+            assert_eq!(failed.job, "test.flaky");
+            assert_eq!(failed.id, id);
+            assert_eq!(failed.queue, "default");
+            assert_eq!(failed.connection.as_deref(), Some("memory"), "the driver's label");
+            assert_eq!(failed.attempt, attempt, "counted from 1");
+            assert_eq!(failed.final_attempt, attempt == 3);
+            assert_eq!(failed.exception.message, "not yet");
+            assert!(!failed.exception.panic);
+            assert!(!failed.meta.extra.contains_key("kubernetes_job"), "ran in-process");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_named_connection_is_what_the_report_carries() {
+        let queue = Arc::new(MemoryQueue::new());
+        queue.push(QueuedJob::from_job(&Exploding).unwrap()).await.unwrap();
+
+        let (reporting, seen) = reports();
+        let worker = worker(Arc::clone(&queue))
+            .with_connection("bulk")
+            .with_reporter(Reporter::new(reporting));
+        assert_eq!(worker.connection(), "bulk");
+
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Failed);
+        assert_eq!(attempts(&seen.lock().unwrap())[0].connection.as_deref(), Some("bulk"));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_job_is_reported_as_a_panic() {
+        // The hook that records a panic's stack, as bootstrap installs it.
+        // Idempotent and chaining, so harmless to the rest of the suite.
+        rainier_support::panic_backtrace::install_panic_hook();
+        let queue = Arc::new(MemoryQueue::new());
+        queue.push(QueuedJob::from_job(&Exploding).unwrap()).await.unwrap();
+
+        let (reporting, seen) = reports();
+        let events = Arc::new(Dispatcher::new());
+        let failed = record::<JobFailed>(&events);
+        let worker =
+            worker(Arc::clone(&queue)).with_events(events).with_reporter(Reporter::new(reporting));
+
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Failed);
+
+        let seen = attempts(&seen.lock().unwrap());
+        assert_eq!(seen.len(), 1);
+        let exception = &seen[0].exception;
+        assert!(exception.panic, "reported as a panic, not as an internal error");
+        assert_eq!(exception.kind, None);
+        assert_eq!(exception.kind_label(), "Panic");
+        assert_eq!(exception.message, "the `Mail` facade could not resolve `Mailer`");
+        if std::env::var("RUST_BACKTRACE").is_ok_and(|v| v != "0") {
+            let stack = exception.backtrace.as_deref().expect("the panic site's stack");
+            assert!(!stack.is_empty());
+        }
+        assert!(seen[0].final_attempt);
+        assert_eq!(seen[0].attempt, 1);
+
+        // The event carries the same, and the stored record is worded as it
+        // always was.
+        let failed = failed.lock().unwrap();
+        assert!(failed[0].exception.panic);
+        assert_eq!(
+            failed[0].error,
+            "the job panicked: the `Mail` facade could not resolve `Mailer`"
+        );
+        assert_eq!(queue.failed_jobs()[0].error, failed[0].error);
+    }
+
+    #[tokio::test]
+    async fn job_failed_carries_the_structured_exception() {
+        let queue = Arc::new(MemoryQueue::new());
+        queue.push(QueuedJob::from_job(&Chained).unwrap()).await.unwrap();
+
+        let events = Arc::new(Dispatcher::new());
+        let failed = record::<JobFailed>(&events);
+        let worker = Worker::new(
+            Arc::clone(&queue) as Arc<dyn Queue>,
+            Arc::new(JobRegistry::new().with::<Chained>()),
+            Arc::new(Container::new()),
+        )
+        .with_events(events);
+
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Failed);
+
+        let failed = failed.lock().unwrap();
+        let exception = &failed[0].exception;
+        assert_eq!(exception.kind, Some(rainier_support::ErrorKind::Internal));
+        assert_eq!(exception.status, 500);
+        assert_eq!(exception.message, "query failed");
+        assert_eq!(exception.sources, vec!["connection refused"]);
+        assert!(!exception.panic);
+        assert!(exception.error.is_some(), "the original error rides along");
+        assert_eq!(failed[0].error, "query failed: connection refused", "the Display form");
+        assert_eq!(queue.failed_jobs()[0].error, failed[0].error);
+    }
+
+    #[tokio::test]
+    async fn job_released_carries_the_structured_exception() {
+        let _serial = reset(99);
+        let queue = Arc::new(MemoryQueue::new());
+        queue.push(QueuedJob::from_job(&Flaky).unwrap()).await.unwrap();
+
+        let events = Arc::new(Dispatcher::new());
+        let released = record::<JobReleased>(&events);
+
+        assert_eq!(
+            worker(Arc::clone(&queue)).with_events(events).run_next().await.unwrap(),
+            Outcome::Released
+        );
+
+        let released = released.lock().unwrap();
+        assert_eq!(released[0].error, "not yet");
+        assert_eq!(released[0].exception.message, "not yet");
+        assert_eq!(released[0].exception.kind, Some(rainier_support::ErrorKind::Internal));
+    }
+
+    #[tokio::test]
+    async fn without_a_reporter_the_process_wide_one_hears_of_it() {
+        let capture = rainier_events::report::capture();
+        let queue = Arc::new(MemoryQueue::new());
+        let job = QueuedJob::from_job(&Exploding).unwrap();
+        let id = job.id.clone();
+        queue.push(job).await.unwrap();
+
+        // Listening on the worker's own events, where a report would land if
+        // the worker invented a reporter of its own.
+        let (events, seen) = reports();
+        let worker = worker(Arc::clone(&queue)).with_events(events);
+        assert!(worker.reporter().is_none());
+
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Failed);
+        assert!(seen.lock().unwrap().is_empty(), "not on the worker's own events");
+
+        let ours: Vec<_> =
+            attempts(&capture.reports()).into_iter().filter(|a| a.id == id).collect();
+        assert_eq!(ours.len(), 1, "on the process-wide reporter instead");
+        assert!(ours[0].exception.panic);
+    }
+
+    // --- a broker that will not settle -----------------------------------
+
+    /// A memory queue whose acknowledge, release and fail can be made to
+    /// refuse, the way a broker mid-failover does.
+    #[derive(Default)]
+    struct Unsettled {
+        inner: MemoryQueue,
+        refuse_ack: bool,
+        refuse_release: bool,
+        refuse_fail: bool,
+    }
+
+    fn refused(operation: &str) -> Error {
+        Error::service_unavailable(format!("the broker refused the {operation}"))
+    }
+
+    impl Queue for Unsettled {
+        fn name(&self) -> &str {
+            "unsettled"
+        }
+        fn push<'q>(&'q self, job: QueuedJob) -> BoxFuture<'q, Result<String>> {
+            self.inner.push(job)
+        }
+        fn reserve<'q>(&'q self, queue: &'q str) -> BoxFuture<'q, Result<Option<QueuedJob>>> {
+            self.inner.reserve(queue)
+        }
+        fn acknowledge<'q>(&'q self, job: &'q QueuedJob) -> BoxFuture<'q, Result<()>> {
+            if self.refuse_ack {
+                return Box::pin(async { Err(refused("ack")) });
+            }
+            self.inner.acknowledge(job)
+        }
+        fn release<'q>(&'q self, job: &'q QueuedJob, delay: Duration) -> BoxFuture<'q, Result<()>> {
+            if self.refuse_release {
+                return Box::pin(async { Err(refused("release")) });
+            }
+            self.inner.release(job, delay)
+        }
+        fn fail<'q>(&'q self, job: &'q QueuedJob, error: &'q str) -> BoxFuture<'q, Result<()>> {
+            if self.refuse_fail {
+                return Box::pin(async { Err(refused("fail")) });
+            }
+            self.inner.fail(job, error)
+        }
+        fn size<'q>(&'q self, queue: &'q str) -> BoxFuture<'q, Result<u64>> {
+            self.inner.size(queue)
+        }
+        fn clear<'q>(&'q self, queue: &'q str) -> BoxFuture<'q, Result<u64>> {
+            self.inner.clear(queue)
+        }
+    }
+
+    /// The queue operations among `seen`, in order.
+    fn operations(seen: &[ExceptionReported]) -> Vec<QueueOperationFailed> {
+        seen.iter()
+            .filter_map(|reported| match &reported.failure {
+                Failure::QueueOperation(failed) => Some(failed.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Run one job of `J` on `queue` with a reporting worker; the outcome and
+    /// what was reported.
+    async fn settle_one<J: Job>(
+        job: &J,
+        queue: Unsettled,
+    ) -> (Result<Outcome>, Vec<ExceptionReported>) {
+        let queue = Arc::new(queue);
+        queue.push(QueuedJob::from_job(job).unwrap()).await.unwrap();
+        let (reporting, seen) = reports();
+        let worker = Worker::new(
+            Arc::clone(&queue) as Arc<dyn Queue>,
+            Arc::new(JobRegistry::new().with::<Patient>().with::<Exploding>().with::<Flaky>()),
+            Arc::new(Container::new()),
+        )
+        .with_reporter(Reporter::new(reporting));
+        let outcome = worker.run_next().await;
+        let seen = seen.lock().unwrap().clone();
+        (outcome, seen)
+    }
+
+    #[tokio::test]
+    async fn an_ack_the_broker_refuses_is_reported_and_still_returned() {
+        // The job succeeded and will run again: nothing else would say so.
+        let (outcome, seen) =
+            settle_one(&Patient, Unsettled { refuse_ack: true, ..Default::default() }).await;
+
+        assert!(outcome.is_err(), "the run loop still counts it");
+        let reported = operations(&seen);
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].operation, "ack");
+        assert_eq!(reported[0].connection.as_deref(), Some("unsettled"));
+        assert_eq!(reported[0].queue.as_deref(), Some("default"));
+        assert!(reported[0].job_id.is_some());
+        assert_eq!(reported[0].exception.status, 503);
+        assert_eq!(reported[0].exception.message, "the broker refused the ack");
+        assert!(attempts(&seen).is_empty(), "the job itself did not fail");
+    }
+
+    #[tokio::test]
+    async fn a_fail_the_broker_refuses_is_reported_after_the_attempt() {
+        let (outcome, seen) =
+            settle_one(&Exploding, Unsettled { refuse_fail: true, ..Default::default() }).await;
+
+        assert!(outcome.is_err());
+        assert_eq!(attempts(&seen).len(), 1, "the attempt is reported first");
+        let reported = operations(&seen);
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].operation, "fail");
+    }
+
+    #[tokio::test]
+    async fn a_release_the_broker_refuses_is_reported_after_the_attempt() {
+        let _serial = reset(99);
+        let (outcome, seen) =
+            settle_one(&Flaky, Unsettled { refuse_release: true, ..Default::default() }).await;
+
+        assert!(outcome.is_err());
+        assert_eq!(attempts(&seen).len(), 1);
+        let reported = operations(&seen);
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].operation, "release");
+    }
+
+    #[tokio::test]
+    async fn a_reserve_failure_the_worker_rides_out_is_reported() {
+        let _serial = reset(1);
+        let broker = Arc::new(FlakyBroker::new(2));
+        broker.push(QueuedJob::from_job(&Flaky).unwrap()).await.unwrap();
+        let (reporting, seen) = reports();
+
+        let worker = Worker::new(
+            Arc::clone(&broker) as Arc<dyn Queue>,
+            registry(),
+            Arc::new(Container::new()),
+        )
+        .with_options(brisk(20).stop_when_empty())
+        .with_reporter(Reporter::new(reporting));
+
+        let stats = worker.run().await.expect("rides it out");
+        assert_eq!(stats.errors, 2);
+
+        let reported = operations(&seen.lock().unwrap());
+        assert_eq!(reported.len(), 2, "one per refusal");
+        assert!(reported.iter().all(|r| r.operation == "reserve" && r.queue.is_none()));
+        assert_eq!(reported[0].connection.as_deref(), Some("flaky-broker"));
+    }
+
+    #[tokio::test]
+    async fn a_reserve_failure_that_ends_the_run_is_returned_not_reported() {
+        let broker = Arc::new(FlakyBroker::new(u32::MAX));
+        let (reporting, seen) = reports();
+        let worker = Worker::new(
+            Arc::clone(&broker) as Arc<dyn Queue>,
+            registry(),
+            Arc::new(Container::new()),
+        )
+        .with_options(brisk(3))
+        .with_reporter(Reporter::new(reporting));
+
+        assert!(worker.run().await.is_err());
+        assert_eq!(
+            operations(&seen.lock().unwrap()).len(),
+            2,
+            "the first two; the third is returned"
+        );
+    }
+
+    /// A cache that is down.
+    struct DownCache;
+
+    impl rainier_cache::Cache for DownCache {
+        fn name(&self) -> &str {
+            "down"
+        }
+        fn get<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>>> {
+            Box::pin(async { Err(Error::service_unavailable("cache down")) })
+        }
+        fn put<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a [u8],
+            _: Option<Duration>,
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Err(Error::service_unavailable("cache down")) })
+        }
+        fn forget<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<bool>> {
+            Box::pin(async { Err(Error::service_unavailable("cache down")) })
+        }
+        fn flush(&self) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Err(Error::service_unavailable("cache down")) })
+        }
+        fn increment<'a>(&'a self, _: &'a str, _: i64) -> BoxFuture<'a, Result<i64>> {
+            Box::pin(async { Err(Error::service_unavailable("cache down")) })
+        }
+        fn add<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a [u8],
+            _: Option<Duration>,
+        ) -> BoxFuture<'a, Result<bool>> {
+            Box::pin(async { Err(Error::service_unavailable("cache down")) })
+        }
+        fn forget_if<'a>(&'a self, _: &'a str, _: &'a [u8]) -> BoxFuture<'a, Result<bool>> {
+            Box::pin(async { Err(Error::service_unavailable("cache down")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_uniqueness_lock_that_will_not_release_is_reported() {
+        let queue = Arc::new(MemoryQueue::new());
+        let mut job = QueuedJob::from_job(&Patient).unwrap();
+        job.unique_key = Some("queue:unique:test.patient:1".into());
+        queue.push(job).await.unwrap();
+        let (reporting, seen) = reports();
+
+        let worker = Worker::new(
+            Arc::clone(&queue) as Arc<dyn Queue>,
+            Arc::new(JobRegistry::new().with::<Patient>()),
+            Arc::new(Container::new()),
+        )
+        .with_locks(LockManager::new(Arc::new(DownCache)))
+        .with_reporter(Reporter::new(reporting));
+
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Processed, "the job still succeeded");
+        let reported = operations(&seen.lock().unwrap());
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].operation, "release_uniqueness");
+        assert_eq!(reported[0].exception.message, "cache down");
+    }
+
+    /// Asks for a pod of its own.
+    #[cfg(feature = "kubernetes")]
+    #[derive(Serialize, Deserialize)]
+    struct Podded;
+
+    #[cfg(feature = "kubernetes")]
+    #[async_trait::async_trait]
+    impl Job for Podded {
+        const NAME: &'static str = "test.podded";
+        const TRIES: u32 = 1;
+
+        fn kubernetes(&self) -> Option<crate::KubernetesJobSpec> {
+            Some(crate::KubernetesJobSpec::new("1Gi", "1Gi", "100m", "100m"))
+        }
+
+        async fn handle(&self, _: &JobContext) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[tokio::test]
+    async fn a_failed_pod_attempt_names_its_kubernetes_job_so_the_pods_report_can_be_matched() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Never reached: with no image on the spec or the dispatcher, the run
+        // fails before its first API call — after the pod's name is decided.
+        let client =
+            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                .unwrap();
+        let dispatcher = Arc::new(crate::KubernetesDispatcher::new(client, "jobs"));
+
+        let queue = Arc::new(MemoryQueue::new());
+        let job = QueuedJob::from_job(&Podded).unwrap();
+        let id = job.id.clone();
+        queue.push(job).await.unwrap();
+        let (reporting, seen) = reports();
+
+        let worker = Worker::new(
+            Arc::clone(&queue) as Arc<dyn Queue>,
+            Arc::new(JobRegistry::new().with::<Podded>()),
+            Arc::new(Container::new()),
+        )
+        .with_kubernetes(dispatcher)
+        .with_reporter(Reporter::new(reporting));
+
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Failed);
+
+        let reported = attempts(&seen.lock().unwrap());
+        assert_eq!(reported.len(), 1);
+        assert!(reported[0].exception.message.contains("no image"), "{}", reported[0].exception);
+        assert_eq!(reported[0].attempt, 1);
+
+        let pod = crate::kubernetes::kubernetes_name_for("test.podded", &id, 1);
+        assert!(pod.ends_with("-1"), "the first attempt's pod is `-1`: {pod}");
+        assert_eq!(reported[0].meta.extra["kubernetes_job"], serde_json::json!(pod));
+    }
+
+    #[test]
+    fn a_kubernetes_job_is_named_for_the_attempt_the_driver_counted() {
+        // Every driver counts on reserve, so a first reservation is attempt 1
+        // — and its pod must be `…-1`, not `…-2`.
+        let mut job = QueuedJob::from_job(&Patient).unwrap();
+        job.attempts = 1;
+        assert_eq!(kubernetes_attempt(&job), 1);
+        job.attempts = 3;
+        assert_eq!(kubernetes_attempt(&job), 3);
+        job.attempts = 0;
+        assert_eq!(kubernetes_attempt(&job), 1, "never zero, for a job no driver reserved");
+    }
+
+    #[tokio::test]
+    async fn the_memory_driver_hands_over_a_first_reservation_as_attempt_one() {
+        // The premise the line above rests on, checked against a real driver.
+        let queue = MemoryQueue::new();
+        queue.push(QueuedJob::from_job(&Patient).unwrap()).await.unwrap();
+        let reserved = queue.reserve("default").await.unwrap().unwrap();
+        assert_eq!(reserved.attempts, 1);
+        assert_eq!(kubernetes_attempt(&reserved), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_jobs_and_timeouts_are_reported_too() {
+        // The failures that never reach a handler still take the same path.
+        let queue = Arc::new(MemoryQueue::new());
+        let mut unknown = QueuedJob::from_job(&Slow).unwrap();
+        unknown.name = "never.registered".into();
+        queue.push(unknown).await.unwrap();
+        queue.push(QueuedJob::from_job(&Slow).unwrap()).await.unwrap();
+
+        let (reporting, seen) = reports();
+        let worker = Worker::new(
+            Arc::clone(&queue) as Arc<dyn Queue>,
+            registry(),
+            Arc::new(Container::new()),
+        )
+        .with_options(
+            WorkerOptions::default().stop_when_empty().timeout(Some(Duration::from_millis(20))),
+        )
+        .with_reporter(Reporter::new(reporting));
+
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Failed);
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Failed);
+
+        let seen = attempts(&seen.lock().unwrap());
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].exception.message.contains("never.registered"));
+        assert!(seen[1].exception.message.contains("timeout"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_reporting_listener_does_not_change_the_outcome() {
+        let queue = Arc::new(MemoryQueue::new());
+        queue.push(QueuedJob::from_job(&Exploding).unwrap()).await.unwrap();
+
+        let reporting = Arc::new(Dispatcher::new());
+        reporting
+            .listen(|_: Arc<ExceptionReported>| async { Err(Error::internal("tracker down")) });
+        let events = Arc::new(Dispatcher::new());
+        let failed = record::<JobFailed>(&events);
+
+        let outcome = worker(Arc::clone(&queue))
+            .with_events(events)
+            .with_reporter(Reporter::new(reporting))
+            .run_next()
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, Outcome::Failed);
+        assert_eq!(queue.failed_jobs().len(), 1, "the job is still recorded as failed");
+        assert_eq!(failed.lock().unwrap().len(), 1, "and JobFailed still fires");
     }
 
     #[tokio::test]

@@ -2,7 +2,12 @@
 
 use std::sync::Arc;
 
+use std::panic::AssertUnwindSafe;
+
+use futures_util::FutureExt as _;
 use rainier_container::Application;
+use rainier_events::report::{self, CommandFailed};
+use rainier_events::{Exception, Reporter};
 use rainier_support::Result;
 
 use crate::arguments::Arguments;
@@ -94,9 +99,15 @@ impl Console {
 
     /// Run the command named in `args`, returning its exit code.
     ///
-    /// Never panics and never propagates: a console's job is to report and
-    /// exit with a code, so an error becomes a message on stderr and
-    /// [`exit::FAILURE`].
+    /// Never propagates: a console's job is to report and exit with a code,
+    /// so an error becomes a message on stderr and [`exit::FAILURE`].
+    ///
+    /// A command's `Err` is also reported as a [`CommandFailed`], and so is a
+    /// panic — which is then resumed, so a panicking command still ends the
+    /// way it always did. It goes through the application's bound
+    /// [`Reporter`], or the process-wide one when none is bound, and nowhere
+    /// when there is neither. A non-zero `Ok` is the command's own answer and
+    /// is not reported.
     pub async fn run(&self, app: &Application, args: Arguments) -> i32 {
         if args.is_empty() {
             println!("{}", self.usage());
@@ -143,7 +154,22 @@ impl Console {
         let handled = command.handle(&args, app);
         #[cfg(feature = "telemetry")]
         let handled = tracing::Instrument::instrument(handled, span.clone());
-        let handled = handled.await;
+
+        // A panic is caught only long enough to report it, then resumed: a
+        // command that panics still exits the way it always did, and the
+        // operator's error tracker hears about it first.
+        let handled = match AssertUnwindSafe(handled).catch_unwind().await {
+            Ok(handled) => handled,
+            Err(payload) => {
+                // Taken unconditionally, so a stack the hook recorded cannot
+                // be attached to some later, unrelated panic on this thread.
+                let backtrace = rainier_support::panic_backtrace::take_panic_backtrace()
+                    .map(|backtrace| backtrace.to_string());
+                let exception = Exception::panic(panic_message(payload.as_ref()), backtrace);
+                report_failure(app, CommandFailed::new(exception, command.name())).await;
+                std::panic::resume_unwind(payload);
+            }
+        };
 
         #[cfg(feature = "telemetry")]
         match &handled {
@@ -160,6 +186,9 @@ impl Console {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("{}: {e}", command.name());
+                // A non-zero `Ok` is the command's own answer, not a failure
+                // to report; an `Err` is.
+                report_failure(app, CommandFailed::new(e, command.name())).await;
                 exit::FAILURE
             }
         }
@@ -243,6 +272,30 @@ impl Console {
                     || lower.contains(&candidate)
             })
             .min_by_key(|candidate| candidate.len())
+    }
+}
+
+/// Report a command's failure through the application's bound [`Reporter`],
+/// or the process-wide one when the application has none.
+async fn report_failure(app: &Application, failure: CommandFailed) {
+    match app.resolve::<Reporter>() {
+        Ok(reporter) => {
+            reporter.report(failure).await;
+        }
+        Err(_) => {
+            report::report(failure).await;
+        }
+    }
+}
+
+/// The message a `panic!` carried, when it carried a string.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "a command panicked with a non-string payload".to_string()
     }
 }
 

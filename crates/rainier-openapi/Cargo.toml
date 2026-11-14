@@ -11,6 +11,9 @@ repository.workspace = true
 rainier-http = { workspace = true }
 rainier-routing = { workspace = true }
 rainier-validation = { workspace = true }
+rainier-support = { workspace = true }
+# Reporting documentation that has drifted from the routes.
+rainier-events = { workspace = true }
 
 serde_json = { workspace = true }
 tracing = { workspace = true }

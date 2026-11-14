@@ -14,6 +14,8 @@ rainier-middleware = { workspace = true }
 rainier-database = { workspace = true }
 rainier-cache = { workspace = true }
 rainier-crypt = { workspace = true }
+# Reporting the session failures this crate works around.
+rainier-events = { workspace = true }
 
 async-trait = { workspace = true }
 chrono = { workspace = true }

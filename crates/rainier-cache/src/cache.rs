@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use rainier_events::report::{report, CacheFailed, Exception};
 use rainier_support::{BoxFuture, Error, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -155,21 +156,27 @@ pub trait Cache: Send + Sync + 'static {
 #[async_trait::async_trait]
 pub trait CacheExt: Cache {
     /// A value, deserialised from JSON.
+    ///
+    /// A stored value that will not deserialise is treated as a miss, logged,
+    /// and reported as a [`CacheFailed`] with the operation `"deserialize"`.
     async fn get_json<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
-        match self.get(key).await? {
-            Some(bytes) => match serde_json::from_slice(&bytes) {
-                Ok(value) => Ok(Some(value)),
-                Err(e) => {
-                    // A cached value we cannot parse is a value from an older
-                    // shape of the application. Treating it as a miss lets the
-                    // caller recompute; failing would make a deploy poison
-                    // every request until the cache expired.
-                    tracing::warn!(key, error = %e, "discarding an unreadable cached value");
-                    Ok(None)
-                }
-            },
-            None => Ok(None),
-        }
+        let Some(bytes) = self.get(key).await? else {
+            return Ok(None);
+        };
+        // Decided before anything is awaited: `T` need not be `Send`.
+        let unreadable = match serde_json::from_slice::<T>(&bytes) {
+            Ok(value) => return Ok(Some(value)),
+            Err(e) => e,
+        };
+
+        // A cached value we cannot parse is a value from an older shape of
+        // the application. Treating it as a miss lets the caller recompute;
+        // failing would make a deploy poison every request until the cache
+        // expired.
+        tracing::warn!(key, error = %unreadable, "discarding an unreadable cached value");
+        let exception = Exception::from_std(&unreadable);
+        report(CacheFailed::new(exception, "cache", Some(key.to_string()), "deserialize")).await;
+        Ok(None)
     }
 
     /// Store a value as JSON.
@@ -231,6 +238,10 @@ pub trait CacheExt: Cache {
     /// A cached value that will not deserialise is treated as a miss and
     /// recomputed — see [`get_json`](Self::get_json).
     ///
+    /// A computed value the cache will not take is still returned; the failed
+    /// write is logged and reported as a [`CacheFailed`] with the operation
+    /// `"put"`.
+    ///
     /// # It is not a lock
     ///
     /// Ten simultaneous misses run `compute` ten times and the last write
@@ -254,6 +265,7 @@ pub trait CacheExt: Cache {
         // broken one — the value in hand is still the right answer.
         if let Err(e) = self.put_json(key, &value, ttl).await {
             tracing::warn!(key, error = %e.message(), "could not cache a computed value");
+            report(CacheFailed::new(e, "cache", Some(key.to_string()), "put")).await;
         }
 
         Ok(value)
@@ -380,5 +392,97 @@ mod tests {
 
         let count: u32 = cache.remember("count", None, || async { Ok(7) }).await.unwrap();
         assert_eq!(count, 7);
+    }
+
+    /// A memory cache that will not take a write.
+    struct Full(crate::MemoryCache);
+
+    impl Cache for Full {
+        fn name(&self) -> &str {
+            "full"
+        }
+        fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>>> {
+            self.0.get(key)
+        }
+        fn put<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a [u8],
+            _: Option<Duration>,
+        ) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Err(Error::internal("cache-test: out of memory")) })
+        }
+        fn forget<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<bool>> {
+            self.0.forget(key)
+        }
+        fn flush(&self) -> BoxFuture<'_, Result<()>> {
+            self.0.flush()
+        }
+        fn increment<'a>(&'a self, key: &'a str, by: i64) -> BoxFuture<'a, Result<i64>> {
+            self.0.increment(key, by)
+        }
+        fn add<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a [u8],
+            _: Option<Duration>,
+        ) -> BoxFuture<'a, Result<bool>> {
+            Box::pin(async { Err(Error::internal("cache-test: out of memory")) })
+        }
+        fn forget_if<'a>(
+            &'a self,
+            key: &'a str,
+            expected: &'a [u8],
+        ) -> BoxFuture<'a, Result<bool>> {
+            self.0.forget_if(key, expected)
+        }
+    }
+
+    fn cache_failures(
+        capture: &rainier_events::report::Capture,
+        key: &str,
+    ) -> Vec<rainier_events::report::CacheFailed> {
+        use rainier_events::report::{Failure, FailureKind};
+        capture
+            .of_kind(FailureKind::Cache)
+            .into_iter()
+            .filter_map(|f| match f {
+                Failure::Cache(c) if c.key.as_deref() == Some(key) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_value_is_reported_and_read_as_a_miss() {
+        use crate::MemoryCache;
+
+        let capture = rainier_events::report::capture();
+        let cache = MemoryCache::new();
+        let key = "cache-test:unreadable";
+        cache.put(key, b"not json", None).await.unwrap();
+
+        let value: Option<u32> = cache.get_json(key).await.unwrap();
+        assert_eq!(value, None);
+
+        let failures = cache_failures(&capture, key);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].store, "cache");
+        assert_eq!(failures[0].operation, "deserialize");
+    }
+
+    #[tokio::test]
+    async fn a_computed_value_the_cache_will_not_take_is_returned_and_reported() {
+        let capture = rainier_events::report::capture();
+        let cache = Full(crate::MemoryCache::new());
+        let key = "cache-test:full";
+
+        let value: u32 = cache.remember(key, None, || async { Ok(7) }).await.unwrap();
+        assert_eq!(value, 7);
+
+        let failures = cache_failures(&capture, key);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].operation, "put");
+        assert_eq!(failures[0].exception.message, "cache-test: out of memory");
     }
 }

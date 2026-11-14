@@ -9,6 +9,9 @@ repository.workspace = true
 
 [dependencies]
 rainier-support = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["rt"] }
 tracing = { workspace = true }
 
 [features]
@@ -18,6 +21,7 @@ telemetry = ["rainier-support/telemetry"]
 
 [dev-dependencies]
 tokio = { workspace = true }
+anyhow = { workspace = true }
 
 [lints]
 workspace = true

@@ -185,7 +185,22 @@ impl Filesystem for LocalFilesystem {
                 Err(e) => {
                     // Leaving the temporary behind would accumulate rubbish next
                     // to the real files.
-                    let _ = tokio::fs::remove_file(&temporary).await;
+                    if let Err(cleanup) = tokio::fs::remove_file(&temporary).await {
+                        // The write's own error is returned; this one would
+                        // otherwise vanish, and the rubbish with it.
+                        rainier_events::report::report(
+                            rainier_events::report::FailureEvent::with_extra(
+                                rainier_events::report::FilesystemFailed::new(
+                                    rainier_events::Exception::from_std(&cleanup),
+                                    "local",
+                                    "remove_temporary",
+                                ),
+                                "path",
+                                temporary.display().to_string(),
+                            ),
+                        )
+                        .await;
+                    }
                     Err(io_error("write", path, e))
                 }
             }

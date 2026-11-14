@@ -71,6 +71,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use percent_encoding::percent_decode_str;
+use rainier_events::report::FailureEvent as _;
 use rainier_http::{IntoResponse, Request, Response, StatusCode};
 use rainier_support::Error;
 
@@ -193,6 +194,19 @@ impl PublicFiles {
         };
         if !resolved.starts_with(&root) {
             tracing::warn!(path = %resolved.display(), "a public path resolved outside the root");
+            // Only a link inside the public directory gets here — the request
+            // was checked above — so it is the deployment that is wrong.
+            rainier_events::report::report(
+                rainier_events::report::ConfigurationFailed::new(
+                    rainier_events::Exception::message(
+                        rainier_support::ErrorKind::Internal,
+                        "a path under the public directory resolves outside it; it is not served",
+                    ),
+                    "public",
+                )
+                .with_extra("path", resolved.display().to_string()),
+            )
+            .await;
             return not_found();
         }
 

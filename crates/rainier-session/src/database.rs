@@ -2,6 +2,8 @@
 
 use chrono::{DateTime, Duration, Utc};
 use rainier_database::{Criteria, Database, EntityRepository, Migrator, Model, Repository};
+use rainier_events::report::{report, SessionFailed};
+use rainier_events::Exception;
 use rainier_orm::Entity;
 use rainier_support::{BoxFuture, Error, Result};
 
@@ -97,6 +99,7 @@ impl SessionStore for DatabaseSessionStore {
                     // out; failing the request locks them out permanently,
                     // with no way to recover but clearing their cookies.
                     tracing::warn!(error = %e, "discarding an unreadable session row");
+                    report(SessionFailed::new(Exception::from_std(&e), "decode_row")).await;
                     self.rows.delete(id.into()).await?;
                     Ok(None)
                 }

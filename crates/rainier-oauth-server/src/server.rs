@@ -719,14 +719,25 @@ impl AuthorizationServer {
             return OAuthError::invalid_request("token").into_response();
         };
 
+        // A revocation that fails still answers `200` — the client cannot tell
+        // a failure from a token that never existed, by design — so the
+        // failure is reported rather than returned: a token the client
+        // believes is revoked and is not is exactly what an operator must
+        // hear about.
         if let Ok(verified) = self.verifier().verify(&token) {
             if verified.client_id == client.id {
-                let _ = self.revoke(&verified.id).await;
+                if let Err(e) = self.revoke(&verified.id).await {
+                    report_revocation_failure(e).await;
+                }
             }
         } else if let Some(refresh) = open_json::<RefreshTokenPayload>(&*self.sealer, &token) {
             if refresh.client_id == client.id {
-                let _ = self.store.revoke_refresh_token(&refresh.refresh_token_id).await;
-                let _ = self.revoke(&refresh.access_token_id).await;
+                if let Err(e) = self.store.revoke_refresh_token(&refresh.refresh_token_id).await {
+                    report_revocation_failure(e).await;
+                }
+                if let Err(e) = self.revoke(&refresh.access_token_id).await {
+                    report_revocation_failure(e).await;
+                }
             }
         }
         token_response(&json!({}))
@@ -825,6 +836,12 @@ fn strip_loopback_port(uri: &str) -> Option<String> {
 
 fn chrono_duration(duration: Duration) -> chrono::Duration {
     chrono::Duration::from_std(duration).unwrap_or(chrono::Duration::MAX)
+}
+
+/// Log and report a revocation that failed behind a `200`.
+async fn report_revocation_failure(error: rainier_support::Error) {
+    tracing::error!(error = %error, "could not revoke a token");
+    rainier_events::report::report(rainier_events::report::OAuthFailed::new(error, "revoke")).await;
 }
 
 #[cfg(test)]

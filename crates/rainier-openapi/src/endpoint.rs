@@ -28,6 +28,17 @@ impl Rendered {
                 routes = ?dangling,
                 "the OpenAPI document describes routes that do not exist; they were renamed or removed"
             );
+            rainier_events::report::report_detached(
+                rainier_events::report::ConfigurationFailed::new(
+                    rainier_events::Exception::message(
+                        rainier_support::ErrorKind::Internal,
+                        format!(
+                            "the OpenAPI document describes routes that do not exist: {dangling:?}"
+                        ),
+                    ),
+                    "openapi",
+                ),
+            );
         }
 
         Self { json: document.to_json(router) }
@@ -85,6 +96,36 @@ mod tests {
         let response = serve(Arc::new(Request::builder().build())).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn documentation_for_a_missing_route_is_reported() {
+        let capture = rainier_events::report::capture();
+        let document = OpenApi::new("Test", "1.0.0")
+            .describe("openapi-report-test.gone", crate::Endpoint::new());
+        Rendered::new(&document, &router());
+
+        let mut ours = Vec::new();
+        for _ in 0..100 {
+            ours = capture
+                .reports()
+                .into_iter()
+                .filter_map(|reported| match reported.failure {
+                    rainier_events::Failure::Configuration(failed)
+                        if failed.exception.message.contains("openapi-report-test.gone") =>
+                    {
+                        Some(failed)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !ours.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(ours.len(), 1, "{ours:?}");
+        assert_eq!(ours[0].setting, "openapi");
     }
 
     #[test]

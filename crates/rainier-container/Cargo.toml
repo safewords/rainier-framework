@@ -14,6 +14,12 @@ rainier-support = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 tracing = { workspace = true }
 
+# Failures this crate works around are reported on the event bus. Not on wasm:
+# `rainier-events` takes the workspace's tokio, whose `net` feature pulls in
+# mio, which does not build for wasm32 — and this crate must.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rainier-events = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true }
 

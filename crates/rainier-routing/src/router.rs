@@ -52,7 +52,9 @@ use crate::handler::{IntoRouteHandler, RouteHandler};
 use crate::route::{normalise_uri, ParamConstraint, Route};
 
 /// Details of the route that matched, placed in the request's extensions so
-/// middleware and handlers can inspect it.
+/// middleware and handlers can inspect it — and in the response's, so code
+/// that runs after the request is consumed (the HTTP kernel's exception
+/// reporting) can too.
 #[derive(Debug, Clone)]
 pub struct MatchedRoute {
     /// The route's name, if it has one.
@@ -467,13 +469,22 @@ impl CompiledRouter {
                 }
             }
 
-            request.extensions_mut().insert(MatchedRoute {
+            let matched = MatchedRoute {
                 name: compiled.route.route_name().map(str::to_string),
                 uri: compiled.route.uri().to_string(),
                 methods: compiled.route.methods().to_vec(),
-            });
+            };
+            request.extensions_mut().insert(matched.clone());
 
-            return compiled.pipeline.run(request).await;
+            // And onto the response, for whoever runs after the request is
+            // gone: the HTTP kernel reports a failed request against its
+            // route pattern, and by then the pipeline has consumed the
+            // request. A response that already names a route keeps it.
+            let mut response = compiled.pipeline.run(request).await;
+            if response.extensions().get::<MatchedRoute>().is_none() {
+                response.extensions_mut().insert(matched);
+            }
+            return response;
         }
 
         if !allowed.is_empty() {
@@ -839,6 +850,20 @@ mod tests {
 
         let response = compile(router).dispatch(get("/posts/1")).await;
         assert_eq!(body_of(response).await, "/posts/{post}|Some(\"posts.show\")");
+    }
+
+    #[tokio::test]
+    async fn the_matched_route_rides_on_the_response_too() {
+        let mut router = Router::new();
+        router.get("/posts/{post}", || async { "post" }).name("posts.show");
+
+        let response = compile(router).dispatch(get("/posts/1")).await;
+        let matched = response.extensions().get::<MatchedRoute>().expect("on the response");
+        assert_eq!(matched.uri, "/posts/{post}");
+        assert_eq!(matched.name.as_deref(), Some("posts.show"));
+
+        let missing = compile(Router::new()).dispatch(get("/nope")).await;
+        assert!(missing.extensions().get::<MatchedRoute>().is_none());
     }
 
     #[tokio::test]

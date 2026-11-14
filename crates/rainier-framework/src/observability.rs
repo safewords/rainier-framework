@@ -103,6 +103,11 @@ impl TelemetrySettings {
     }
 }
 
+/// A layer of the framework's subscriber, boxed so layers of different types
+/// sit in one list.
+pub type SubscriberLayer =
+    Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
+
 impl TelemetrySettings {
     /// Install a global subscriber in this format.
     ///
@@ -114,23 +119,81 @@ impl TelemetrySettings {
     /// `filter` is an `EnvFilter` directive, usually `RUST_LOG`. One that does
     /// not parse falls back to `info` rather than refusing to log at all.
     pub fn install_logging(&self, environment: &str, filter: &str) -> bool {
-        use tracing_subscriber::{fmt, EnvFilter};
+        self.install_logging_with(environment, filter, Vec::new())
+    }
 
-        let filter =
-            EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
-        let builder = fmt().with_env_filter(filter);
+    /// [`install_logging`](Self::install_logging), with `unfiltered` layers
+    /// beside the log lines — layers that must see every span whatever
+    /// `RUST_LOG` says, such as Lookout's recorder.
+    pub fn install_logging_with(
+        &self,
+        environment: &str,
+        filter: &str,
+        unfiltered: Vec<SubscriberLayer>,
+    ) -> bool {
+        use tracing_subscriber::util::SubscriberInitExt as _;
 
-        match self.log_format.resolve(environment) {
+        if tracing::dispatcher::has_been_set() {
+            return false;
+        }
+        self.subscriber(environment, filter, None, unfiltered).try_init().is_ok()
+    }
+
+    /// The subscriber the framework installs, without installing it.
+    ///
+    /// Three kinds of layer over one registry:
+    ///
+    /// - **the log lines**, in [`log_format`](Self::log_format), behind
+    ///   `filter`;
+    /// - **the exporter**, when one is given, behind its own copy of
+    ///   `filter` — `RUST_LOG=warn` has always meant "and export no `info`
+    ///   spans", and it still does;
+    /// - **`unfiltered`**, which see everything.
+    ///
+    /// The filter is a *per-layer* filter rather than one over the whole
+    /// subscriber. A global `EnvFilter` decides for every layer at once, so
+    /// with `RUST_LOG=warn` the `info`-level `db.query` and request spans
+    /// would never be created at all, and a recorder beside the log lines
+    /// would see nothing. Per layer, the log lines are exactly what they
+    /// were, and a span nobody but the recorder wants is created for the
+    /// recorder alone. With no unfiltered layer, a callsite every filter
+    /// rejects is still disabled outright, so the default build pays nothing
+    /// for the change.
+    pub fn subscriber(
+        &self,
+        environment: &str,
+        filter: &str,
+        exporter: Option<SubscriberLayer>,
+        unfiltered: Vec<SubscriberLayer>,
+    ) -> impl tracing::Subscriber + Send + Sync + 'static {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::{fmt, EnvFilter, Layer};
+
+        let parse =
+            || EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+
+        let lines: SubscriberLayer = match self.log_format.resolve(environment) {
             // `flatten_event` puts the message and its fields at the top
             // level, where every aggregator's default parser looks for them;
             // nested under `fields` they are one query deeper forever.
-            LogFormat::Json => {
-                builder.json().flatten_event(true).with_current_span(true).try_init().is_ok()
-            }
-            LogFormat::Compact => builder.compact().try_init().is_ok(),
+            LogFormat::Json => fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(true)
+                .with_filter(parse())
+                .boxed(),
+            LogFormat::Compact => fmt::layer().compact().with_filter(parse()).boxed(),
             // `Auto` cannot reach here — `resolve` has answered it.
-            LogFormat::Pretty | LogFormat::Auto => builder.try_init().is_ok(),
+            LogFormat::Pretty | LogFormat::Auto => fmt::layer().with_filter(parse()).boxed(),
+        };
+
+        let mut layers = vec![lines];
+        if let Some(exporter) = exporter {
+            layers.push(exporter.with_filter(parse()).boxed());
         }
+        layers.extend(unfiltered);
+
+        tracing_subscriber::registry().with(layers)
     }
 }
 

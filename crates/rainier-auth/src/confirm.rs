@@ -34,6 +34,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rainier_events::report::{report, AuthFailed};
+use rainier_events::Exception;
 use rainier_http::{IntoResponse, Request, Response};
 use rainier_middleware::{Middleware, MiddlewareStack, Next};
 use rainier_session::SessionRequestExt;
@@ -126,6 +128,16 @@ impl Middleware for ConfirmPassword {
                 "`ConfirmPassword` ran without a session, so it cannot tell whether the password \
                  was confirmed — refusing. Is this route behind the `web` group?"
             );
+            report(AuthFailed::new(
+                Exception::message(
+                    rainier_support::ErrorKind::Internal,
+                    "`ConfirmPassword` ran without a session, so it cannot tell whether the \
+                     password was confirmed",
+                ),
+                "confirm",
+                "confirm_password",
+            ))
+            .await;
             return Error::new(
                 rainier_support::ErrorKind::Status(423),
                 "Password confirmation is required.",
@@ -302,6 +314,7 @@ mod tests {
     async fn without_a_session_it_refuses_rather_than_passing() {
         // A misordered route. This guard stands in front of the actions that
         // let an attacker keep the account, so failing open is not an option.
+        let capture = rainier_events::report::capture();
         let status = Pipeline::new()
             .through(ConfirmPassword::recently())
             .then(|_| async { Response::ok("through") })
@@ -310,6 +323,20 @@ mod tests {
             .status();
 
         assert_eq!(status, StatusCode::LOCKED);
+
+        // And the misconfiguration is reported, not only logged.
+        let reported = capture
+            .reports()
+            .into_iter()
+            .filter(|reported| {
+                matches!(
+                    &reported.failure,
+                    rainier_events::Failure::Auth(failed)
+                        if failed.guard == "confirm" && failed.operation == "confirm_password"
+                )
+            })
+            .count();
+        assert!(reported >= 1, "{:?}", capture.reports());
     }
 
     #[tokio::test]

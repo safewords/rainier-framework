@@ -9,6 +9,9 @@ repository.workspace = true
 
 [dependencies]
 rainier-support = { workspace = true }
+# Failures this crate works around — an unreadable message, a refused
+# subscription, a broadcaster that would not build — are reported on the bus.
+rainier-events = { workspace = true }
 rainier-drivers = { workspace = true, optional = true }
 rainier-websocket = { workspace = true, optional = true }
 

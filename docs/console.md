@@ -240,6 +240,16 @@ exit::USAGE     // 2 — unknown command, or bad arguments
 Returning `Err` from `handle` prints the message and exits `1`. Return
 `Ok(code)` to choose.
 
+The `Err` is also [reported](errors.md#reporting), as a `CommandFailed` naming
+the command — through the application's reporter, which every booted one has,
+or the process-wide one otherwise. So is a panic, which is then resumed: the
+command still ends the way a panic always ended it. A non-zero `Ok(code)` is
+the command's own answer and is not reported.
+
+An option given as a bare flag — `--port 8000` where `--port=8000` was meant —
+is ignored with a warning when a command asks for it, and reported as a
+`ConfigurationFailed` whose `setting` is `--port`.
+
 Getting these right matters more than it looks: they are what a CI step, a
 supervisor, or a `&&` in a deploy script reads.
 

@@ -10,7 +10,9 @@ use rainier_websocket::WebSocketRoutes;
 use crate::upgrade;
 use hyper_util::rt::TokioIo;
 use rainier_container::{with_facade_application, Application};
-use rainier_http::{ClientIp, IntoResponse, Request, Response};
+use rainier_events::report::{HttpRequestFailed, ServerFailed};
+use rainier_events::Exception;
+use rainier_http::{ClientIp, IntoResponse, OriginalError, Request, Response};
 use rainier_support::{Error, Result};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -182,6 +184,9 @@ impl Server {
                     // One bad accept (a fd limit, a client that hung up during
                     // the handshake) must not stop the server.
                     tracing::warn!(error = %e, "failed to accept a connection");
+                    self.kernel
+                        .report_failure(ServerFailed::new(Exception::from_std(&e), "accept"))
+                        .await;
                     continue;
                 }
             };
@@ -190,6 +195,7 @@ impl Server {
             let options = self.options.clone();
             let websockets = self.websockets.clone();
             let application = self.application.clone();
+            let reporting = Arc::clone(&self.kernel);
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
@@ -217,8 +223,16 @@ impl Server {
 
                 if let Err(e) = served {
                     // A client disconnecting mid-response is routine, not an
-                    // error worth raising the log level for.
+                    // error worth raising the log level for — but it is still
+                    // a failure, and whether it matters is the application's
+                    // call, so it is reported.
                     tracing::debug!(error = %e, "connection closed");
+                    reporting
+                        .report_failure(ServerFailed::new(
+                            Exception::from_std(&e),
+                            "serve_connection",
+                        ))
+                        .await;
                 }
             });
         }
@@ -251,8 +265,26 @@ async fn serve_one(
     let bytes = match read_body(body, options.max_body_bytes).await {
         Ok(bytes) => bytes,
         // A body we could not read (too large, or a broken stream) never
-        // reaches a route: there is nothing for a handler to act on.
-        Err(e) => return Ok(e.into_response().into_http()),
+        // reaches a route: there is nothing for a handler to act on. It never
+        // reaches the kernel either, so it is reported here.
+        Err(e) => {
+            let exception = Exception::message(e.kind(), e.message());
+            let response = e.into_response();
+            // The rendered response keeps the whole error; report that one.
+            let exception = match response.extensions().get::<OriginalError>() {
+                Some(OriginalError(original)) => Exception::from_shared(Arc::clone(original)),
+                None => exception,
+            };
+            kernel
+                .report_failure(HttpRequestFailed::new(
+                    exception,
+                    parts.method.as_str(),
+                    parts.uri.path(),
+                    None,
+                ))
+                .await;
+            return Ok(response.into_http());
+        }
     };
 
     let mut request = Request::from_http(hyper::Request::from_parts(parts, bytes));
@@ -441,6 +473,44 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 413"), "{response}");
 
         let _ = shutdown.send(true);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_body_never_reaches_the_kernel_but_is_still_reported() {
+        use rainier_events::report::{capture, Failure};
+
+        let capture = capture();
+        let (address, shutdown) = start().await;
+        // A path of its own: the other oversized-body test runs in parallel
+        // and reports into this capture too. The body is refused before
+        // routing, so the path needs no route.
+        let oversized = "x".repeat(300);
+        request(
+            address,
+            &format!(
+                "POST /unreadable-body-test HTTP/1.1\r\nHost: localhost\r\n\
+                 Connection: close\r\nContent-Length: {}\r\n\r\n{oversized}",
+                oversized.len()
+            ),
+        )
+        .await;
+        let _ = shutdown.send(true);
+
+        let ours: Vec<_> = capture
+            .reports()
+            .into_iter()
+            .filter_map(|reported| match reported.failure {
+                Failure::HttpRequest(failed)
+                    if failed.path == "/unreadable-body-test" && failed.exception.status == 413 =>
+                {
+                    Some(failed)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ours.len(), 1, "{ours:?}");
+        assert_eq!(ours[0].method, "POST");
+        assert!(ours[0].exception.error.is_some(), "the original error rides along");
     }
 
     #[tokio::test]

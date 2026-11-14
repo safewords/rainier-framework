@@ -240,6 +240,8 @@ You can listen to these without raising them:
 | `MessageSending`, `MessageSent` | [the mailer](mail.md) |
 | `JobProcessing`, `JobProcessed` | [the worker](queues.md#worker-events) |
 | `JobReleased`, `JobFailed` | |
+| `HttpRequestFailed`, `JobAttemptFailed`, `CommandFailed`, … | [the reporter](errors.md#reporting) — one event per kind of failure; the full catalogue is there |
+| `ExceptionReported` | the reporter — every failure once, whatever its kind |
 
 That is enough to build an audit log, a metrics feed, or a webhook fan-out
 without touching the code that does the work.

@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// Each domain failure names its status (authentication → 401, validation
 /// → 422, …) so the "throw a domain error, get the right response" flow
 /// works without any component knowing the renderer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ErrorKind {
     /// 400 — the request was malformed.
     BadRequest,

@@ -64,7 +64,11 @@ use std::time::Duration;
 
 use chrono::Utc;
 use rainier_drivers::{RedisClient, RedisConnector};
-use rainier_support::{BoxFuture, Error, Result};
+use rainier_events::report::{
+    ConfigurationFailed, FailureEvent, QueueMessageDiscarded, QueueOperationFailed,
+};
+use rainier_events::Exception;
+use rainier_support::{BoxFuture, Error, ErrorKind, Result};
 use serde_json::json;
 
 use crate::job::QueuedJob;
@@ -188,17 +192,22 @@ impl RedisQueue {
     /// eviction policy set, Redis discards keys to stay under `maxmemory`, and
     /// a deep queue is a large key. Jobs disappear with no error anywhere.
     ///
+    /// Any policy but `noeviction` is also reported, through the process-wide
+    /// reporter, as a `ConfigurationFailed` for the setting
+    /// `maxmemory-policy`.
+    ///
     /// Worth calling at boot. It only reads configuration, and a managed Redis
     /// that refuses `CONFIG GET` simply gets no answer rather than an error.
     pub async fn check_eviction_policy(&self) -> Option<String> {
         let policy = self.client.config_get("maxmemory-policy").await.ok().flatten()?;
 
-        if policy != "noeviction" {
+        if let Some(unsafe_policy) = eviction_policy_failure(&policy) {
             tracing::warn!(
                 policy,
                 "this Redis evicts keys under memory pressure, and a queued job is a key it can \
                  evict — set `maxmemory-policy noeviction` before relying on this queue"
             );
+            crate::reporting::report(unsafe_policy).await;
         }
         Some(policy)
     }
@@ -296,12 +305,17 @@ impl Queue for RedisQueue {
 
             let Some(entry) = entry else { return Ok(None) };
 
-            let mut job: QueuedJob = match serde_json::from_slice(&entry.body) {
+            let mut job: QueuedJob = match decode_entry(queue, &stream, &entry) {
                 Ok(job) => job,
-                Err(e) => {
+                Err(discarded) => {
                     // Not a job. Leaving it would make every reserve on this
                     // queue return it again forever, so it goes.
-                    tracing::error!(entry = entry.id, error = %e, "discarding an unreadable entry");
+                    tracing::error!(
+                        entry = entry.id,
+                        error = %discarded.exception,
+                        "discarding an unreadable entry"
+                    );
+                    crate::reporting::report(*discarded).await;
                     self.client.xack_delete(&stream, GROUP, &entry.id).await?;
                     return Ok(None);
                 }
@@ -430,18 +444,82 @@ impl RedisQueue {
     pub async fn failed_jobs(&self, queue: &str) -> Result<Vec<FailedJob>> {
         let raw = self.client.lrange_all(&self.keys.failed(queue)).await?;
 
-        Ok(raw
-            .iter()
-            .filter_map(|body| {
-                let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-                Some(FailedJob {
-                    job: serde_json::from_value(value.get("job")?.clone()).ok()?,
-                    error: value.get("error")?.as_str()?.to_string(),
-                    failed_at: serde_json::from_value(value.get("failed_at")?.clone()).ok()?,
-                })
-            })
-            .collect())
+        let mut failed = Vec::with_capacity(raw.len());
+        for body in &raw {
+            match read_failed_job(body) {
+                Ok(job) => failed.push(job),
+                // Left in the list, and left out of the answer — but said, so a
+                // listing that comes back short is not mistaken for complete.
+                Err(exception) => {
+                    tracing::warn!(queue, error = %exception, "skipping an unreadable failed job");
+                    crate::reporting::report(QueueOperationFailed::new(
+                        exception,
+                        Some("redis".to_string()),
+                        Some(queue.to_string()),
+                        "read_failed_job",
+                        None,
+                    ))
+                    .await;
+                }
+            }
+        }
+        Ok(failed)
     }
+}
+
+/// Read a reserved stream entry as a job, or say why it is being discarded.
+///
+/// Boxed because the failure is large and this is on every reserve's path.
+fn decode_entry(
+    queue: &str,
+    stream: &str,
+    entry: &rainier_drivers::StreamEntry,
+) -> std::result::Result<QueuedJob, Box<QueueMessageDiscarded>> {
+    serde_json::from_slice(&entry.body).map_err(|e| {
+        Box::new(
+            QueueMessageDiscarded::new(
+                Exception::from_std(&e),
+                "redis",
+                queue,
+                Some(entry.id.clone()),
+            )
+            .with_extra("stream", stream),
+        )
+    })
+}
+
+/// One record of the failed-job list.
+fn read_failed_job(body: &[u8]) -> std::result::Result<FailedJob, Exception> {
+    let unreadable = |why: &str| {
+        Exception::message(ErrorKind::Internal, format!("an unreadable failed job: {why}"))
+    };
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| Exception::from_std(&e))?;
+    let field = |name: &str| value.get(name).cloned().ok_or_else(|| unreadable(name));
+
+    Ok(FailedJob {
+        job: serde_json::from_value(field("job")?).map_err(|e| Exception::from_std(&e))?,
+        error: field("error")?.as_str().ok_or_else(|| unreadable("error"))?.to_string(),
+        failed_at: serde_json::from_value(field("failed_at")?)
+            .map_err(|e| Exception::from_std(&e))?,
+    })
+}
+
+/// The report for an eviction policy that can lose jobs, or `None` for
+/// `noeviction`.
+fn eviction_policy_failure(policy: &str) -> Option<ConfigurationFailed> {
+    (policy != "noeviction").then(|| {
+        ConfigurationFailed::new(
+            Exception::message(
+                ErrorKind::Internal,
+                format!(
+                    "Redis `maxmemory-policy` is `{policy}`: queued jobs can be evicted under \
+                     memory pressure. Set it to `noeviction`."
+                ),
+            ),
+            "maxmemory-policy",
+        )
+    })
 }
 
 /// A name for this worker: the host and the process, which is enough to tell
@@ -548,6 +626,75 @@ mod tests {
 
         assert!(err.message().contains("not reserved"), "{}", err.message());
         assert!(err.message().contains("j1"), "{}", err.message());
+    }
+
+    #[test]
+    fn an_unreadable_entry_becomes_a_discard_naming_the_queue_and_the_entry() {
+        let entry = rainier_drivers::StreamEntry {
+            id: "1700000000000-0".into(),
+            body: b"not json".to_vec(),
+        };
+        let discarded = *decode_entry("mail", "queues:mail", &entry).unwrap_err();
+
+        assert_eq!(discarded.connection, "redis");
+        assert_eq!(discarded.queue, "mail");
+        assert_eq!(discarded.message_id.as_deref(), Some("1700000000000-0"));
+        assert_eq!(discarded.meta.extra["stream"], "queues:mail");
+        assert!(!discarded.exception.message.is_empty());
+    }
+
+    #[test]
+    fn an_entry_with_no_body_is_discarded_rather_than_left_pending() {
+        // What the stream reader hands over for an entry written without a
+        // `body` field: an empty body, which is not a job.
+        let entry = rainier_drivers::StreamEntry { id: "1-0".into(), body: Vec::new() };
+        assert!(decode_entry("default", "s", &entry).is_err());
+    }
+
+    #[test]
+    fn a_readable_entry_is_a_job() {
+        let entry = rainier_drivers::StreamEntry {
+            id: "1-0".into(),
+            body: serde_json::to_vec(&job()).unwrap(),
+        };
+        assert_eq!(decode_entry("default", "s", &entry).unwrap().id, "j1");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_discard_reaches_the_process_wide_reporter() {
+        let capture = rainier_events::report::capture();
+        let entry =
+            rainier_drivers::StreamEntry { id: "redis-discard-test".into(), body: b"{".to_vec() };
+        crate::reporting::report(*decode_entry("default", "s", &entry).unwrap_err()).await;
+
+        let found = capture.reports().into_iter().any(|r| {
+            matches!(
+                &r.failure,
+                rainier_events::Failure::QueueMessageDiscarded(d)
+                    if d.message_id.as_deref() == Some("redis-discard-test")
+            )
+        });
+        assert!(found);
+    }
+
+    #[test]
+    fn an_unreadable_failed_job_says_why_instead_of_vanishing() {
+        assert!(read_failed_job(b"nope").is_err());
+        let missing = read_failed_job(br#"{"error": "x"}"#).unwrap_err();
+        assert_eq!(missing.message, "an unreadable failed job: job");
+
+        let whole = json!({ "job": job(), "error": "boom", "failed_at": Utc::now() });
+        let read = read_failed_job(&serde_json::to_vec(&whole).unwrap()).unwrap();
+        assert_eq!(read.error, "boom");
+    }
+
+    #[test]
+    fn only_noeviction_is_a_safe_policy() {
+        assert!(eviction_policy_failure("noeviction").is_none());
+        let failure = eviction_policy_failure("allkeys-lru").expect("reported");
+        assert_eq!(failure.setting, "maxmemory-policy");
+        assert!(failure.exception.message.contains("allkeys-lru"));
     }
 
     #[test]

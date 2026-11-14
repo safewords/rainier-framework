@@ -6,6 +6,7 @@ use std::time::Duration;
 use rainier_auth::{ConfirmPassword, Hasher, StatefulGuard};
 use rainier_cache::{Cache, CacheRateLimiter};
 use rainier_crypt::UrlSigner;
+use rainier_events::report::{report, AccountFailed};
 use rainier_events::Dispatcher;
 use rainier_http::{IntoResponse, Redirect, Request, Response, StatusCode};
 use rainier_middleware::{IntoMiddlewareStack, MiddlewareStack, RateLimitStore};
@@ -501,6 +502,7 @@ impl<U: AccountUser> Accounts<U> {
             // does not undo it. The resend endpoint is the recovery.
             if let Err(e) = self.send_verification(&user).await {
                 tracing::error!(error = %e, "could not send the verification link at registration");
+                report(AccountFailed::new(e, "registration", "send_verification_link")).await;
             }
         }
 
@@ -568,6 +570,7 @@ impl<U: AccountUser> Accounts<U> {
                 let upgraded = self.hasher.hash(&password)?;
                 if let Err(e) = self.users.set_password_hash(&user, &upgraded).await {
                     tracing::warn!(error = %e, "could not upgrade a password hash at login");
+                    report(AccountFailed::new(e, "login", "rehash_password")).await;
                 }
             }
         }
@@ -623,6 +626,7 @@ impl<U: AccountUser> Accounts<U> {
         // account than for one without.
         if let Err(e) = self.send_reset_link(&email).await {
             tracing::error!(error = %e, "could not send a password reset link");
+            report(AccountFailed::new(e, "password_reset", "send_reset_link")).await;
         }
 
         Ok(self.respond(request, StatusCode::OK, json!({ "status": RESET_LINK_SENT }), "back"))
@@ -657,6 +661,7 @@ impl<U: AccountUser> Accounts<U> {
                 runtime.spawn(async move {
                     if let Err(e) = sender.send_reset_link(&user, &url).await {
                         tracing::error!(error = %e, "could not send a password reset link");
+                        report(AccountFailed::new(e, "password_reset", "send_reset_link")).await;
                     }
                 });
                 return Ok(());

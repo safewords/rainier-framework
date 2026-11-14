@@ -6,6 +6,8 @@
 //! [`Json<T>`], a [`Redirect`], a `StatusCode`, a `Result`, or a tuple pairing
 //! a status with any of those.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use rainier_support::{Error, Extensions};
@@ -419,11 +421,26 @@ pub struct RenderedError {
     pub backtrace: Option<String>,
 }
 
+/// The framework [`Error`] a response was rendered from, kept whole.
+///
+/// [`RenderedError`] is a snapshot for *rendering* — status, message, details
+/// — and deliberately loses the rest. Exception reporting wants the rest: the
+/// [`ErrorKind`](rainier_support::ErrorKind) itself, the cause chain, and a
+/// source a listener can downcast. So [`IntoResponse`] for [`Error`] attaches
+/// both, and the HTTP kernel reports from this one when it is present.
+///
+/// Shared behind an `Arc` because [`Error`] is not `Clone` and response
+/// extensions are read by reference. Like [`RenderedError`] it lives in the
+/// response's extensions and never reaches the client.
+#[derive(Debug, Clone)]
+pub struct OriginalError(pub Arc<Error>);
+
 /// Renders a framework error as JSON.
 ///
 /// The default, and what an API client should get. The HTTP kernel wraps it
 /// with content negotiation — an HTML error page for a browser — using the
-/// [`RenderedError`] this attaches.
+/// [`RenderedError`] this attaches, and reports it using the
+/// [`OriginalError`] it attaches alongside.
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status =
@@ -448,6 +465,7 @@ impl IntoResponse for Error {
             // that holds the `Error` itself.
             backtrace: self.backtrace().map(|b| b.to_string()),
         });
+        response.extensions_mut().insert(OriginalError(Arc::new(self)));
         response
     }
 }
@@ -483,6 +501,21 @@ mod tests {
 
         assert_eq!(Response::no_content().status(), StatusCode::NO_CONTENT);
         assert_eq!(Response::created("/posts/1").header("location"), Some("/posts/1"));
+    }
+
+    #[test]
+    fn an_error_response_carries_the_original_error_alongside_the_snapshot() {
+        let error = Error::internal("query failed")
+            .with_source(std::io::Error::other("connection refused"));
+        let response = error.into_response();
+
+        let rendered = response.extensions().get::<RenderedError>().expect("snapshot");
+        assert_eq!(rendered.message, "query failed");
+
+        let OriginalError(original) = response.extensions().get::<OriginalError>().expect("whole");
+        assert_eq!(original.kind(), rainier_support::ErrorKind::Internal);
+        assert_eq!(original.message(), "query failed");
+        assert_eq!(original.source_error().unwrap().to_string(), "connection refused");
     }
 
     #[test]

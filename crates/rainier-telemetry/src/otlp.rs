@@ -13,6 +13,7 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 
+use rainier_events::report::{report_detached, Exception, TelemetryFailed};
 use rainier_support::{Error, Result};
 
 /// Where spans go, and what this service calls itself.
@@ -155,10 +156,14 @@ impl Otlp {
 /// Call it before the process exits. A batch exporter holds spans for a few
 /// seconds by design, and without this the last few seconds of a shutdown —
 /// which is often the part you wanted to see — never leave.
+///
+/// A flush that fails is logged and reported as a
+/// [`TelemetryFailed`] with the operation `"otlp_shutdown"`.
 pub fn shutdown() {
     if let Some(provider) = PROVIDER.get() {
         if let Err(e) = provider.shutdown() {
             tracing::warn!(error = %e, "the OTLP exporter did not flush cleanly");
+            report_detached(TelemetryFailed::new(Exception::from_std(&e), "otlp_shutdown"));
         }
     }
 }
@@ -191,5 +196,35 @@ mod tests {
 
         assert_eq!(otlp.service_version.as_deref(), Some("1.2.3"));
         assert_eq!(otlp.environment.as_deref(), Some("production"));
+    }
+
+    #[tokio::test]
+    async fn a_flush_that_fails_is_reported() {
+        use rainier_events::report::{capture, Failure, FailureKind};
+
+        let capture = capture();
+        // No exporter is needed to fail a flush: a provider shut down once
+        // refuses the second.
+        let provider = PROVIDER.get_or_init(|| SdkTracerProvider::builder().build());
+        let _ = provider.shutdown();
+        shutdown();
+
+        let mut found = Vec::new();
+        for _ in 0..100 {
+            found = capture
+                .of_kind(FailureKind::Telemetry)
+                .into_iter()
+                .filter_map(|f| match f {
+                    Failure::Telemetry(t) if t.operation == "otlp_shutdown" => Some(t),
+                    _ => None,
+                })
+                .collect();
+            if !found.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].exception.message.is_empty());
     }
 }

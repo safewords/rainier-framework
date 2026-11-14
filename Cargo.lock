@@ -3786,6 +3786,7 @@ dependencies = [
  "rainier-cache",
  "rainier-crypt",
  "rainier-database",
+ "rainier-events",
  "rainier-http",
  "rainier-middleware",
  "rainier-orm",
@@ -3830,6 +3831,7 @@ dependencies = [
  "futures-util",
  "hmac 0.13.0",
  "rainier-drivers",
+ "rainier-events",
  "rainier-support",
  "rainier-websocket",
  "rand 0.10.3",
@@ -3847,6 +3849,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "rainier-drivers",
+ "rainier-events",
  "rainier-middleware",
  "rainier-support",
  "serde",
@@ -3903,7 +3906,9 @@ name = "rainier-console"
 version = "2.0.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "rainier-container",
+ "rainier-events",
  "rainier-support",
  "rpassword",
  "tokio",
@@ -3914,6 +3919,7 @@ dependencies = [
 name = "rainier-container"
 version = "2.0.0"
 dependencies = [
+ "rainier-events",
  "rainier-support",
  "tokio",
  "tracing",
@@ -3968,6 +3974,7 @@ dependencies = [
 name = "rainier-debug"
 version = "2.0.0"
 dependencies = [
+ "rainier-events",
  "rainier-framework",
  "rainier-http",
  "rainier-server",
@@ -4007,7 +4014,10 @@ dependencies = [
 name = "rainier-events"
 version = "2.0.0"
 dependencies = [
+ "anyhow",
  "rainier-support",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -4033,6 +4043,7 @@ dependencies = [
  "chrono",
  "hmac 0.13.0",
  "rainier-drivers",
+ "rainier-events",
  "rainier-support",
  "serde",
  "serde_json",
@@ -4067,6 +4078,7 @@ dependencies = [
  "rainier-filesystem",
  "rainier-http",
  "rainier-http-client",
+ "rainier-lookout",
  "rainier-mail",
  "rainier-metrics",
  "rainier-mfa",
@@ -4124,6 +4136,31 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rainier-lookout"
+version = "2.0.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "rainier-cache",
+ "rainier-console",
+ "rainier-container",
+ "rainier-database",
+ "rainier-drivers",
+ "rainier-events",
+ "rainier-http",
+ "rainier-middleware",
+ "rainier-orm",
+ "rainier-routing",
+ "rainier-server",
+ "rainier-support",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4187,6 +4224,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "rainier-container",
+ "rainier-events",
  "rainier-http",
  "rainier-support",
  "serde_json",
@@ -4198,6 +4236,7 @@ dependencies = [
 name = "rainier-notify"
 version = "2.0.0"
 dependencies = [
+ "rainier-events",
  "rainier-http-client",
  "rainier-mail",
  "rainier-support",
@@ -4216,6 +4255,7 @@ dependencies = [
  "chrono",
  "rainier-auth",
  "rainier-crypt",
+ "rainier-events",
  "rainier-http",
  "rainier-session",
  "rainier-support",
@@ -4234,8 +4274,10 @@ name = "rainier-openapi"
 version = "2.0.0"
 dependencies = [
  "rainier-container",
+ "rainier-events",
  "rainier-http",
  "rainier-routing",
+ "rainier-support",
  "rainier-validation",
  "serde_json",
  "tokio",
@@ -4329,6 +4371,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rainier-container",
+ "rainier-events",
  "rainier-http",
  "rainier-middleware",
  "rainier-routing",
@@ -4350,6 +4393,7 @@ dependencies = [
  "rainier-cache",
  "rainier-crypt",
  "rainier-database",
+ "rainier-events",
  "rainier-http",
  "rainier-middleware",
  "rainier-orm",
@@ -4403,6 +4447,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "rainier-events",
  "rainier-http",
  "rainier-middleware",
  "rainier-support",

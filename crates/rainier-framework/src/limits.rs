@@ -21,8 +21,11 @@
 use std::sync::Arc;
 
 use rainier_cache::CacheRateLimiter;
+use rainier_events::report::{ConfigurationFailed, FailureEvent as _};
+use rainier_events::Exception;
 use rainier_middleware::{MiddlewareStack, RateLimitStore, ThrottleRequests};
 use rainier_routing::CompiledRouter;
+use rainier_support::ErrorKind;
 
 /// The store every shared limiter in this application counts in.
 ///
@@ -91,17 +94,20 @@ pub fn shared(throttle: ThrottleRequests) -> MiddlewareStack {
 /// lock, a per-process limit is a *weaker* control rather than an absent one,
 /// and plenty of applications limit for politeness rather than for safety. The
 /// deployment gets told; it does not get stopped.
+///
+/// Returns the warning as a [`ConfigurationFailed`] (setting
+/// `rate_limits`) for the caller to report; boot does.
 pub fn warn_if_rate_limits_are_not_shared(
     app: &rainier_container::Application,
     router: &CompiledRouter,
-) {
+) -> Option<ConfigurationFailed> {
     let Ok(limits) = app.resolve::<RateLimits>() else {
         // Nothing bound one, so nothing is claiming to be shared.
-        return;
+        return None;
     };
 
     if limits.is_shared() {
-        return;
+        return None;
     }
 
     let throttled: Vec<String> = router
@@ -112,7 +118,7 @@ pub fn warn_if_rate_limits_are_not_shared(
         .collect();
 
     if throttled.is_empty() {
-        return;
+        return None;
     }
 
     tracing::warn!(
@@ -123,6 +129,21 @@ pub fn warn_if_rate_limits_are_not_shared(
          store (redis, redis-cluster, memcached, dynamodb) if any of these protects credentials.",
         throttled.len()
     );
+    Some(
+        ConfigurationFailed::new(
+            Exception::message(
+                ErrorKind::Internal,
+                format!(
+                    "{} route(s) are rate-limited against a per-process counter, so the \
+                     effective limit is multiplied by the number of replicas",
+                    throttled.len()
+                ),
+            ),
+            "rate_limits",
+        )
+        .with_extra("store", limits.name())
+        .with_extra("routes", throttled),
+    )
 }
 
 #[cfg(test)]
@@ -179,15 +200,16 @@ mod tests {
         router.get("/", || async { "home" });
         let compiled = router.compile(app.container()).unwrap();
 
-        warn_if_rate_limits_are_not_shared(&app, &compiled);
+        assert!(warn_if_rate_limits_are_not_shared(&app, &compiled).is_none());
 
-        // With one, it has something to say — asserted by it not panicking and
-        // by the route table containing what the check reads.
+        // With one, it has something to say.
         let mut router = Router::new();
         router.post("/login", || async { "in" }).middleware(ThrottleRequests::per_minute(5));
         let compiled = router.compile(app.container()).unwrap();
 
         assert!(compiled.describe()[0].middleware.iter().any(|s| s.contains("Throttle")));
-        warn_if_rate_limits_are_not_shared(&app, &compiled);
+        let warning = warn_if_rate_limits_are_not_shared(&app, &compiled).expect("a warning");
+        assert_eq!(warning.setting, "rate_limits");
+        assert_eq!(warning.meta.extra["routes"][0], "POST /login");
     }
 }

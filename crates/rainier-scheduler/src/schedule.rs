@@ -192,7 +192,8 @@ impl Schedule {
                 }
                 Outcome::Failed(e) => {
                     tracing::error!(task = %name, error = %e.message(), "scheduled task failed");
-                    summary.failed.push((name, e.message().to_string()));
+                    summary.failed.push((name.clone(), e.message().to_string()));
+                    summary.errors.push((name, Arc::new(e)));
                 }
                 Outcome::Skipped(why) => {
                     tracing::debug!(task = %name, %why, "scheduled task skipped");
@@ -218,6 +219,10 @@ pub struct RunSummary {
     pub ran: Vec<String>,
     /// Tasks that ran and failed, with the message.
     pub failed: Vec<(String, String)>,
+    /// The same failures as [`failed`](Self::failed), in the same order,
+    /// with the original error rather than its message — its kind, its
+    /// details and its cause chain, for whoever reports it.
+    pub errors: Vec<(String, Arc<rainier_support::Error>)>,
     /// Tasks that were due but did not run, and why.
     pub skipped: Vec<(String, Skipped)>,
     /// How long each due task took, in the order they ran — including the

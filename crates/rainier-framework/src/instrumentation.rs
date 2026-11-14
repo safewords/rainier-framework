@@ -41,7 +41,7 @@ use rainier_metrics::{labels, Metrics};
 use rainier_middleware::Middleware;
 use rainier_queue::{JobTiming, QueueObserver};
 use rainier_scheduler::RunSummary;
-use rainier_telemetry::{LogFormat, Otlp};
+use rainier_telemetry::Otlp;
 
 use crate::keys;
 use crate::observability::TelemetrySettings;
@@ -85,11 +85,24 @@ impl TelemetrySettings {
     /// boot failure, and a service that will not start is worse than one that
     /// is not traced.
     pub fn install(&self, environment: &str, filter: &str) -> bool {
-        use tracing_subscriber::prelude::*;
-        use tracing_subscriber::{fmt, EnvFilter, Layer};
+        self.install_with(environment, filter, Vec::new())
+    }
+
+    /// [`install`](Self::install), with `unfiltered` layers beside the log
+    /// lines and the exporter — see
+    /// [`subscriber`](TelemetrySettings::subscriber) for how `filter` applies
+    /// to each.
+    pub fn install_with(
+        &self,
+        environment: &str,
+        filter: &str,
+        unfiltered: Vec<crate::observability::SubscriberLayer>,
+    ) -> bool {
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        use tracing_subscriber::Layer as _;
 
         if !self.exports() {
-            return self.install_logging(environment, filter);
+            return self.install_logging_with(environment, filter, unfiltered);
         }
         if tracing::dispatcher::has_been_set() {
             return false;
@@ -101,23 +114,14 @@ impl TelemetrySettings {
             .sample_ratio(self.sample_ratio);
 
         let exporter = match otlp.layer() {
-            Ok(layer) => layer,
+            Ok(layer) => layer.boxed(),
             Err(error) => {
                 eprintln!("telemetry: spans will not be exported: {}", error.message());
-                return self.install_logging(environment, filter);
+                return self.install_logging_with(environment, filter, unfiltered);
             }
         };
 
-        let filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
-        let lines = match self.log_format.resolve(environment) {
-            LogFormat::Json => {
-                fmt::layer().json().flatten_event(true).with_current_span(true).boxed()
-            }
-            LogFormat::Compact => fmt::layer().compact().boxed(),
-            LogFormat::Pretty | LogFormat::Auto => fmt::layer().boxed(),
-        };
-
-        tracing_subscriber::registry().with(filter).with(lines).with(exporter).try_init().is_ok()
+        self.subscriber(environment, filter, Some(exporter), unfiltered).try_init().is_ok()
     }
 }
 
@@ -324,7 +328,19 @@ pub async fn serve_metrics(
     let listener = tokio::net::TcpListener::bind(address).await?;
     Ok(tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { continue };
+            let mut stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    // The endpoint keeps listening; the scrape that failed is
+                    // lost. Process-wide, as the task has no application.
+                    rainier_events::report::report(rainier_events::report::TelemetryFailed::new(
+                        rainier_events::Exception::from_std(&e),
+                        "metrics_accept",
+                    ))
+                    .await;
+                    continue;
+                }
+            };
             let metrics = Arc::clone(&metrics);
             tokio::spawn(async move {
                 let mut head = [0u8; 1024];

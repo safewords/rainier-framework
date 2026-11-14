@@ -580,6 +580,16 @@ impl Middleware for ThrottleRequests {
                     limiter = self.name.as_deref().unwrap_or("unnamed"),
                     "the rate limit store is unreachable; allowing the request"
                 );
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    use rainier_events::report::{report, MiddlewareFailed};
+                    use rainier_events::FailureEvent as _;
+                    report(
+                        MiddlewareFailed::new(e, "ThrottleRequests", "rate_limit_store")
+                            .with_extra("limiter", self.name.as_deref().unwrap_or("unnamed")),
+                    )
+                    .await;
+                }
                 return next.run(request).await;
             }
         };
@@ -948,13 +958,37 @@ mod tests {
             }
         }
 
+        let capture = rainier_events::report::capture();
         let response = Pipeline::new()
-            .through(ThrottleRequests::per_minute(1).stored_in(Arc::new(Broken)))
+            .through(
+                ThrottleRequests::per_minute(1)
+                    .stored_in(Arc::new(Broken))
+                    .named("unreachable-store-test"),
+            )
             .then(|_| async { Response::ok("through") })
             .run(Request::builder().header("authorization", "Bearer a").build())
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        // Failing open is still a failure the application hears about.
+        let ours: Vec<_> = capture
+            .reports()
+            .into_iter()
+            .filter_map(|reported| match reported.failure {
+                rainier_events::Failure::Middleware(failed)
+                    if failed.meta.extra.get("limiter")
+                        == Some(&serde_json::json!("unreachable-store-test")) =>
+                {
+                    Some(failed)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ours.len(), 1, "{ours:?}");
+        assert_eq!(ours[0].middleware, "ThrottleRequests");
+        assert_eq!(ours[0].operation, "rate_limit_store");
+        assert_eq!(ours[0].exception.message, "connection refused");
     }
 
     #[test]

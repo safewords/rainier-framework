@@ -70,6 +70,17 @@ facade!(
 );
 
 facade!(
+    /// The application's reporter —
+    /// `Report::instance().report_error(error)` for an
+    /// [`ApplicationFailed`](rainier_events::report::ApplicationFailed), or
+    /// `Report::instance().report(failure)` for any type in the catalogue.
+    ///
+    /// The one the kernel, the worker, the console and the scheduler report
+    /// through; see [`crate::reporting`].
+    Report => rainier_events::Reporter
+);
+
+facade!(
     /// The database handle.
     DB => rainier_database::Database
 );

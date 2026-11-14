@@ -614,6 +614,23 @@ events.listen(|e: Arc<JobFailed>| async move {
 });
 ```
 
+`JobReleased` and `JobFailed` carry the failure twice: `error`, the string the
+queue stores and the log prints, unchanged; and `exception`, the same failure
+as an [`Exception`](errors.md#reporting) — its kind, cause chain and backtrace,
+with `exception.panic` set when the job panicked rather than returned `Err`.
+
+Separately from these events, `queue:work` hands the worker the application's
+[reporter](errors.md#reporting), so every failed attempt — released or failed
+for good — is reported as a `JobAttemptFailed` naming the job, its id, its
+queue and connection, the attempt and whether it was the last
+(`final_attempt`). A panic is reported as a panic, with the stack when the
+panic hook recorded one. A worker built by hand without
+`Worker::with_reporter` reports through the process-wide reporter, which boot
+installs; `Worker::with_connection(name)` fills in the report's `connection`,
+as `queue:work` does for each pool. Failures outside a job's own run — a
+message the driver could not read, an ack or release that failed — are
+reported as `QueueMessageDiscarded` and `QueueOperationFailed`.
+
 ## Testing
 
 ```rust

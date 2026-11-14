@@ -34,14 +34,46 @@
 //! should keep the work on one task, or install its application globally and
 //! not run in parallel with another that does.
 //!
+//! # It records what was reported
+//!
+//! A booted application publishes every failure through its [`Reporter`] —
+//! see [`crate::reporting`]. The harness listens on that reporter's
+//! dispatcher from the moment it is built, so a test can assert a failure was
+//! reported without wiring anything — as the catch-all, or as its own type:
+//!
+//! ```ignore
+//! use rainier_framework::report::HttpRequestFailed;
+//!
+//! app.get("/explodes").await.assert_status(StatusCode::INTERNAL_SERVER_ERROR);
+//! assert_eq!(app.reported()[0].exception().message, "disk full");
+//! assert_eq!(app.reported_of::<HttpRequestFailed>()[0].path, "/explodes");
+//! ```
+//!
+//! What it sees is what reached **this application's** reporter. A failure
+//! reported through the process-wide reporter — by a component with no handle
+//! to the application, or a failing event listener — reaches it only when
+//! this application was installed process-wide, and a test application
+//! booted [`without_facades`](crate::Rainier::without_facades) is not. For
+//! those, take a [`rainier_events::report::capture`] in the test.
+//!
+//! Reports made **during** boot happened before the harness existed; listen
+//! with [`Rainier::with_events`](crate::Rainier::with_events) for them.
+//!
+//! Swapping a [`Dispatcher::fake()`](rainier_events::Dispatcher::fake) into
+//! the container after boot does **not** capture reports: the reporter was
+//! handed the real dispatcher at boot. A [`Reporter`] built over a fake, in a
+//! unit test, records them as usual.
+//!
 //! [`FacadeScope`]: rainier_container::FacadeScope
 
-use std::sync::Arc;
+use std::any::Any;
+use std::sync::{Arc, Mutex};
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use rainier_container::{scope_facade_application, Application, FacadeScope};
+use rainier_events::{ExceptionReported, Failure, FailureEvent, Reporter};
 use rainier_http::{Method, Request, Response, StatusCode};
 use rainier_server::Kernel;
 use rainier_support::Result;
@@ -57,6 +89,57 @@ pub struct TestApp {
     _scope: FacadeScope,
     /// Headers added to every request — a bearer token, usually.
     defaults: Vec<(String, String)>,
+    /// Every report the application's reporter dispatched since the harness
+    /// was built.
+    reported: Arc<Mutex<Vec<ExceptionReported>>>,
+}
+
+/// The catalogue variant's struct, as `F` — the original error included.
+fn downcast<F: FailureEvent>(failure: Failure) -> Option<F> {
+    fn cast<T: Any, F: Any>(value: T) -> Option<F> {
+        (Box::new(value) as Box<dyn Any>).downcast::<F>().ok().map(|boxed| *boxed)
+    }
+
+    macro_rules! variants {
+        ($($variant:ident),* $(,)?) => {
+            match failure {
+                $( Failure::$variant(failure) => cast(failure), )*
+                // A kind added to the catalogue after this list: through its
+                // JSON, which keeps everything but the original error.
+                other => serde_json::to_value(&other).ok().and_then(|v| serde_json::from_value(v).ok()),
+            }
+        };
+    }
+
+    variants!(
+        HttpRequest,
+        WebSocket,
+        Server,
+        Middleware,
+        Auth,
+        Session,
+        OAuth,
+        Account,
+        JobAttempt,
+        QueueMessageDiscarded,
+        QueueOperation,
+        Command,
+        ScheduledTask,
+        Listener,
+        BackgroundTask,
+        Broadcast,
+        Notification,
+        Mail,
+        Publish,
+        Webhook,
+        Cache,
+        Database,
+        Integration,
+        Telemetry,
+        Filesystem,
+        Configuration,
+        Application,
+    )
 }
 
 impl TestApp {
@@ -69,7 +152,54 @@ impl TestApp {
         let kernel = app.resolve::<Kernel>()?;
         let scope = scope_facade_application(Arc::clone(&app));
 
-        Ok(Self { app, kernel, _scope: scope, defaults: Vec::new() })
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        if let Ok(reporter) = app.resolve::<Reporter>() {
+            let sink = Arc::clone(&reported);
+            reporter.events().listen(move |report: Arc<ExceptionReported>| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock().expect("report log poisoned").push((*report).clone());
+                    Ok(())
+                }
+            });
+        }
+
+        Ok(Self { app, kernel, _scope: scope, defaults: Vec::new(), reported })
+    }
+
+    /// Every failure the application reported since this harness was built,
+    /// in order, as the catch-all [`ExceptionReported`] — the HTTP kernel's,
+    /// and anything the test triggered through [`crate::report()`], the
+    /// console, the scheduler or the worker.
+    pub fn reported(&self) -> Vec<ExceptionReported> {
+        self.reported.lock().expect("report log poisoned").clone()
+    }
+
+    /// The reported failures of one type, in order —
+    /// `app.reported_of::<HttpRequestFailed>()` — with their own fields to
+    /// assert on.
+    pub fn reported_of<F: FailureEvent>(&self) -> Vec<F> {
+        self.reported()
+            .into_iter()
+            .filter(|reported| reported.kind() == F::KIND)
+            .filter_map(|reported| downcast::<F>(reported.failure))
+            .collect()
+    }
+
+    /// Panic if anything was reported.
+    ///
+    /// # Panics
+    ///
+    /// If a failure was reported, naming each one.
+    pub fn assert_nothing_reported(&self) -> &Self {
+        let reported = self.reported();
+        assert!(
+            reported.is_empty(),
+            "expected nothing to be reported, but {} failure(s) were: {:?}",
+            reported.len(),
+            reported.iter().map(|r| format!("{}: {}", r.kind(), r.exception())).collect::<Vec<_>>()
+        );
+        self
     }
 
     /// The application, for resolving a service to assert on.

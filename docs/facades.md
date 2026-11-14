@@ -23,6 +23,7 @@ indirection is visible at the call site rather than hidden in a base class.
 |---|---|
 | `Config` | `rainier_config::Config` |
 | `Event` | `rainier_events::Dispatcher` |
+| `Report` | `rainier_events::Reporter` — `report_error(e)`, `report(failure)`; see [reporting](errors.md#reporting) |
 | `DB` | `rainier_database::Database` |
 | `Queue` | `rainier_queue::QueueManager` |
 | `Mail` | `rainier_mail::Mailer` |

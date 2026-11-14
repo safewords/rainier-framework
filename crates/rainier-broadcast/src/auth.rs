@@ -22,7 +22,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use rainier_support::{BoxFuture, Error, Result};
+use rainier_events::report::{report, BroadcastFailed, Exception};
+use rainier_support::{BoxFuture, Error, ErrorKind, Result};
 
 use crate::channel::Channel;
 
@@ -171,6 +172,9 @@ impl<U: Send + Sync + 'static> ChannelRegistry<U> {
     ///
     /// A public channel is allowed without consulting the table — there is
     /// nothing to authorise, and a Pusher-protocol server never asks.
+    ///
+    /// A private channel no declared pattern matches is denied, and reported
+    /// as a [`BroadcastFailed`] with the operation `"authorize"`.
     pub async fn authorize(&self, user: &U, channel: &Channel) -> Result<ChannelAccess> {
         if !channel.needs_authorisation() {
             return Ok(ChannelAccess::Allowed);
@@ -183,6 +187,15 @@ impl<U: Send + Sync + 'static> ChannelRegistry<U> {
                 channel = channel.name(),
                 "no channel authoriser matched; denying the subscription"
             );
+            report(BroadcastFailed::new(
+                Exception::message(
+                    ErrorKind::Unauthorized,
+                    format!("no channel authoriser matches `{}`", channel.name()),
+                ),
+                Some(channel.name().to_string()),
+                "authorize",
+            ))
+            .await;
             return Ok(ChannelAccess::Denied);
         };
 
@@ -295,6 +308,32 @@ mod tests {
             registry.authorize(&User { id: 7 }, &Channel::private("secrets.1")).await.unwrap();
 
         assert_eq!(access, ChannelAccess::Denied);
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_channel_is_reported_on_the_bus() {
+        use rainier_events::report::{capture, Failure, FailureKind};
+
+        let capture = capture();
+        let registry = registry();
+        let channel = "broadcast-test-undeclared.1";
+        registry.authorize(&User { id: 7 }, &Channel::private(channel)).await.unwrap();
+
+        let reported: Vec<_> = capture
+            .of_kind(FailureKind::Broadcast)
+            .into_iter()
+            .filter_map(|f| match f {
+                Failure::Broadcast(b)
+                    if b.channel.as_deref().is_some_and(|c| c.contains(channel)) =>
+                {
+                    Some(b)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].operation, "authorize");
+        assert_eq!(reported[0].exception.status, 403);
     }
 
     #[tokio::test]

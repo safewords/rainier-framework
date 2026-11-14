@@ -531,6 +531,79 @@ async fn by_default_delivery_is_off_the_request_so_its_latency_cannot_be_timed()
     assert_eq!(slow.resets.lock().unwrap().len(), 1);
 }
 
+/// A sender whose provider is down.
+struct BrokenOutbox(&'static str);
+
+#[async_trait::async_trait]
+impl SendsPasswordResetLinks<User> for BrokenOutbox {
+    async fn send_reset_link(&self, _: &User, _: &str) -> Result<()> {
+        Err(Error::internal(self.0))
+    }
+}
+
+/// The `AccountFailed` reports carrying `marker` as their message, waiting a
+/// little for one sent from a background task.
+async fn account_failures(
+    capture: &rainier_events::report::Capture,
+    marker: &str,
+) -> Vec<rainier_events::report::AccountFailed> {
+    use rainier_events::report::{Failure, FailureKind};
+    for _ in 0..50 {
+        let found: Vec<_> = capture
+            .of_kind(FailureKind::Account)
+            .into_iter()
+            .filter_map(|f| match f {
+                Failure::Account(a) if a.exception.message == marker => Some(a),
+                _ => None,
+            })
+            .collect();
+        if !found.is_empty() {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Vec::new()
+}
+
+#[tokio::test]
+async fn a_reset_link_that_cannot_be_sent_is_reported_but_answered_the_same() {
+    let capture = rainier_events::report::capture();
+    let marker = "accounts-test: reset provider down (inline)";
+    let app = app_with(Features::default(), move |accounts| {
+        accounts.sends_reset_links_with(Arc::new(BrokenOutbox(marker)) as _)
+    });
+    app.seed("ada@example.com", "correct horse");
+
+    let answer = app.post("/forgot-password", json!({ "email": "ada@example.com" })).await;
+    assert_eq!(answer.status, StatusCode::OK);
+    assert_eq!(answer.body["status"], RESET_LINK_SENT);
+
+    let failures = account_failures(&capture, marker).await;
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].flow, "password_reset");
+    assert_eq!(failures[0].operation, "send_reset_link");
+}
+
+#[tokio::test]
+async fn a_reset_link_that_cannot_be_sent_in_the_background_is_reported() {
+    let capture = rainier_events::report::capture();
+    let marker = "accounts-test: reset provider down (background)";
+    let app = app_with(Features::default(), move |accounts| {
+        accounts
+            .sends_reset_links_with(Arc::new(BrokenOutbox(marker)) as _)
+            .deliver_links_inline(false)
+    });
+    app.seed("ada@example.com", "correct horse");
+
+    let answer = app.post("/forgot-password", json!({ "email": "ada@example.com" })).await;
+    assert_eq!(answer.status, StatusCode::OK);
+
+    let failures = account_failures(&capture, marker).await;
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].flow, "password_reset");
+    assert_eq!(failures[0].operation, "send_reset_link");
+}
+
 /// The token from the last reset link sent.
 fn last_token(app: &App) -> String {
     let url = app.outbox.resets.lock().unwrap().last().unwrap().1.clone();

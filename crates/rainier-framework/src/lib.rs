@@ -128,6 +128,8 @@ pub mod jwks;
 pub mod kafka;
 pub mod keys;
 pub mod limits;
+#[cfg(feature = "lookout")]
+pub mod lookout;
 pub mod mail;
 pub mod mailers;
 pub mod model_cache;
@@ -137,6 +139,7 @@ pub mod public;
 pub mod queued_listeners;
 #[cfg(feature = "kafka")]
 pub mod relay;
+pub mod reporting;
 pub mod scheduling;
 pub mod session_delivery;
 pub mod signed;
@@ -153,6 +156,13 @@ pub use facades::Views;
 pub use health::{Health, Report as HealthReport};
 pub use limits::RateLimits;
 pub use queued_listeners::{DispatcherExt, FromEvent};
+/// The failure catalogue — one event per kind of failure — and the
+/// process-wide reporter. See [`reporting`].
+pub use rainier_events::report;
+pub use rainier_events::{
+    Exception, ExceptionReported, Failure, FailureEvent, FailureKind, ReportMeta, Reporter,
+};
+pub use reporting::{report, report_failure};
 pub use scheduling::{
     CommandTask, JobTask, ScheduleExt, ScheduleListCommand, ScheduleRunCommand, ScheduleWorkCommand,
 };
@@ -217,8 +227,8 @@ pub use rainier_database::bind_executor;
 pub mod prelude {
     pub use crate::bootstrap::Rainier;
     pub use crate::facades::{
-        Broadcast, Cache, Config, Crypt, Event, Hash, Mail, Middleware, Notify, Queue, Session,
-        Storage, Url, View, Views, DB,
+        Broadcast, Cache, Config, Crypt, Event, Hash, Mail, Middleware, Notify, Queue, Report,
+        Session, Storage, Url, View, Views, DB,
     };
 
     pub use rainier_container::{Application, Container, Facade, ServiceProvider};
@@ -264,7 +274,9 @@ pub mod prelude {
         AuthManager, Authenticatable, AuthenticatedUser, Credentials, Gate, GuardExt as _,
     };
     pub use rainier_broadcast::{Broadcastable, Broadcasting, Channel as BroadcastChannelName};
-    pub use rainier_events::Dispatcher;
+    pub use rainier_events::{
+        Dispatcher, ExceptionReported, FailureEvent, FailureKind, ReportMeta, Reporter,
+    };
     pub use rainier_mail::{Content, Envelope, MailDriver, MailEncryption, Mailable};
     pub use rainier_metrics::{Metrics, RecordMetrics};
     pub use rainier_notify::{Channels, Notifiable, Notification, Notifier};

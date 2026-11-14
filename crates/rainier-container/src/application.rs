@@ -156,6 +156,16 @@ impl Application {
     pub fn booting(&self, hook: impl Fn(&Application) + Send + Sync + 'static) {
         if self.is_booted() {
             tracing::warn!("`booting` hook registered after the application booted; ignoring");
+            #[cfg(not(target_arch = "wasm32"))]
+            rainier_events::report::report_detached(
+                rainier_events::report::ConfigurationFailed::new(
+                    rainier_events::Exception::message(
+                        rainier_support::ErrorKind::Internal,
+                        "a `booting` hook was registered after the application booted and was ignored",
+                    ),
+                    "booting_hook",
+                ),
+            );
             return;
         }
         self.booting_hooks.lock().expect("hooks lock poisoned").push(Box::new(hook));
@@ -395,6 +405,29 @@ mod tests {
 
         app.terminate();
         assert_eq!(*seen.lock().unwrap(), vec!["booting", "booted", "terminating"]);
+    }
+
+    #[tokio::test]
+    async fn a_booting_hook_added_late_is_reported() {
+        let capture = rainier_events::report::capture();
+        let app = Application::new(".");
+        app.boot().await.unwrap();
+        app.booting(|_| {});
+
+        let mut found = false;
+        for _ in 0..100 {
+            found = capture.reports().iter().any(|reported| {
+                matches!(
+                    &reported.failure,
+                    rainier_events::Failure::Configuration(failed) if failed.setting == "booting_hook"
+                )
+            });
+            if found {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(found, "{:?}", capture.reports());
     }
 
     #[tokio::test]

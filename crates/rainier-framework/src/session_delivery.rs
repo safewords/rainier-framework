@@ -69,6 +69,11 @@ pub fn key_of(request: &Request, session_key: &str) -> Option<String> {
     let key = SessionChannels::mint();
     if let Err(e) = session.put(session_key, &key) {
         tracing::warn!(error = %e.message(), "could not store a session delivery key");
+        // Not `async`, so without waiting, through the process-wide reporter.
+        rainier_events::report::report_detached(rainier_events::report::SessionFailed::new(
+            e,
+            "put_delivery_key",
+        ));
         return None;
     }
 

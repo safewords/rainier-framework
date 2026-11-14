@@ -374,6 +374,21 @@ impl ExceptionRenderer for DebugExceptionRenderer {
                      page was suppressed AND 5xx messages were hidden. Set APP_DEBUG=false, or \
                      correct APP_ENV."
                 );
+                {
+                    use rainier_events::report::{report_detached, ConfigurationFailed};
+                    use rainier_events::{Exception, FailureEvent as _};
+                    report_detached(
+                        ConfigurationFailed::new(
+                            Exception::message(
+                                rainier_support::ErrorKind::Internal,
+                                "APP_DEBUG is true but the environment names production; the \
+                                 debug error page was suppressed",
+                            ),
+                            "APP_DEBUG",
+                        )
+                        .with_extra("path", request.path()),
+                    );
+                }
             }
             return self.fallback.render(request, error, false);
         }
@@ -468,6 +483,37 @@ mod tests {
         assert!(!body.contains("rainier-debug"), "no debug page");
         // The plain renderer hides a 5xx message when debug is off.
         assert!(body.contains("Server Error"));
+    }
+
+    #[tokio::test]
+    async fn debug_on_in_production_is_reported_as_a_configuration_failure() {
+        let capture = rainier_events::report::capture();
+        let renderer = DebugExceptionRenderer::new().with_environment("production");
+        let request = Request::builder().method(Method::GET).uri("/debug-report-test").build();
+        renderer.render(&request, &error(), true);
+
+        let mut ours = Vec::new();
+        for _ in 0..100 {
+            ours = capture
+                .reports()
+                .into_iter()
+                .filter_map(|reported| match reported.failure {
+                    rainier_events::Failure::Configuration(failed)
+                        if failed.meta.extra.get("path")
+                            == Some(&serde_json::json!("/debug-report-test")) =>
+                    {
+                        Some(failed)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !ours.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(ours.len(), 1, "{ours:?}");
+        assert_eq!(ours[0].setting, "APP_DEBUG");
     }
 
     #[tokio::test]

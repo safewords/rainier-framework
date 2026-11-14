@@ -624,7 +624,9 @@ impl Split {
     ///
     /// Once rather than per query: a console command or a worker that never
     /// enters a scope would otherwise write this line for every row it reads,
-    /// and a warning that repeats is a warning that gets filtered.
+    /// and a warning that repeats is a warning that gets filtered. Reported,
+    /// once, as a `DatabaseFailed` with the operation
+    /// `"read_outside_sticky_scope"`.
     fn warn_about_the_missing_scope(&self) {
         self.unscoped.call_once(|| {
             tracing::warn!(
@@ -635,6 +637,15 @@ impl Split {
                  far. Wrap the unit of work in `rainier_database::with_sticky_scope`, or \
                  drop `sticky` if these reads tolerate replication lag"
             );
+            rainier_events::report::report_detached(rainier_events::report::DatabaseFailed::new(
+                rainier_events::report::Exception::message(
+                    rainier_support::ErrorKind::Internal,
+                    "a read on a `sticky` connection reached it outside a sticky scope and was \
+                     served by the write endpoint",
+                ),
+                None::<String>,
+                "read_outside_sticky_scope",
+            ));
         });
     }
 }
@@ -1022,6 +1033,37 @@ mod tests {
 
         assert_eq!(writers[0].statement_count(), 1);
         assert_eq!(readers[0].statement_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_sticky_read_outside_a_scope_is_reported_once() {
+        use rainier_events::report::{capture, Failure, FailureKind};
+
+        let capture = capture();
+        let (writes, _writers) = endpoints(1);
+        let (reads, _readers) = endpoints(1);
+        let db = Database::with_endpoints(writes, reads, true).expect("built");
+
+        let _: Vec<Post> = db.fetch_all(select()).await.unwrap();
+
+        let mut found = 0;
+        for _ in 0..100 {
+            // Other tests' connections report the same thing in parallel, so
+            // this proves arrival and shape, not a count.
+            found = capture
+                .of_kind(FailureKind::Database)
+                .into_iter()
+                .filter(|f| {
+                    matches!(f, Failure::Database(d)
+                        if d.operation == "read_outside_sticky_scope" && d.connection.is_none())
+                })
+                .count();
+            if found > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(found >= 1, "the unscoped sticky read was not reported");
     }
 
     #[tokio::test]

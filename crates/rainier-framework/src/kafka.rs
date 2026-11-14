@@ -139,10 +139,13 @@ fn record_for_event<E: Serialize>(name: &str, event: &E, key: String) -> Result<
 ///
 /// # A failed publish does not fail the request
 ///
-/// It is logged and swallowed. A listener that returns `Err` stops the
-/// listeners behind it, and "the analytics topic was unreachable" is not a
-/// reason to abandon the rest of what an event set off. Where the publish
-/// *must* happen, publish from a [job](rainier_queue) instead, so it retries.
+/// It is logged, reported as a
+/// [`PublishFailed`](rainier_events::report::PublishFailed) through the
+/// process-wide reporter, and otherwise swallowed. A listener that returns
+/// `Err` stops the listeners behind it, and "the analytics topic was
+/// unreachable" is not a reason to abandon the rest of what an event set off.
+/// Where the publish *must* happen, publish from a [job](rainier_queue)
+/// instead, so it retries.
 pub fn publish_events<E>(
     events: &rainier_events::Dispatcher,
     client: Arc<KafkaClient>,
@@ -160,13 +163,25 @@ pub fn publish_events<E>(
         let key = key_of(&event);
 
         Box::pin(async move {
-            match record_for_event(name, &*event, key) {
-                Ok(record) => {
-                    if let Err(e) = client.produce(&topic, vec![record]).await {
+            let failed = match record_for_event(name, &*event, key) {
+                Ok(record) => match client.produce(&topic, vec![record]).await {
+                    Ok(_) => None,
+                    Err(e) => {
                         tracing::error!(topic, event = name, error = %e, "could not publish an event");
+                        Some((e, "produce"))
                     }
+                },
+                Err(e) => {
+                    tracing::error!(topic, event = name, error = %e, "could not serialise an event");
+                    Some((e, "serialise"))
                 }
-                Err(e) => tracing::error!(topic, event = name, error = %e, "could not serialise an event"),
+            };
+            if let Some((error, stage)) = failed {
+                use rainier_events::report::{FailureEvent as _, PublishFailed};
+                rainier_events::report::report(
+                    PublishFailed::new(error, topic.as_str(), name).with_extra("stage", stage),
+                )
+                .await;
             }
             Ok(())
         })

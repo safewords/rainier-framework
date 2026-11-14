@@ -32,9 +32,11 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame, Role};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::WebSocketStream;
 
+use rainier_events::report::{report, WebSocketFailed};
+use rainier_events::Exception;
 use rainier_http::{Request, Response, StatusCode};
 use rainier_websocket::{Message, Outbound, Socket, SocketId, WebSocketHandler, WebSocketRoutes};
 
@@ -118,6 +120,8 @@ pub async fn handle_upgrade(
             Ok(upgraded) => upgraded,
             Err(e) => {
                 tracing::debug!(error = %e, path, "the connection never finished upgrading");
+                // No socket yet, so no id.
+                report(WebSocketFailed::new(Exception::from_std(&e), "", path, "upgrade")).await;
                 return;
             }
         };
@@ -172,6 +176,7 @@ async fn run<S>(
 
     if let Err(e) = connected.await {
         tracing::warn!(socket = %id, path, error = %e, "on_connect failed; closing");
+        report(WebSocketFailed::new(e, id.to_string(), path.as_str(), "connect")).await;
         handler.on_close(&socket).await;
         let _ = writer.close().await;
         return;
@@ -204,8 +209,20 @@ async fn run<S>(
                 let frame = match incoming {
                     Ok(frame) => frame,
                     Err(e) => {
-                        // A client that vanished mid-frame is routine.
+                        // A client that vanished mid-frame is routine — logged
+                        // quietly, but still reported: whether it matters is
+                        // the application's call. A connection that is simply
+                        // closed is not a failure at all.
                         tracing::debug!(socket = %id, error = %e, "socket read failed");
+                        if !matches!(e, WsError::ConnectionClosed | WsError::AlreadyClosed) {
+                            report(WebSocketFailed::new(
+                                Exception::from_std(&e),
+                                id.to_string(),
+                                path.as_str(),
+                                "read",
+                            ))
+                            .await;
+                        }
                         break;
                     }
                 };
@@ -238,6 +255,7 @@ async fn run<S>(
                             // Not sent to the client: an error message is
                             // written for you, not for whoever is connected.
                             tracing::warn!(socket = %id, path, error = %e, "on_message failed; closing");
+                            report(WebSocketFailed::new(e, id.to_string(), path.as_str(), "message")).await;
                             break;
                         }
                         if closing {
@@ -352,5 +370,46 @@ mod tests {
     #[test]
     fn a_close_with_no_reason_stays_a_close() {
         assert_eq!(from_tungstenite(WsMessage::Close(None)), Some(Message::Close(None)));
+    }
+
+    struct Refuses;
+
+    #[async_trait::async_trait]
+    impl WebSocketHandler for Refuses {
+        async fn on_message(&self, _: &Socket, _: Message) -> rainier_support::Result<()> {
+            Err(rainier_support::Error::internal("upgrade-test: on_message refused"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_on_message_is_reported_as_a_websocket_failure() {
+        use rainier_events::report::{capture, Failure};
+
+        let capture = capture();
+        let (server, client) = tokio::io::duplex(4096);
+        let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+
+        let running = tokio::spawn(run(
+            Arc::new(Refuses),
+            server,
+            "/ws/upgrade-test".to_string(),
+            Vec::new(),
+        ));
+        client.send(WsMessage::Text("hello".into())).await.unwrap();
+        running.await.unwrap();
+
+        let ours: Vec<_> = capture
+            .reports()
+            .into_iter()
+            .filter_map(|reported| match reported.failure {
+                Failure::WebSocket(failed) if failed.path == "/ws/upgrade-test" => Some(failed),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ours.len(), 1, "{ours:?}");
+        assert_eq!(ours[0].stage, "message");
+        assert!(!ours[0].socket.is_empty());
+        assert_eq!(ours[0].exception.message, "upgrade-test: on_message refused");
     }
 }

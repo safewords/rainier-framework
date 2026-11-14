@@ -47,11 +47,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use rainier_events::report::{FailureEvent as _, IntegrationFailed};
+use rainier_events::Exception;
 use rainier_http::{IntoResponse, Request, Response};
 use rainier_http_client::transport::OutboundRequest;
 use rainier_http_client::Transport;
 use rainier_middleware::{Middleware, Next};
-use rainier_support::{Error, Result};
+use rainier_support::{Error, ErrorKind, Result};
 use serde_json::{json, Value};
 
 /// Which provider's endpoint and form field.
@@ -245,9 +247,12 @@ impl Captcha {
             timeout: Some(self.timeout),
         };
 
-        let answer = match http.send(request).await {
+        let (answer, failure) = match http.send(request).await {
             Ok(response) if (200..300).contains(&response.status) => {
-                serde_json::from_slice::<Value>(&response.body).ok()
+                match serde_json::from_slice::<Value>(&response.body) {
+                    Ok(answer) => (Some(answer), None),
+                    Err(e) => (None, Some(Exception::from_std(&e))),
+                }
             }
             Ok(response) => {
                 tracing::warn!(
@@ -255,13 +260,29 @@ impl Captcha {
                     status = response.status,
                     "captcha verification answered with an error status"
                 );
-                None
+                let message =
+                    format!("captcha verification answered with status {}", response.status);
+                (None, Some(Exception::message(ErrorKind::ServiceUnavailable, message)))
             }
             Err(e) => {
                 tracing::warn!(provider = self.provider.name(), error = %e, "captcha verification failed");
-                None
+                (None, Some(Exception::from_error(e)))
             }
         };
+
+        // Reported whichever way the verdict then goes; `fail_open` says
+        // which, so a listener can tell a let-through from a refusal.
+        if let Some(exception) = failure {
+            rainier_events::report::report(
+                IntegrationFailed::new(
+                    exception,
+                    format!("captcha:{}", self.provider.name()),
+                    "verify",
+                )
+                .with_extra("fail_open", self.fail_open),
+            )
+            .await;
+        }
 
         let Some(answer) = answer else {
             if self.fail_open {
@@ -494,6 +515,37 @@ mod tests {
 
         let open = Captcha::turnstile(fake as _, "s").fail_open();
         assert!(open.verify("t", None).await.success);
+    }
+
+    #[tokio::test]
+    async fn an_outage_is_reported_as_a_failed_integration_either_way() {
+        use rainier_events::report::{capture, Failure};
+
+        let capture = capture();
+        let fake = Arc::new(FakeTransport::new());
+        fake.responding(503, "down");
+        fake.responding(200, "not json");
+        Captcha::new(CaptchaProvider::HCaptcha, Arc::clone(&fake) as _, "s")
+            .verify("t", None)
+            .await;
+        Captcha::new(CaptchaProvider::HCaptcha, fake as _, "s").fail_open().verify("t", None).await;
+
+        // Other tests report turnstile outages in parallel; only these use
+        // hCaptcha.
+        let failed: Vec<_> = capture
+            .reports()
+            .into_iter()
+            .filter_map(|r| match r.failure {
+                Failure::Integration(f) if f.service == "captcha:hcaptcha" => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed.len(), 2);
+        assert_eq!(failed[0].operation, "verify");
+        assert_eq!(failed[0].exception.status, 503);
+        assert_eq!(failed[0].meta.extra["fail_open"], false);
+        assert_eq!(failed[1].exception.status, 500, "a body that is not JSON");
+        assert_eq!(failed[1].meta.extra["fail_open"], true);
     }
 
     #[tokio::test]
