@@ -196,8 +196,13 @@ fn routes_are_named_under_lookout() {
             "lookout.api.aggregates",
             "lookout.api.batch",
             "lookout.api.batches",
+            "lookout.api.case",
+            "lookout.api.case.act",
+            "lookout.api.cases",
             "lookout.api.clear",
             "lookout.api.entries",
+            "lookout.api.insights",
+            "lookout.api.series",
             "lookout.api.status",
             "lookout.app",
             "lookout.assets.css",
@@ -516,4 +521,129 @@ async fn clearing_needs_the_header() {
     assert_eq!(answer.status, StatusCode::NO_CONTENT);
     assert!(store.batches.lock().unwrap().is_empty());
     assert_eq!(answer.header("cache-control"), Some("no-store"));
+}
+
+#[tokio::test]
+async fn narrows_entries_to_one_family_and_searches_them() {
+    let router = app(sample());
+    let body =
+        get(&router, "/_lookout/api/entries/query?key=select%20*%20from%20posts").await.json();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1, "{body}");
+    assert_eq!(data[0]["id"], "q1");
+
+    let body = get(&router, "/_lookout/api/entries/query?q=USERS").await.json();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1, "{body}");
+    assert_eq!(data[0]["id"], "q2");
+    assert!(body["next"].is_null());
+
+    let body = get(&router, "/_lookout/api/entries/query?key=nothing").await.json();
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn searching_batches_passes_the_text_to_the_store() {
+    let store = sample();
+    let router = app(Arc::clone(&store));
+    get(&router, "/_lookout/api/batches?q=posts").await;
+    let query = store.last_query.lock().unwrap().clone().unwrap();
+    assert_eq!(query.search.as_deref(), Some("posts"));
+}
+
+#[tokio::test]
+async fn draws_a_zero_filled_series_with_a_forecast_and_per_key_series() {
+    let router = app(sample());
+    let since = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+    let since = since.replace('+', "%2B");
+    let body = get(&router, &format!("/_lookout/api/series/query?since={since}&keys=5&forecast=3"))
+        .await
+        .json();
+    assert_eq!(body["period"], 60, "{body}");
+    let points = body["data"].as_array().unwrap();
+    assert!((10..=12).contains(&points.len()), "{}", points.len());
+    let total: u64 = points.iter().map(|p| p["count"].as_u64().unwrap()).sum();
+    assert_eq!(total, 2);
+    assert_eq!(body["forecast"].as_array().unwrap().len(), 3);
+    assert_eq!(body["keys"].as_object().unwrap().len(), 2);
+
+    let body = get(
+        &router,
+        &format!("/_lookout/api/series/query?since={since}&key=select%20*%20from%20posts"),
+    )
+    .await
+    .json();
+    let total: u64 =
+        body["data"].as_array().unwrap().iter().map(|p| p["count"].as_u64().unwrap()).sum();
+    assert_eq!(total, 1);
+
+    let answer =
+        get(&router, "/_lookout/api/series/log?period=60&since=2001-01-01T00:00:00Z&keys=99").await;
+    assert_eq!(answer.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let body = answer.json();
+    for field in ["type", "since", "keys"] {
+        assert!(body["errors"][field].is_array(), "{field}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn reports_insights_with_the_thresholds_it_used() {
+    let router = app(sample());
+    let body = get(&router, "/_lookout/api/insights?window=30&min=1&change=10").await.json();
+    assert_eq!(body["enabled"], true, "{body}");
+    assert_eq!(body["config"]["window_minutes"], 30);
+    assert_eq!(body["config"]["min_count"], 1);
+    // Everything in the sample is new in this window.
+    let data = body["data"].as_array().unwrap();
+    assert!(
+        data.iter().any(|i| i["kind"] == "new" && i["key"] == "Boom@app" && i["severity"] == "bad"),
+        "{body}"
+    );
+
+    let answer = get(&router, "/_lookout/api/insights?window=0&change=x").await;
+    assert_eq!(answer.status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+async fn post(router: &CompiledRouter, uri: &str, header: bool, body: &str) -> Answer {
+    let mut builder =
+        Request::builder().method(Method::POST).uri(uri).header("content-type", "application/json");
+    if header {
+        builder = builder.header("x-lookout", "1");
+    }
+    let mut response = router.dispatch(builder.body(body.to_string()).build()).await;
+    let bytes = response.take_body().collect().await.unwrap();
+    Answer {
+        status: response.status(),
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+        response,
+    }
+}
+
+#[tokio::test]
+async fn lists_cases_and_closes_one() {
+    let router = app(sample());
+    let body = get(&router, "/_lookout/api/cases").await.json();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1, "{body}");
+    let id = data[0]["id"].as_str().unwrap().to_string();
+    assert_eq!(data[0]["key"], "Boom@app");
+    assert_eq!(data[0]["status"], "open");
+
+    let answer = get(&router, &format!("/_lookout/api/cases/{id}")).await;
+    assert_eq!(answer.status, StatusCode::OK);
+    assert_eq!(get(&router, "/_lookout/api/cases/nope").await.status, StatusCode::NOT_FOUND);
+
+    let uri = format!("/_lookout/api/cases/{id}");
+    let refused = post(&router, &uri, false, r#"{"action":"resolve"}"#).await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    let bad = post(&router, &uri, true, r#"{"action":"explode"}"#).await;
+    assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", bad.text);
+    let done = post(&router, &uri, true, r#"{"action":"resolve","note":"fixed"}"#).await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.text);
+    assert_eq!(done.json()["data"]["status"], "resolved");
+
+    let open = get(&router, "/_lookout/api/cases?status=open").await.json();
+    assert_eq!(open["data"].as_array().unwrap().len(), 0);
+    let bad = get(&router, "/_lookout/api/cases?status=sideways&severity=huge").await;
+    assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
 }

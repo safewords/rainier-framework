@@ -1,10 +1,17 @@
 <script setup>
 import BatchStatus from './BatchStatus.vue'
+import DataTable from './DataTable.vue'
 import Flags from './Flags.vue'
 import TimeAgo from './TimeAgo.vue'
-import { duration } from '../format.js'
+import { time } from '../format.js'
 
-defineProps({ batches: { type: Array, required: true } })
+defineProps({
+  batches: { type: Array, required: true },
+  filterable: Boolean,
+  loading: Boolean,
+  empty: { type: String, default: 'Nothing recorded yet.' },
+  label: { type: String, default: 'Batches' },
+})
 
 function total(counts) {
   return Object.values(counts || {}).reduce((sum, n) => sum + n, 0)
@@ -14,51 +21,60 @@ function breakdown(counts) {
     .map(([type, n]) => `${n} ${type}`)
     .join(' · ')
 }
+function flags(batch) {
+  const out = []
+  if (batch.has_exception) out.push('exception')
+  if (batch.has_slow) out.push('slow')
+  return out.concat(batch.tags || []).join(' ')
+}
+
+const columns = [
+  {
+    key: 'summary',
+    label: 'Summary',
+    sortable: true,
+    text: (b) => [b.summary, b.route_name].filter(Boolean).join(' '),
+    value: (b) => b.summary,
+  },
+  {
+    key: 'status',
+    label: 'Status',
+    sortable: true,
+    value: (b) => b.status || (b.has_exception ? 600 : 0),
+    text: (b) => (b.status ? String(b.status) : b.has_exception ? 'failed' : 'done'),
+  },
+  { key: 'duration', label: 'Duration', title: 'How long this whole unit of work took, start to finish', align: 'right', sortable: true, value: (b) => b.duration_us, text: (b) => time(b.duration_us) },
+  { key: 'entries', label: 'Entries', title: 'How many entries (queries, cache calls, logs, …) it recorded', align: 'right', sortable: true, value: (b) => total(b.counts), text: (b) => breakdown(b.counts) },
+  { key: 'user', label: 'User', sortable: true, value: (b) => b.user_id || '', text: (b) => (b.user_id ? `user ${b.user_id}` : 'guest') },
+  { key: 'flags', label: 'Flags', text: flags },
+  { key: 'when', label: 'When', title: 'When it started', align: 'right', sortable: true, value: (b) => b.started_at, text: (b) => b.started_at },
+]
 </script>
 
 <template>
-  <div>
-    <div
-      class="hidden grid-cols-[minmax(0,1fr)_4.5rem_5.5rem_4.5rem_6rem_9rem_5.5rem] gap-3 border-b border-zinc-200 px-4 py-2 md:grid dark:border-zinc-800"
-    >
-      <span class="lk-th">Summary</span>
-      <span class="lk-th">Status</span>
-      <span class="lk-th text-right">Duration</span>
-      <span class="lk-th text-right">Entries</span>
-      <span class="lk-th">User</span>
-      <span class="lk-th">Flags</span>
-      <span class="lk-th text-right">When</span>
-    </div>
-    <ul class="divide-y divide-zinc-200 dark:divide-zinc-800">
-      <li v-for="batch in batches" :key="batch.id">
-        <RouterLink
-          :to="{ name: 'batch', params: { id: batch.id } }"
-          class="block px-4 py-3 transition hover:bg-zinc-50 md:grid md:grid-cols-[minmax(0,1fr)_4.5rem_5.5rem_4.5rem_6rem_9rem_5.5rem] md:items-center md:gap-3 md:py-2.5 dark:hover:bg-zinc-800/50"
-        >
-          <div class="min-w-0">
-            <div class="truncate font-mono text-[13px] text-zinc-900 dark:text-zinc-100" :title="batch.summary">
-              {{ batch.summary }}
-            </div>
-            <div v-if="batch.route_name" class="truncate text-xs text-zinc-500 dark:text-zinc-400">
-              {{ batch.route_name }}
-            </div>
-          </div>
-          <!-- On a phone the columns become one wrapped line of facts. -->
-          <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-zinc-500 md:contents dark:text-zinc-400">
-            <span><BatchStatus :batch="batch" /></span>
-            <span class="tabular-nums md:text-right md:text-sm md:text-zinc-700 md:dark:text-zinc-300">{{ duration(batch.duration_us) }}</span>
-            <span class="tabular-nums md:text-right md:text-sm" :title="breakdown(batch.counts)">
-              {{ total(batch.counts) }}<span class="md:hidden"> entries</span>
-            </span>
-            <span class="truncate md:text-sm">
-              <template v-if="batch.user_id">user {{ batch.user_id }}</template>
-              <span v-else class="text-zinc-400 dark:text-zinc-500">guest</span>
-            </span>
-            <span><Flags :exception="batch.has_exception" :slow="batch.has_slow" :tags="batch.tags" /></span>
-            <span class="md:text-right"><TimeAgo :at="batch.started_at" /></span>
-          </div>
-        </RouterLink>
-      </li>
-    </ul>
-  </div>
+  <DataTable
+    :columns="columns"
+    :rows="batches"
+    :row-key="(b) => b.id"
+    :to="(b) => ({ name: 'batch', params: { id: b.id } })"
+    :filterable="filterable"
+    filter-placeholder="Filter these batches…"
+    :loading="loading"
+    :empty="empty"
+    :label="label"
+  >
+    <template #cell-summary="{ row }">
+      <span class="block truncate font-mono text-[13px] text-zinc-900 dark:text-zinc-100">{{ row.summary }}</span>
+      <span v-if="row.route_name" class="block truncate text-xs text-zinc-500 dark:text-zinc-400">{{ row.route_name }}</span>
+    </template>
+    <template #cell-status="{ row }"><BatchStatus :batch="row" /></template>
+    <template #cell-duration="{ row }">{{ time(row.duration_us) }}</template>
+    <template #cell-entries="{ row }"><span :title="breakdown(row.counts)">{{ total(row.counts) }}</span></template>
+    <template #cell-user="{ row }">
+      <template v-if="row.user_id">user {{ row.user_id }}</template>
+      <span v-else class="text-zinc-400 dark:text-zinc-500">guest</span>
+    </template>
+    <template #cell-flags="{ row }"><Flags :exception="row.has_exception" :slow="row.has_slow" :tags="row.tags || []" /></template>
+    <template #cell-when="{ row }"><span class="text-zinc-500 dark:text-zinc-400"><TimeAgo :at="row.started_at" /></span></template>
+  </DataTable>
 </template>

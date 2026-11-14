@@ -164,14 +164,103 @@ pub(crate) fn batch_query(params: &mut Params<'_>) -> BatchQuery {
         trace_id: params.text("trace"),
         has_exception: params.boolean("exception"),
         has_slow: params.boolean("slow"),
+        search: params.text("q"),
         before: params.time("before"),
         limit: Some(params.limit(MAX_LIMIT, DEFAULT_LIMIT)),
     }
 }
 
-/// `GET /api/entries/{type}`: `(before, limit)`.
-pub(crate) fn entries_query(params: &mut Params<'_>) -> (Option<DateTime<Utc>>, usize) {
-    (params.time("before"), params.limit(MAX_LIMIT, DEFAULT_LIMIT))
+/// `GET /api/entries/{type}`.
+pub(crate) struct EntriesQuery {
+    pub(crate) before: Option<DateTime<Utc>>,
+    pub(crate) limit: usize,
+    /// One family: `key`.
+    pub(crate) key: Option<String>,
+    /// Text in the summary or the family key: `q`.
+    pub(crate) search: Option<String>,
+}
+
+/// `GET /api/entries/{type}`.
+pub(crate) fn entries_query(params: &mut Params<'_>) -> EntriesQuery {
+    EntriesQuery {
+        before: params.time("before"),
+        limit: params.limit(MAX_LIMIT, DEFAULT_LIMIT),
+        key: params.raw("key"),
+        search: params.text("q"),
+    }
+}
+
+/// `GET /api/series/{type}`.
+pub(crate) struct SeriesQuery {
+    pub(crate) entry_type: EntryType,
+    pub(crate) period_s: u32,
+    pub(crate) since: DateTime<Utc>,
+    /// Only this family.
+    pub(crate) key: Option<String>,
+    /// Also a series for each of the busiest keys, at most this many.
+    pub(crate) keys: usize,
+    /// Buckets to project past now.
+    pub(crate) forecast: usize,
+}
+
+fn period(params: &mut Params<'_>) -> Option<u32> {
+    match params.raw("period")?.as_str() {
+        "60" => Some(60),
+        "600" => Some(600),
+        "3600" => Some(3600),
+        _ => {
+            params.fail("period", "The period must be one of: 60, 600, 3600.");
+            None
+        }
+    }
+}
+
+/// `GET /api/series/{type}`. The period defaults to one giving the span from
+/// `since` a dozen points or more; a span of more than 2000 buckets is refused.
+pub(crate) fn series_query(
+    params: &mut Params<'_>,
+    entry_type: Option<EntryType>,
+    now: DateTime<Utc>,
+    default_forecast: usize,
+) -> Option<SeriesQuery> {
+    if let Some(t) = entry_type {
+        if !AGGREGATED.contains(&t) {
+            params.fail("type", format!("Entries of type {t} are not aggregated."));
+        }
+    }
+    let since = params.time("since").unwrap_or(now - Duration::hours(24));
+    if since > now {
+        params.fail("since", "The since must be in the past.");
+    }
+    let period_s = period(params).unwrap_or_else(|| crate::trends::period_for(now - since));
+    if (now - since).num_seconds() / i64::from(period_s) > 2000 {
+        params.fail("since", "That is more than 2000 buckets; use a longer period.");
+    }
+    let key = params.raw("key");
+    let keys = params.integer("keys", 0, 50).unwrap_or(0) as usize;
+    let forecast = params.integer("forecast", 0, 100).map_or(default_forecast, |n| n as usize);
+    Some(SeriesQuery { entry_type: entry_type?, period_s, since, key, keys, forecast })
+}
+
+/// `GET /api/insights`: the configured thresholds, each overridable.
+pub(crate) fn insights_query(
+    params: &mut Params<'_>,
+    defaults: crate::trends::InsightsConfig,
+) -> (crate::trends::InsightsConfig, usize) {
+    let mut config = defaults;
+    if let Some(n) = params.integer("window", 1, 7 * 24 * 60) {
+        config.window_minutes = n;
+    }
+    if let Some(n) = params.integer("min", 1, 1_000_000) {
+        config.min_count = n;
+    }
+    if let Some(n) = params.integer("change", 1, 10_000) {
+        config.change_percent = n;
+    }
+    if let Some(n) = params.integer("forecast", 0, 100) {
+        config.forecast_buckets = n as usize;
+    }
+    (config, params.limit(MAX_AGGREGATE_LIMIT, 20))
 }
 
 /// `GET /api/aggregates/{type}`.
@@ -185,18 +274,7 @@ pub(crate) fn aggregate_query(
             params.fail("type", format!("Entries of type {t} are not aggregated."));
         }
     }
-    let period_s = match params.raw("period") {
-        None => 3600,
-        Some(p) => match p.as_str() {
-            "60" => 60,
-            "600" => 600,
-            "3600" => 3600,
-            _ => {
-                params.fail("period", "The period must be one of: 60, 600, 3600.");
-                3600
-            }
-        },
-    };
+    let period_s = period(params).unwrap_or(3600);
     let since = params.time("since").unwrap_or(now - Duration::hours(24));
     let order = match params.raw("order") {
         None => AggregateOrder::Max,
@@ -212,4 +290,30 @@ pub(crate) fn aggregate_query(
     };
     let limit = params.limit(MAX_AGGREGATE_LIMIT, 10);
     Some(AggregateQuery { entry_type: entry_type?, period_s, since, order, limit })
+}
+
+/// `GET /api/cases`.
+pub(crate) fn case_query(params: &mut Params<'_>) -> crate::cases::CaseQuery {
+    use crate::cases::{CaseQuery, CaseSeverity, CaseStatus};
+    let status = params.raw("status").and_then(|v| match CaseStatus::parse(&v) {
+        Some(s) => Some(s),
+        None if v == "all" => None,
+        None => {
+            params.fail("status", "The status must be one of: open, resolved, ignored, all.");
+            None
+        }
+    });
+    let min_severity = params.raw("severity").and_then(|v| match CaseSeverity::parse(&v) {
+        Some(s) => Some(s),
+        None => {
+            params.fail("severity", "The severity must be one of: low, medium, high, critical.");
+            None
+        }
+    });
+    CaseQuery {
+        status,
+        min_severity,
+        search: params.text("q"),
+        limit: Some(params.limit(MAX_LIMIT, DEFAULT_LIMIT)),
+    }
 }

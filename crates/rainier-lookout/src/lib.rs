@@ -24,6 +24,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod aggregate;
+pub mod cases;
 pub mod commands;
 pub mod config;
 pub mod entry;
@@ -33,6 +34,7 @@ pub mod middleware;
 pub mod recorder;
 pub mod redact;
 pub mod store;
+pub mod trends;
 pub mod watchers;
 
 pub use config::LookoutConfig;

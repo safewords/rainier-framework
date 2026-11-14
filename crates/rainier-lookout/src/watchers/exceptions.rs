@@ -75,7 +75,13 @@ pub fn entry(config: &LookoutConfig, failure: &Failure) -> Entry {
         .get_mut("exception")
         .and_then(|e| e.as_object_mut())
         .and_then(|e| e.remove("backtrace"));
+    let frames = backtrace.as_ref().and_then(Value::as_str).map(|t| app_frames(t, 30));
     redact_json(&mut content, &config.redaction);
+    if let (Some(frames), Some(map)) = (frames, content.as_object_mut()) {
+        if !frames.is_empty() {
+            map.insert("frames".into(), Value::Array(frames));
+        }
+    }
     if let (Some(backtrace), Some(e)) =
         (backtrace, content.get_mut("exception").and_then(|e| e.as_object_mut()))
     {
@@ -128,6 +134,88 @@ pub fn fingerprint(failure: &Failure) -> String {
     key
 }
 
+/// The application's own frames in a rendered backtrace, outermost last, at
+/// most `limit`: `{"function": "shop::orders::show", "file": "./src/orders.rs",
+/// "line": 9}`, `file` and `line` only when the binary has line tables.
+///
+/// A stripped binary renders every frame as `<unknown>`, which gives none.
+pub fn app_frames(trace: &str, limit: usize) -> Vec<Value> {
+    let mut frames: Vec<serde_json::Map<String, Value>> = Vec::new();
+    let mut last_was_app = false;
+    for line in trace.lines() {
+        let line = line.trim();
+        if let Some(location) = line.strip_prefix("at ") {
+            if last_was_app {
+                if let Some(frame) = frames.last_mut() {
+                    if frame.contains_key("file") {
+                        continue;
+                    }
+                    // `./src/orders.rs:9:5` — the column is dropped.
+                    let mut parts = location.rsplitn(3, ':');
+                    let column_or_line = parts.next();
+                    let maybe_line = parts.next();
+                    let (file, line_no) = match (maybe_line, parts.next()) {
+                        (Some(l), Some(file)) if l.chars().all(|c| c.is_ascii_digit()) => {
+                            (file, l.parse::<u64>().ok())
+                        }
+                        _ => match (column_or_line, maybe_line) {
+                            (Some(l), Some(file)) => (file, l.parse::<u64>().ok()),
+                            _ => (location, None),
+                        },
+                    };
+                    frame.insert("file".into(), Value::String(file.to_string()));
+                    if let Some(n) = line_no {
+                        frame.insert("line".into(), Value::from(n));
+                    }
+                }
+            }
+            continue;
+        }
+        let Some((index, symbol)) = line.split_once(": ") else { continue };
+        if !index.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let symbol = symbol.trim();
+        last_was_app =
+            symbol.contains("::") && !FOREIGN_FRAMES.iter().any(|p| symbol.starts_with(p));
+        if !last_was_app {
+            continue;
+        }
+        if frames.len() >= limit {
+            break;
+        }
+        let symbol = match symbol.rsplit_once("::h") {
+            Some((head, hash)) if hash.chars().all(|c| c.is_ascii_hexdigit()) => head,
+            _ => symbol,
+        };
+        // Consecutive frames of one async fn (`{{closure}}` polls) are one.
+        let function = without_closures(symbol).to_string();
+        if frames.last().and_then(|f| f.get("function")).and_then(Value::as_str)
+            == Some(function.as_str())
+        {
+            last_was_app = false;
+            continue;
+        }
+        let mut frame = serde_json::Map::new();
+        frame.insert("function".into(), Value::String(function));
+        frames.push(frame);
+    }
+    frames.into_iter().map(Value::Object).collect()
+}
+
+/// `symbol` without its trailing closure segments: `{{closure}}` from older
+/// compilers, `{closure#0}` from newer ones.
+fn without_closures(mut symbol: &str) -> &str {
+    loop {
+        let Some((head, last)) = symbol.rsplit_once("::") else { return symbol };
+        if last == "{{closure}}" || (last.starts_with("{closure#") && last.ends_with('}')) {
+            symbol = head;
+        } else {
+            return symbol;
+        }
+    }
+}
+
 /// The first frame of the backtrace that is the application's own code.
 pub fn first_app_frame(exception: &Exception) -> Option<String> {
     let trace = exception.backtrace.as_deref()?;
@@ -157,6 +245,30 @@ mod tests {
     use super::*;
     use rainier_events::report::{ApplicationFailed, HttpRequestFailed};
     use rainier_support::Error;
+
+    #[test]
+    fn app_frames_keep_the_applications_own_with_their_locations() {
+        let trace = "   0: std::backtrace::Backtrace::force_capture\n\
+                     \x20 1: rainier_lookout::layer::on_close\n\
+                     \x20            at ./crates/rainier-lookout/src/layer.rs:360:9\n\
+                     \x20 2: shop::orders::load::{{closure}}::h0123456789abcdef\n\
+                     \x20            at ./src/orders.rs:42:17\n\
+                     \x20 3: shop::orders::load::{{closure}}\n\
+                     \x20            at ./src/orders.rs:40:1\n\
+                     \x20 4: tokio::runtime::task::poll\n\
+                     \x20 5: shop::http::show::{closure#0}::{closure#1}\n\
+                     \x20 6: <unknown>";
+        let frames = app_frames(trace, 10);
+        assert_eq!(
+            frames,
+            vec![
+                serde_json::json!({ "function": "shop::orders::load", "file": "./src/orders.rs", "line": 42 }),
+                serde_json::json!({ "function": "shop::http::show" }),
+            ]
+        );
+        assert_eq!(app_frames(trace, 1).len(), 1);
+        assert!(app_frames("   0: <unknown>\n   1: <unknown>", 10).is_empty());
+    }
 
     #[test]
     fn fingerprints_ignore_numbers_and_keep_the_first_app_frame() {

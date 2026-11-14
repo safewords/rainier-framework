@@ -52,10 +52,14 @@ use rainier_support::{BoxFuture, Error, Result};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
 
-use super::conformance::{effective_limit, matches, newest_first, select_aggregates};
-use super::{AggregateQuery, BatchQuery, Store};
+use super::conformance::{effective_limit, matches, newest_first};
+use super::{BatchQuery, Store};
 use crate::aggregate::{self, bucket_start};
+use crate::cases::{observe, occurrences, select_cases, Case, CaseQuery, CaseStatus};
 use crate::entry::{Aggregate, Batch, BatchSummary, Entry, EntryType};
+
+/// The most cases the cache store keeps.
+pub const MAX_CASES: usize = 1000;
 
 /// How long the writers' lock is held at most, if its holder dies.
 const LOCK_TTL: Duration = Duration::from_secs(30);
@@ -230,7 +234,56 @@ impl CacheStore {
                 self.cache.forget(&self.batch_key(&gone.summary.id)).await?;
             }
 
-            self.roll_up(&batches).await
+            self.roll_up(&batches).await?;
+            self.observe_cases(&batches).await
+        })
+        .await
+    }
+
+    /// Fold `batches`' exceptions into the cases. Under the lock.
+    async fn observe_cases(&self, batches: &[Batch]) -> Result<()> {
+        let seen = occurrences(batches);
+        if seen.is_empty() {
+            return Ok(());
+        }
+        let mut cases = self.all_cases().await?;
+        for occurrence in &seen {
+            let existing = cases.remove(&occurrence.id);
+            cases.insert(occurrence.id.clone(), observe(existing, occurrence));
+        }
+        self.put_cases(cases).await
+    }
+
+    async fn all_cases(&self) -> Result<BTreeMap<String, Case>> {
+        Ok(self
+            .get_json::<Vec<Case>>(&self.key("cases"))
+            .await?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| (c.id.clone(), c))
+            .collect())
+    }
+
+    /// Write the cases back, keeping at most [`MAX_CASES`]: the ones seen
+    /// longest ago go first, closed before open.
+    async fn put_cases(&self, cases: BTreeMap<String, Case>) -> Result<()> {
+        let mut cases: Vec<Case> = cases.into_values().collect();
+        if cases.len() > MAX_CASES {
+            cases.sort_by(|a, b| {
+                (b.status == CaseStatus::Open)
+                    .cmp(&(a.status == CaseStatus::Open))
+                    .then_with(|| b.last_seen.cmp(&a.last_seen))
+            });
+            cases.truncate(MAX_CASES);
+        }
+        self.put_json(&self.key("cases"), &cases, self.aggregate_ttl).await
+    }
+
+    async fn save(&self, case: Case) -> Result<()> {
+        self.locked(async {
+            let mut cases = self.all_cases().await?;
+            cases.insert(case.id.clone(), case);
+            self.put_cases(cases).await
         })
         .await
     }
@@ -295,6 +348,7 @@ impl CacheStore {
     async fn of_type(
         &self,
         entry_type: EntryType,
+        key: Option<&str>,
         before: Option<DateTime<Utc>>,
         limit: usize,
     ) -> Result<Vec<Entry>> {
@@ -316,6 +370,7 @@ impl CacheStore {
             let Some(batch) = self.find(&id).await? else { continue };
             for (seq, entry) in batch.entries.into_iter().enumerate() {
                 if entry.entry_type == entry_type
+                    && key.is_none_or(|key| entry.family_key() == key)
                     && before.is_none_or(|before| entry.occurred_at < before)
                 {
                     found.push((seq, entry));
@@ -333,12 +388,17 @@ impl CacheStore {
         Ok(found.into_iter().take(limit).map(|(_, e)| e).collect())
     }
 
-    async fn rolled_up(&self, query: AggregateQuery) -> Result<Vec<Aggregate>> {
-        let from = bucket_start(query.since, query.period_s).timestamp();
+    async fn rows(
+        &self,
+        entry_type: EntryType,
+        period_s: u32,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<Aggregate>> {
+        let from = bucket_start(since, period_s).timestamp();
         let mut rows = Vec::new();
         for bucket in self.buckets().await? {
-            if bucket.period_s == query.period_s
-                && bucket.entry_type == query.entry_type
+            if bucket.period_s == period_s
+                && bucket.entry_type == entry_type
                 && bucket.start >= from
             {
                 rows.extend(
@@ -348,7 +408,7 @@ impl CacheStore {
                 );
             }
         }
-        Ok(select_aggregates(rows, &query))
+        Ok(rows)
     }
 
     async fn prune_keys(
@@ -379,6 +439,12 @@ impl CacheStore {
                     self.cache.forget(&self.bucket_key(bucket)).await?;
                 }
             }
+            let mut cases = self.all_cases().await?;
+            let before = cases.len();
+            cases.retain(|_, c| c.last_seen >= aggregates_before);
+            if cases.len() != before {
+                self.put_cases(cases).await?;
+            }
             Ok(gone.len() as u64)
         })
         .await
@@ -398,6 +464,7 @@ impl CacheStore {
             }
             self.cache.forget(&self.key("index")).await?;
             self.cache.forget(&self.key("buckets")).await?;
+            self.cache.forget(&self.key("cases")).await?;
             Ok(())
         })
         .await
@@ -446,11 +513,49 @@ impl Store for CacheStore {
         before: Option<DateTime<Utc>>,
         limit: usize,
     ) -> BoxFuture<'_, Result<Vec<Entry>>> {
-        Box::pin(self.of_type(entry_type, before, limit).instrument(internal("entries")))
+        Box::pin(self.of_type(entry_type, None, before, limit).instrument(internal("entries")))
     }
 
-    fn aggregates(&self, query: AggregateQuery) -> BoxFuture<'_, Result<Vec<Aggregate>>> {
-        Box::pin(self.rolled_up(query).instrument(internal("aggregates")))
+    fn family_entries(
+        &self,
+        entry_type: EntryType,
+        key: &str,
+        before: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<Entry>>> {
+        let key = key.to_string();
+        Box::pin(async move {
+            self.of_type(entry_type, Some(&key), before, limit)
+                .instrument(internal("family_entries"))
+                .await
+        })
+    }
+
+    fn aggregate_rows(
+        &self,
+        entry_type: EntryType,
+        period_s: u32,
+        since: DateTime<Utc>,
+    ) -> BoxFuture<'_, Result<Vec<Aggregate>>> {
+        Box::pin(self.rows(entry_type, period_s, since).instrument(internal("aggregates")))
+    }
+
+    fn cases(&self, query: CaseQuery) -> BoxFuture<'_, Result<Vec<Case>>> {
+        Box::pin(
+            async move { Ok(select_cases(self.all_cases().await?.into_values(), &query)) }
+                .instrument(internal("cases")),
+        )
+    }
+
+    fn case(&self, id: &str) -> BoxFuture<'_, Result<Option<Case>>> {
+        let id = id.to_string();
+        Box::pin(
+            async move { Ok(self.all_cases().await?.remove(&id)) }.instrument(internal("case")),
+        )
+    }
+
+    fn save_case(&self, case: Case) -> BoxFuture<'_, Result<()>> {
+        Box::pin(self.save(case).instrument(internal("save_case")))
     }
 
     fn prune(
@@ -483,6 +588,7 @@ mod tests {
     use super::*;
     use crate::entry::BatchKind;
     use crate::store::conformance::{at, batch};
+    use crate::store::AggregateQuery;
     use rainier_cache::{CacheExt as _, MemoryCache};
 
     fn store(capacity: usize) -> CacheStore {

@@ -54,7 +54,7 @@ pub fn rollup(batches: &[Batch]) -> Vec<Aggregate> {
                 continue;
             }
             let duration = entry.duration_us.unwrap_or(0);
-            let key = entry.family_hash.clone().unwrap_or_else(|| entry.summary.clone());
+            let key = entry.family_key().to_string();
             for &period in PERIODS {
                 let slot = acc
                     .entry((

@@ -13,6 +13,11 @@
 //! | `GET` | `/api/batches/{id}` | `lookout.api.batch` | One [`Batch`](crate::entry::Batch), with entries |
 //! | `GET` | `/api/entries/{type}` | `lookout.api.entries` | [`Entry`](crate::entry::Entry) list |
 //! | `GET` | `/api/aggregates/{type}` | `lookout.api.aggregates` | [`Aggregate`](crate::entry::Aggregate) list |
+//! | `GET` | `/api/series/{type}` | `lookout.api.series` | Zero-filled points per bucket, a forecast, and per-key series with `keys=N` |
+//! | `GET` | `/api/insights` | `lookout.api.insights` | What changed since the previous window ([`trends`](crate::trends)) |
+//! | `GET` | `/api/cases` | `lookout.api.cases` | [`Case`](crate::cases::Case) list: `status`, `severity` (minimum), `q`, `limit` |
+//! | `GET` | `/api/cases/{id}` | `lookout.api.case` | One case |
+//! | `POST` | `/api/cases/{id}` | `lookout.api.case.act` | `{"action": "resolve"\|"reopen"\|"ignore"\|"severity", "severity"?, "note"?}` — needs `X-Lookout: 1` |
 //! | `GET` | `/api/status` | `lookout.api.status` | Store, watchers, sample rates, retention |
 //! | `GET` | `/{rest*}` | `lookout.app` | The same shell, for the app's own client-side routes |
 //!
@@ -231,6 +236,11 @@ pub fn routes(
         router
             .get("/api/aggregates/{type}", guarded(&state, api::aggregates))
             .name("api.aggregates");
+        router.get("/api/series/{type}", guarded(&state, api::series)).name("api.series");
+        router.get("/api/insights", guarded(&state, api::insights)).name("api.insights");
+        router.get("/api/cases", guarded(&state, api::cases)).name("api.cases");
+        router.get("/api/cases/{id}", guarded(&state, api::case)).name("api.case");
+        router.post("/api/cases/{id}", guarded(&state, api::act_on_case)).name("api.case.act");
         router.get("/api/status", guarded(&state, api::status)).name("api.status");
 
         // Declared last, so every route above wins: the app's own client
@@ -246,8 +256,11 @@ pub fn routes(
             "/{rest*}",
             guarded(&state, |_: Arc<Shared>, request: Req| async move {
                 let rest = request.route_param("rest").unwrap_or_default();
-                let allow = if rest.trim_end_matches('/') == "api/batches" {
+                let rest = rest.trim_end_matches('/');
+                let allow = if rest == "api/batches" {
                     "GET, HEAD, DELETE"
+                } else if rest.starts_with("api/cases/") {
+                    "GET, HEAD, POST"
                 } else {
                     "GET, HEAD"
                 };

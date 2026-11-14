@@ -12,6 +12,29 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Lookout drills in, forecasts and keeps cases** (`rainier-lookout`).
+  - Every dashboard row opens its own page — one route, query, job, exception
+    or outgoing call — with its series over time, a forecast, p50/p95/p99, a
+    duration histogram and every occurrence linking to its trace; before, a
+    click went to the whole category.
+  - The dashboard shows throughput, request, error and job metrics with
+    graphs; a Jobs page compares every job's runs, averages, maxima and total
+    time; every table sorts, filters and fits a phone; a search box looks
+    through batches, entries and cases.
+  - **Insights**: what is new, rising, falling, slower or faster than the
+    previous window, and where each type is heading, with thresholds from
+    `LOOKOUT_INSIGHTS_*` that a viewer can change.
+  - **Cases**: each exception fingerprint is a case with a severity that
+    escalates with occurrences, affected users and regressions, the routes,
+    jobs and users it touched, and links to every trace. A case can be
+    resolved, reopened or ignored; one that recurs after being resolved
+    reopens as a regression. The database store adds migration
+    `rainier_lookout_0005_cases`.
+  - **Code traces**: an exception's application frames, and for a slow query,
+    cache call or outgoing request the code it was called from
+    (`LOOKOUT_CAPTURE_CODE_TRACES`, on).
+  - API: `GET /api/series/{type}`, `GET /api/insights`, `GET`/`POST
+    /api/cases…`, and `key`/`q` on the entries and `q` on the batches lists.
 - `Rainier::with_lookout_viewers_where`: let a predicate over the
   authenticated user **and the request** decide who sees Lookout, for an
   application whose roles live in the session or a header rather than on the
@@ -391,6 +414,14 @@ the release as a whole and names the crate it landed in.
 
 ### Changed
 
+- **Lookout no longer counts a request's client error as a failure**
+  (`rainier-lookout`). A `404` or `422` answered to a request is recorded
+  with its status, but adds no exception, does not flag the batch and opens no
+  case; `LOOKOUT_CAPTURE_CLIENT_ERRORS=true` restores the old behaviour. A
+  client error inside a job or command is still recorded.
+- `rainier_lookout::Store` gains `aggregate_rows` (required; `aggregates` is
+  now provided on top of it), `family_entries`, and `cases`, `case` and
+  `save_case` (provided, keeping no cases). `BatchQuery` gains `search`.
 - **The minimum supported Rust version is 1.100**, up from 1.99: the
   workspace `rust-version`, every toolchain pin in CI, and what
   `docs/installation.md` and the README badge say (both still said 1.89).
@@ -596,7 +627,6 @@ the release as a whole and names the crate it landed in.
   `TRYAGAIN`, `CROSSSLOT` and a missing node connection are likewise said rather
   than echoed. All of them stay 503s: the shard is unavailable, the request is
   not wrong.
-
 
 ## [2.0.0] - 2026-07-31
 

@@ -16,9 +16,10 @@ use std::sync::{Mutex, MutexGuard};
 use chrono::{DateTime, Utc};
 use rainier_support::{BoxFuture, Result};
 
-use super::conformance::{effective_limit, matches, newest_first, select_aggregates};
-use super::{AggregateQuery, BatchQuery, Store};
-use crate::aggregate::{merge, rollup};
+use super::conformance::{effective_limit, matches, newest_first};
+use super::{BatchQuery, Store};
+use crate::aggregate::{bucket_start, merge, rollup};
+use crate::cases::{observe, occurrences, select_cases, Case, CaseQuery};
 use crate::entry::{Aggregate, Batch, BatchSummary, Entry, EntryType};
 
 /// (bucket start, period, type, key).
@@ -36,6 +37,7 @@ struct State {
     /// Oldest stored first.
     batches: VecDeque<Batch>,
     aggregates: BTreeMap<AggregateKey, Aggregate>,
+    cases: BTreeMap<String, Case>,
 }
 
 impl MemoryStore {
@@ -77,7 +79,12 @@ impl Store for MemoryStore {
     fn store(&self, batches: Vec<Batch>) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let rolled = rollup(&batches);
+            let seen = occurrences(&batches);
             let mut state = self.lock();
+            for occurrence in &seen {
+                let existing = state.cases.remove(&occurrence.id);
+                state.cases.insert(occurrence.id.clone(), observe(existing, occurrence));
+            }
             for row in rolled {
                 let key = (row.bucket_start, row.period_s, row.entry_type, row.key.clone());
                 match state.aggregates.get_mut(&key) {
@@ -144,10 +151,65 @@ impl Store for MemoryStore {
         })
     }
 
-    fn aggregates(&self, query: AggregateQuery) -> BoxFuture<'_, Result<Vec<Aggregate>>> {
+    fn family_entries(
+        &self,
+        entry_type: EntryType,
+        key: &str,
+        before: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<Entry>>> {
+        let key = key.to_string();
         Box::pin(async move {
-            let rows: Vec<Aggregate> = self.lock().aggregates.values().cloned().collect();
-            Ok(select_aggregates(rows, &query))
+            let state = self.lock();
+            let mut found: Vec<Entry> = state
+                .batches
+                .iter()
+                .flat_map(|b| b.entries.iter())
+                .filter(|e| e.entry_type == entry_type && e.family_key() == key)
+                .filter(|e| before.is_none_or(|before| e.occurred_at < before))
+                .cloned()
+                .collect();
+            found.sort_by_key(|e| std::cmp::Reverse(e.occurred_at));
+            found.truncate(limit);
+            Ok(found)
+        })
+    }
+
+    fn aggregate_rows(
+        &self,
+        entry_type: EntryType,
+        period_s: u32,
+        since: DateTime<Utc>,
+    ) -> BoxFuture<'_, Result<Vec<Aggregate>>> {
+        Box::pin(async move {
+            let from = bucket_start(since, period_s);
+            Ok(self
+                .lock()
+                .aggregates
+                .values()
+                .filter(|a| a.entry_type == entry_type && a.period_s == period_s)
+                .filter(|a| a.bucket_start >= from)
+                .cloned()
+                .collect())
+        })
+    }
+
+    fn cases(&self, query: CaseQuery) -> BoxFuture<'_, Result<Vec<Case>>> {
+        Box::pin(async move {
+            let all: Vec<Case> = self.lock().cases.values().cloned().collect();
+            Ok(select_cases(all, &query))
+        })
+    }
+
+    fn case(&self, id: &str) -> BoxFuture<'_, Result<Option<Case>>> {
+        let id = id.to_string();
+        Box::pin(async move { Ok(self.lock().cases.get(&id).cloned()) })
+    }
+
+    fn save_case(&self, case: Case) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.lock().cases.insert(case.id.clone(), case);
+            Ok(())
         })
     }
 
@@ -162,6 +224,7 @@ impl Store for MemoryStore {
             state.batches.retain(|b| b.started_at >= batches_before);
             let removed = before - state.batches.len();
             state.aggregates.retain(|_, a| a.bucket_start >= aggregates_before);
+            state.cases.retain(|_, c| c.last_seen >= aggregates_before);
             Ok(removed as u64)
         })
     }
@@ -171,6 +234,7 @@ impl Store for MemoryStore {
             let mut state = self.lock();
             state.batches.clear();
             state.aggregates.clear();
+            state.cases.clear();
             Ok(())
         })
     }

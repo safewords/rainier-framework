@@ -17,12 +17,18 @@ pub(crate) struct FakeStore {
     pub(crate) aggregates: Mutex<Vec<Aggregate>>,
     pub(crate) last_query: Mutex<Option<BatchQuery>>,
     pub(crate) pruned_with: Mutex<Option<(DateTime<Utc>, DateTime<Utc>)>>,
+    pub(crate) cases: Mutex<std::collections::BTreeMap<String, crate::cases::Case>>,
 }
 
 impl FakeStore {
     pub(crate) fn with(batches: Vec<Batch>) -> Self {
         let store = Self::default();
         *store.aggregates.lock().unwrap() = rollup(&batches);
+        for o in crate::cases::occurrences(&batches) {
+            let mut cases = store.cases.lock().unwrap();
+            let existing = cases.remove(&o.id);
+            cases.insert(o.id.clone(), crate::cases::observe(existing, &o));
+        }
         *store.batches.lock().unwrap() = batches;
         store
     }
@@ -97,6 +103,48 @@ impl Store for FakeStore {
             out.sort_by_key(|e| std::cmp::Reverse(e.occurred_at));
             out.truncate(limit);
             Ok(out)
+        })
+    }
+
+    fn cases(
+        &self,
+        query: crate::cases::CaseQuery,
+    ) -> BoxFuture<'_, Result<Vec<crate::cases::Case>>> {
+        Box::pin(async move {
+            let all: Vec<_> = self.cases.lock().unwrap().values().cloned().collect();
+            Ok(crate::cases::select_cases(all, &query))
+        })
+    }
+
+    fn case(&self, id: &str) -> BoxFuture<'_, Result<Option<crate::cases::Case>>> {
+        let found = self.cases.lock().unwrap().get(id).cloned();
+        Box::pin(async move { Ok(found) })
+    }
+
+    fn save_case(&self, case: crate::cases::Case) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.cases.lock().unwrap().insert(case.id.clone(), case);
+            Ok(())
+        })
+    }
+
+    fn aggregate_rows(
+        &self,
+        entry_type: EntryType,
+        period_s: u32,
+        since: DateTime<Utc>,
+    ) -> BoxFuture<'_, Result<Vec<Aggregate>>> {
+        Box::pin(async move {
+            let from = crate::aggregate::bucket_start(since, period_s);
+            Ok(self
+                .aggregates
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| a.entry_type == entry_type && a.period_s == period_s)
+                .filter(|a| a.bucket_start >= from)
+                .cloned()
+                .collect())
         })
     }
 

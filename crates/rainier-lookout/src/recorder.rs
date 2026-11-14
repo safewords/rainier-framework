@@ -38,7 +38,8 @@
 //!
 //! One report arrives *after* its span: the HTTP kernel reports a failed
 //! request once `handle` has returned, and the server span closed with it. So
-//! a request batch that closes with a status of 400 or more is **parked** for
+//! a request batch that closes with a status of 500 or more (400 with
+//! `capture.client_errors`, which records client errors) is **parked** for
 //! a moment instead of finalized, and remembered on the closing thread; the
 //! `HttpRequestFailed` that follows on the same thread joins it and releases
 //! it. Parked batches nobody claims are released by the writer's next tick
@@ -767,7 +768,10 @@ impl Inner {
         {
             pending.rejected = Some(Rejection::Scope);
         }
-        if pending.kind == BatchKind::Request && pending.status.is_some_and(|s| s >= 400) {
+        // Only a status whose failure will be recorded is worth waiting for:
+        // client errors are not, unless `capture.client_errors` says so.
+        let awaited = if self.config.capture.client_errors { 400 } else { 500 };
+        if pending.kind == BatchKind::Request && pending.status.is_some_and(|s| s >= awaited) {
             let key = self.key();
             let id = pending.id.clone();
             let overflow = {
@@ -1622,9 +1626,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_error_is_not_a_failure_unless_asked_for() {
+        let not_found = || ExceptionReported {
+            failure: HttpRequestFailed::new(
+                Error::not_found("no such post"),
+                "GET",
+                "/posts/9",
+                Some("/posts/{post}".to_string()),
+            )
+            .into(),
+        };
+
+        let quiet = rig(local());
+        let events = Arc::new(Dispatcher::new());
+        quiet.lookout.listen(&events);
+        request("/posts/9", 404, || {});
+        events.dispatch(not_found()).await.unwrap();
+        quiet.lookout.flush().await;
+        let batches = quiet.store.all();
+        assert_eq!(batches.len(), 1, "{batches:#?}");
+        assert!(!batches[0].has_exception, "a 404 is not a failure");
+        assert!(batches[0].entries.iter().all(|e| e.entry_type != EntryType::Exception));
+
+        let mut config = local();
+        config.capture.client_errors = true;
+        let loud = rig(config);
+        let events = Arc::new(Dispatcher::new());
+        loud.lookout.listen(&events);
+        request("/posts/9", 404, || {});
+        events.dispatch(not_found()).await.unwrap();
+        loud.lookout.flush().await;
+        let batches = loud.store.all();
+        assert_eq!(batches.len(), 1, "{batches:#?}");
+        assert!(batches[0].has_exception, "recorded when asked for");
+    }
+
+    #[tokio::test]
     async fn a_parked_batch_nobody_claims_is_released_on_flush() {
         let rig = rig(local());
-        request("/posts/1", 404, || {});
+        request("/posts/1", 500, || {});
         assert!(rig.store.all().is_empty());
         rig.lookout.flush().await;
         assert_eq!(rig.store.all().len(), 1);
@@ -1771,12 +1811,14 @@ mod tests {
         ) -> rainier_support::BoxFuture<'_, rainier_support::Result<Vec<Entry>>> {
             self.0.entries(t, b, l)
         }
-        fn aggregates(
+        fn aggregate_rows(
             &self,
-            q: crate::store::AggregateQuery,
+            t: EntryType,
+            p: u32,
+            s: chrono::DateTime<chrono::Utc>,
         ) -> rainier_support::BoxFuture<'_, rainier_support::Result<Vec<crate::entry::Aggregate>>>
         {
-            self.0.aggregates(q)
+            self.0.aggregate_rows(t, p, s)
         }
         fn prune(
             &self,

@@ -1,6 +1,6 @@
 <script setup>
-import { computed, onBeforeUnmount, provide, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
 import { api } from './api.js'
 import { config } from './config.js'
@@ -18,13 +18,17 @@ const generation = ref(0)
 
 const route = useRoute()
 const menu = ref(false)
-watch(() => route.fullPath, () => (menu.value = false))
+watch(() => route.fullPath, () => {
+  menu.value = false
+  searchOpen.value = false
+})
 
 const sections = [
   {
     title: null,
     items: [
       { label: 'Dashboard', to: { name: 'dashboard' }, match: (r) => r.name === 'dashboard' },
+      { label: 'Cases', to: { name: 'cases' }, match: (r) => r.name === 'cases' || r.name === 'case' },
     ],
   },
   {
@@ -39,7 +43,7 @@ const sections = [
       label,
       to: { name: 'batches', query: { kind } },
       match: (r) => r.name === 'batches' && (r.query.kind || 'request') === kind,
-    })),
+    })).concat([{ label: 'Jobs (timing)', to: { name: 'jobs' }, match: (r) => r.name === 'jobs' }]),
   },
   {
     title: 'Entries',
@@ -88,6 +92,45 @@ async function clear() {
 }
 
 const environment = computed(() => config.environment)
+
+// --- Global search: `/` focuses it; on a phone it hides behind an icon.
+const router = useRouter()
+const search = ref(typeof route.query.q === 'string' && route.name === 'search' ? route.query.q : '')
+const searchOpen = ref(false)
+const searchInput = ref(null)
+const mobileSearchInput = ref(null)
+watch(
+  () => [route.name, route.query.q],
+  ([name, q]) => {
+    if (name === 'search') search.value = typeof q === 'string' ? q : ''
+  },
+)
+function submitSearch() {
+  const q = search.value.trim()
+  if (!q) return
+  searchOpen.value = false
+  router.push({ name: 'search', query: { q } })
+}
+const wideHeader = () => !window.matchMedia || window.matchMedia('(min-width: 40rem)').matches
+async function focusSearch() {
+  if (wideHeader()) {
+    searchInput.value && searchInput.value.focus()
+    return
+  }
+  searchOpen.value = true
+  await nextTick()
+  mobileSearchInput.value && mobileSearchInput.value.focus()
+}
+function onKey(event) {
+  if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey) return
+  const target = event.target
+  const tag = target && target.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (target && target.isContentEditable)) return
+  event.preventDefault()
+  focusSearch()
+}
+onMounted(() => window.addEventListener('keydown', onKey))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 </script>
 
 <template>
@@ -121,6 +164,34 @@ const environment = computed(() => config.environment)
         class="hidden rounded-full border border-zinc-200 px-2 py-0.5 text-xs text-zinc-500 sm:inline dark:border-zinc-700 dark:text-zinc-400"
       >{{ environment }}</span>
       <span class="flex-1" />
+      <form role="search" class="relative hidden w-full max-w-xs sm:block" @submit.prevent="submitSearch">
+        <svg viewBox="0 0 20 20" class="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-zinc-400" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <circle cx="9" cy="9" r="5.5" /><path d="M13 13l4 4" />
+        </svg>
+        <input
+          ref="searchInput"
+          v-model="search"
+          type="search"
+          class="lk-input pr-7 pl-8"
+          placeholder="Search"
+          aria-label="Search Lookout"
+          aria-keyshortcuts="/"
+          @keydown.esc="$event.target.blur()"
+        />
+        <kbd class="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 rounded border border-zinc-300 px-1 text-[10px] text-zinc-400 dark:border-zinc-700">/</kbd>
+      </form>
+      <button
+        type="button"
+        class="lk-btn px-2 sm:hidden"
+        :aria-expanded="searchOpen"
+        aria-controls="lookout-mobile-search"
+        aria-label="Search"
+        @click="searchOpen ? (searchOpen = false) : focusSearch()"
+      >
+        <svg viewBox="0 0 20 20" class="size-4" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <circle cx="9" cy="9" r="5.5" /><path d="M13 13l4 4" />
+        </svg>
+      </button>
       <span
         v-if="notice"
         class="hidden text-xs sm:inline"
@@ -137,6 +208,24 @@ const environment = computed(() => config.environment)
         @click="clear"
       >Clear</button>
     </header>
+    <form
+      v-if="searchOpen"
+      id="lookout-mobile-search"
+      role="search"
+      class="sticky top-14 z-30 flex gap-2 border-b border-zinc-200 bg-white px-4 py-2 sm:hidden dark:border-zinc-800 dark:bg-zinc-900"
+      @submit.prevent="submitSearch"
+    >
+      <input
+        ref="mobileSearchInput"
+        v-model="search"
+        type="search"
+        class="lk-input min-w-0 flex-1"
+        placeholder="Search Lookout…"
+        aria-label="Search Lookout"
+        @keydown.esc="searchOpen = false"
+      />
+      <button type="submit" class="lk-btn">Go</button>
+    </form>
 
     <div class="lg:grid lg:grid-cols-[14rem_minmax(0,1fr)]">
       <div v-if="menu" class="fixed inset-0 top-14 z-10 bg-zinc-950/30 lg:hidden" aria-hidden="true" @click="menu = false" />

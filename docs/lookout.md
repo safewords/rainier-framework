@@ -66,6 +66,13 @@ Read at boot through the application's `Env` (so `.env` counts), with
 | `LOOKOUT_CAPTURE_CACHE_KEYS` | | a boolean | `false` |
 | `LOOKOUT_CAPTURE_MAIL` | | a boolean | `false` |
 | `LOOKOUT_CAPTURE_USER_ID` | | a boolean | `false` |
+| `LOOKOUT_CAPTURE_CLIENT_ERRORS` | record a request's 4xx as an exception ([below](#client-errors-are-not-failures)) | a boolean | `false` |
+| `LOOKOUT_CAPTURE_CODE_TRACES` | where a slow query or call came from ([below](#code-traces)) | a boolean | `true` |
+| `LOOKOUT_INSIGHTS_ENABLED` | the dashboard's [insights and forecasts](#insights-and-forecasts) | a boolean | `true` |
+| `LOOKOUT_INSIGHTS_WINDOW_MINUTES` | the window compared with the one before | `1..=10080` | `60` |
+| `LOOKOUT_INSIGHTS_MIN_COUNT` | how many a key needs before a change in it is reported | a positive integer | `5` |
+| `LOOKOUT_INSIGHTS_CHANGE_PERCENT` | the smallest change reported | a positive integer | `50` |
+| `LOOKOUT_INSIGHTS_FORECAST_BUCKETS` | how many buckets a forecast reaches; `0` draws none | `0..=100` | `6` |
 | `APP_ENV` | `local` when it is `local` | — | — |
 
 Booleans accept `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`; an empty
@@ -144,6 +151,34 @@ jobs and outbound HTTP calls to 1000 ms.
 A run of at least `n_plus_one.min_repeats` (5) queries with the same sanitised
 SQL in one batch, taking at least `n_plus_one.min_total_ms` (50 ms) together,
 adds an `n_plus_one` entry naming the query.
+
+### Client errors are not failures
+
+The framework's reporter puts every error on the event bus, a `404` or a
+`422` included, because some listener may want them. Lookout does not: a
+request answered with a client error is recorded with its status, but it adds
+no exception entry, does not flag the batch as failed, and does not open a
+[case](#cases). `LOOKOUT_CAPTURE_CLIENT_ERRORS=true` records them. A client
+error inside a job or a command — a `NotFound` for a row that should exist —
+is always recorded: there it is the application's fault.
+
+### Code traces
+
+An exception carries its backtrace when the error captured one
+(`RUST_BACKTRACE=1`), and its content gains `frames`: the application's own
+frames — framework, runtime and standard-library frames left out — as
+`{"function", "file", "line"}`, innermost first.
+
+A slow query, cache call, outgoing request, mail, notification or view gets
+`code.trace` in the same shape: the stack **as its span closes**. `on_close`
+runs as the instrumented future is dropped, inside the poll of the code that
+awaited it, so those frames are where the call came from. Only spans over
+their slow threshold are traced, because a capture walks the stack; fast ones
+cost nothing. `LOOKOUT_CAPTURE_CODE_TRACES=false` turns it off.
+
+Both need symbols. A stripped binary renders every frame as `<unknown>`, which
+gives no frames; function names need the symbol table, and files and lines
+need line tables (`[profile.release] debug = "line-tables-only"`).
 
 ### Entry types
 
@@ -224,10 +259,65 @@ id only with `capture.user_id`.
 
 Mounted at `LOOKOUT_PATH` (`/_lookout`) **outside every middleware group** —
 no session middleware, no CSRF check. The one route that changes anything,
-clearing, is a `DELETE` that needs an `X-Lookout: 1` header besides the gate:
+clearing, is a `DELETE` that needs an `X-Lookout: 1` header besides the gate
+(changing a [case](#cases) needs the same header):
 a cross-site form cannot set one, and a cross-site `fetch` that does is
 preflighted. Mounting it inside a group would also put that group's cookies
 on a refused request, which is the next point.
+
+### What it shows
+
+- **Dashboard** — requests, throughput, error and job counts for the chosen
+  range, graphs over time with a forecast, the insights, and the slowest and
+  most frequent of each type.
+- **Every row drills in.** A route, query, job, exception or outgoing call
+  opens its own page: its series over time with the forecast, p50/p95/p99 from
+  the raw occurrences, a duration histogram, every occurrence linking to its
+  batch's waterfall, and the code trace or stack.
+- **Jobs** — per-job runs, throughput, average, maximum, total time and share,
+  with a trend for each.
+- **Cases** — see [below](#cases).
+- **Search** — the header's search box looks through batches, entries and
+  cases.
+
+### Cases
+
+Every exception's fingerprint — failure kind, exception kind, message with
+digits as `N`, first frame of the application's own code — is a **case**. The
+first occurrence opens it; every later one adds to its count, users, sources
+(routes, jobs, commands) and recent batches, and the case outlives the raw
+batches for the aggregate retention after it was last seen.
+
+**Severity** starts from what failed: a panic is critical, a server error or a
+job's final attempt high, an attempt that will be retried medium, a client
+error low. It goes up a step at 100 occurrences or 10 affected users, and
+again each time the case **regresses**. A severity set by hand stays.
+
+**Status** is open, resolved or ignored. Resolving records when, with an
+optional note; an occurrence after that reopens the case as a regression. An
+ignored case keeps counting and stays ignored. Changing a case is a `POST`
+that needs `X-Lookout: 1`, like clearing.
+
+The cache store keeps at most 1000 cases (open ones and the most recently
+seen first). The database store keeps them in `lookout_cases`, migration
+`rainier_lookout_0005_cases`; two pods folding the same case in the same
+instant can lose one occurrence's count, never the case.
+
+### Insights and forecasts
+
+The dashboard compares the last window (`LOOKOUT_INSIGHTS_WINDOW_MINUTES`)
+with the one before it, per type and per key, and reports what is **new**,
+what is **rising** or **falling** in count, what is **slower** or **faster** on
+average — each when the change is at least `LOOKOUT_INSIGHTS_CHANGE_PERCENT`
+and the key had at least `LOOKOUT_INSIGHTS_MIN_COUNT` — and where each type is
+**projected** to go over the next window. More exceptions and slower work are
+bad; fewer exceptions and faster work are good.
+
+A forecast is a least-squares line through the series' complete buckets (the
+still-filling one is left out, so a half-counted minute does not read as a
+fall), never below zero. It is a trend, not a model. The thresholds are the
+deployment's defaults; a viewer can change them for their own view, and the
+API takes them as `window`, `min`, `change` and `forecast`.
 
 ### Who may see it
 
@@ -288,12 +378,17 @@ shape.
 
 | Method | URI | What |
 |---|---|---|
-| `GET` | `/api/batches` | batch summaries, newest first — `kind`, `type`, `route`, `user`, `tag`, `trace`, `exception`, `slow`, `before`, `limit` (≤ 200, default 50) |
+| `GET` | `/api/batches` | batch summaries, newest first — `kind`, `type`, `route`, `user`, `tag`, `trace`, `exception`, `slow`, `q` (text in the summary, route, user or ids), `before`, `limit` (≤ 200, default 50) |
 | `DELETE` | `/api/batches` | delete everything — needs `X-Lookout: 1` |
 | `GET` | `/api/batches/{id}` | one batch, with its entries |
-| `GET` | `/api/entries/{type}` | entries of one type across batches — `before`, `limit` |
+| `GET` | `/api/entries/{type}` | entries of one type across batches — `key` (one family), `q` (text in the summary or key; reads at most five pages), `before`, `limit` |
 | `GET` | `/api/aggregates/{type}` | rolled-up counts and durations — `period` (60, 600, 3600), `since`, `order` (`count`, `average`, `max`) |
-| `GET` | `/api/status` | the store, watchers, sample rates and retention |
+| `GET` | `/api/series/{type}` | one zero-filled point per bucket from `since` to now — `period` (default: a dozen points or more), `key`, `keys` (that many busiest keys' own series), `forecast` (buckets) |
+| `GET` | `/api/insights` | what changed since the previous window — `window`, `min`, `change`, `forecast`, `limit` |
+| `GET` | `/api/cases` | cases — `status` (`open`, `resolved`, `ignored`, `all`), `severity` (minimum), `q`, `limit` |
+| `GET` | `/api/cases/{id}` | one case |
+| `POST` | `/api/cases/{id}` | `{"action": "resolve" \| "reopen" \| "ignore" \| "severity", "severity"?, "note"?}` — needs `X-Lookout: 1` |
+| `GET` | `/api/status` | the store, watchers, sample rates, retention and insight thresholds |
 
 The page itself is a prebuilt Vue app served from the binary, with a strict
 Content-Security-Policy, `X-Frame-Options: DENY` and `Cache-Control:

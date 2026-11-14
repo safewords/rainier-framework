@@ -155,6 +155,14 @@ pub struct Entry {
     pub content: serde_json::Value,
 }
 
+impl Entry {
+    /// The key this entry is aggregated and grouped under: its
+    /// [`family_hash`](Self::family_hash), or its summary when it has none.
+    pub fn family_key(&self) -> &str {
+        self.family_hash.as_deref().unwrap_or(&self.summary)
+    }
+}
+
 /// What started a batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

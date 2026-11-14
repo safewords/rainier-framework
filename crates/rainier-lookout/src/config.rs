@@ -162,10 +162,11 @@ impl Default for NPlusOne {
     }
 }
 
-/// What may be captured beyond the defaults. Everything is off: the defaults
-/// carry what the framework's telemetry spans carry, which deliberately leave
-/// out values.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// What may be captured beyond the defaults. Everything that could carry a
+/// value is off: the defaults carry what the framework's telemetry spans
+/// carry, which deliberately leave out values. Code traces carry only
+/// function names and source locations, and are on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capture {
     /// Request headers (redacted by name).
     pub request_headers: bool,
@@ -178,6 +179,39 @@ pub struct Capture {
     /// The authenticated user's id on the batch. Needed for user scoping and
     /// the "top users" view.
     pub user_id: bool,
+    /// A request answered with a client error (a 4xx — not found, invalid
+    /// input, unauthenticated) as an exception entry. Off, the request is
+    /// still recorded with its status, but it is not a failure: it adds no
+    /// exception and does not flag the batch. A client error inside a job or
+    /// a command is always recorded — there it is the application's fault.
+    #[serde(default)]
+    pub client_errors: bool,
+    /// Where in the application a slow query, cache call or outgoing request
+    /// came from: the application's own frames of the stack as its span
+    /// closes, as `code.trace`. Captured only for spans over their slow
+    /// threshold, so fast ones cost nothing. Function names need a binary
+    /// that is not stripped; files and lines need line tables
+    /// (`debug = "line-tables-only"`). On by default.
+    #[serde(default = "yes")]
+    pub code_traces: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Capture {
+    fn default() -> Self {
+        Self {
+            request_headers: false,
+            request_body_on_exception: false,
+            cache_keys: false,
+            mail: false,
+            user_id: false,
+            client_errors: false,
+            code_traces: true,
+        }
+    }
 }
 
 /// Names that are always redacted, plus the application's own.
@@ -325,6 +359,9 @@ pub struct LookoutConfig {
     /// keep rule keeps every batch there; elsewhere only the interesting ones.
     #[serde(default)]
     pub local: bool,
+    /// When the dashboard calls a change an insight, and how far it forecasts.
+    #[serde(default)]
+    pub insights: crate::trends::InsightsConfig,
 }
 
 impl std::fmt::Debug for LookoutConfig {
@@ -346,6 +383,7 @@ impl std::fmt::Debug for LookoutConfig {
             .field("ingest", &self.ingest)
             .field("keep", &self.keep.is_some())
             .field("local", &self.local)
+            .field("insights", &self.insights)
             .finish()
     }
 }
@@ -386,6 +424,7 @@ impl Default for LookoutConfig {
             ingest: Ingest::default(),
             keep: None,
             local: false,
+            insights: crate::trends::InsightsConfig::default(),
         }
     }
 }
@@ -497,7 +536,12 @@ impl LookoutConfig {
     /// | `LOOKOUT_LOG_LEVEL` | [`log_level`](Self::log_level) | one of [`LOG_LEVELS`] |
     /// | `LOOKOUT_RETENTION_HOURS` | [`Retention::batches_hours`] | a positive integer |
     /// | `LOOKOUT_AGGREGATE_RETENTION_DAYS` | [`Retention::aggregates_days`] | a positive integer |
-    /// | `LOOKOUT_CAPTURE_REQUEST_HEADERS`, `…_REQUEST_BODY_ON_EXCEPTION`, `…_CACHE_KEYS`, `…_MAIL`, `…_USER_ID` | [`Capture`] | booleans |
+    /// | `LOOKOUT_CAPTURE_REQUEST_HEADERS`, `…_REQUEST_BODY_ON_EXCEPTION`, `…_CACHE_KEYS`, `…_MAIL`, `…_USER_ID`, `…_CLIENT_ERRORS`, `…_CODE_TRACES` | [`Capture`] | booleans |
+    /// | `LOOKOUT_INSIGHTS_ENABLED` | [`InsightsConfig::enabled`](crate::trends::InsightsConfig) | a boolean |
+    /// | `LOOKOUT_INSIGHTS_WINDOW_MINUTES` | the window compared with the one before | a positive integer |
+    /// | `LOOKOUT_INSIGHTS_MIN_COUNT` | how many a key needs before it is reported | a positive integer |
+    /// | `LOOKOUT_INSIGHTS_CHANGE_PERCENT` | the smallest change reported | a positive integer |
+    /// | `LOOKOUT_INSIGHTS_FORECAST_BUCKETS` | how far a forecast reaches; `0` draws none | an integer |
     /// | `APP_ENV` | [`local`](Self::local), when `local` | any |
     ///
     /// Booleans accept `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`. An
@@ -587,7 +631,7 @@ impl LookoutConfig {
                 parse_positive("LOOKOUT_AGGREGATE_RETENTION_DAYS", &v)?;
         }
 
-        let flags: [(&str, &mut bool); 5] = [
+        let flags: [(&str, &mut bool); 7] = [
             ("LOOKOUT_CAPTURE_REQUEST_HEADERS", &mut config.capture.request_headers),
             (
                 "LOOKOUT_CAPTURE_REQUEST_BODY_ON_EXCEPTION",
@@ -596,11 +640,45 @@ impl LookoutConfig {
             ("LOOKOUT_CAPTURE_CACHE_KEYS", &mut config.capture.cache_keys),
             ("LOOKOUT_CAPTURE_MAIL", &mut config.capture.mail),
             ("LOOKOUT_CAPTURE_USER_ID", &mut config.capture.user_id),
+            ("LOOKOUT_CAPTURE_CLIENT_ERRORS", &mut config.capture.client_errors),
+            ("LOOKOUT_CAPTURE_CODE_TRACES", &mut config.capture.code_traces),
         ];
         for (name, slot) in flags {
             if let Some(v) = get(name) {
                 *slot = parse_bool(name, &v)?;
             }
+        }
+
+        if let Some(v) = get("LOOKOUT_INSIGHTS_ENABLED") {
+            config.insights.enabled = parse_bool("LOOKOUT_INSIGHTS_ENABLED", &v)?;
+        }
+        if let Some(v) = get("LOOKOUT_INSIGHTS_WINDOW_MINUTES") {
+            let minutes = parse_positive("LOOKOUT_INSIGHTS_WINDOW_MINUTES", &v)?;
+            if minutes > 7 * 24 * 60 {
+                return Err(ConfigError::new(
+                    "LOOKOUT_INSIGHTS_WINDOW_MINUTES",
+                    v,
+                    "at most 10080 (a week)",
+                ));
+            }
+            config.insights.window_minutes = minutes;
+        }
+        if let Some(v) = get("LOOKOUT_INSIGHTS_MIN_COUNT") {
+            config.insights.min_count = parse_positive("LOOKOUT_INSIGHTS_MIN_COUNT", &v)?;
+        }
+        if let Some(v) = get("LOOKOUT_INSIGHTS_CHANGE_PERCENT") {
+            config.insights.change_percent = parse_positive("LOOKOUT_INSIGHTS_CHANGE_PERCENT", &v)?;
+        }
+        if let Some(v) = get("LOOKOUT_INSIGHTS_FORECAST_BUCKETS") {
+            let n = parse_u64("LOOKOUT_INSIGHTS_FORECAST_BUCKETS", &v)?;
+            if n > 100 {
+                return Err(ConfigError::new(
+                    "LOOKOUT_INSIGHTS_FORECAST_BUCKETS",
+                    v,
+                    "an integer from 0 to 100",
+                ));
+            }
+            config.insights.forecast_buckets = n as usize;
         }
 
         if let Some(v) = get("APP_ENV") {

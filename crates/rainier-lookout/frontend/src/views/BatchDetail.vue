@@ -7,10 +7,11 @@ import ErrorBox from '../components/ErrorBox.vue'
 import Flags from '../components/Flags.vue'
 import Json from '../components/Json.vue'
 import Pill from '../components/Pill.vue'
+import StackTrace from '../components/StackTrace.vue'
 import TimeAgo from '../components/TimeAgo.vue'
 import Waterfall from '../components/Waterfall.vue'
 import { api } from '../api.js'
-import { absolute, duration, hasTag } from '../format.js'
+import { absolute, caseId, duration, hasTag } from '../format.js'
 
 const props = defineProps({ id: { type: String, required: true } })
 
@@ -50,6 +51,31 @@ const counts = computed(() => {
 const entry = computed(() =>
   batch.value && selected.value ? batch.value.entries.find((e) => e.id === selected.value) : null,
 )
+
+/** What an exception entry says about itself: message, cause chain, stack, and its case. */
+const failure = computed(() => {
+  const e = entry.value
+  if (!e || e.type !== 'exception') return null
+  const c = e.content && typeof e.content === 'object' ? e.content : {}
+  const ex = c.exception && typeof c.exception === 'object' ? c.exception : {}
+  const key = e.family_hash || e.summary
+  return {
+    key,
+    caseId: caseId(key),
+    kind: typeof c.kind_label === 'string' ? c.kind_label : null,
+    message: typeof ex.message === 'string' ? ex.message : null,
+    sources: Array.isArray(ex.sources) ? ex.sources.map(String) : [],
+    frames: Array.isArray(c.frames) ? c.frames : [],
+    backtrace: typeof ex.backtrace === 'string' ? ex.backtrace : '',
+  }
+})
+
+/** Where a slow span was called from, when Lookout captured it. */
+const calledFrom = computed(() => {
+  const e = entry.value
+  const trace = e && e.content && typeof e.content === 'object' ? e.content['code.trace'] : null
+  return Array.isArray(trace) && trace.length ? trace : null
+})
 
 function offset(e) {
   return Math.max(0, (Date.parse(e.occurred_at) - Date.parse(batch.value.started_at)) * 1000)
@@ -174,6 +200,38 @@ onMounted(async () => {
           </dl>
           <div v-if="entry.tags.length" class="flex flex-wrap gap-1">
             <Pill v-for="tag in entry.tags" :key="tag">{{ tag }}</Pill>
+          </div>
+          <div v-if="failure" class="space-y-3 rounded-lg border border-rose-200 p-3 dark:border-rose-500/30">
+            <div class="flex flex-wrap items-center gap-2">
+              <Pill v-if="failure.kind" tone="bad">{{ failure.kind }}</Pill>
+              <span class="flex-1" />
+              <RouterLink
+                :to="{ name: 'issue', params: { type: 'exception' }, query: { key: failure.key } }"
+                class="text-sm text-indigo-600 hover:underline dark:text-indigo-400"
+              >Issue →</RouterLink>
+              <RouterLink
+                :to="{ name: 'case', params: { id: failure.caseId } }"
+                class="text-sm text-indigo-600 hover:underline dark:text-indigo-400"
+              >Case →</RouterLink>
+            </div>
+            <p v-if="failure.message" class="font-mono text-[13px] break-words whitespace-pre-wrap">{{ failure.message }}</p>
+            <ol v-if="failure.sources.length" class="space-y-1">
+              <li v-for="(s, i) in failure.sources" :key="i" class="font-mono text-xs break-words text-zinc-600 dark:text-zinc-400">↳ {{ s }}</li>
+            </ol>
+            <div>
+              <h3 class="lk-th mb-1.5">Stack</h3>
+              <StackTrace :frames="failure.frames" :backtrace="failure.backtrace" />
+            </div>
+          </div>
+          <div v-if="calledFrom">
+            <h3 class="lk-th mb-1.5">Called from</h3>
+            <StackTrace :frames="calledFrom" />
+          </div>
+          <div v-if="entry.family_hash && entry.type !== 'exception'">
+            <RouterLink
+              :to="{ name: 'issue', params: { type: entry.type }, query: { key: entry.family_hash } }"
+              class="text-sm text-indigo-600 hover:underline dark:text-indigo-400"
+            >Every {{ entry.type }} like this →</RouterLink>
           </div>
           <Json :value="entry.content" />
         </div>

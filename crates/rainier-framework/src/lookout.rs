@@ -377,6 +377,55 @@ impl Store for DeferredStore {
         }
     }
 
+    fn aggregate_rows(
+        &self,
+        entry_type: EntryType,
+        period_s: u32,
+        since: DateTime<Utc>,
+    ) -> BoxFuture<'_, Result<Vec<Aggregate>>> {
+        match self.get() {
+            Ok(store) => store.aggregate_rows(entry_type, period_s, since),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
+    }
+
+    fn family_entries(
+        &self,
+        entry_type: EntryType,
+        key: &str,
+        before: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<Entry>>> {
+        match self.get() {
+            Ok(store) => store.family_entries(entry_type, key, before, limit),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
+    }
+
+    fn cases(
+        &self,
+        query: rainier_lookout::cases::CaseQuery,
+    ) -> BoxFuture<'_, Result<Vec<rainier_lookout::cases::Case>>> {
+        match self.get() {
+            Ok(store) => store.cases(query),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
+    }
+
+    fn case(&self, id: &str) -> BoxFuture<'_, Result<Option<rainier_lookout::cases::Case>>> {
+        match self.get() {
+            Ok(store) => store.case(id),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
+    }
+
+    fn save_case(&self, case: rainier_lookout::cases::Case) -> BoxFuture<'_, Result<()>> {
+        match self.get() {
+            Ok(store) => store.save_case(case),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
+    }
+
     fn prune(
         &self,
         batches_before: DateTime<Utc>,

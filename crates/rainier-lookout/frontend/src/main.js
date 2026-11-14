@@ -9,6 +9,11 @@ import Batches from './views/Batches.vue'
 import BatchDetail from './views/BatchDetail.vue'
 import Entries from './views/Entries.vue'
 import Status from './views/Status.vue'
+import Issue from './views/Issue.vue'
+import Jobs from './views/Jobs.vue'
+import Cases from './views/Cases.vue'
+import CaseDetail from './views/CaseDetail.vue'
+import Search from './views/Search.vue'
 import NotFound from './views/NotFound.vue'
 
 const router = createRouter({
@@ -19,6 +24,13 @@ const router = createRouter({
     { path: '/batches/:id', name: 'batch', component: BatchDetail, props: true },
     { path: '/entries/:type', name: 'entries', component: Entries, props: true },
     { path: '/status', name: 'status', component: Status },
+    // One family of one type: ?key=<family key>
+    { path: '/issues/:type', name: 'issue', component: Issue, props: true },
+    { path: '/jobs', name: 'jobs', component: Jobs },
+    { path: '/cases', name: 'cases', component: Cases },
+    { path: '/cases/:id', name: 'case', component: CaseDetail, props: true },
+    // ?q=<text>
+    { path: '/search', name: 'search', component: Search },
     { path: '/:rest(.*)*', name: 'not-found', component: NotFound },
   ],
   scrollBehavior: (to, from, saved) => saved || { top: 0 },

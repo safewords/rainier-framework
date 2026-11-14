@@ -97,6 +97,22 @@ pub fn matches(query: &BatchQuery, batch: &BatchSummary) -> bool {
     if query.before.is_some_and(|before| batch.started_at >= before) {
         return false;
     }
+    if let Some(search) = &query.search {
+        let needle = search.to_lowercase();
+        let found = [
+            Some(batch.summary.as_str()),
+            batch.route_name.as_deref(),
+            batch.user_id.as_deref(),
+            Some(batch.id.as_str()),
+            Some(batch.trace_id.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|field| field.to_lowercase().contains(&needle));
+        if !found {
+            return false;
+        }
+    }
     true
 }
 
@@ -293,6 +309,10 @@ pub async fn run(store: &dyn Store) {
     a_batch_round_trips_with_its_entries_in_order(store).await;
     storing_an_id_again_replaces_it(store).await;
     entries_by_type_are_newest_first_with_a_cursor(store).await;
+    family_entries_are_one_keys_occurrences(store).await;
+    search_matches_summary_route_user_and_ids(store).await;
+    aggregate_rows_are_unmerged_buckets(store).await;
+    exceptions_become_cases_that_can_be_closed(store).await;
     aggregates_roll_up_and_order(store).await;
     aggregates_merge_across_writes_into_one_bucket(store).await;
     prune_cuts_batches_and_aggregates_independently(store).await;
@@ -521,6 +541,122 @@ pub async fn entries_by_type_are_newest_first_with_a_cursor(store: &dyn Store) {
     );
 
     assert!(store.entries(EntryType::Mail, None, 10).await.expect("entries").is_empty());
+}
+
+/// [`Store::family_entries`] returns one family's entries, newest first,
+/// with the same strict cursor — including entries keyed by their summary.
+pub async fn family_entries_are_one_keys_occurrences(store: &dyn Store) {
+    let name = store.name();
+    let mut a = batch("fa", BatchKind::Job, at(10, 0));
+    a.entries = vec![
+        entry("fa", 0, EntryType::Query, "select ?", at(10, 1), Some(5)),
+        entry("fa", 1, EntryType::Query, "update ?", at(10, 2), Some(5)),
+        entry("fa", 2, EntryType::Query, "select ?", at(10, 3), Some(5)),
+    ];
+    let mut bare = entry("fa", 3, EntryType::Query, "ignored", at(10, 4), Some(5));
+    bare.family_hash = None;
+    bare.summary = "select ?".into();
+    a.entries.push(bare);
+    let mut b = batch("fb", BatchKind::Job, at(20, 0));
+    b.entries = vec![entry("fb", 0, EntryType::Query, "select ?", at(20, 1), Some(5))];
+    seed(store, vec![a, b]).await;
+
+    let ids = |entries: Vec<Entry>| entries.into_iter().map(|e| e.id).collect::<Vec<_>>();
+    let got = store.family_entries(EntryType::Query, "select ?", None, 10).await.expect("family");
+    assert_eq!(ids(got), ["fb-e0", "fa-e3", "fa-e2", "fa-e0"], "[{name}] family");
+    let got = store
+        .family_entries(EntryType::Query, "select ?", Some(at(10, 3)), 1)
+        .await
+        .expect("cursor");
+    assert_eq!(ids(got), ["fa-e0"], "[{name}] family cursor");
+    let got = store.family_entries(EntryType::Exception, "select ?", None, 10).await.expect("type");
+    assert!(got.is_empty(), "[{name}] family of another type");
+}
+
+/// `search` matches text in the summary, route name, user, id or trace id.
+/// Lower-case text, so a case-sensitive `LIKE` agrees.
+pub async fn search_matches_summary_route_user_and_ids(store: &dyn Store) {
+    let name = store.name();
+    let mut a = batch("sa", BatchKind::Request, at(10, 0));
+    a.summary = "GET /posts/1 200".into();
+    let mut b = batch("sb", BatchKind::Request, at(20, 0));
+    b.route_name = Some("users.show".into());
+    let mut c = batch("sc", BatchKind::Request, at(30, 0));
+    c.user_id = Some("alice".into());
+    seed(store, vec![a, b, c]).await;
+    let search = |text: &str| BatchQuery { search: Some(text.into()), ..BatchQuery::default() };
+    assert_eq!(ids(store, search("posts")).await, ["sa"], "[{name}] summary");
+    assert_eq!(ids(store, search("users.sh")).await, ["sb"], "[{name}] route");
+    assert_eq!(ids(store, search("alic")).await, ["sc"], "[{name}] user");
+    assert_eq!(ids(store, search("trace-sb")).await, ["sb"], "[{name}] trace");
+    assert!(ids(store, search("nowhere")).await.is_empty(), "[{name}] no match");
+}
+
+/// [`Store::aggregate_rows`] returns one row per bucket and key, unmerged.
+pub async fn aggregate_rows_are_unmerged_buckets(store: &dyn Store) {
+    let name = store.name();
+    let mut a = batch("ra", BatchKind::Job, at(0, 0));
+    a.entries = vec![
+        entry("ra", 0, EntryType::Job, "send", at(0, 0), Some(10)),
+        entry("ra", 1, EntryType::Job, "send", at(120, 0), Some(30)),
+        entry("ra", 2, EntryType::Job, "other", at(120, 0), Some(5)),
+    ];
+    seed(store, vec![a]).await;
+    let mut rows = store.aggregate_rows(EntryType::Job, 60, at(0, 0)).await.expect("rows");
+    rows.sort_by(|x, y| x.bucket_start.cmp(&y.bucket_start).then_with(|| x.key.cmp(&y.key)));
+    let shape: Vec<(String, u64, u64)> =
+        rows.iter().map(|r| (r.key.clone(), r.count, r.sum_us)).collect();
+    assert_eq!(
+        shape,
+        [("send".into(), 1, 10), ("other".into(), 1, 5), ("send".into(), 1, 30)],
+        "[{name}] rows"
+    );
+    let later = store.aggregate_rows(EntryType::Job, 60, at(61, 0)).await.expect("rows");
+    assert_eq!(later.len(), 2, "[{name}] since");
+}
+
+/// Stored exceptions open a case per fingerprint; later ones add to it; a
+/// saved change sticks; clear removes cases.
+pub async fn exceptions_become_cases_that_can_be_closed(store: &dyn Store) {
+    use crate::cases::{act, case_id, CaseAction, CaseQuery, CaseStatus};
+    let name = store.name();
+    let mut a = batch("ca", BatchKind::Request, at(10, 0));
+    a.user_id = Some("7".into());
+    a.entries = vec![entry("ca", 0, EntryType::Exception, "Boom|x", at(10, 1), None)];
+    let mut b = batch("cb", BatchKind::Job, at(20, 0));
+    b.entries = vec![
+        entry("cb", 0, EntryType::Exception, "Boom|x", at(20, 1), None),
+        entry("cb", 1, EntryType::Exception, "Other|y", at(20, 2), None),
+    ];
+    seed(store, vec![a]).await;
+    store.store(vec![b]).await.expect("store");
+
+    let all = store.cases(CaseQuery::default()).await.expect("cases");
+    assert_eq!(all.len(), 2, "[{name}] one case per fingerprint");
+    let id = case_id("Boom|x");
+    let boom = store.case(&id).await.expect("case").expect("[boom] exists");
+    assert_eq!(boom.occurrences, 2, "[{name}] counted");
+    assert_eq!(boom.first_batch_id, "ca", "[{name}] first batch");
+    assert_eq!(boom.recent_batches, ["cb", "ca"], "[{name}] recent batches");
+    assert_eq!(boom.users, ["7"], "[{name}] users");
+
+    let resolved = act(boom, &CaseAction::Resolve, None, at(30, 0));
+    store.save_case(resolved).await.expect("save");
+    let open = store
+        .cases(CaseQuery { status: Some(CaseStatus::Open), ..CaseQuery::default() })
+        .await
+        .expect("cases");
+    assert_eq!(open.len(), 1, "[{name}] the resolved one left the open list");
+
+    let mut c = batch("cc", BatchKind::Job, at(40, 0));
+    c.entries = vec![entry("cc", 0, EntryType::Exception, "Boom|x", at(40, 1), None)];
+    store.store(vec![c]).await.expect("store");
+    let back = store.case(&id).await.expect("case").expect("exists");
+    assert_eq!(back.status, CaseStatus::Open, "[{name}] regressed");
+    assert_eq!(back.regressions, 1, "[{name}] regressions");
+
+    store.clear().await.expect("clear");
+    assert!(store.cases(CaseQuery::default()).await.expect("cases").is_empty(), "[{name}]");
 }
 
 fn agg_query(

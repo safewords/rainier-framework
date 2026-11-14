@@ -1,6 +1,6 @@
 //! [`DatabaseStore`]: Lookout's own tables, with their own migrations.
 //!
-//! Four tables, defined as ORM entities so the same code runs on every dialect
+//! Five tables (batches, entries, batch tags, aggregates, cases), defined as ORM entities so the same code runs on every dialect
 //! Rainier supports (SQLite and D1, MySQL/MariaDB, Postgres):
 //!
 //! | Table | Key | Holds |
@@ -9,6 +9,7 @@
 //! | `lookout_entries` | `(batch_id, seq)` | one row per entry, its payload as JSON text |
 //! | `lookout_batch_tags` | `(batch_id, tag)` | one row per batch tag, so the tag filter is an indexed lookup |
 //! | `lookout_aggregates` | `(bucket_start, period_s, type, key_hash)` | rolled-up counts and durations |
+//! | `lookout_cases` | `id` (the fingerprint's hash) | one row per case: status and last seen as columns, the rest as JSON |
 //!
 //! Register [`DatabaseStore::migrations`] with the application's migrator.
 //!
@@ -48,7 +49,7 @@
 //! Every statement runs inside a span carrying `rainier.lookout.internal =
 //! true`, so Lookout does not record its own queries.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use rainier_database::{statement, Criteria, Database, Migrator, Subquery, Upsert};
@@ -56,9 +57,10 @@ use rainier_orm::Entity;
 use rainier_support::{BoxFuture, Error, Result};
 use tracing::Instrument as _;
 
-use super::conformance::{effective_limit, select_aggregates};
-use super::{AggregateQuery, BatchQuery, Store};
+use super::conformance::effective_limit;
+use super::{BatchQuery, Store};
 use crate::aggregate;
+use crate::cases::{self, Case, CaseQuery};
 use crate::entry::{Aggregate, Batch, BatchKind, BatchSummary, Entry, EntryType};
 
 /// The longest an indexed string column holds — see the module docs.
@@ -157,6 +159,36 @@ struct AggregateRow {
     max_us: i64,
 }
 
+/// A case, as a row: the fields a listing filters and orders by, and the rest
+/// as JSON.
+#[derive(Entity, Clone, Debug, PartialEq)]
+#[orm(table = "lookout_cases")]
+struct CaseRow {
+    #[orm(pk)]
+    id: String,
+    #[orm(index)]
+    status: String,
+    #[orm(index)]
+    last_seen_us: i64,
+    /// JSON: the whole [`Case`].
+    data: String,
+}
+
+impl CaseRow {
+    fn from_case(case: &Case) -> Result<Self> {
+        Ok(Self {
+            id: case.id.clone(),
+            status: case.status.as_str().to_string(),
+            last_seen_us: micros(case.last_seen),
+            data: serde_json::to_string(case)?,
+        })
+    }
+
+    fn into_case(self) -> Result<Case> {
+        Ok(serde_json::from_str(&self.data)?)
+    }
+}
+
 /// Lookout's own tables, on any Rainier database connection.
 ///
 /// ```ignore
@@ -188,6 +220,7 @@ impl DatabaseStore {
             .create_table::<EntryRow>("rainier_lookout_0002_entries")
             .create_table::<TagRow>("rainier_lookout_0003_batch_tags")
             .create_table::<AggregateRow>("rainier_lookout_0004_aggregates")
+            .create_table::<CaseRow>("rainier_lookout_0005_cases")
     }
 
     /// How many rows of `columns` columns fit one statement.
@@ -271,7 +304,65 @@ impl DatabaseStore {
         self.insert_all(&tag_rows, TagRow::columns().len()).await?;
         self.insert_all(&entry_rows, EntryRow::columns().len()).await?;
 
-        self.roll_up(&batches).await
+        self.roll_up(&batches).await?;
+        self.observe_cases(&batches).await
+    }
+
+    /// Fold `batches`' exceptions into their cases: read the rows of the
+    /// cases they touch, fold in Rust, write them back. Two writers folding
+    /// the same case at once can lose an occurrence's count; the case itself
+    /// is never lost.
+    async fn observe_cases(&self, batches: &[Batch]) -> Result<()> {
+        let seen = cases::occurrences(batches);
+        if seen.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> =
+            seen.iter().map(|o| o.id.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+        let mut current: BTreeMap<String, Case> = BTreeMap::new();
+        for chunk in ids.chunks(self.max_bind_params.min(PRUNE_CHUNK)) {
+            for row in
+                self.select::<CaseRow>(Criteria::new().where_in("id", chunk.to_vec())).await?
+            {
+                let case = row.into_case()?;
+                current.insert(case.id.clone(), case);
+            }
+        }
+        for occurrence in &seen {
+            let existing = current.remove(&occurrence.id);
+            current.insert(occurrence.id.clone(), cases::observe(existing, occurrence));
+        }
+        self.write_cases(current.into_values().collect()).await
+    }
+
+    async fn write_cases(&self, cases: Vec<Case>) -> Result<()> {
+        let rows = cases.iter().map(CaseRow::from_case).collect::<Result<Vec<_>>>()?;
+        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        for chunk in ids.chunks(self.max_bind_params.min(PRUNE_CHUNK)) {
+            self.delete::<CaseRow>(Criteria::new().where_in("id", chunk.to_vec())).await?;
+        }
+        self.insert_all(&rows, CaseRow::columns().len()).await
+    }
+
+    async fn list_cases(&self, query: CaseQuery) -> Result<Vec<Case>> {
+        let mut criteria = Criteria::new();
+        if let Some(status) = query.status {
+            criteria = criteria.where_eq("status", status.as_str());
+        }
+        let all = self
+            .select::<CaseRow>(criteria.order_by_desc("last_seen_us").limit(5000))
+            .await?
+            .into_iter()
+            .map(CaseRow::into_case)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(cases::select_cases(all, &query))
+    }
+
+    async fn find_case(&self, id: &str) -> Result<Option<Case>> {
+        match self.select::<CaseRow>(Criteria::new().where_eq("id", id).limit(1)).await?.pop() {
+            Some(row) => Ok(Some(row.into_case()?)),
+            None => Ok(None),
+        }
     }
 
     async fn roll_up(&self, batches: &[Batch]) -> Result<()> {
@@ -337,6 +428,14 @@ impl DatabaseStore {
         if let Some(before) = query.before {
             criteria = criteria.where_lt("started_at_us", micros(before));
         }
+        if let Some(search) = &query.search {
+            let pattern = format!("%{search}%");
+            criteria = criteria.or_where(|group| {
+                ["summary", "route_name", "user_id", "id", "trace_id"]
+                    .into_iter()
+                    .fold(group, |group, column| group.where_like(column, pattern.clone()))
+            });
+        }
         if let Some(entry_type) = query.entry_type {
             criteria = criteria.where_exists(
                 Subquery::count(EntryRow::table())
@@ -396,20 +495,70 @@ impl DatabaseStore {
         self.select::<EntryRow>(criteria).await?.into_iter().map(EntryRow::into_entry).collect()
     }
 
-    async fn rolled_up(&self, query: AggregateQuery) -> Result<Vec<Aggregate>> {
-        let from = aggregate::bucket_start(query.since, query.period_s).timestamp();
-        let rows = self
-            .select::<AggregateRow>(
-                Criteria::new()
-                    .where_eq("type", query.entry_type.as_str())
-                    .where_eq("period_s", i64::from(query.period_s))
-                    .where_gte("bucket_start", from),
-            )
+    async fn rows(
+        &self,
+        entry_type: EntryType,
+        period_s: u32,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<Aggregate>> {
+        let from = aggregate::bucket_start(since, period_s).timestamp();
+        self.select::<AggregateRow>(
+            Criteria::new()
+                .where_eq("type", entry_type.as_str())
+                .where_eq("period_s", i64::from(period_s))
+                .where_gte("bucket_start", from),
+        )
+        .await?
+        .into_iter()
+        .map(AggregateRow::into_aggregate)
+        .collect()
+    }
+
+    /// One family's entries: those whose family key hashes to `key`'s hash
+    /// (the index) and is `key`, and those without a family key whose summary
+    /// is `key`. Two indexed queries, merged in Rust.
+    async fn family(
+        &self,
+        entry_type: EntryType,
+        key: &str,
+        before: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<Entry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let narrowed = |criteria: Criteria| {
+            let criteria = criteria.where_eq("type", entry_type.as_str());
+            let criteria = match before {
+                Some(before) => criteria.where_lt("occurred_at_us", micros(before)),
+                None => criteria,
+            };
+            criteria
+                .order_by_desc("occurred_at_us")
+                .order_by_desc("batch_id")
+                .order_by_desc("seq")
+                .limit(limit as u64)
+        };
+        let mut rows: Vec<EntryRow> = self
+            .select::<EntryRow>(narrowed(Criteria::new().where_eq("family_hash", hash(key))))
             .await?
             .into_iter()
-            .map(AggregateRow::into_aggregate)
-            .collect::<Result<Vec<_>>>()?;
-        Ok(select_aggregates(rows, &query))
+            .filter(|row| row.family_key.as_deref() == Some(key))
+            .collect();
+        rows.extend(
+            self.select::<EntryRow>(narrowed(
+                Criteria::new().where_null("family_key").where_eq("summary", key),
+            ))
+            .await?,
+        );
+        rows.sort_by(|a, b| {
+            b.occurred_at_us
+                .cmp(&a.occurred_at_us)
+                .then_with(|| b.batch_id.cmp(&a.batch_id))
+                .then_with(|| b.seq.cmp(&a.seq))
+        });
+        rows.truncate(limit);
+        rows.into_iter().map(EntryRow::into_entry).collect()
     }
 
     async fn prune_rows(
@@ -460,12 +609,19 @@ impl DatabaseStore {
             )
             .await?;
         }
+        self.delete::<CaseRow>(Criteria::new().where_lt("last_seen_us", micros(aggregates_before)))
+            .await?;
         Ok(pruned)
     }
 
     async fn clear_all(&self) -> Result<()> {
-        for table in [EntryRow::table(), TagRow::table(), BatchRow::table(), AggregateRow::table()]
-        {
+        for table in [
+            EntryRow::table(),
+            TagRow::table(),
+            BatchRow::table(),
+            AggregateRow::table(),
+            CaseRow::table(),
+        ] {
             self.db.statement(&format!("DELETE FROM {table}")).await?;
         }
         Ok(())
@@ -509,8 +665,41 @@ impl Store for DatabaseStore {
         Box::pin(self.of_type(entry_type, before, limit).instrument(internal("entries")))
     }
 
-    fn aggregates(&self, query: AggregateQuery) -> BoxFuture<'_, Result<Vec<Aggregate>>> {
-        Box::pin(self.rolled_up(query).instrument(internal("aggregates")))
+    fn family_entries(
+        &self,
+        entry_type: EntryType,
+        key: &str,
+        before: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<Entry>>> {
+        let key = key.to_string();
+        Box::pin(async move {
+            self.family(entry_type, &key, before, limit)
+                .instrument(internal("family_entries"))
+                .await
+        })
+    }
+
+    fn aggregate_rows(
+        &self,
+        entry_type: EntryType,
+        period_s: u32,
+        since: DateTime<Utc>,
+    ) -> BoxFuture<'_, Result<Vec<Aggregate>>> {
+        Box::pin(self.rows(entry_type, period_s, since).instrument(internal("aggregates")))
+    }
+
+    fn cases(&self, query: CaseQuery) -> BoxFuture<'_, Result<Vec<Case>>> {
+        Box::pin(self.list_cases(query).instrument(internal("cases")))
+    }
+
+    fn case(&self, id: &str) -> BoxFuture<'_, Result<Option<Case>>> {
+        let id = id.to_string();
+        Box::pin(async move { self.find_case(&id).await }.instrument(internal("case")))
+    }
+
+    fn save_case(&self, case: Case) -> BoxFuture<'_, Result<()>> {
+        Box::pin(self.write_cases(vec![case]).instrument(internal("save_case")))
     }
 
     fn prune(
@@ -729,6 +918,7 @@ mod tests {
                 "rainier_lookout_0002_entries",
                 "rainier_lookout_0003_batch_tags",
                 "rainier_lookout_0004_aggregates",
+                "rainier_lookout_0005_cases",
             ]
         );
     }
@@ -742,12 +932,13 @@ mod tests {
                 rainier_orm::schema::schema_ddl::<EntryRow>(dialect),
                 rainier_orm::schema::schema_ddl::<TagRow>(dialect),
                 rainier_orm::schema::schema_ddl::<AggregateRow>(dialect),
+                rainier_orm::schema::schema_ddl::<CaseRow>(dialect),
             ]
             .concat()
             .join(";\n");
             assert!(!ddl.to_lowercase().contains("unsigned"), "{dialect:?}: {ddl}");
             assert!(ddl.contains("lookout_aggregates"), "{dialect:?}");
-            // Four tables plus their secondary indexes.
+            // Five tables plus their secondary indexes.
             assert!(ddl.matches("CREATE INDEX").count() >= 6, "{dialect:?}: {ddl}");
         }
     }
@@ -814,7 +1005,7 @@ mod tests {
                 .await
                 .expect("connect");
             let db = Database::new(executor);
-            assert_eq!(DatabaseStore::migrations().run(&db).await.unwrap().len(), 4);
+            assert_eq!(DatabaseStore::migrations().run(&db).await.unwrap().len(), 5);
             assert!(DatabaseStore::migrations().run(&db).await.unwrap().is_empty());
         }
 

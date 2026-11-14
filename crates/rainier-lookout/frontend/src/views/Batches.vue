@@ -3,7 +3,6 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import BatchList from '../components/BatchList.vue'
-import Empty from '../components/Empty.vue'
 import ErrorBox from '../components/ErrorBox.vue'
 import LoadMore from '../components/LoadMore.vue'
 import { api } from '../api.js'
@@ -19,6 +18,7 @@ const label = computed(() => (KINDS.find((k) => k.key === kind.value) || { label
 
 const text = (key) => (typeof route.query[key] === 'string' ? route.query[key] : '')
 const form = reactive({
+  q: text('q'),
   route: text('route'),
   user: text('user'),
   tag: text('tag'),
@@ -28,6 +28,7 @@ const form = reactive({
 })
 const filters = computed(() => ({
   kind: kind.value,
+  q: text('q'),
   route: text('route'),
   user: text('user'),
   tag: text('tag'),
@@ -37,7 +38,7 @@ const filters = computed(() => ({
   trace: text('trace'),
 }))
 const filtered = computed(() =>
-  ['route', 'user', 'tag', 'type', 'exception', 'slow', 'trace'].some((k) => filters.value[k]),
+  ['q', 'route', 'user', 'tag', 'type', 'exception', 'slow', 'trace'].some((k) => filters.value[k]),
 )
 
 const batches = ref([])
@@ -48,7 +49,7 @@ const error = ref(null)
 
 function apply() {
   const query = { kind: kind.value }
-  for (const key of ['route', 'user', 'tag', 'type']) if (form[key].trim()) query[key] = form[key].trim()
+  for (const key of ['q', 'route', 'user', 'tag', 'type']) if (form[key].trim()) query[key] = form[key].trim()
   if (form.exception) query.exception = '1'
   if (form.slow) query.slow = '1'
   router.replace({ query })
@@ -122,6 +123,13 @@ usePolling(refresh)
     </nav>
 
     <form class="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:flex lg:flex-wrap lg:items-center" @submit.prevent="apply">
+      <input
+        v-model="form.q"
+        class="lk-input col-span-2 sm:col-span-3 lg:w-64"
+        type="search"
+        placeholder="Search summaries…"
+        aria-label="Search batches"
+      />
       <input v-model="form.route" class="lk-input lg:w-44" type="search" placeholder="Route name" aria-label="Route name" />
       <input v-model="form.user" class="lk-input lg:w-32" type="search" placeholder="User id" aria-label="User id" />
       <input v-model="form.tag" class="lk-input lg:w-32" type="search" placeholder="Tag" aria-label="Tag" />
@@ -144,8 +152,12 @@ usePolling(refresh)
     <ErrorBox :error="error" />
 
     <section class="lk-card">
-      <BatchList v-if="batches.length" :batches="batches" />
-      <Empty v-else>{{ loading ? 'Loading…' : filtered ? 'Nothing matches those filters.' : 'Nothing recorded yet.' }}</Empty>
+      <BatchList
+        :batches="batches"
+        :loading="loading"
+        :label="label"
+        :empty="filtered ? 'Nothing matches those filters.' : 'Nothing recorded yet.'"
+      />
       <LoadMore v-if="next" :loading="more" @more="loadMore" />
     </section>
   </div>

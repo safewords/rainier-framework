@@ -83,6 +83,7 @@ fn render(state: &Shared) -> String {
         "environment": state.environment,
         "store": state.store.name(),
         "version": version(),
+        "insights": state.config.insights,
     });
     let assets = attribute(&format!("{}/assets", state.base));
     let version = version();

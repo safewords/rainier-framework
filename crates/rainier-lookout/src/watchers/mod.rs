@@ -80,6 +80,14 @@ impl Lookout {
         if !inner.active() || !inner.config.watcher(EntryType::Exception).enabled {
             return;
         }
+        // A 404 or a 422 is the client's mistake, not a failure of the
+        // application — unless it was asked for.
+        if matches!(failure, Failure::HttpRequest(_))
+            && failure.exception().is_client_error()
+            && !inner.config.capture.client_errors
+        {
+            return;
+        }
         let entry = exceptions::entry(&inner.config, failure);
         let failed_job = matches!(failure, Failure::JobAttempt(f) if f.final_attempt);
         let after_request = matches!(failure, Failure::HttpRequest(_));

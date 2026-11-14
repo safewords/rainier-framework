@@ -14,8 +14,13 @@ use serde_json::{json, Map, Value};
 
 use super::params::{self, Params};
 use super::{Shared, CLEAR_HEADER};
+use std::collections::BTreeMap;
+
+use crate::aggregate::AGGREGATED;
+use crate::cases::{self, CaseAction, CaseSeverity};
 use crate::config::StoreKind;
-use crate::entry::{Aggregate, EntryType};
+use crate::entry::{Aggregate, Entry, EntryType};
+use crate::trends;
 
 fn page<T: serde::Serialize>(
     items: &[T],
@@ -48,17 +53,56 @@ pub(crate) async fn batch(state: Arc<Shared>, request: Req) -> Result<Response> 
     }
 }
 
-/// `GET /api/entries/{type}`.
+/// `GET /api/entries/{type}`: newest first; `key` narrows to one family,
+/// `q` to entries whose summary or family key contains the text.
 pub(crate) async fn entries(state: Arc<Shared>, request: Req) -> Result<Response> {
     let mut params = Params::new(request.query());
     let entry_type = params.parse_type("type", request.route_param("type").unwrap_or_default());
-    let (before, limit) = params::entries_query(&mut params);
+    let query = params::entries_query(&mut params);
     params.finish()?;
     let Some(entry_type) = entry_type else {
         return Err(Error::internal("validated entry type missing"));
     };
-    let found = state.store.entries(entry_type, before, limit).await?;
-    Ok(Response::json(&page(&found, limit, |e| e.occurred_at)))
+    let limit = query.limit;
+    let Some(search) = query.search.map(|q| q.to_lowercase()) else {
+        let found = match &query.key {
+            Some(key) => state.store.family_entries(entry_type, key, query.before, limit).await?,
+            None => state.store.entries(entry_type, query.before, limit).await?,
+        };
+        return Ok(Response::json(&page(&found, limit, |e| e.occurred_at)));
+    };
+
+    // A text search reads at most this many pages, so it is bounded however
+    // rare the text is; `next` carries on from where it stopped.
+    const PAGES: usize = 5;
+    let matches = |e: &Entry| {
+        e.summary.to_lowercase().contains(&search)
+            || e.family_key().to_lowercase().contains(&search)
+    };
+    let mut found = Vec::new();
+    let mut cursor = query.before;
+    let mut exhausted = false;
+    for _ in 0..PAGES {
+        let page = match &query.key {
+            Some(key) => {
+                state.store.family_entries(entry_type, key, cursor, params::MAX_LIMIT).await?
+            }
+            None => state.store.entries(entry_type, cursor, params::MAX_LIMIT).await?,
+        };
+        exhausted = page.len() < params::MAX_LIMIT;
+        cursor = page.last().map(|e| e.occurred_at);
+        found.extend(page.into_iter().filter(|e| matches(e)));
+        if exhausted || found.len() >= limit {
+            break;
+        }
+    }
+    found.truncate(limit);
+    let next = match (exhausted, found.len() >= limit, found.last(), cursor) {
+        (_, true, Some(last), _) => json!({ "before": last.occurred_at.to_rfc3339() }),
+        (false, false, _, Some(cursor)) => json!({ "before": cursor.to_rfc3339() }),
+        _ => Value::Null,
+    };
+    Ok(Response::json(&json!({ "data": found, "next": next })))
 }
 
 /// One aggregate row as the API shows it: the stored fields plus the average.
@@ -83,6 +127,149 @@ pub(crate) async fn aggregates(state: Arc<Shared>, request: Req) -> Result<Respo
     let rows = state.store.aggregates(query).await?;
     let data: Vec<Value> = rows.iter().map(aggregate_json).collect();
     Ok(Response::json(&json!({ "data": data })))
+}
+
+/// `GET /api/series/{type}`: one zero-filled point per bucket from `since`
+/// to now, the projection past it, and with `keys=N` a series for each of the
+/// N busiest keys.
+pub(crate) async fn series(state: Arc<Shared>, request: Req) -> Result<Response> {
+    let mut params = Params::new(request.query());
+    let entry_type = params.parse_type("type", request.route_param("type").unwrap_or_default());
+    let now = Utc::now();
+    let forecast_default =
+        if state.config.insights.enabled { state.config.insights.forecast_buckets } else { 0 };
+    let query = params::series_query(&mut params, entry_type, now, forecast_default);
+    params.finish()?;
+    let Some(query) = query else {
+        return Err(Error::internal("validated series query missing"));
+    };
+    let mut rows =
+        state.store.aggregate_rows(query.entry_type, query.period_s, query.since).await?;
+    if let Some(key) = &query.key {
+        rows.retain(|r| &r.key == key);
+    }
+    let points = trends::series(&rows, query.period_s, query.since, now);
+    let forecast = trends::forecast(&points, query.period_s, query.forecast);
+
+    let mut keys = Map::new();
+    if query.keys > 0 {
+        let mut totals: BTreeMap<&str, u64> = BTreeMap::new();
+        for row in &rows {
+            *totals.entry(row.key.as_str()).or_default() += row.count;
+        }
+        let mut busiest: Vec<(&str, u64)> = totals.into_iter().collect();
+        busiest.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        for (key, _) in busiest.into_iter().take(query.keys) {
+            let own: Vec<Aggregate> = rows.iter().filter(|r| r.key == key).cloned().collect();
+            keys.insert(
+                key.to_string(),
+                json!(trends::series(&own, query.period_s, query.since, now)),
+            );
+        }
+    }
+    Ok(Response::json(&json!({
+        "data": points,
+        "forecast": forecast,
+        "period": query.period_s,
+        "keys": keys,
+    })))
+}
+
+/// `GET /api/insights`: what changed between the last window and the one
+/// before, by the configured thresholds or the ones in the query.
+pub(crate) async fn insights(state: Arc<Shared>, request: Req) -> Result<Response> {
+    let mut params = Params::new(request.query());
+    let (config, limit) = params::insights_query(&mut params, state.config.insights);
+    params.finish()?;
+    if !state.config.insights.enabled {
+        return Ok(Response::json(&json!({ "data": [], "config": config, "enabled": false })));
+    }
+    let now = Utc::now();
+    let period = config.period_s();
+    let window = chrono::Duration::minutes(config.window_minutes as i64);
+    let since = now - window - window - chrono::Duration::seconds(i64::from(period));
+    let mut rows = Vec::new();
+    for &entry_type in AGGREGATED {
+        rows.extend(state.store.aggregate_rows(entry_type, period, since).await?);
+    }
+    let found = trends::insights(&rows, &config, now, limit);
+    Ok(Response::json(&json!({ "data": found, "config": config, "enabled": true })))
+}
+
+/// `GET /api/cases`.
+pub(crate) async fn cases(state: Arc<Shared>, request: Req) -> Result<Response> {
+    let mut params = Params::new(request.query());
+    let query = params::case_query(&mut params);
+    params.finish()?;
+    let found = state.store.cases(query).await?;
+    Ok(Response::json(&json!({ "data": found })))
+}
+
+/// `GET /api/cases/{id}`.
+pub(crate) async fn case(state: Arc<Shared>, request: Req) -> Result<Response> {
+    let id = request.route_param("id").unwrap_or_default();
+    match state.store.case(id).await? {
+        Some(case) => Ok(Response::json(&json!({ "data": case }))),
+        None => Err(Error::not_found("No such case.")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CaseActionBody {
+    action: String,
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// `POST /api/cases/{id}`: resolve, reopen, ignore, or set the severity.
+/// Needs the same header as clearing, so a form on another site cannot.
+pub(crate) async fn act_on_case(state: Arc<Shared>, request: Req) -> Result<Response> {
+    if request.header(CLEAR_HEADER.0) != Some(CLEAR_HEADER.1) {
+        return Err(Error::unauthorized(format!(
+            "Changing a case needs the `{}: {}` header.",
+            CLEAR_HEADER.0, CLEAR_HEADER.1
+        )));
+    }
+    let body: CaseActionBody = request.json()?;
+    let mut errors = Map::new();
+    let action = match body.action.as_str() {
+        "resolve" => Some(CaseAction::Resolve),
+        "reopen" => Some(CaseAction::Reopen),
+        "ignore" => Some(CaseAction::Ignore),
+        "severity" => match body.severity.as_deref().and_then(CaseSeverity::parse) {
+            Some(severity) => Some(CaseAction::Severity(severity)),
+            None => {
+                errors.insert(
+                    "severity".into(),
+                    json!(["The severity must be one of: low, medium, high, critical."]),
+                );
+                None
+            }
+        },
+        _ => {
+            errors.insert(
+                "action".into(),
+                json!(["The action must be one of: resolve, reopen, ignore, severity."]),
+            );
+            None
+        }
+    };
+    let note = body.note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    if note.as_ref().is_some_and(|n| n.chars().count() > 2000) {
+        errors.insert("note".into(), json!(["The note may not be longer than 2000 characters."]));
+    }
+    let Some(action) = action.filter(|_| errors.is_empty()) else {
+        return Err(Error::validation(Value::Object(errors)));
+    };
+    let id = request.route_param("id").unwrap_or_default();
+    let Some(case) = state.store.case(id).await? else {
+        return Err(Error::not_found("No such case."));
+    };
+    let case = cases::act(case, &action, note, Utc::now());
+    state.store.save_case(case.clone()).await?;
+    Ok(Response::json(&json!({ "data": case })))
 }
 
 /// `GET /api/status`.
@@ -130,6 +317,7 @@ pub(crate) fn status_value(
             "aggregates_days": config.retention.aggregates_days,
         },
         "n_plus_one": config.n_plus_one,
+        "insights": config.insights,
         "log_level": config.log_level,
     })
 }
