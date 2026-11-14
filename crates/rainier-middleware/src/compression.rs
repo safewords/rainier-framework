@@ -146,9 +146,18 @@ impl Middleware for Compress {
         }
 
         match compress(&bytes, encoding, self.level) {
-            Some(compressed) if compressed.len() < bytes.len() => response
-                .with_body(compressed)
-                .with_header("content-encoding", encoding.header_value()),
+            Some(compressed) if compressed.len() < bytes.len() => {
+                // A `content-length` set by whoever built the response — a
+                // static file, a download — counts the bytes this replaces.
+                // Left in place it contradicts the body, and the server
+                // refuses the response outright: the client sees the
+                // connection drop instead of the page. The server frames the
+                // compressed body itself.
+                response.headers_mut().remove("content-length");
+                response
+                    .with_body(compressed)
+                    .with_header("content-encoding", encoding.header_value())
+            }
             // Either it failed, or it came out bigger — which happens with
             // small or already-dense payloads. Either way the original is the
             // better answer.
@@ -326,6 +335,28 @@ mod tests {
         let bytes = response.into_bytes().await.unwrap();
         assert!(bytes.len() < original.len() / 2, "{} vs {}", bytes.len(), original.len());
         assert_eq!(gunzip(&bytes), original);
+    }
+
+    #[tokio::test]
+    async fn a_content_length_for_the_original_body_does_not_survive_compression() {
+        // What a static file response looks like: its length declared up front.
+        let original = json_body();
+        let declared = original.len().to_string();
+        let response = respond(
+            Some("gzip"),
+            json(original.clone()).with_header("content-length", declared.as_str()),
+        )
+        .await;
+
+        assert_eq!(response.header("content-encoding"), Some("gzip"));
+        assert_eq!(response.header("content-length"), None, "the server frames the new body");
+        assert_eq!(gunzip(&response.into_bytes().await.unwrap()), original);
+
+        // Not compressed: the declared length is still the truth, and stays.
+        let plain =
+            respond(None, json(original.clone()).with_header("content-length", declared.as_str()))
+                .await;
+        assert_eq!(plain.header("content-length"), Some(declared.as_str()));
     }
 
     #[tokio::test]
