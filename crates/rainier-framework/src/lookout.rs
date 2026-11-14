@@ -200,39 +200,82 @@ async fn allows<U: Authenticatable>(
     ability: &str,
     predicate: Option<&ViewerFn<U>>,
 ) -> bool {
-    let Ok(auth) = app.resolve::<AuthManager<U>>() else { return false };
+    let decision = decide(app, &mut request, guard, ability, predicate).await;
+    if let Err(reason) = decision {
+        // Why a viewer was turned away, for the operator: the response is the
+        // router's own 404 and says nothing. The reason only — never the
+        // cookie, the session id or the user.
+        tracing::info!(target: "rainier_lookout::gate", reason, "lookout: dashboard refused");
+    }
+    decision.is_ok()
+}
+
+async fn decide<U: Authenticatable>(
+    app: &Application,
+    request: &mut Request,
+    guard: Option<&str>,
+    ability: &str,
+    predicate: Option<&ViewerFn<U>>,
+) -> std::result::Result<(), &'static str> {
+    let auth = app.resolve::<AuthManager<U>>().map_err(|_| "no AuthManager is bound")?;
 
     // The dashboard is mounted outside the `web` group, so nothing has loaded
     // the session. Load it here, read-only: running `StartSession` on these
     // routes would set a cookie on a refused request's 404, and the 404 must
     // be indistinguishable from a path that does not exist.
-    if let Some(session) = read_session(app, &request).await {
-        request.extensions_mut().insert(session);
-    }
+    //
+    // No session is not fatal: a guard that reads a header may still
+    // authenticate. Kept so a refusal can say what was missing.
+    let no_session = match read_session(app, request).await {
+        Ok(session) => {
+            request.extensions_mut().insert(session);
+            None
+        }
+        Err(reason) => Some(reason),
+    };
 
     let user = match guard {
-        Some(name) => auth.user_via(name, &request).await,
-        None => auth.user(&request).await,
+        Some(name) => auth.user_via(name, request).await,
+        None => auth.user(request).await,
     };
-    let Ok(Some(user)) = user else { return false };
-    match predicate {
-        Some(predicate) => predicate(&user, &request),
+    let user = match user {
+        Ok(Some(user)) => user,
+        Ok(None) => return Err(no_session.unwrap_or("the session has no authenticated user")),
+        Err(_) => return Err("the guard failed"),
+    };
+    let allowed = match predicate {
+        Some(predicate) => predicate(&user, request),
         None => match app.resolve::<Gate<U>>() {
             Ok(gate) => gate.allows::<()>(ability, &user, None),
-            Err(_) => false,
+            Err(_) => return Err("no Gate is bound"),
         },
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err("the viewer is authenticated but not allowed")
     }
 }
 
-async fn read_session(app: &Application, request: &Request) -> Option<rainier_session::Session> {
-    let manager = app.resolve::<rainier_session::SessionManager>().ok()?;
-    let value = request.cookie(&manager.config().cookie)?;
-    let (id, carried) = manager.store().decode(value).ok()?;
+async fn read_session(
+    app: &Application,
+    request: &Request,
+) -> std::result::Result<rainier_session::Session, &'static str> {
+    let manager = app
+        .resolve::<rainier_session::SessionManager>()
+        .map_err(|_| "no SessionManager is bound")?;
+    let value = request.cookie(&manager.config().cookie).ok_or("no session cookie")?;
+    let (id, carried) =
+        manager.store().decode(value).map_err(|_| "the session cookie did not decode")?;
     let data = match carried {
         Some(data) => data,
-        None => manager.read(&id).await.ok()??,
+        None => manager
+            .read(&id)
+            .await
+            .map_err(|_| "the session store failed")?
+            .ok_or("the session cookie names no stored session")?,
     };
-    Some(rainier_session::Session::restore(id, data))
+    Ok(rainier_session::Session::restore(id, data))
 }
 
 /// Build the store `kind` names, from what boot has already bound.
