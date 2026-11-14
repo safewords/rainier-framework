@@ -44,10 +44,19 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 # The middleware test runs a real kernel and router, with their spans on.
 rainier-server = { workspace = true, features = ["telemetry"] }
-# The conformance suite runs the database store against a real in-memory SQLite.
-rainier-database = { workspace = true, features = ["sea-orm-executor"] }
-rainier-drivers = { workspace = true, features = ["sea-orm-executor"] }
-rainier-orm = { workspace = true }
+# The executor the database store's tests connect with. Its SQL support comes
+# from the `sea-orm-executor` feature below, not from here: a feature named on
+# a dev-dependency is unified into every crate's tests in `cargo test
+# --workspace`, which handed the default-features run an executor the
+# framework's own tests are written not to have.
+rainier-drivers = { workspace = true }
+
+[features]
+default = []
+# Run the database store against a real executor: the conformance suite on an
+# in-memory SQLite, and on the servers `LOOKOUT_TEST_DATABASE_URLS` names. The
+# store itself needs no feature; this is what its tests connect with.
+sea-orm-executor = ["rainier-database/sea-orm-executor"]
 
 [lints]
 workspace = true

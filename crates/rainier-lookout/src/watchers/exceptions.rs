@@ -38,6 +38,18 @@ const FOREIGN_FRAMES: &[&str] = &[
     "<",
     "__rust",
     "rust_begin_unwind",
+    // The test harness, and the runtime and library crates a request passes
+    // through on its way to application code: none of them is where the
+    // failure is, and a fingerprint keyed on one would change with the call
+    // path rather than the bug.
+    "test::",
+    "tracing",
+    "pin_project",
+    "sea_orm",
+    "sqlx",
+    "serde",
+    "hashbrown",
+    "anyhow::",
 ];
 
 /// The entry for `failure`.
@@ -126,7 +138,9 @@ pub fn first_app_frame(exception: &Exception) -> Option<String> {
             return None;
         }
         let symbol = symbol.trim();
-        if symbol.is_empty() || FOREIGN_FRAMES.iter().any(|p| symbol.starts_with(p)) {
+        // An application frame is a Rust path (`shop::orders::show`); libc's
+        // and the OS's (`__pthread_cond_wait`, `start_thread`) are not.
+        if !symbol.contains("::") || FOREIGN_FRAMES.iter().any(|p| symbol.starts_with(p)) {
             return None;
         }
         // Drop the `::h0123abcd` hash suffix, which changes per build.
@@ -146,8 +160,15 @@ mod tests {
 
     #[test]
     fn fingerprints_ignore_numbers_and_keep_the_first_app_frame() {
-        let a = Failure::from(ApplicationFailed::new(Error::internal("order 42 is missing")));
-        let b = Failure::from(ApplicationFailed::new(Error::internal("order 977 is missing")));
+        // Without a stack: `RUST_BACKTRACE`, which CI sets, would give these
+        // one, and which frame it starts at is not what this checks.
+        let quiet = |message: &str| {
+            let mut failure = ApplicationFailed::new(Error::internal(message.to_string()));
+            failure.exception.backtrace = None;
+            Failure::from(failure)
+        };
+        let a = quiet("order 42 is missing");
+        let b = quiet("order 977 is missing");
         assert_eq!(fingerprint(&a), fingerprint(&b));
         assert_eq!(fingerprint(&a), "Application|Internal|order N is missing");
 
@@ -157,6 +178,13 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(first_app_frame(&exception).as_deref(), Some("shop::orders::show"));
+
+        // A stack that is all harness and runtime has no application frame.
+        exception.backtrace = Some(
+            "   0: std::panicking::begin_panic\n   1: test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>>\n   2: tokio::runtime::task::raw::poll\n   3: tracing::instrument::Instrumented<T>::poll\n   4: __pthread_cond_wait\n   5: start_thread"
+                .to_string(),
+        );
+        assert_eq!(first_app_frame(&exception), None);
     }
 
     #[test]

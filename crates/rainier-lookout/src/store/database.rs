@@ -779,7 +779,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "sea-orm-executor", not(target_arch = "wasm32")))]
     mod sqlite {
         use super::super::*;
         use rainier_drivers::sql::SeaOrmExecutor;
