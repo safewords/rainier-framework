@@ -9,10 +9,14 @@
 //!
 //! ```sh
 //! docker run -d --rm -p 3307:3306 -e MARIADB_ROOT_PASSWORD=pw -e MARIADB_DATABASE=lookout mariadb:11
-//! LOOKOUT_TEST_DATABASE_URLS=mysql://root:pw@127.0.0.1:3307/lookout cargo test -p rainier-lookout --test database_server
+//! LOOKOUT_TEST_DATABASE_URLS=mysql://root:pw@127.0.0.1:3307/lookout cargo test -p rainier-lookout --features sea-orm-executor --test database_server
 //! ```
 //!
 //! The tables are dropped first, so point it at a database you can throw away.
+//! Needs the `sea-orm-executor` feature, which the CI runs that have servers
+//! turn on.
+
+#![cfg(feature = "sea-orm-executor")]
 
 use rainier_database::Database;
 use rainier_drivers::sql::SeaOrmExecutor;

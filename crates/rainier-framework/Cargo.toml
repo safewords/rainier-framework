@@ -81,7 +81,7 @@ default = ["debug-page"]
 # the crate were not linked at all.
 debug-page = ["dep:rainier-debug"]
 # The native sea-orm executor (MySQL / Postgres / SQLite).
-sea-orm-executor = ["rainier-database/sea-orm-executor"]
+sea-orm-executor = ["rainier-database/sea-orm-executor", "rainier-lookout?/sea-orm-executor"]
 # Redis, everywhere it can be used: the cache, the queue, and the broadcast
 # fan-out. One feature rather than three, because "I have a Redis" is one fact
 # about a deployment — and because a `redis` feature that gave you a cache and
