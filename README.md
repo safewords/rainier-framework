@@ -525,6 +525,7 @@ whole.
 
 ## Licence
 
-MIT OR Apache-2.0.
+MIT OR Apache-2.0, at your option: [LICENSE-MIT](LICENSE-MIT) or
+[LICENSE-APACHE](LICENSE-APACHE).
 
 [rainier-sample-project]: https://github.com/safewords/rainier-sample-project
