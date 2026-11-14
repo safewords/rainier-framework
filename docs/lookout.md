@@ -261,6 +261,21 @@ works on a dashboard mounted outside the `web` group. **It denies** without
 without the ability defined — an undefined ability is denied by the gate
 itself.
 
+When "may see it" is not a property of the user value — roles carried as
+claims in the session, or a header from a proxy in front — name a predicate
+instead of a gate ability:
+
+```rust
+Rainier::new(".")
+    .with_lookout_viewers_where(|_user: &User, request: &Request| is_admin(request))
+    .with_instance_arc(auth)          // AuthManager<User>
+```
+
+The guard still authenticates first, so an anonymous request never reaches
+the predicate; the predicate sees the request with its session loaded
+(read-only). No `Gate<User>` is needed, and the dashboard's `ability` is not
+consulted.
+
 `LookoutConfig::local` decides "local", not the raw `APP_ENV`: an application
 can turn it off in a local environment with `.local(false)`.
 

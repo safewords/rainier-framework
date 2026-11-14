@@ -231,6 +231,35 @@ async fn outside_local_a_viewer_with_the_ability_sees_the_dashboard() {
 }
 
 #[tokio::test]
+async fn outside_local_a_viewer_predicate_decides_from_the_user_and_the_request() {
+    // No `Gate` bound at all: the predicate stands in for it, and sees the
+    // request — here a header a proxy would set — as well as the user.
+    let app = builder()
+        .with_lookout(on(false))
+        .with_lookout_viewers_where(|user: &User, request: &rainier_http::Request| {
+            user.admin && request.header("x-role") == Some("ops")
+        })
+        .with_instance_arc(auth())
+        .boot()
+        .await
+        .unwrap();
+    let app = TestApp::new(app).unwrap();
+    let fresh = || TestApp::new(Arc::clone(app.app())).unwrap();
+
+    // Unauthenticated: never asked, however the request looks.
+    fresh().with_header("x-role", "ops").get("/_lookout").await.assert_not_found();
+
+    let user = TestApp::new(Arc::clone(app.app())).unwrap().with_token("user-token");
+    user.with_header("x-role", "ops").get("/_lookout").await.assert_not_found();
+
+    let admin = TestApp::new(Arc::clone(app.app())).unwrap().with_token("admin-token");
+    admin.get("/_lookout").await.assert_not_found();
+    let admin = admin.with_header("x-role", "ops");
+    admin.get("/_lookout").await.assert_ok();
+    admin.get("/_lookout/api/batches").await.assert_ok();
+}
+
+#[tokio::test]
 async fn the_framework_subscriber_lets_lookout_see_info_spans_under_a_warn_filter() {
     let app = TestApp::new(builder().with_lookout(on(true)).boot().await.unwrap()).unwrap();
     let lookout = app.resolve::<Lookout>().unwrap();

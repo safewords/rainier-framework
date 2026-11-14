@@ -12,6 +12,10 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- `Rainier::with_lookout_viewers_where`: let a predicate over the
+  authenticated user **and the request** decide who sees Lookout, for an
+  application whose roles live in the session or a header rather than on the
+  user value. The guard still authenticates first.
 - **Lookout, the diagnostics suite** (`rainier-lookout`, `rainier-framework`
   feature `lookout`, mirrored by `rainier`). Every request, job, console
   command and scheduled task is recorded as a batch of the queries, cache

@@ -689,7 +689,28 @@ impl Rainier {
     /// holds when either is not bound, or the ability is not defined.
     #[cfg(feature = "lookout")]
     pub fn with_lookout_viewers<U: rainier_auth::Authenticatable>(mut self) -> Self {
-        self.lookout_viewers = Some(crate::lookout::viewers::<U>());
+        self.lookout_viewers = Some(crate::lookout::viewers::<U>(None));
+        self
+    }
+
+    /// Let users of type `U` see Lookout's dashboard when `allow` says so.
+    ///
+    /// Like [`with_lookout_viewers`](Self::with_lookout_viewers), the viewer
+    /// is first authenticated with the dashboard's guard through the bound
+    /// `AuthManager<U>`; nobody unauthenticated gets in. Then, instead of the
+    /// `Gate<U>`'s ability, `allow` decides — given the user and the request,
+    /// with the session loaded read-only. For an application whose roles are
+    /// carried on the request (claims in the session, a header from a proxy)
+    /// rather than on the user value.
+    ///
+    /// The dashboard's [`ability`](crate::lookout::config::Dashboard::ability)
+    /// is not consulted. A later call to either method replaces this one.
+    #[cfg(feature = "lookout")]
+    pub fn with_lookout_viewers_where<U: rainier_auth::Authenticatable>(
+        mut self,
+        allow: impl Fn(&U, &rainier_http::Request) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.lookout_viewers = Some(crate::lookout::viewers::<U>(Some(Arc::new(allow))));
         self
     }
 

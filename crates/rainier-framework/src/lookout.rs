@@ -54,6 +54,18 @@
 //! or without the ability defined on it, the answer is no — and "no" is the
 //! router's own 404.
 //!
+//! An application whose idea of "may see it" lives on the request rather than
+//! the user — groups carried in the session, say — names a predicate instead
+//! of a gate ability:
+//!
+//! ```ignore
+//! Rainier::new(".")
+//!     .with_lookout_viewers_where(|_user: &User, request: &Request| is_admin(request))
+//! ```
+//!
+//! The predicate runs only for a viewer the guard authenticated, and sees the
+//! request with its session loaded.
+//!
 //! # A subscriber of your own
 //!
 //! An application that installs its own subscriber (or boots
@@ -147,10 +159,19 @@ pub(crate) fn gate_environment(local: bool, environment: &str) -> String {
     }
 }
 
+/// How an authenticated viewer is authorised: the bound `Gate<U>`'s ability,
+/// or the application's own predicate over the user and the request.
+pub(crate) type ViewerPredicate<U> = Arc<ViewerFn<U>>;
+
+/// The predicate itself, unshared.
+pub(crate) type ViewerFn<U> = dyn Fn(&U, &Request) -> bool + Send + Sync;
+
 /// The access check for viewers of type `U`: authenticate with the
-/// dashboard's guard, then ask the bound `Gate<U>` for its ability.
-pub(crate) fn viewers<U: Authenticatable>() -> Viewers {
-    Arc::new(|app: Weak<Application>, dashboard: config::Dashboard| -> http::AccessCheck {
+/// dashboard's guard, then ask the bound `Gate<U>` for its ability — or,
+/// given `predicate`, ask that instead.
+pub(crate) fn viewers<U: Authenticatable>(predicate: Option<ViewerPredicate<U>>) -> Viewers {
+    Arc::new(move |app: Weak<Application>, dashboard: config::Dashboard| -> http::AccessCheck {
+        let predicate = predicate.clone();
         Arc::new(move |request: &Request| -> BoxFuture<'static, bool> {
             // A header-only copy: the check outlives the borrow, and a guard
             // reads nothing but the headers and the session.
@@ -163,9 +184,10 @@ pub(crate) fn viewers<U: Authenticatable>() -> Viewers {
             let app = app.clone();
             let guard = dashboard.guard.clone();
             let ability = dashboard.ability.clone();
+            let predicate = predicate.clone();
             Box::pin(async move {
                 let Some(app) = app.upgrade() else { return false };
-                allows::<U>(&app, copy, guard.as_deref(), &ability).await
+                allows::<U>(&app, copy, guard.as_deref(), &ability, predicate.as_deref()).await
             })
         })
     })
@@ -176,10 +198,9 @@ async fn allows<U: Authenticatable>(
     mut request: Request,
     guard: Option<&str>,
     ability: &str,
+    predicate: Option<&ViewerFn<U>>,
 ) -> bool {
-    let (Ok(auth), Ok(gate)) = (app.resolve::<AuthManager<U>>(), app.resolve::<Gate<U>>()) else {
-        return false;
-    };
+    let Ok(auth) = app.resolve::<AuthManager<U>>() else { return false };
 
     // The dashboard is mounted outside the `web` group, so nothing has loaded
     // the session. Load it here, read-only: running `StartSession` on these
@@ -193,9 +214,13 @@ async fn allows<U: Authenticatable>(
         Some(name) => auth.user_via(name, &request).await,
         None => auth.user(&request).await,
     };
-    match user {
-        Ok(Some(user)) => gate.allows::<()>(ability, &user, None),
-        _ => false,
+    let Ok(Some(user)) = user else { return false };
+    match predicate {
+        Some(predicate) => predicate(&user, &request),
+        None => match app.resolve::<Gate<U>>() {
+            Ok(gate) => gate.allows::<()>(ability, &user, None),
+            Err(_) => false,
+        },
     }
 }
 
