@@ -176,10 +176,15 @@ impl Executor for SeaOrmExecutor {
     async fn execute(&self, sql: &str, params: Vec<Value>) -> Result<ExecOutcome> {
         let stmt = self.statement(sql, params);
         let res = self.db.execute_raw(stmt).await.map_err(Error::from)?;
-        Ok(ExecOutcome {
-            rows_affected: res.rows_affected(),
-            last_insert_id: res.last_insert_id() as i64,
-        })
+        // Postgres has no "last insert id" — an insert that wants its key
+        // asks with `RETURNING` — and sea-orm 2 panics rather than answering
+        // 0 when asked anyway, which made every plain statement on Postgres
+        // (a `DROP TABLE`, a migration, an `UPDATE`) take the process down.
+        let last_insert_id = match self.dialect {
+            Dialect::Postgres => 0,
+            Dialect::MySql | Dialect::Sqlite => res.last_insert_id() as i64,
+        };
+        Ok(ExecOutcome { rows_affected: res.rows_affected(), last_insert_id })
     }
 }
 

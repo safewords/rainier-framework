@@ -47,6 +47,7 @@ rainier-server = { workspace = true, features = ["telemetry"] }
 # The conformance suite runs the database store against a real in-memory SQLite.
 rainier-database = { workspace = true, features = ["sea-orm-executor"] }
 rainier-drivers = { workspace = true, features = ["sea-orm-executor"] }
+rainier-orm = { workspace = true }
 
 [lints]
 workspace = true

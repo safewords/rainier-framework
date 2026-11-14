@@ -13,6 +13,8 @@
 //!
 //! ```sh
 //! cargo run -p rainier-framework --example lookout --features lookout
+//! # …and keep serving, to click through the dashboard:
+//! cargo run -p rainier-framework --example lookout --features lookout -- --serve
 //! ```
 //!
 //! # In a deployment
@@ -121,7 +123,16 @@ async fn main() -> Result<()> {
     }
 
     println!("\n== The dashboard ==");
-    println!("Run `serve` and open http://127.0.0.1:8000{path}");
+    if std::env::args().any(|arg| arg == "--serve") {
+        // The demo's batches are in the store; serve the same kernel so the
+        // dashboard can be browsed, until Ctrl-C.
+        let kernel = app.resolve::<rainier_framework::server::Kernel>()?;
+        let options =
+            rainier_framework::server::ServerOptions::default().bind_to("127.0.0.1", 8017)?;
+        println!("Serving: open http://127.0.0.1:8017{path} (Ctrl-C to stop)");
+        rainier_framework::server::Server::from_arc(kernel).with_options(options).run().await?;
+    }
+    println!("Run with `-- --serve`, or `serve` in an app, and open http://127.0.0.1:8000{path}");
     println!("Outside APP_ENV=local it is a 404 unless the viewer has `viewLookout`.");
     println!("Dropped batches (channel full): {}", lookout.dropped());
 
