@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use rainier_events::report::{report, SessionFailed};
 use rainier_http::{Cookie, Request, Response, SameSite};
 use rainier_middleware::{Middleware, Next};
 use rainier_support::Result;
@@ -90,9 +91,15 @@ impl StartSession {
         // this application could have issued. A value it rejects gets a fresh
         // session rather than an error: a client cannot be trusted to send a
         // good one, and a bad one is not worth failing a page over.
+        //
+        // Still reported: one forged cookie is noise, but every visitor's
+        // cookie being refused at once is a rotated key logging everyone out.
         let (id, carried) = match self.store.decode(value) {
             Ok(decoded) => decoded,
-            Err(_) => return Loaded::attached(Session::new()),
+            Err(e) => {
+                report(SessionFailed::new(e, "decode")).await;
+                return Loaded::attached(Session::new());
+            }
         };
 
         // A client-side store has already produced the data; there is nothing
@@ -151,6 +158,7 @@ impl StartSession {
                     error = %e,
                     "could not read the session; serving this request without one"
                 );
+                report(SessionFailed::new(e, "load")).await;
                 Loaded::detached(Session::restore(id, SessionData::default()))
             }
         }
@@ -236,6 +244,7 @@ impl Middleware for StartSession {
                 // cost of a failed save is a lost session, not a wrong page.
                 // Sending no cookie is better than sending a stale one.
                 tracing::error!(error = %e, "could not save the session");
+                report(SessionFailed::new(e, "save")).await;
                 response
             }
         }
@@ -502,13 +511,16 @@ mod tests {
                 _: &'a str,
                 _: &'a SessionData,
             ) -> rainier_support::BoxFuture<'a, Result<()>> {
-                Box::pin(async { Err(rainier_support::Error::internal("down")) })
+                Box::pin(async {
+                    Err(rainier_support::Error::internal("session-save-test: store down"))
+                })
             }
             fn destroy<'a>(&'a self, _: &'a str) -> rainier_support::BoxFuture<'a, Result<()>> {
                 Box::pin(async { Ok(()) })
             }
         }
 
+        let capture = rainier_events::report::capture();
         let start = Arc::new(StartSession::new(Arc::new(Broken)));
         let response = run(&start, Request::builder().build(), |request| {
             Box::pin(async move {
@@ -519,6 +531,22 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), rainier_http::StatusCode::OK);
+
+        // The page rendered, and the lost session was reported.
+        let saves: Vec<_> = capture
+            .reports()
+            .into_iter()
+            .filter_map(|reported| match reported.failure {
+                rainier_events::Failure::Session(failed)
+                    if failed.exception.message == "session-save-test: store down" =>
+                {
+                    Some(failed)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(saves.len(), 1, "{saves:?}");
+        assert_eq!(saves[0].operation, "save");
     }
 
     /// A store that holds one session and refuses every read, so a request

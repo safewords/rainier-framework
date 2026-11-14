@@ -64,6 +64,25 @@
 //! accepted, gets an id, and then waits in a store no worker drains — no error,
 //! no retry, no failed-job row.
 //!
+//! ## When a job fails
+//!
+//! The [`Worker`] retries a failed job until its attempts run out, then fails
+//! it for good. Each failed attempt fires [`JobReleased`] or [`JobFailed`]
+//! (with [`Worker::with_events`]), which carry the failure both as text and as
+//! a structured [`rainier_events::Exception`] — a panic included, flagged as
+//! one.
+//!
+//! Every failed attempt is also **reported**, as a
+//! [`JobAttemptFailed`](rainier_events::report::JobAttemptFailed) naming the
+//! job, queue, connection and attempt — through [`Worker::with_reporter`], or
+//! the process-wide reporter without one. So is every failure the queue would
+//! otherwise only log: a broker refusing an acknowledgement, a release or a
+//! fail, a reserve it retries, a message it had to throw away, a dead-letter
+//! write, a Kubernetes call it worked around
+//! ([`QueueOperationFailed`](rainier_events::report::QueueOperationFailed),
+//! [`QueueMessageDiscarded`](rainier_events::report::QueueMessageDiscarded)).
+//! See [`worker`] for the details.
+//!
 //! ## Testing
 //!
 //! [`QueueManager::fake`] records dispatches instead of performing them:
@@ -97,6 +116,7 @@ pub mod manager;
 pub mod queue;
 #[cfg(feature = "redis")]
 pub mod redis;
+mod reporting;
 #[cfg(feature = "sqs")]
 pub mod sqs;
 #[cfg(feature = "telemetry")]

@@ -10,7 +10,7 @@ use std::time::Duration;
 use rainier_console::{exit, io, Arguments, Command};
 use rainier_container::Application;
 use rainier_database::{Database, Migrator};
-use rainier_events::Dispatcher;
+use rainier_events::{Dispatcher, Reporter};
 use rainier_queue::{QueueManager, Worker, WorkerOptions};
 use rainier_routing::CompiledRouter;
 use rainier_server::{Kernel, Server, ServerOptions};
@@ -141,6 +141,10 @@ impl Command for ServeCommand {
         // Terminating hooks run once the server has stopped accepting, which
         // is where an application flushes whatever it deferred.
         app.terminate();
+
+        // The last requests' batches, before the process goes.
+        #[cfg(feature = "lookout")]
+        crate::lookout::flush(app).await;
         Ok(exit::SUCCESS)
     }
 }
@@ -573,10 +577,22 @@ impl Command for QueueWorkCommand {
             )
             .with_options(pool_options);
 
+            // So a failed attempt's report names the connection it came from.
+            if let Some(connection) = &pool.connection {
+                worker = worker.with_connection(connection.clone());
+            }
+
             // Worker events are how an application observes its queue; wire
             // them up when a dispatcher is available.
             if let Ok(events) = app.resolve::<Dispatcher>() {
                 worker = worker.with_events(events);
+            }
+
+            // Every failed attempt — released or failed for good, error or
+            // panic — through the application's reporter, so the error
+            // tracker hears about a job the way it hears about a request.
+            if let Ok(reporter) = app.resolve::<Reporter>() {
+                worker = worker.with_reporter((*reporter).clone());
             }
 
             // Job timings, wait, outcomes and sampled depth, into the
@@ -663,6 +679,14 @@ impl Command for QueueWorkCommand {
                     }
                     Err(e) => {
                         eprintln!("Could not serve metrics at {address}: {e}");
+                        crate::reporting::report_failure(
+                            app,
+                            rainier_events::report::TelemetryFailed::new(
+                                rainier_events::Exception::from_std(&e),
+                                "serve_metrics",
+                            ),
+                        )
+                        .await;
                         None
                     }
                 }
@@ -715,6 +739,8 @@ impl Command for QueueWorkCommand {
         // worker being shut down are the ones somebody will want to see.
         #[cfg(feature = "telemetry")]
         crate::instrumentation::shutdown();
+        #[cfg(feature = "lookout")]
+        crate::lookout::flush(app).await;
 
         if let Some(e) = failure {
             return Err(e);
@@ -745,17 +771,29 @@ impl Command for QueueWorkCommand {
 ///
 /// `None` if no handler could be installed. That is not fatal: the worker
 /// carries on and shuts down the way it did before, which is the behaviour
-/// this replaces rather than a new failure.
+/// this replaces rather than a new failure — but it is reported, as a
+/// [`BackgroundTaskFailed`](rainier_events::report::BackgroundTaskFailed)
+/// through the process-wide reporter, since the task this runs in is spawned.
 #[cfg(unix)]
 async fn stop_signal() -> Option<&'static str> {
     use tokio::signal::unix::{signal, SignalKind};
 
-    let mut term = signal(SignalKind::terminate())
-        .inspect_err(|e| tracing::warn!(error = %e, "no SIGTERM handler; shutdown will not drain"))
-        .ok()?;
-    let mut interrupt = signal(SignalKind::interrupt())
-        .inspect_err(|e| tracing::warn!(error = %e, "no SIGINT handler"))
-        .ok()?;
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(term) => term,
+        Err(e) => {
+            tracing::warn!(error = %e, "no SIGTERM handler; shutdown will not drain");
+            report_no_signal_handler(&e, "SIGTERM").await;
+            return None;
+        }
+    };
+    let mut interrupt = match signal(SignalKind::interrupt()) {
+        Ok(interrupt) => interrupt,
+        Err(e) => {
+            tracing::warn!(error = %e, "no SIGINT handler");
+            report_no_signal_handler(&e, "SIGINT").await;
+            return None;
+        }
+    };
 
     tokio::select! {
         _ = term.recv() => Some("SIGTERM"),
@@ -766,11 +804,28 @@ async fn stop_signal() -> Option<&'static str> {
 /// Ctrl-C, which is all a non-Unix host offers here.
 #[cfg(not(unix))]
 async fn stop_signal() -> Option<&'static str> {
-    tokio::signal::ctrl_c()
-        .await
-        .inspect_err(|e| tracing::warn!(error = %e, "no Ctrl-C handler; shutdown will not drain"))
-        .ok()
-        .map(|()| "Ctrl-C")
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => Some("Ctrl-C"),
+        Err(e) => {
+            tracing::warn!(error = %e, "no Ctrl-C handler; shutdown will not drain");
+            report_no_signal_handler(&e, "Ctrl-C").await;
+            None
+        }
+    }
+}
+
+/// A signal handler `queue:work` could not install, reported.
+async fn report_no_signal_handler(error: &std::io::Error, signal: &str) {
+    use rainier_events::report::{BackgroundTaskFailed, FailureEvent as _};
+
+    rainier_events::report::report(
+        BackgroundTaskFailed::new(
+            rainier_events::Exception::from_std(error),
+            "queue:work stop-signal handler",
+        )
+        .with_extra("signal", signal),
+    )
+    .await;
 }
 
 /// `key:generate` — mint an application key.
@@ -808,8 +863,11 @@ impl Command for KeyGenerateCommand {
 }
 
 /// A console with every built-in command registered.
+///
+/// With the `lookout` feature, that includes `lookout:prune`, `lookout:clear`
+/// and `lookout:status`.
 pub fn console(name: impl Into<String>) -> rainier_console::Console {
-    rainier_console::Console::new(name)
+    let console = rainier_console::Console::new(name)
         .register(RouteListCommand)
         .register(ServeCommand)
         .register(MigrateCommand)
@@ -818,7 +876,14 @@ pub fn console(name: impl Into<String>) -> rainier_console::Console {
         .register(crate::scheduling::ScheduleRunCommand)
         .register(crate::scheduling::ScheduleWorkCommand)
         .register(crate::scheduling::ScheduleListCommand)
-        .register(KeyGenerateCommand)
+        .register(KeyGenerateCommand);
+
+    #[cfg(feature = "lookout")]
+    let console = crate::lookout::console_commands()
+        .into_iter()
+        .fold(console, rainier_console::Console::register_arc);
+
+    console
 }
 
 #[cfg(test)]
@@ -997,6 +1062,56 @@ mod tests {
 
         let console = Console::new("rainier").register(QueueWorkCommand);
         assert_eq!(console.run_argv(&app, ["queue:work", "--once"]).await, exit::FAILURE);
+    }
+
+    #[tokio::test]
+    async fn queue_work_reports_a_failed_job_through_the_applications_reporter() {
+        use rainier_events::report::JobAttemptFailed;
+        use rainier_queue::{Job, JobContext};
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize)]
+        struct Boom;
+
+        #[async_trait::async_trait]
+        impl Job for Boom {
+            const NAME: &'static str = "test.reported";
+            const TRIES: u32 = 1;
+            async fn handle(&self, _: &JobContext) -> Result<()> {
+                Err(rainier_support::Error::internal("the upstream refused"))
+            }
+        }
+
+        let app = app().await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        app.resolve::<Reporter>().unwrap().events().listen(move |failed: Arc<JobAttemptFailed>| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push((*failed).clone());
+                Ok(())
+            }
+        });
+
+        let queue = Arc::new(MemoryQueue::new());
+        let manager = QueueManager::new(
+            Arc::clone(&queue) as Arc<_>,
+            Arc::new(JobRegistry::new().with::<Boom>()),
+        );
+        manager.dispatch(Boom).await.unwrap();
+        app.instance(manager);
+
+        let console = Console::new("rainier").register(QueueWorkCommand);
+        assert_eq!(console.run_argv(&app, ["queue:work", "--once"]).await, exit::FAILURE);
+
+        // Once, as the job: `queue:work` returned `Ok(1)`, which the console
+        // does not report as a `CommandFailed`.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].exception.message, "the upstream refused");
+        assert_eq!(seen[0].job, "test.reported");
+        assert_eq!(seen[0].attempt, 1);
+        assert!(seen[0].final_attempt);
     }
 
     #[tokio::test]

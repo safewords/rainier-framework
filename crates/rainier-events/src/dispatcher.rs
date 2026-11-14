@@ -281,21 +281,31 @@ impl Dispatcher {
         let wildcards = self.wildcard_handlers();
         #[cfg(feature = "telemetry")]
         let listeners = handlers.len() + wildcards.len();
+        // A failing listener of a failure event is not reported again: that
+        // listener is usually the one sending reports somewhere, and
+        // reporting its failure would loop.
+        let reportable = !crate::report::is_failure_event(TypeId::of::<E>());
         let deliver = async move {
-            let mut failures = 0;
+            let mut failures = Vec::new();
             for handler in handlers {
                 if let Err(e) = handler(Arc::clone(&payload)).await {
                     tracing::error!(event = name, error = %e, "event listener failed");
-                    failures += 1;
+                    failures.push(e);
                 }
             }
             for wildcard in wildcards {
                 if let Err(e) = wildcard.handle(name, Arc::clone(&payload)).await {
                     tracing::error!(event = name, error = %e, "wildcard event listener failed");
-                    failures += 1;
+                    failures.push(e);
                 }
             }
-            failures
+            let count = failures.len();
+            if reportable {
+                for error in failures {
+                    report_listener_failure(name, error).await;
+                }
+            }
+            count
         };
 
         #[cfg(feature = "telemetry")]
@@ -432,6 +442,17 @@ fn event_span(name: &'static str, listeners: usize) -> tracing::Span {
         rainier.event.name = name,
         rainier.event.listeners = listeners,
     )
+}
+
+/// Report a quietly-dispatched listener's failure through the process-wide
+/// reporter, as a [`ListenerFailed`](crate::report::ListenerFailed).
+///
+/// Boxed: reporting dispatches quietly too, and an unboxed future here would
+/// contain itself.
+fn report_listener_failure(event: &'static str, error: rainier_support::Error) -> BoxedFuture<()> {
+    Box::pin(async move {
+        crate::report::report(crate::report::ListenerFailed::new(error, event)).await;
+    })
 }
 
 impl std::fmt::Debug for Dispatcher {

@@ -475,8 +475,10 @@ impl QueueManager {
             // and is not getting it.
             tracing::warn!(
                 key,
-                "a job declares `unique_id` but the queue has no lock manager;                  dispatching without deduplicating"
+                "a job declares `unique_id` but the queue has no lock manager; \
+                 dispatching without deduplicating"
             );
+            crate::reporting::report(uniqueness_not_enforced(key)).await;
             return Ok(Claim::NotEnforced);
         };
 
@@ -710,6 +712,21 @@ const _: fn() = || {
     assert_send_sync::<QueueManager>();
 };
 
+/// A job asked for uniqueness that this manager cannot give it.
+fn uniqueness_not_enforced(key: &str) -> rainier_events::report::ConfigurationFailed {
+    use rainier_events::report::FailureEvent;
+
+    rainier_events::report::ConfigurationFailed::new(
+        rainier_events::Exception::message(
+            rainier_support::ErrorKind::Internal,
+            "a job declares `unique_id` but the queue has no lock manager; it was dispatched \
+             without deduplicating. Give the queue one with `QueueManager::with_locks`.",
+        ),
+        "queue.locks",
+    )
+    .with_extra("unique_key", key)
+}
+
 #[cfg(test)]
 mod unique_tests {
     use super::*;
@@ -765,6 +782,33 @@ mod unique_tests {
         let manager = QueueManager::new(Arc::clone(&queue) as Arc<_>, Arc::new(JobRegistry::new()))
             .with_locks(rainier_cache::LockManager::new(Arc::new(MemoryCache::new())));
         (manager, queue)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn uniqueness_without_a_lock_manager_is_reported_as_configuration() {
+        let capture = rainier_events::report::capture();
+        let queue = Arc::new(MemoryQueue::new());
+        let manager = QueueManager::new(Arc::clone(&queue) as Arc<_>, Arc::new(JobRegistry::new()));
+
+        assert!(manager.dispatch(SendInvoice { id: 90_210 }).await.unwrap().is_some());
+        assert_eq!(queue.size("default").await.unwrap(), 1, "dispatched anyway");
+
+        let reported: Vec<_> = capture
+            .reports()
+            .into_iter()
+            .filter_map(|r| match r.failure {
+                rainier_events::Failure::Configuration(f)
+                    if f.meta.extra.get("unique_key")
+                        == Some(&serde_json::json!("queue:unique:billing.invoice:90210")) =>
+                {
+                    Some(f)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].setting, "queue.locks");
     }
 
     #[tokio::test]

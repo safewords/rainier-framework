@@ -246,3 +246,38 @@ async fn the_eviction_policy_is_reported() {
         assert!(!policy.is_empty());
     }
 }
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn an_entry_that_is_not_a_job_is_discarded_and_reported() {
+    let queue = redis_or_skip!("discard");
+    let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+    let client = rainier_drivers::RedisClient::connect(&RedisConnector::open(&url).unwrap())
+        .await
+        .expect("a second client");
+
+    // Creates the group, so the entry below is delivered to it.
+    assert!(queue.reserve("default").await.expect("reserve").is_none());
+    let stream = queue.keys().stream("default");
+    let id = client.xadd(&stream, b"not a job").await.expect("xadd");
+
+    let capture = rainier_events::report::capture();
+    assert!(queue.reserve("default").await.expect("reserve").is_none(), "nothing to run");
+    assert_eq!(queue.size("default").await.unwrap(), 0, "and it is gone, not pending");
+
+    let discarded: Vec<_> = capture
+        .reports()
+        .into_iter()
+        .filter_map(|r| match r.failure {
+            rainier_events::Failure::QueueMessageDiscarded(d)
+                if d.message_id.as_deref() == Some(id.as_str()) =>
+            {
+                Some(d)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(discarded.len(), 1);
+    assert_eq!(discarded[0].connection, "redis");
+    assert_eq!(discarded[0].queue, "default");
+}

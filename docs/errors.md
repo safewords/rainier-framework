@@ -182,6 +182,9 @@ catching is per-poll rather than around the closure.
 
 Panics are a backstop, not a control-flow mechanism. Return `Err`.
 
+A caught panic is always [reported](#reporting), as an `HttpRequestFailed`
+with `exception.panic` set — `dont_report` never filters one out.
+
 ## Debug mode
 
 ```env
@@ -204,6 +207,308 @@ A job returning `Err` is released for another attempt. A command returning
 `Err` prints the message and exits non-zero. A provider returning `Err` aborts
 the boot. In none of those cases is there a client, so the disclosure rule does
 not apply and the full message is shown.
+
+In every one of those cases except the boot, the failure is also
+[reported](#reporting).
+
+## Reporting
+
+Rendering and reporting are two different jobs. The [exception
+renderer](#the-exception-renderer) decides what the **client** sees. Reporting
+is how the **application** hears that something failed.
+
+The framework does not decide which failures matter. It **publishes every
+failure it would otherwise swallow** — a request that ended in an error, a job
+attempt that failed, a command that panicked, a cache write that was lost, a
+captcha provider that did not answer, configuration it replaced with a default
+— as a typed event on the application's [event bus](events.md). The
+**application subscribes** to the ones it cares about and decides what to do:
+page someone, send them to an error tracker, count them, ignore them.
+
+### The catalogue
+
+Each kind of failure has its own event struct in `rainier_events::report`
+(re-exported as `rainier_framework::report`), with fixed, typed fields. Every
+one of them also carries:
+
+- **`exception`** — an `Exception`, a `Clone` snapshot every listener can
+  share: `kind` (`None` for a panic), `status`, the error's **own** `message`
+  (never the generic one the client got), `details`, the cause chain as
+  `sources`, the `backtrace` when there is one, `panic`, and the original
+  `Arc<Error>` in `error` for a listener that wants to downcast its source.
+- **`meta`** — a [`ReportMeta`](#reportmeta): an id, when, which process, and
+  whatever the application attached.
+
+| `FailureKind` | Event | Fields | Emitted by |
+|---|---|---|---|
+| `HttpRequest` | `HttpRequestFailed` | `method`, `path` (no query string), `route: Option` | the HTTP kernel — every error response and every caught panic (`rainier-server` `kernel.rs`, `server.rs`) |
+| `WebSocket` | `WebSocketFailed` | `socket`, `path`, `stage` | the WebSocket upgrade — a failed upgrade or a failing `connect` / `message` / `close` callback (`rainier-server` `upgrade.rs`) |
+| `Server` | `ServerFailed` | `operation` | the server outside any request — `accept`, serving a connection (`rainier-server` `server.rs`) |
+| `Middleware` | `MiddlewareFailed` | `middleware`, `operation` | middleware that worked around a failure — the throttle's store, a timeout (`rainier-middleware` `builtin.rs`, `timeout.rs`) |
+| `Auth` | `AuthFailed` | `guard`, `operation` | guards and password confirmation unable to decide (`rainier-auth` `middleware.rs`, `confirm.rs`) |
+| `Session` | `SessionFailed` | `operation` | session load/save and CSRF sealing (`rainier-session` `middleware.rs`, `csrf.rs`, `database.rs`); storing a session delivery key (`rainier-framework` `session_delivery.rs`) |
+| `OAuth` | `OAuthFailed` | `operation` | the OAuth server — a `server_error` answer, a failed revocation (`rainier-oauth-server` `error.rs`, `server.rs`) |
+| `Account` | `AccountFailed` | `flow`, `operation` | an accounts flow that failed partway — a verification or reset link not sent (`rainier-accounts` `accounts.rs`) |
+| `JobAttempt` | `JobAttemptFailed` | `job`, `id`, `queue`, `connection: Option`, `attempt`, `final_attempt` | the queue worker — every failed attempt, released or failed for good, error, panic or timeout (`rainier-queue` `worker.rs`) |
+| `QueueMessageDiscarded` | `QueueMessageDiscarded` | `connection`, `queue`, `message_id: Option` | a queue driver throwing away a message it could not read (`rainier-queue` `redis.rs`, `sqs.rs`, `kafka.rs`) |
+| `QueueOperation` | `QueueOperationFailed` | `connection: Option`, `queue: Option`, `operation`, `job_id: Option` | ack / release / fail / dead-letter / cleanup failing outside a job's own run (`rainier-queue` `worker.rs`, `redis.rs`, `sqs.rs`, `kafka.rs`) |
+| `Command` | `CommandFailed` | `command` | the console — a command's `Err`, or its panic, which is then resumed (`rainier-console` `console.rs`) |
+| `ScheduledTask` | `ScheduledTaskFailed` | `task` | `schedule:run` / `schedule:work` — a task that failed (`rainier-framework` `scheduling.rs`) |
+| `Listener` | `ListenerFailed` | `event` | the dispatcher — a listener that failed under `dispatch_quietly` (`rainier-events` `dispatcher.rs`) |
+| `BackgroundTask` | `BackgroundTaskFailed` | `task` | spawned work — a health check that panicked (`health:<name>`), `queue:work`'s stop-signal handler (`rainier-framework` `health.rs`, `commands.rs`) |
+| `Broadcast` | `BroadcastFailed` | `channel: Option`, `operation` | broadcasting — a refused subscription, a broadcaster that fell back to the log, the Kafka relay falling over (`rainier-broadcast` `auth.rs`, `broadcasters.rs`, `kafka.rs`, `pusher_server.rs`; `rainier-framework` `relay.rs`) |
+| `Notification` | `NotificationFailed` | `channel`, `notification` | the notifier — a channel that could not deliver (`rainier-notify` `notifier.rs`) |
+| `Mail` | `MailFailed` | `mailer`, `operation` | reserved for mail transports; nothing emits it yet |
+| `Publish` | `PublishFailed` | `topic`, `event` | `kafka::publish_events` — an event that could not be serialised or produced (`rainier-framework` `kafka.rs`) |
+| `Webhook` | `WebhookFailed` | `provider`, `event_id: Option`, `operation` | incoming webhooks (`rainier-billing` `webhook.rs`) |
+| `Cache` | `CacheFailed` | `store`, `key: Option`, `operation` | the cache and the rate limiter working around a store failure (`rainier-cache` `cache.rs`, `rate_limit.rs`); the model cache, store `model_cache`, `meta.extra["table"]` (`rainier-framework` `model_cache.rs`) |
+| `Database` | `DatabaseFailed` | `connection: Option`, `operation` | the database layer working around a failure (`rainier-database` `connection.rs`) |
+| `Filesystem` | `FilesystemFailed` | `disk`, `operation` | a filesystem operation worked around — a temporary file not cleaned up, a write retried (`rainier-filesystem` `local.rs`) |
+| `Integration` | `IntegrationFailed` | `service`, `operation` | calls to outside services — captcha verification, service `captcha:<provider>`, `meta.extra["fail_open"]` (`rainier-framework` `captcha.rs`) |
+| `Telemetry` | `TelemetryFailed` | `operation` | exporters and the worker's metrics endpoint (`rainier-telemetry` `otlp.rs`; `rainier-framework` `instrumentation.rs`, `commands.rs`) |
+| `Configuration` | `ConfigurationFailed` | `setting` | configuration ignored or replaced with a default — a generated `APP_KEY`, CORS no preflight can reach, a per-process rate limiter or scheduler lock, a symlink out of `public/`, a bare `--option` (`rainier-framework` `bootstrap.rs`, `cors.rs`, `limits.rs`, `scheduling.rs`, `public.rs`; `rainier-console` `arguments.rs`; `rainier-container`, `rainier-debug`, `rainier-middleware` `proxy.rs`, `rainier-openapi`, `rainier-queue` `manager.rs`, `redis.rs`) |
+| `Application` | `ApplicationFailed` | — | your code — `rainier_framework::report`, `Reporter::report_error`, `report::report_error` |
+
+`Failure` is the same catalogue as an enum, one variant per struct, and
+`FailureKind` is the same list without data — for matching, metric labels and
+filtering.
+
+### Subscribing
+
+Every report is dispatched **twice**: once as its own typed event, and once
+wrapped in the catch-all `ExceptionReported { failure }`. Listen for the typed
+event to handle one kind of failure with its own fields:
+
+```rust
+use rainier_framework::report::{HttpRequestFailed, JobAttemptFailed};
+
+Rainier::new(".").with_events(|events| {
+    events.listen(|failed: Arc<HttpRequestFailed>| async move {
+        if failed.exception.is_server_error() {
+            tracing::error!(route = ?failed.route, "{} {}: {}", failed.method, failed.path, failed.exception);
+        }
+        Ok(())
+    });
+
+    events.listen(|failed: Arc<JobAttemptFailed>| async move {
+        if failed.final_attempt {
+            page_on_call(&failed.job, &failed.exception).await?;
+        }
+        Ok(())
+    });
+})
+```
+
+Listen for `ExceptionReported` to see every failure once — what an error
+tracker wants:
+
+```rust
+use rainier_framework::{ExceptionReported, Failure};
+
+events.listen(|reported: Arc<ExceptionReported>| async move {
+    match &reported.failure {
+        Failure::HttpRequest(failed) if failed.exception.is_client_error() => {}
+        other => tracker::capture(other.kind().as_str(), other.exception(), other.meta()),
+    }
+    Ok(())
+});
+```
+
+`Failure` and `FailureKind` are `#[non_exhaustive]` — the catalogue grows — so
+a `match` needs an arm for the rest.
+
+### Filtering
+
+By default **everything is reported**, 4xx included: a `404` is a failure the
+framework swallowed into a response like any other, and whether it matters is
+the application's call. Most applications decide in their listeners. For the
+failures an application never wants on the bus at all, filter at the reporter:
+
+```rust
+use rainier_framework::FailureKind;
+
+Rainier::new(".").with_reporting(|reporter| {
+    reporter
+        .dont_report(ErrorKind::NotFound)       // by the error's kind, from any source
+        .dont_report(ErrorKind::Validation)
+        .ignore(FailureKind::Cache)              // by the kind of failure
+})
+```
+
+`dont_report(ErrorKind)` drops a failure whose error has that kind — except a
+**panic**, which has no kind and is never deliberate. `ignore(FailureKind)`
+drops every failure of that kind, panics included.
+
+### Context providers
+
+Every report already carries `app` (`APP_NAME`) and `environment` (`APP_ENV`)
+in `meta.extra`. Add more with a context provider. It runs for every report and
+is told which kind it is:
+
+```rust
+Rainier::new(".").with_reporting(|reporter| {
+    reporter.with_context(|kind, meta| {
+        meta.extra.insert("release".into(), env!("CARGO_PKG_VERSION").into());
+        if kind == FailureKind::HttpRequest {
+            meta.extra.insert("region".into(), region().into());
+        }
+    })
+})
+```
+
+Providers run in the order they were added, after the defaults, so one may
+overwrite `app` or `environment`. Fields the failure already carried — attached
+with `with_extra` before reporting — win over every provider. `with_reporting`
+may be called more than once; the adjustments apply in order.
+
+### `ReportMeta`
+
+Filled in by the reporter; leave it default when building a failure.
+
+| Field | |
+|---|---|
+| `id` | unique per report — the same on the typed event and the catch-all, so a forwarder can de-duplicate downstream |
+| `reported_at_ms` | milliseconds since the Unix epoch |
+| `pid` | the reporting process |
+| `host` | `HOSTNAME` — the pod name on Kubernetes |
+| `extra` | a `BTreeMap<String, serde_json::Value>`: the context providers' fields and the failure's own |
+
+Some emitters link their reports through `extra`: a scheduled **command**
+that fails is reported twice, as the console's `CommandFailed` (the command's
+own error) and the scheduler's `ScheduledTaskFailed`, whose
+`meta.extra["command"]` is the `CommandFailed`'s `command`. Subscribe to the
+one you want, or to both and join them. See
+[scheduling](scheduling.md#failures).
+
+### Reporting something yourself
+
+An error you handled — the customer saw a friendly page — that somebody should
+still know about:
+
+```rust
+if let Err(error) = refund(&order).await {
+    rainier_framework::report(&app, error).await;   // an ApplicationFailed
+    return Ok(Response::html(refund_pending_page()));
+}
+```
+
+Any type from the catalogue, with fields of your own:
+
+```rust
+use rainier_framework::report::{FailureEvent as _, IntegrationFailed};
+
+rainier_framework::report_failure(
+    &app,
+    IntegrationFailed::new(error, "payments", "refund").with_extra("order", order.id),
+).await;
+```
+
+Or through the facade — `Report::instance().report_error(error)`, or
+`.report(failure)`. Each returns whether it was reported: `false` when a
+filter dropped it, or when there is no reporter at all.
+
+### The process-wide reporter
+
+The kernel, the worker, the console and the scheduler hold the application's
+reporter. A cache, a queue driver, a session store or the dispatcher itself
+does not — so boot also **installs** the application's reporter process-wide,
+and those components report through `rainier_framework::report::report(…)`
+(awaited) or `report::report_detached(…)` (spawned, for code that is not
+`async`). With nothing installed, both do nothing. A `Kernel` or a `Worker`
+built by hand without `with_reporter` falls back to the process-wide reporter
+too.
+
+The **last application booted wins.** An application built
+`without_facades()` — a test, or one of several applications in one process —
+leaves the process-wide reporter alone, so parallel tests do not receive each
+other's failures. Install one yourself with `report::install(reporter)`.
+
+`rainier_framework::report` and `report_failure` use the application's bound
+reporter, and fall back to the process-wide one for an `Application` that was
+assembled by hand rather than booted.
+
+### Across processes
+
+Every failure struct, `Failure` and `ExceptionReported` is
+`Serialize + Deserialize`, so a listener can forward a report to a queue, a
+broadcast channel or another service as JSON:
+
+```json
+{
+  "failure": {
+    "type": "JobAttempt",
+    "job": "SendInvoice", "id": "42", "queue": "default", "connection": "redis",
+    "attempt": 3, "final_attempt": true,
+    "exception": {
+      "kind": "Internal", "status": 500, "message": "boom", "details": null,
+      "sources": ["connecting to mariadb", "connection refused"],
+      "backtrace": null, "panic": false
+    },
+    "meta": {
+      "id": "18c3a…-1f2-0", "reported_at_ms": 1763030400000, "pid": 4242,
+      "host": "worker-7c9f", "extra": { "app": "Rainier", "environment": "production" }
+    }
+  }
+}
+```
+
+`type` is the `FailureKind`. The original `Arc<Error>` stays behind; everything
+else travels. Use `meta.id` to de-duplicate: the typed event and the catch-all
+carry the same one, and a forwarder subscribed to both would otherwise send it
+twice.
+
+### Listeners run inline
+
+A report is dispatched with `dispatch_quietly`: a listener that fails is logged
+and the others still run, and **no reporting failure ever changes the outcome**
+of what failed. A failing listener is itself reported as a `ListenerFailed` —
+except a listener of a failure event, which would loop.
+
+But listeners run inline. The `500` a failed request gets waits for every
+listener — so a listener that talks to the network should not. Hand it to the
+queue with a [queued listener](events.md#queued-listeners):
+
+```rust
+events.listen_queued::<ExceptionReported, SendToTracker>();
+```
+
+### Testing reports
+
+[`TestApp`](testing.md#testapp) listens on the application's reporter from the
+moment it is built:
+
+```rust
+use rainier_framework::report::HttpRequestFailed;
+
+app.get("/explodes").await.assert_status(StatusCode::INTERNAL_SERVER_ERROR);
+
+let failed = app.reported_of::<HttpRequestFailed>();   // typed
+assert_eq!(failed[0].path, "/explodes");
+assert_eq!(app.reported()[0].exception().message, "disk full");   // catch-all
+
+app.get("/fine").await;
+app.assert_nothing_reported();
+```
+
+What a `TestApp` sees is what reached **its** application's reporter. For a
+failure reported process-wide — by a cache, a driver, a failing listener — take
+a capture, which installs a collecting reporter for the duration of the test:
+
+```rust
+let capture = rainier_framework::report::capture();
+// … exercise the code …
+assert_eq!(capture.of_kind(FailureKind::Cache).len(), 1);
+```
+
+A capture holds a process-wide lock, so captures in parallel tests run one at a
+time; and other tests' process-wide reports can land in it, so filter for
+yours. Reports made **during** boot happen before a `TestApp` exists — listen
+with `with_events` for those.
+
+Swapping a `Dispatcher::fake()` into the container after boot does **not**
+capture reports — the reporter was handed the real dispatcher at boot. A
+`Reporter::new(Arc::new(Dispatcher::fake()))` in a unit test records them as
+usual, and `assert_dispatched::<HttpRequestFailed>()` works on it.
 
 ---
 

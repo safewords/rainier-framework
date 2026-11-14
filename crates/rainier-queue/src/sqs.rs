@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use rainier_drivers::{AwsConnector, SqsClient};
+use rainier_drivers::{AwsConnector, SqsClient, SqsMessage};
+use rainier_events::report::{FailureEvent, QueueMessageDiscarded, QueueOperationFailed};
+use rainier_events::Exception;
 use rainier_support::{BoxFuture, Error, Result};
 
 use crate::job::QueuedJob;
@@ -134,24 +136,46 @@ impl Queue for SqsQueue {
         })
     }
 
-    fn reserve<'a>(&'a self, _queue: &'a str) -> BoxFuture<'a, Result<Option<QueuedJob>>> {
+    fn reserve<'a>(&'a self, queue: &'a str) -> BoxFuture<'a, Result<Option<QueuedJob>>> {
         Box::pin(async move {
-            // The queue name is unused: an SQS queue *is* a URL, so one
-            // `SqsQueue` serves one queue. A worker wanting several names wants
+            // The queue name only labels reports: an SQS queue *is* a URL, so
+            // one `SqsQueue` serves one queue. A worker wanting several names wants
             // several instances, which is also how SQS priorities are done.
             let Some(message) = self.client.receive(self.visibility, self.wait_time).await? else {
                 return Ok(None);
             };
 
-            let mut job: QueuedJob = match serde_json::from_str(&message.body) {
+            let mut job: QueuedJob = match decode_message(queue, self.queue_url(), &message) {
                 Ok(job) => job,
-                Err(e) => {
+                Err(discarded) => {
                     // A message we cannot parse is not a job. Leaving it would
                     // have every poll return it forever; deleting it loses
-                    // whatever it was. Logging loudly and deleting is the lesser
-                    // evil, and a redrive policy is the real answer.
-                    tracing::error!(error = %e, "discarding an unparseable SQS message");
-                    let _ = self.client.delete(&message.receipt_handle).await;
+                    // whatever it was. Reporting loudly and deleting is the
+                    // lesser evil, and a redrive policy is the real answer.
+                    tracing::error!(
+                        error = %discarded.exception,
+                        "discarding an unparseable SQS message"
+                    );
+                    crate::reporting::report(*discarded).await;
+
+                    // Not fatal to the reserve: an undeleted message comes back
+                    // after its visibility timeout and is discarded again. But
+                    // said, because until one delete works it comes back
+                    // forever.
+                    if let Err(e) = self.client.delete(&message.receipt_handle).await {
+                        tracing::error!(error = %e.message(), "could not delete a discarded SQS message");
+                        crate::reporting::report(
+                            QueueOperationFailed::new(
+                                crate::reporting::snapshot(&e),
+                                Some("sqs".to_string()),
+                                Some(queue.to_string()),
+                                "delete_discarded",
+                                None,
+                            )
+                            .with_extra("queue_url", self.queue_url()),
+                        )
+                        .await;
+                    }
                     return Ok(None);
                 }
             };
@@ -221,6 +245,24 @@ impl std::fmt::Debug for SqsQueue {
 }
 
 /// The receipt handle [`reserve`](Queue::reserve) put on the job.
+/// Read a received message as a job, or say why it is being discarded.
+///
+/// No `message_id`: what the client hands over is the receipt handle, which
+/// is valid for one receive and identifies nothing afterwards.
+fn decode_message(
+    queue: &str,
+    queue_url: &str,
+    message: &SqsMessage,
+) -> std::result::Result<QueuedJob, Box<QueueMessageDiscarded>> {
+    serde_json::from_str(&message.body).map_err(|e| {
+        Box::new(
+            QueueMessageDiscarded::new(Exception::from_std(&e), "sqs", queue, None)
+                .with_extra("queue_url", queue_url)
+                .with_extra("receive_count", message.receive_count),
+        )
+    })
+}
+
 fn receipt_handle(job: &QueuedJob) -> Result<&str> {
     job.delivery_handle.as_deref().ok_or_else(|| {
         // Reachable only if a job was constructed rather than reserved, which is
@@ -272,6 +314,45 @@ mod tests {
 
         assert_eq!(queue.visibility, Duration::from_secs(600));
         assert_eq!(queue.wait_time, Duration::from_secs(20));
+    }
+
+    fn message(body: &str) -> SqsMessage {
+        SqsMessage {
+            body: body.to_string(),
+            receipt_handle: "AQEB-handle".to_string(),
+            receive_count: 2,
+        }
+    }
+
+    #[test]
+    fn an_unparseable_message_becomes_a_discard_naming_the_queue() {
+        let discarded = *decode_message("default", URL, &message("not a job")).unwrap_err();
+
+        assert_eq!(discarded.connection, "sqs");
+        assert_eq!(discarded.queue, "default");
+        assert_eq!(discarded.message_id, None, "a receipt handle is not an id");
+        assert_eq!(discarded.meta.extra["queue_url"], URL);
+        assert_eq!(discarded.meta.extra["receive_count"], 2);
+        assert!(!discarded.exception.message.is_empty());
+    }
+
+    #[test]
+    fn a_job_message_decodes() {
+        let body = serde_json::to_string(&job()).unwrap();
+        assert_eq!(decode_message("default", URL, &message(&body)).unwrap().id, "job-1");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_discard_reaches_the_process_wide_reporter() {
+        let capture = rainier_events::report::capture();
+        let discarded = *decode_message("sqs-discard-test", URL, &message("{")).unwrap_err();
+        crate::reporting::report(discarded).await;
+
+        assert!(capture.reports().into_iter().any(|r| matches!(
+            &r.failure,
+            rainier_events::Failure::QueueMessageDiscarded(d) if d.queue == "sqs-discard-test"
+        )));
     }
 
     #[test]

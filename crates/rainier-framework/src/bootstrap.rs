@@ -18,7 +18,8 @@ use rainier_config::{Config, Env};
 use rainier_container::{Application, ServiceProvider};
 use rainier_crypt::{Encryption, Key, KeyRing};
 use rainier_database::{Database, DatabaseManager, Databases};
-use rainier_events::Dispatcher;
+use rainier_events::report::ConfigurationFailed;
+use rainier_events::{Dispatcher, Exception, Reporter};
 use rainier_filesystem::Storage;
 use rainier_mail::Mailer;
 use rainier_middleware::MiddlewareRegistry;
@@ -29,7 +30,7 @@ use rainier_queue::{
 use rainier_routing::{Router, UrlGenerator};
 use rainier_server::Kernel;
 use rainier_session::{MemorySessionStore, SessionManager};
-use rainier_support::{Error, Result};
+use rainier_support::{Error, ErrorKind, Result};
 use rainier_view::{TemplateEngine, ViewEngine};
 
 use crate::facades::Views;
@@ -62,6 +63,11 @@ pub struct Rainier {
     /// swallowed. So it waits here.
     deferred: Option<Error>,
     events: Dispatcher,
+    /// Adjustments to the application's [`Reporter`], applied in order at
+    /// boot — the reporter needs the dispatcher the container hands out, which
+    /// does not exist until then.
+    #[allow(clippy::type_complexity, reason = "one boxed closure per adjustment")]
+    reporting: Vec<Box<dyn FnOnce(Reporter) -> Reporter>>,
     middleware: MiddlewareRegistry,
     router: Router,
     views: Option<Arc<dyn ViewEngine>>,
@@ -85,6 +91,14 @@ pub struct Rainier {
     providers: Vec<Arc<dyn ServiceProvider>>,
     install_facades: bool,
     install_tracing: bool,
+    /// Adjustments to Lookout's configuration, applied over the environment
+    /// at boot.
+    #[cfg(feature = "lookout")]
+    lookout: Vec<crate::lookout::Adjustment>,
+    /// Who may see Lookout's dashboard — `None` until the application names
+    /// its user type.
+    #[cfg(feature = "lookout")]
+    lookout_viewers: Option<crate::lookout::Viewers>,
 }
 
 impl Rainier {
@@ -110,6 +124,7 @@ impl Rainier {
             config,
             deferred,
             events: Dispatcher::new(),
+            reporting: Vec::new(),
             middleware: default_middleware(),
             router: Router::new(),
             views: None,
@@ -130,6 +145,10 @@ impl Rainier {
             providers: Vec::new(),
             install_facades: true,
             install_tracing: true,
+            #[cfg(feature = "lookout")]
+            lookout: Vec::new(),
+            #[cfg(feature = "lookout")]
+            lookout_viewers: None,
         }
     }
 
@@ -181,6 +200,53 @@ impl Rainier {
     /// Register event listeners.
     pub fn with_events(self, register: impl FnOnce(&Dispatcher)) -> Self {
         register(&self.events);
+        self
+    }
+
+    /// Adjust how failures are reported.
+    ///
+    /// Every booted application has one [`Reporter`], bound in the container
+    /// and handed to the HTTP kernel, the queue worker, the console and the
+    /// scheduler. It publishes **every** failure the framework would otherwise
+    /// swallow on the application's own dispatcher — as its typed event
+    /// ([`HttpRequestFailed`](rainier_events::report::HttpRequestFailed),
+    /// [`JobAttemptFailed`](rainier_events::report::JobAttemptFailed), …) and
+    /// as the catch-all [`ExceptionReported`](rainier_events::ExceptionReported)
+    /// — so acting on failures is a listener registered with
+    /// [`with_events`](Self::with_events). This is where the failures an
+    /// application never wants on the bus at all are filtered out, and where
+    /// context is added to every report:
+    ///
+    /// ```no_run
+    /// # use rainier_framework::Rainier;
+    /// # use rainier_framework::FailureKind;
+    /// # use rainier_support::ErrorKind;
+    /// # fn wire(app: Rainier) -> Rainier {
+    /// app.with_reporting(|reporter| {
+    ///     reporter
+    ///         .dont_report(ErrorKind::NotFound)
+    ///         .ignore(FailureKind::Cache)
+    ///         .with_context(|_kind, meta| {
+    ///             meta.extra.insert("release".into(), env!("CARGO_PKG_VERSION").into());
+    ///         })
+    /// })
+    /// # }
+    /// ```
+    ///
+    /// Called more than once, the adjustments apply in order. Every report
+    /// already carries `app` (`APP_NAME`) and `environment` (`APP_ENV`) in
+    /// [`ReportMeta::extra`](rainier_events::ReportMeta::extra); a provider
+    /// added here runs after those and may overwrite them.
+    ///
+    /// Unless the application was built
+    /// [`without_facades`](Self::without_facades), boot also installs this
+    /// reporter as the process-wide one, for the components that have no
+    /// handle to the application — see [`crate::reporting`].
+    pub fn with_reporting(
+        mut self,
+        configure: impl FnOnce(Reporter) -> Reporter + 'static,
+    ) -> Self {
+        self.reporting.push(Box::new(configure));
         self
     }
 
@@ -579,6 +645,54 @@ impl Rainier {
         self
     }
 
+    /// Adjust Lookout's configuration.
+    ///
+    /// Boot starts from [`LookoutConfig::from_env`](crate::lookout::LookoutConfig::from_env)
+    /// — `LOOKOUT_ENABLED`, `LOOKOUT_STORE` and the rest, read through the
+    /// application's environment — and applies each adjustment in order. The
+    /// environment sets the scalars; scope, per-watcher rules and the keep
+    /// rule are about the application's own routes and belong here:
+    ///
+    /// ```no_run
+    /// # use rainier_framework::Rainier;
+    /// use rainier_framework::lookout::config::{Patterns, Scope};
+    /// # fn wire(app: Rainier) -> Rainier {
+    /// app.with_lookout(|lookout| {
+    ///     lookout.scope(Scope {
+    ///         routes: Patterns { include: vec![], exclude: vec!["health".into()] },
+    ///         jobs: true,
+    ///         commands: true,
+    ///         scheduled_tasks: true,
+    ///         ..Scope::default()
+    ///     })
+    /// })
+    /// # }
+    /// ```
+    ///
+    /// Calling this does not turn Lookout on; `LOOKOUT_ENABLED` does, or
+    /// `.enabled(true)` in the closure. See `docs/lookout.md`.
+    #[cfg(feature = "lookout")]
+    pub fn with_lookout(
+        mut self,
+        configure: impl FnOnce(crate::lookout::LookoutConfig) -> crate::lookout::LookoutConfig + 'static,
+    ) -> Self {
+        self.lookout.push(Box::new(configure));
+        self
+    }
+
+    /// Let users of type `U` see Lookout's dashboard when they may.
+    ///
+    /// Outside the local environment a viewer is authenticated with the
+    /// dashboard's guard through the bound `AuthManager<U>`, and must pass the
+    /// dashboard's ability (`viewLookout` by default) on the bound `Gate<U>`.
+    /// Without this call nobody may — the dashboard answers 404 — and the same
+    /// holds when either is not bound, or the ability is not defined.
+    #[cfg(feature = "lookout")]
+    pub fn with_lookout_viewers<U: rainier_auth::Authenticatable>(mut self) -> Self {
+        self.lookout_viewers = Some(crate::lookout::viewers::<U>());
+        self
+    }
+
     /// Build and boot the application.
     ///
     /// Compiling the router here is what makes an unknown middleware alias or
@@ -591,8 +705,39 @@ impl Rainier {
             return Err(error);
         }
 
-        if self.install_tracing {
-            install_tracing(&self.env, &self.config);
+        // Lookout is built before the subscriber, because its layer is part
+        // of it. Its store needs databases and caches that do not exist yet,
+        // so it starts on a deferred one that is filled in below.
+        #[cfg(feature = "lookout")]
+        let lookout = {
+            let config = crate::lookout::configure(
+                &self.env,
+                &self.config,
+                std::mem::take(&mut self.lookout),
+            )?;
+            config.enabled.then(|| {
+                let deferred = Arc::new(crate::lookout::DeferredStore::default());
+                let store: Arc<dyn crate::lookout::Store> = deferred.clone();
+                (crate::lookout::Lookout::new(config, store), deferred)
+            })
+        };
+        #[allow(unused_mut, reason = "only the `lookout` feature adds a layer")]
+        let mut layers: Vec<crate::observability::SubscriberLayer> = Vec::new();
+        #[cfg(feature = "lookout")]
+        if let Some((lookout, _)) = &lookout {
+            use tracing_subscriber::Layer as _;
+            layers.push(lookout.layer().boxed());
+        }
+        let has_layers = !layers.is_empty();
+
+        let installed = self.install_tracing && install_tracing(&self.env, &self.config, layers);
+        if has_layers && !installed {
+            tracing::warn!(
+                "lookout: Lookout's layer is not in the tracing subscriber — one was already \
+                 installed, or the application boots without tracing — so nothing will be \
+                 recorded until the application adds `Lookout::layer()` to its own (see \
+                 docs/lookout.md)"
+            );
         }
 
         let environment = self.config.get(keys::APP_ENV).unwrap_or_default().to_string();
@@ -617,8 +762,12 @@ impl Rainier {
             )
         });
 
+        // Failures boot works around before the reporter exists, reported
+        // once it does.
+        let mut boot_failures: Vec<ConfigurationFailed> = Vec::new();
+
         let crypt = self.crypt.unwrap_or_else(|| {
-            let keys = app_keys(&self.env);
+            let keys = app_keys(&self.env, &mut boot_failures);
 
             match self.config.setting(keys::APP_CIPHER).unwrap_or_default() {
                 rainier_crypt::CryptScheme::Native => Encryption::from_keys(keys),
@@ -642,7 +791,7 @@ impl Rainier {
         // the router compiles, which is long before there are named routes to
         // generate links to.
         let url_signer = rainier_crypt::UrlSigner::new(
-            crypt.keys().cloned().unwrap_or_else(|| app_keys(&self.env)),
+            crypt.keys().cloned().unwrap_or_else(|| app_keys(&self.env, &mut boot_failures)),
         );
         let sessions = self
             .sessions
@@ -651,6 +800,42 @@ impl Rainier {
         app.instance(self.config);
         app.instance(self.env);
         app.instance(self.events);
+
+        // One reporter, over the same dispatcher the container hands out — so
+        // a listener registered with `with_events`, by a provider, or on
+        // `Event::instance()` sees every report, and a test that swaps in a
+        // fake sees them too. Bound before the providers run so one of them
+        // can resolve it; the kernel and the worker are handed the same one.
+        let reporter = {
+            let settings = app.resolve::<Config>()?;
+            let name = settings.get_or(keys::APP_NAME, String::from("Rainier"));
+            let environment = environment.clone();
+            let mut reporter =
+                Reporter::new(app.resolve::<Dispatcher>()?).with_context(move |_, meta| {
+                    meta.extra.insert("app".into(), name.clone().into());
+                    meta.extra.insert("environment".into(), environment.clone().into());
+                });
+            for configure in self.reporting {
+                reporter = configure(reporter);
+            }
+            reporter
+        };
+        app.instance(reporter.clone());
+
+        // And process-wide, for what has no handle to the application: a
+        // queue driver, a cache, a failing event listener. The last
+        // application booted wins, which is why an application that leaves
+        // the facades alone — a test, one of several in a process — leaves
+        // this alone too.
+        if self.install_facades {
+            rainier_events::report::install(reporter.clone());
+        }
+
+        // What boot carried on past before there was a reporter to tell.
+        for failure in boot_failures.drain(..) {
+            reporter.report(failure).await;
+        }
+
         app.instance(Views::new(views));
         app.instance(crypt);
         app.instance(url_signer);
@@ -784,6 +969,24 @@ impl Rainier {
             app.instance(mailer);
         }
 
+        // Lookout's real store, now that the databases and caches it may
+        // live in are bound — and the recorder, bound before the providers
+        // so one of them can resolve it.
+        #[cfg(feature = "lookout")]
+        if let Some((lookout, deferred)) = &lookout {
+            let store = crate::lookout::build_store(&app, &lookout.config().store)?;
+            deferred.set(Arc::clone(&store));
+            lookout.identify_with(|response| {
+                response
+                    .extensions()
+                    .get::<rainier_auth::Authenticated>()
+                    .map(|who| (who.guard.clone(), Some(who.user_id.clone())))
+            });
+            lookout.listen(app.resolve::<Dispatcher>()?.as_ref());
+            app.instance(store);
+            app.instance(lookout.clone());
+        }
+
         // Providers register before the router compiles, so a middleware that
         // resolves a service gets one a provider bound.
         for provider in self.providers {
@@ -811,6 +1014,28 @@ impl Rainier {
                 let files = files.clone();
                 async move { files.serve(&request).await }
             });
+        }
+
+        // Lookout's dashboard, outside every middleware group: its clearing
+        // endpoint is a DELETE that the gate and a custom header protect, and
+        // a group's middleware — a session cookie, a CSRF check — would make a
+        // refused request's 404 different from a path that does not exist.
+        #[cfg(feature = "lookout")]
+        if let Some((lookout, _)) = &lookout {
+            let config = lookout.config();
+            let gate = match &self.lookout_viewers {
+                Some(viewers) => crate::lookout::LookoutGate::from_check(viewers(
+                    Arc::downgrade(&app),
+                    config.dashboard.clone(),
+                )),
+                None => crate::lookout::LookoutGate::deny_all(),
+            };
+            self.router.merge(crate::lookout::routes(
+                Arc::clone(&*app.resolve::<Arc<dyn crate::lookout::Store>>()?),
+                Arc::new(config.clone()),
+                gate,
+                &crate::lookout::gate_environment(config.local, &environment),
+            ));
         }
 
         // Compiled once and shared: the kernel serves it, and the container
@@ -854,7 +1079,7 @@ impl Rainier {
         // one place both halves are in scope: a CORS policy is only reachable
         // by a preflight from `global`, and only *visible* as a mistake next to
         // the route table that carries it instead.
-        crate::cors::warn_if_cors_cannot_answer_a_preflight(&global, &compiled);
+        let cors = crate::cors::warn_if_cors_cannot_answer_a_preflight(&global, &compiled);
 
         // Outermost of all, with the `telemetry` feature: every log line and
         // every span below it — the timeout and compression included — joins
@@ -868,9 +1093,20 @@ impl Rainier {
             ),
         );
 
+        // Lookout just inside `Trace` — outermost after it — so it sees every
+        // request, including the ones a timeout, a throttle or the
+        // application's own global middleware turned away.
+        #[cfg(feature = "lookout")]
+        if let Some((lookout, _)) = &lookout {
+            let at = global.iter().position(|stage| stage.name() == "Trace").map_or(0, |i| i + 1);
+            global.insert(at, Arc::new(lookout.middleware()));
+        }
+
         let settings_for_kernel = app.resolve::<Config>()?;
         let debug = settings_for_kernel.get_or(keys::APP_DEBUG, false);
-        let mut kernel = Kernel::from_shared(Arc::clone(&compiled), global).with_debug(debug);
+        let mut kernel = Kernel::from_shared(Arc::clone(&compiled), global)
+            .with_debug(debug)
+            .with_reporter(reporter.clone());
 
         // The exception renderer, in order of preference:
         //
@@ -935,12 +1171,28 @@ impl Rainier {
         // `schedule:run` refuses, because that is the one whose guarantees are
         // at stake. A web container refusing to serve HTTP over a scheduling
         // concern would be a larger outage than the one being prevented.
-        crate::scheduling::warn_if_locks_are_not_shared(&app);
+        let locks = crate::scheduling::warn_if_locks_are_not_shared(&app);
 
         // The same question one layer over: a route that rate-limits against a
         // per-process counter permits its limit once per replica, and looks
         // entirely correct while doing it.
-        crate::limits::warn_if_rate_limits_are_not_shared(&app, &compiled);
+        let limits = crate::limits::warn_if_rate_limits_are_not_shared(&app, &compiled);
+
+        // Each of those is configuration the application is running with
+        // anyway, so it goes on the bus as well as in the log.
+        for failure in [cors, locks, limits].into_iter().flatten() {
+            reporter.report(failure).await;
+        }
+
+        // The writer, once everything it might write to is up. Boot is async,
+        // so there is a runtime; the handle lives in the container for as
+        // long as the application does, and `lookout::shutdown` stops it.
+        #[cfg(feature = "lookout")]
+        if let Some((lookout, _)) = lookout {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                app.instance(crate::lookout::Writer::new(lookout.start_writer()));
+            }
+        }
 
         Ok(app)
     }
@@ -1445,7 +1697,10 @@ fn queue_resources(app: &Application, jobs: Arc<JobRegistry>) -> Result<QueueRes
 /// `APP_KEY` is the current key; `APP_PREVIOUS_KEYS` is a comma-separated list
 /// of retired ones, still needed to read what they wrote. See
 /// [`rainier_crypt`].
-fn app_keys(env: &Env) -> KeyRing {
+///
+/// A key that is unusable or missing is replaced with a generated one, and the
+/// failure pushed onto `failures` for boot to report.
+fn app_keys(env: &Env, failures: &mut Vec<ConfigurationFailed>) -> KeyRing {
     let previous: Vec<String> =
         env.get("APP_PREVIOUS_KEYS").unwrap_or_default().split(',').map(str::to_string).collect();
 
@@ -1457,8 +1712,10 @@ fn app_keys(env: &Env) -> KeyRing {
                 // every existing encrypted value unreadable, so say plainly
                 // what is wrong instead of hiding it in a decrypt failure
                 // three screens later.
+                let message = e.message().to_string();
+                push_once(failures, ConfigurationFailed::new(e, "APP_KEY"));
                 tracing::error!(
-                    error = %e.message(),
+                    error = %message,
                     "APP_KEY is not usable; generating a temporary key. Encrypted values \
                      written before this boot cannot be read, and values written now cannot \
                      be read after a restart."
@@ -1467,6 +1724,18 @@ fn app_keys(env: &Env) -> KeyRing {
             }
         },
         None => {
+            // Not the generated key: a report travels further than a log line.
+            push_once(
+                failures,
+                ConfigurationFailed::new(
+                    Exception::message(
+                        ErrorKind::Internal,
+                        "APP_KEY is not set; a temporary key was generated, so nothing encrypted \
+                         will survive a restart",
+                    ),
+                    "APP_KEY",
+                ),
+            );
             tracing::warn!(
                 "APP_KEY is not set; generating a temporary key. Set one with \
                  `APP_KEY={}` or nothing encrypted will survive a restart.",
@@ -1474,6 +1743,14 @@ fn app_keys(env: &Env) -> KeyRing {
             );
             KeyRing::new(Key::generate())
         }
+    }
+}
+
+/// `app_keys` runs twice when a hand-built `Encryption` has no ring; say it
+/// once.
+fn push_once(failures: &mut Vec<ConfigurationFailed>, failure: ConfigurationFailed) {
+    if !failures.iter().any(|f| f.setting == failure.setting) {
+        failures.push(failure);
     }
 }
 
@@ -1499,20 +1776,33 @@ fn default_middleware() -> MiddlewareRegistry {
     registry
 }
 
-fn install_tracing(env: &Env, config: &Config) {
+/// Install the subscriber, with `unfiltered` layers beside the log lines.
+/// Whether it was installed: `false` when one already was.
+fn install_tracing(
+    env: &Env,
+    config: &Config,
+    unfiltered: Vec<crate::observability::SubscriberLayer>,
+) -> bool {
     let environment = config.get(keys::APP_ENV).unwrap_or_default().to_string();
 
     // A second subscriber would panic, and an application that installs its
-    // own should keep it — so a failure here is expected and ignored.
+    // own should keep it — so a failure here is expected, and only matters
+    // to a caller with a layer to add.
     #[cfg(not(feature = "telemetry"))]
-    crate::observability::TelemetrySettings::from_config(config)
-        .install_logging(&environment, &env.string("RUST_LOG", "info"));
+    return crate::observability::TelemetrySettings::from_config(config).install_logging_with(
+        &environment,
+        &env.string("RUST_LOG", "info"),
+        unfiltered,
+    );
 
     // With the feature, the exporter rides along when an endpoint is set —
     // from the configuration or from `OTEL_EXPORTER_OTLP_ENDPOINT`.
     #[cfg(feature = "telemetry")]
-    crate::observability::TelemetrySettings::from_config_and_env(config, env)
-        .install(&environment, &env.string("RUST_LOG", "info"));
+    crate::observability::TelemetrySettings::from_config_and_env(config, env).install_with(
+        &environment,
+        &env.string("RUST_LOG", "info"),
+        unfiltered,
+    )
 }
 
 #[cfg(test)]

@@ -10,8 +10,13 @@ repository.workspace = true
 [dependencies]
 rainier-support = { workspace = true }
 rainier-container = { workspace = true }
+# A failing command is reported through the application's `Reporter`, when
+# one is bound. `rainier-events` depends on nothing but `rainier-support`.
+rainier-events = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+# Catching a command's panic long enough to report it.
+futures-util = { workspace = true, features = ["std"] }
 # Reading a password without echoing it needs the terminal's own API — termios
 # on Unix, SetConsoleMode on Windows. Not optional: a `secret` that sometimes
 # echoes is worse than no `secret` at all.

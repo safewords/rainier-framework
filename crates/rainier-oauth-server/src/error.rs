@@ -6,7 +6,10 @@
 //! a client that matches on a message — they exist — sees the same text from
 //! this server as from the one it replaces.
 
+use rainier_events::report::{report_detached, OAuthFailed};
+use rainier_events::Exception;
 use rainier_http::{Response, StatusCode};
+use rainier_support::ErrorKind;
 use serde_json::{Map, Value};
 
 /// A refusal from the authorization server.
@@ -135,9 +138,27 @@ impl OAuthError {
         .with_hint(hint)
     }
 
-    /// `server_error` — 500. The detail goes to the log, not the client.
+    /// `server_error` — 500. The detail goes to the log and is reported as an
+    /// [`OAuthFailed`] — never to the client.
     pub fn server_error(detail: impl std::fmt::Display) -> Self {
         tracing::error!(error = %detail, "the authorization server failed");
+        report_detached(OAuthFailed::new(
+            Exception::message(ErrorKind::Internal, detail.to_string()),
+            "server_error",
+        ));
+        Self::internal()
+    }
+
+    /// [`server_error`](Self::server_error) for a framework error, reporting
+    /// the error whole — its kind and cause chain — rather than its message.
+    fn server_error_from(error: rainier_support::Error) -> Self {
+        tracing::error!(error = %error, "the authorization server failed");
+        report_detached(OAuthFailed::new(error, "server_error"));
+        Self::internal()
+    }
+
+    /// The `server_error` a client sees, which says nothing.
+    fn internal() -> Self {
         Self::new(
             "server_error",
             "The authorization server encountered an unexpected condition which prevented it \
@@ -196,7 +217,7 @@ impl std::error::Error for OAuthError {}
 
 impl From<rainier_support::Error> for OAuthError {
     fn from(error: rainier_support::Error) -> Self {
-        Self::server_error(error)
+        Self::server_error_from(error)
     }
 }
 
@@ -275,6 +296,38 @@ pub(crate) fn token_response(body: &Value) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_server_error_is_reported_with_its_cause_but_not_shown() {
+        let capture = rainier_events::report::capture();
+        let error: OAuthError = rainier_support::Error::internal("oauth-report-test: store down")
+            .with_source(std::io::Error::other("connection refused"))
+            .into();
+        assert!(!error.to_string().contains("store down"), "the client sees nothing");
+
+        let mut ours = Vec::new();
+        for _ in 0..100 {
+            ours = capture
+                .reports()
+                .into_iter()
+                .filter_map(|reported| match reported.failure {
+                    rainier_events::Failure::OAuth(failed)
+                        if failed.exception.message == "oauth-report-test: store down" =>
+                    {
+                        Some(failed)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !ours.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(ours.len(), 1, "{ours:?}");
+        assert_eq!(ours[0].operation, "server_error");
+        assert_eq!(ours[0].exception.sources, vec!["connection refused"]);
+    }
 
     #[test]
     fn the_payload_is_the_rfc_shape() {

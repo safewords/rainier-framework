@@ -88,6 +88,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use rainier_events::report::{report, BroadcastFailed};
 use rainier_support::{Error, Result};
 
 use crate::broadcaster::{Broadcaster, LogBroadcaster, MemoryBroadcaster};
@@ -404,6 +405,9 @@ impl BroadcasterConfig {
                 eprintln!("       Falling back to the log broadcaster.");
                 eprintln!("       Symptom: the application serves normally and nothing");
                 eprintln!("       updates live — no feeds, no notifications, no chat.");
+                // Usually nothing is installed to hear this yet, at boot; an
+                // application that builds its broadcaster later does.
+                report(BroadcastFailed::new(e, None::<String>, "build")).await;
                 Broadcasting::log()
             }
         }

@@ -93,6 +93,19 @@ impl Middleware for Timeout {
                     timeout_ms = self.limit.as_millis() as u64,
                     "request cancelled at its timeout"
                 );
+                #[cfg(not(target_arch = "wasm32"))]
+                rainier_events::report::report(rainier_events::report::MiddlewareFailed::new(
+                    rainier_events::Exception::message(
+                        rainier_support::ErrorKind::Status(408),
+                        format!(
+                            "{method} {uri} was cancelled at its timeout of {}ms",
+                            self.limit.as_millis()
+                        ),
+                    ),
+                    "Timeout",
+                    "timeout",
+                ))
+                .await;
 
                 Error::request_timeout(format!(
                     "The request did not finish within {} seconds.",
@@ -143,6 +156,36 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_timeout_is_reported() {
+        let capture = rainier_events::report::capture();
+        let response = Pipeline::new()
+            .through(Timeout::millis(10))
+            .then(|_| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Response::ok("far too late")
+            })
+            .run(Request::builder().method(Method::GET).uri("/timeout-report-test").build())
+            .await;
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+
+        let ours: Vec<_> = capture
+            .reports()
+            .into_iter()
+            .filter_map(|reported| match reported.failure {
+                rainier_events::Failure::Middleware(failed)
+                    if failed.exception.message.contains("/timeout-report-test") =>
+                {
+                    Some(failed)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ours.len(), 1, "{ours:?}");
+        assert_eq!(ours[0].middleware, "Timeout");
+        assert_eq!(ours[0].exception.status, 408);
     }
 
     #[tokio::test]

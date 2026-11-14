@@ -14,6 +14,8 @@ rainier-http = { workspace = true }
 rainier-auth = { workspace = true }
 rainier-session = { workspace = true }
 rainier-crypt = { workspace = true }
+# Reporting the server's own failures, which a client is never shown.
+rainier-events = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }

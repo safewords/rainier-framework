@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rainier_broadcast::kafka::{KafkaRelay, RelayedBroadcast};
+use rainier_events::report::{BroadcastFailed, FailureEvent as _};
 use rainier_support::Result;
 use rainier_websocket::{socket_from_identity, Rooms};
 
@@ -151,6 +152,10 @@ pub async fn run(relay: &KafkaRelay, fan_out: &SocketFanOut) -> Result<()> {
 /// The task carries the facade scope with it, so anything the fan-out reaches
 /// can resolve from the container — a spawned task inherits neither the thread
 /// nor the task scope on its own.
+///
+/// Each time it falls over it is reported as a
+/// [`BroadcastFailed`] (operation `relay`, `meta.extra["topic"]`) through the
+/// process-wide reporter, then reconnects.
 pub fn spawn(relay: KafkaRelay, fan_out: SocketFanOut) -> tokio::task::JoinHandle<()> {
     rainier_container::spawn_with_facades(async move {
         loop {
@@ -160,6 +165,13 @@ pub fn spawn(relay: KafkaRelay, fan_out: SocketFanOut) -> tokio::task::JoinHandl
                     error = %e,
                     "the broadcast relay stopped; reconnecting"
                 );
+                // Through the process-wide reporter: the relay has no handle
+                // to the application.
+                rainier_events::report::report(
+                    BroadcastFailed::new(e, None::<String>, "relay")
+                        .with_extra("topic", relay.topic()),
+                )
+                .await;
             }
 
             tokio::time::sleep(RECONNECT_AFTER).await;

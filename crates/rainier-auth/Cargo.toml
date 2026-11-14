@@ -18,6 +18,8 @@ rainier-database = { workspace = true }
 rainier-session = { workspace = true }
 rainier-cache = { workspace = true }
 rainier-orm = { workspace = true }
+# Reporting the failures the guards and middleware work around.
+rainier-events = { workspace = true }
 rand = { workspace = true }
 subtle = { workspace = true }
 async-trait = { workspace = true }

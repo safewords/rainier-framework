@@ -10,6 +10,8 @@ description = "Notifications for Rainier: a message to a recipient, over the cha
 [dependencies]
 rainier-mail = { workspace = true }
 rainier-support = { workspace = true }
+# A channel that fails, or was never registered, is reported on the bus.
+rainier-events = { workspace = true }
 
 serde_json = { workspace = true }
 tracing = { workspace = true }

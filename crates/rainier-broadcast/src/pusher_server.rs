@@ -56,7 +56,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rainier_support::Result;
+use rainier_events::report::{report_detached, BroadcastFailed, Exception};
+use rainier_support::{ErrorKind, Result};
 use rainier_websocket::{Message, Rooms, Socket, WebSocketHandler};
 use serde_json::{json, Value};
 
@@ -180,6 +181,10 @@ impl PusherServer {
     /// what was published — `{"event":…,"data":…,"socket":…}`. Returns how many
     /// sockets received it, which is zero whenever no browser on *this* replica
     /// is subscribed and is the ordinary case rather than a fault.
+    ///
+    /// A message for a channel with subscribers that cannot be read, or names
+    /// no `event`, is dropped and reported as a
+    /// [`BroadcastFailed`] with the operation `"deliver"`.
     pub fn deliver_published(&self, channel: &str, body: &str) -> usize {
         let name = channel.trim_prefix(&self.prefix);
 
@@ -216,13 +221,26 @@ impl PusherServer {
             return 0;
         }
 
-        let Ok(published) = serde_json::from_str::<Value>(body) else {
-            tracing::warn!(channel, "discarding an unreadable published message");
-            return 0;
+        let published = match serde_json::from_str::<Value>(body) {
+            Ok(published) => published,
+            Err(e) => {
+                tracing::warn!(channel, "discarding an unreadable published message");
+                report_detached(BroadcastFailed::new(
+                    Exception::from_std(&e),
+                    Some(channel.to_string()),
+                    "deliver",
+                ));
+                return 0;
+            }
         };
 
         let Some(event) = published.get("event").and_then(Value::as_str) else {
             tracing::warn!(channel, "discarding a published message with no `event`");
+            report_detached(BroadcastFailed::new(
+                Exception::message(ErrorKind::Internal, "a published message has no `event`"),
+                Some(channel.to_string()),
+                "deliver",
+            ));
             return 0;
         };
 
@@ -354,6 +372,14 @@ impl PusherServer {
 
             if !self.authorised(&self.socket_id_of(socket), &channel, presented, member) {
                 tracing::warn!(channel = %name, "refused a subscription with a bad signature");
+                report_detached(BroadcastFailed::new(
+                    Exception::message(
+                        ErrorKind::Unauthorized,
+                        "refused a subscription with a bad signature",
+                    ),
+                    Some(name.clone()),
+                    "subscribe",
+                ));
                 return socket.send(Message::text(Self::frame(
                     "pusher:error",
                     None,
@@ -649,6 +675,39 @@ mod tests {
         let server = PusherServer::new(auth());
         assert_eq!(server.deliver_published("chan", "not json"), 0);
         assert_eq!(server.deliver_published("chan", &json!({ "data": {} }).to_string()), 0);
+    }
+
+    #[tokio::test]
+    async fn a_message_for_a_subscribed_channel_that_cannot_be_read_is_reported() {
+        use rainier_events::report::{capture, Failure, FailureKind};
+        use rainier_websocket::SocketId;
+
+        let capture = capture();
+        let server = PusherServer::new(auth());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let room = "broadcast-test-unreadable";
+        server.rooms().join(room, Socket::new(SocketId::next(), "/app/key", Vec::new(), tx));
+
+        assert_eq!(server.deliver_published(room, "not json"), 0);
+        assert_eq!(server.deliver_published(room, &json!({ "data": {} }).to_string()), 0);
+
+        let mut reported = Vec::new();
+        for _ in 0..100 {
+            reported = capture
+                .of_kind(FailureKind::Broadcast)
+                .into_iter()
+                .filter_map(|f| match f {
+                    Failure::Broadcast(b) if b.channel.as_deref() == Some(room) => Some(b),
+                    _ => None,
+                })
+                .collect();
+            if reported.len() >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(reported.len(), 2, "{reported:?}");
+        assert!(reported.iter().all(|b| b.operation == "deliver"));
     }
 
     #[test]

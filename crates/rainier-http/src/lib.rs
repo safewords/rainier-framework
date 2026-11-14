@@ -48,7 +48,7 @@ pub use body::Body;
 pub use cookie::{Cookie, SameSite};
 pub use extract::FromRequest;
 pub use request::{ClientIp, Request, RequestBuilder};
-pub use response::{Html, IntoResponse, Json, Redirect, RenderedError, Response};
+pub use response::{Html, IntoResponse, Json, OriginalError, Redirect, RenderedError, Response};
 pub use upload::{Multipart, UploadedFile};
 
 // Re-exported so downstream crates and applications reference one `http`

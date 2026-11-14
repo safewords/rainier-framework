@@ -264,7 +264,9 @@ mod dispatcher {
     use kube::api::{Api, DeleteParams, ListParams, LogParams, PostParams};
     use kube::runtime::wait::{await_condition, Condition};
     use kube::Client;
-    use rainier_support::{Error, Result};
+    use rainier_events::report::{ConfigurationFailed, FailureEvent, QueueOperationFailed};
+    use rainier_events::Exception;
+    use rainier_support::{Error, ErrorKind, Result};
 
     use super::{
         KubernetesJobSpec, ATTEMPT_ENV, JOB_NAME_ENV, PAYLOAD_ENV, QUEUED_ID_ENV,
@@ -352,12 +354,16 @@ mod dispatcher {
             let client = Client::try_default()
                 .await
                 .map_err(|e| Error::internal(format!("building in-cluster kube client: {e}")))?;
-            let namespace = std::env::var("KUBERNETES_NAMESPACE").unwrap_or_else(|_| {
-                tracing::warn!(
-                    "KUBERNETES_NAMESPACE not set via DownwardAPI; falling back to `default`"
-                );
-                "default".into()
-            });
+            let namespace = match std::env::var("KUBERNETES_NAMESPACE") {
+                Ok(namespace) => namespace,
+                Err(_) => {
+                    tracing::warn!(
+                        "KUBERNETES_NAMESPACE not set via DownwardAPI; falling back to `default`"
+                    );
+                    crate::reporting::report(namespace_defaulted()).await;
+                    "default".into()
+                }
+            };
             let default_image = std::env::var("RAINIER_K8S_DEFAULT_IMAGE").ok();
             let default_sa = std::env::var("RAINIER_K8S_DEFAULT_SA").ok();
             Ok(Some(Self {
@@ -530,7 +536,13 @@ mod dispatcher {
                 let outcome = match timeout {
                     Some(limit) => match tokio::time::timeout(
                         limit,
-                        watch_to_terminal(&jobs_api, &self.inner.client, &namespace, &k8s_name),
+                        watch_to_terminal(
+                            &jobs_api,
+                            &self.inner.client,
+                            &namespace,
+                            &k8s_name,
+                            queued_id,
+                        ),
                     )
                     .await
                     {
@@ -545,7 +557,7 @@ mod dispatcher {
                                 ?limit,
                                 "kubernetes job exceeded its timeout; deleting"
                             );
-                            delete_job(&jobs_api, &k8s_name).await;
+                            delete_job(&jobs_api, &k8s_name, queued_id).await;
                             timing.timed_out = true;
                             Err(Error::internal(format!(
                                 "kubernetes job `{k8s_name}` exceeded its {limit:?} timeout"
@@ -553,15 +565,27 @@ mod dispatcher {
                         }
                     },
                     None => {
-                        watch_to_terminal(&jobs_api, &self.inner.client, &namespace, &k8s_name)
-                            .await
+                        watch_to_terminal(
+                            &jobs_api,
+                            &self.inner.client,
+                            &namespace,
+                            &k8s_name,
+                            queued_id,
+                        )
+                        .await
                     }
                 };
 
                 // Before the delete below, which takes the pod with it.
                 if measure && !timing.timed_out {
-                    let measured =
-                        measure_pod(&self.inner.client, &namespace, &k8s_name, dispatched).await;
+                    let measured = measure_pod(
+                        &self.inner.client,
+                        &namespace,
+                        &k8s_name,
+                        queued_id,
+                        dispatched,
+                    )
+                    .await;
                     timing.start = measured.start;
                     timing.run = measured.run;
                 }
@@ -570,7 +594,7 @@ mod dispatcher {
                     // Succeeded with ttl=0 — delete the Job so the pod and
                     // its logs vanish immediately. Not an error if the TTL
                     // controller already reaped it.
-                    delete_job(&jobs_api, &k8s_name).await;
+                    delete_job(&jobs_api, &k8s_name, queued_id).await;
                 }
 
                 outcome
@@ -599,6 +623,7 @@ mod dispatcher {
         client: &Client,
         namespace: &str,
         k8s_name: &str,
+        queued_id: &str,
         dispatched: chrono::DateTime<chrono::Utc>,
     ) -> PodTiming {
         let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
@@ -609,6 +634,7 @@ mod dispatcher {
             }
             Err(e) => {
                 tracing::debug!(k8s_name, error = %e, "could not list pods to time the job");
+                report_call("kubernetes_measure_pod", queued_id, k8s_name, &e).await;
                 PodTiming::default()
             }
         }
@@ -726,6 +752,7 @@ mod dispatcher {
         client: &Client,
         namespace: &str,
         k8s_name: &str,
+        queued_id: &str,
     ) -> Result<()> {
         // `await_condition` returns Ok(Some(obj)) when the condition
         // becomes true, Ok(None) only when the object is deleted
@@ -767,7 +794,7 @@ mod dispatcher {
         // from the async-boundary that fetch_pod_log_tail crosses.
         let reason = condition.reason.clone().unwrap_or_else(|| "unspecified".into());
         let message = condition.message.clone().unwrap_or_else(|| "no message".into());
-        let logs = fetch_pod_log_tail(client, namespace, k8s_name).await;
+        let logs = fetch_pod_log_tail(client, namespace, k8s_name, queued_id).await;
         Err(Error::internal(format!(
             "kubernetes job `{k8s_name}` failed ({reason}: {message}){}",
             if logs.is_empty() { String::new() } else { format!("\n--- pod log tail ---\n{logs}") }
@@ -776,14 +803,21 @@ mod dispatcher {
 
     /// Best-effort log fetch for a failed Job's pod. Returns the empty
     /// string on any error — a missing log is not worth upgrading the
-    /// job's failure into a different one.
-    async fn fetch_pod_log_tail(client: &Client, namespace: &str, k8s_name: &str) -> String {
+    /// job's failure into a different one — and reports the error, since
+    /// the failed-job record it would have explained now goes without.
+    async fn fetch_pod_log_tail(
+        client: &Client,
+        namespace: &str,
+        k8s_name: &str,
+        queued_id: &str,
+    ) -> String {
         let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
         let selector = format!("job-name={k8s_name}");
         let pods = match pods_api.list(&ListParams::default().labels(&selector)).await {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(k8s_name, error = %e, "could not list pods for failed job");
+                report_call("kubernetes_list_pods", queued_id, k8s_name, &e).await;
                 return String::new();
             }
         };
@@ -799,12 +833,13 @@ mod dispatcher {
             Ok(logs) => logs,
             Err(e) => {
                 tracing::warn!(pod = %name, error = %e, "could not read pod logs for failed job");
+                report_call("kubernetes_read_logs", queued_id, k8s_name, &e).await;
                 String::new()
             }
         }
     }
 
-    async fn delete_job(jobs_api: &Api<K8sJob>, k8s_name: &str) {
+    async fn delete_job(jobs_api: &Api<K8sJob>, k8s_name: &str, queued_id: &str) {
         // `propagation_policy: Background` so the GC sweeps the pods on
         // its own. `Foreground` would make this call block until the
         // pods are gone, which inside a worker's handler would hold the
@@ -817,8 +852,47 @@ mod dispatcher {
             // 404 = already gone (ttl controller beat us), fine.
             if !matches!(&e, kube::Error::Api(err) if err.code == 404) {
                 tracing::warn!(k8s_name, error = %e, "could not delete kubernetes job");
+                // A timed-out job's pod keeps running until somebody does.
+                report_call("kubernetes_delete_job", queued_id, k8s_name, &e).await;
             }
         }
+    }
+
+    /// Report a Kubernetes API call the dispatcher worked around.
+    ///
+    /// Through the process-wide reporter: the dispatcher holds nothing of the
+    /// application. Carries the Kubernetes Job's name under
+    /// `"kubernetes_job"`, as the worker's report of the same attempt does.
+    async fn report_call(operation: &str, queued_id: &str, k8s_name: &str, error: &kube::Error) {
+        crate::reporting::report(call_failed(operation, queued_id, k8s_name, error)).await;
+    }
+
+    fn call_failed(
+        operation: &str,
+        queued_id: &str,
+        k8s_name: &str,
+        error: &kube::Error,
+    ) -> QueueOperationFailed {
+        QueueOperationFailed::new(
+            Exception::from_std(error),
+            Some("kubernetes".to_string()),
+            None,
+            operation,
+            Some(queued_id.to_string()),
+        )
+        .with_extra("kubernetes_job", k8s_name)
+    }
+
+    /// `KUBERNETES_NAMESPACE` was missing and `default` was used instead.
+    fn namespace_defaulted() -> ConfigurationFailed {
+        ConfigurationFailed::new(
+            Exception::message(
+                ErrorKind::Internal,
+                "KUBERNETES_NAMESPACE is not set (expose it through the DownwardAPI); \
+                 Kubernetes jobs are created in the `default` namespace",
+            ),
+            "KUBERNETES_NAMESPACE",
+        )
     }
 
     async fn check_verb(
@@ -1003,7 +1077,7 @@ mod dispatcher {
     /// pair. Kubernetes constrains `metadata.name` to DNS-1123 (lowercase
     /// alphanumeric + `-`, max 63 chars) and uniqueness within the
     /// namespace; both are what reattach-on-worker-restart needs.
-    fn kubernetes_name_for(job_name: &str, queued_id: &str, attempt: u32) -> String {
+    pub(crate) fn kubernetes_name_for(job_name: &str, queued_id: &str, attempt: u32) -> String {
         // 16 chars of slug (readable), 10 chars of hash (unique even if
         // two queued ids slugify the same), 2-digit attempt. Keeps the
         // name well under the 63-char DNS-1123 label limit.
@@ -1108,8 +1182,139 @@ mod dispatcher {
             assert_ne!(a, b);
         }
     }
+
+    #[cfg(test)]
+    // The capture's guard is held across awaits on purpose: it is what keeps
+    // two captures apart, on a current-thread runtime.
+    #[allow(clippy::await_holding_lock)]
+    mod reporting_tests {
+        use super::*;
+        use rainier_events::report::capture;
+        use rainier_events::Failure;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn client_for(url: &str) -> Client {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            Client::try_from(kube::Config::new(url.parse().unwrap())).unwrap()
+        }
+
+        /// Nothing listens here, so every call fails to connect.
+        fn unreachable() -> Client {
+            client_for("http://127.0.0.1:1")
+        }
+
+        /// An API server that lists one pod and answers everything else —
+        /// the pod's log included — with a 500.
+        async fn half_working() -> Client {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buffer = vec![0u8; 16 * 1024];
+                        let read = socket.read(&mut buffer).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&buffer[..read]).to_string();
+                        let path = head.split_whitespace().nth(1).unwrap_or_default();
+                        let (status, body) = if path.contains("/log") {
+                            (
+                                "500 Internal Server Error",
+                                r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"logs unavailable","reason":"InternalError","code":500}"#,
+                            )
+                        } else {
+                            (
+                                "200 OK",
+                                r#"{"kind":"PodList","apiVersion":"v1","metadata":{},"items":[{"metadata":{"name":"pod-1"}}]}"#,
+                            )
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+            client_for(&format!("http://{address}"))
+        }
+
+        /// The queue operations reported for the queued job `id`.
+        fn reported_for(
+            capture: &rainier_events::report::Capture,
+            id: &str,
+        ) -> Vec<QueueOperationFailed> {
+            capture
+                .reports()
+                .into_iter()
+                .filter_map(|r| match r.failure {
+                    Failure::QueueOperation(f) if f.job_id.as_deref() == Some(id) => Some(f),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn pods_that_cannot_be_listed_for_a_failed_job_are_reported() {
+            let capture = capture();
+            let logs = fetch_pod_log_tail(&unreachable(), "ns", "rainier-x-1", "k8s-list").await;
+
+            assert!(logs.is_empty(), "the job's own failure is unchanged");
+            let reported = reported_for(&capture, "k8s-list");
+            assert_eq!(reported.len(), 1);
+            assert_eq!(reported[0].operation, "kubernetes_list_pods");
+            assert_eq!(reported[0].connection.as_deref(), Some("kubernetes"));
+            assert_eq!(reported[0].meta.extra["kubernetes_job"], "rainier-x-1");
+        }
+
+        #[tokio::test]
+        async fn logs_that_cannot_be_read_for_a_failed_job_are_reported() {
+            let client = half_working().await;
+            let capture = capture();
+            let logs = fetch_pod_log_tail(&client, "ns", "rainier-x-2", "k8s-logs").await;
+
+            assert!(logs.is_empty());
+            let reported = reported_for(&capture, "k8s-logs");
+            assert_eq!(reported.len(), 1, "{reported:?}");
+            assert_eq!(reported[0].operation, "kubernetes_read_logs");
+            assert!(reported[0].exception.message.contains("logs unavailable"));
+        }
+
+        #[tokio::test]
+        async fn a_job_that_cannot_be_deleted_is_reported() {
+            let capture = capture();
+            let api: Api<K8sJob> = Api::namespaced(unreachable(), "ns");
+            delete_job(&api, "rainier-x-3", "k8s-delete").await;
+
+            let reported = reported_for(&capture, "k8s-delete");
+            assert_eq!(reported.len(), 1);
+            assert_eq!(reported[0].operation, "kubernetes_delete_job");
+        }
+
+        #[tokio::test]
+        async fn pods_that_cannot_be_measured_are_reported() {
+            let capture = capture();
+            let timing =
+                measure_pod(&unreachable(), "ns", "rainier-x-4", "k8s-measure", chrono::Utc::now())
+                    .await;
+
+            assert_eq!(timing, PodTiming::default());
+            let reported = reported_for(&capture, "k8s-measure");
+            assert_eq!(reported.len(), 1);
+            assert_eq!(reported[0].operation, "kubernetes_measure_pod");
+        }
+
+        #[test]
+        fn a_missing_namespace_is_a_configuration_failure() {
+            let failure = namespace_defaulted();
+            assert_eq!(failure.setting, "KUBERNETES_NAMESPACE");
+            assert!(failure.exception.message.contains("`default`"));
+        }
+    }
 }
 
+#[cfg(feature = "kubernetes")]
+pub(crate) use dispatcher::kubernetes_name_for;
 #[cfg(feature = "kubernetes")]
 pub use dispatcher::{KubernetesDispatcher, PodTiming, RbacReport};
 

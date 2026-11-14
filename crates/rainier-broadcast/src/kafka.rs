@@ -40,7 +40,8 @@
 use std::sync::Arc;
 
 use rainier_drivers::kafka::{KafkaClient, KafkaMessage, KafkaOffset, KafkaPosition, KafkaRecord};
-use rainier_support::{BoxFuture, Error, Result};
+use rainier_events::report::{report, BroadcastFailed, Exception, FailureEvent};
+use rainier_support::{BoxFuture, Error, ErrorKind, Result};
 use serde_json::Value;
 
 use crate::broadcaster::Broadcaster;
@@ -381,6 +382,20 @@ impl KafkaRelay {
                     to = end,
                     "the relay's cursor is no longer in the log; rejoining at the end"
                 );
+                // What lay between is never delivered.
+                report(BroadcastFailed::new(
+                    Exception::message(
+                        ErrorKind::Internal,
+                        format!(
+                            "the relay's cursor on `{}` partition {partition} fell off the log at \
+                             offset {}; skipped to {end}",
+                            self.topic, *offset
+                        ),
+                    ),
+                    None::<String>,
+                    "relay_rejoin",
+                ))
+                .await;
                 *offset = end;
                 continue;
             };
@@ -395,13 +410,31 @@ impl KafkaRelay {
                     // One unreadable record must not stop the relay: it would
                     // stop every browser, forever, over one bad write by
                     // something else on the topic.
-                    Err(e) => tracing::warn!(
-                        topic = self.topic,
-                        partition = message.partition,
-                        offset = message.offset,
-                        error = %e,
-                        "skipping a record that is not a broadcast"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            topic = self.topic,
+                            partition = message.partition,
+                            offset = message.offset,
+                            error = %e,
+                            "skipping a record that is not a broadcast"
+                        );
+                        report(
+                            BroadcastFailed::new(
+                                e,
+                                message.header(CHANNEL_HEADER).map(str::to_string).or_else(|| {
+                                    message
+                                        .key
+                                        .as_ref()
+                                        .and_then(|key| String::from_utf8(key.clone()).ok())
+                                }),
+                                "relay_read",
+                            )
+                            .with_extra("topic", self.topic.clone())
+                            .with_extra("partition", message.partition)
+                            .with_extra("offset", message.offset),
+                        )
+                        .await;
+                    }
                 }
             }
         }

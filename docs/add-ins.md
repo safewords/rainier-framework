@@ -22,6 +22,7 @@ that does not issue tokens has no `/oauth/token` to misconfigure.
 | `compat-php-oauth` | `compat-php`, `oauth-server`, and `php::oauth` | [Compatibility](compat.md) | `compat_php` |
 | `compat-php-webauthn` | `compat-php`, `passkeys`, and `php::webauthn` | [Compatibility](compat.md) | `compat_php` |
 | `telemetry` | a `telemetry` feature in every component, and the OTLP exporter | [Observability](observability.md#passive-instrumentation) | `telemetry` |
+| `lookout` | `rainier-lookout`, and the same per-component spans as `telemetry` without the exporter | [Lookout](lookout.md) | `lookout` |
 | `captcha` | `http-client` | [Human Checks](captcha.md) | `captcha` |
 | `notify-discord` | `rainier-notify/discord`, `http-client` | [Notifications](notifications.md#discord) | `notify_discord` |
 
@@ -65,7 +66,7 @@ nothing about whether this deployment bills. Inferring from text would build
 everything the repository *could* do — and an add-in that fails closed at boot
 without its keys, like the OAuth server without a signing key, would fail the
 deploy. An unknown name is reported rather than ignored. `TELEMETRY_ENABLED=true`
-still asks for `telemetry` on its own. See
+still asks for `telemetry` on its own, and `LOOKOUT_ENABLED=true` for `lookout`. See
 [`rainier-features`](../crates/rainier-features).
 
 ---
@@ -83,6 +84,7 @@ cargo run -p rainier-framework --example billing_stripe --features billing-strip
 cargo run -p rainier-framework --example oauth_server --features oauth-server
 cargo run -p rainier-framework --example compat_php --features compat-php-oauth,compat-php-webauthn
 cargo run -p rainier-framework --example telemetry --features telemetry
+cargo run -p rainier-framework --example lookout --features lookout
 ```
 
 They are documentation that compiles: CI's `clippy --all-targets

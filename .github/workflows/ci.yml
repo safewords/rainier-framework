@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # So a branch is proven before it reaches trunk, without anybody running the
+  # whole matrix on their own machine.
+  pull_request:
   # So a dependency that breaks the build is found on a schedule rather than by
   # the next person to push to main.
   schedule:

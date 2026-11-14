@@ -188,7 +188,10 @@ impl Health {
             let check = Arc::clone(check);
             let timeout = self.timeout;
 
-            async move { (name, run_one(check, app, timeout).await) }
+            async move {
+                let outcome = run_one(&name, check, app, timeout).await;
+                (name, outcome)
+            }
         });
 
         let checks: BTreeMap<String, Outcome> =
@@ -226,8 +229,20 @@ impl Health {
 ///
 /// And [`spawn_with_facades`] carries the application scope in, so a check
 /// that reaches for a facade finds the same application the report is about.
-async fn run_one(check: Check, app: Arc<Application>, timeout: Option<Duration>) -> Outcome {
+///
+/// A failing check is the probe's answer, not a failure of the framework, and
+/// is not reported — it is served to whoever asked, and an orchestrator asks
+/// every few seconds. A **panicking** check is a bug in the check, and is
+/// reported as a [`BackgroundTaskFailed`](rainier_events::report::BackgroundTaskFailed)
+/// named `health:<check>`.
+async fn run_one(
+    name: &str,
+    check: Check,
+    app: Arc<Application>,
+    timeout: Option<Duration>,
+) -> Outcome {
     let started = Instant::now();
+    let reporting = Arc::clone(&app);
 
     let running = rainier_container::spawn_with_facades(async move {
         match timeout {
@@ -244,7 +259,18 @@ async fn run_one(check: Check, app: Arc<Application>, timeout: Option<Duration>)
 
     let result = match running.await {
         Ok(result) => result,
-        Err(e) if e.is_panic() => Err(Error::internal("the check panicked".to_string())),
+        Err(e) if e.is_panic() => {
+            let message = crate::reporting::panic_message(e.into_panic().as_ref());
+            crate::reporting::report_failure(
+                &reporting,
+                rainier_events::report::BackgroundTaskFailed::new(
+                    rainier_events::Exception::panic(message, None),
+                    format!("health:{name}"),
+                ),
+            )
+            .await;
+            Err(Error::internal("the check panicked".to_string()))
+        }
         Err(_) => Err(Error::internal("the check was cancelled")),
     };
 

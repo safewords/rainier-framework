@@ -335,6 +335,28 @@ stop the backups.
 `schedule:run` exits non-zero if anything failed, which is what a supervisor or
 an alert should watch.
 
+Each failed task is also [reported](errors.md#reporting), as a
+`ScheduledTaskFailed` naming the task, with the task's own error — its kind and
+cause chain, not just the line the summary prints. `RunSummary::errors` holds
+them beside `failed`'s messages.
+
+A scheduled **command** that fails is reported twice, as two different events,
+and the application subscribes to whichever it wants:
+
+| Event | From | Carries |
+|---|---|---|
+| `CommandFailed` | the console | `command` — the command's name — and the command's **own** error or panic |
+| `ScheduledTaskFailed` | the scheduler | `task` — the task's name, arguments included — the error ``"`app:seed` exited with 1"``, and `meta.extra["command"]`, the command's name |
+
+`meta.extra["command"]` on the one equals `command` on the other, which is how
+a listener for both links them. A scheduled closure or job has no `command`.
+
+An expression that did not parse is not reported on its own: it is what makes
+`schedule:run` refuse to start, below, and that refusal is reported as the
+command's failure. A per-process lock under `without_overlapping` or
+`on_one_server` is reported at boot as a `ConfigurationFailed` (setting
+`cache.stores`).
+
 Both running commands **refuse to start** if any task's expression did not
 parse. The builders are lenient on purpose — `.daily_at("03:00")` should not
 need a `?` in the middle of a chain — and this is where that is paid back: a

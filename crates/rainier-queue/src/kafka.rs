@@ -55,7 +55,9 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use rainier_cache::{Cache, CacheExt, LockGuard, LockManager};
 use rainier_drivers::kafka::{KafkaClient, KafkaOffset, KafkaPosition, KafkaRecord};
-use rainier_support::{BoxFuture, Error, Result};
+use rainier_events::report::{FailureEvent, QueueMessageDiscarded, QueueOperationFailed};
+use rainier_events::Exception;
+use rainier_support::{BoxFuture, Error, ErrorKind, Result};
 use serde_json::json;
 
 use crate::job::QueuedJob;
@@ -217,6 +219,13 @@ impl KafkaQueue {
                     partition,
                     "the lease on this partition had already expired — jobs may have run twice"
                 );
+                crate::reporting::report(lease_lost(
+                    &topic,
+                    partition,
+                    "the lease on this partition had already expired when it was given up — \
+                     jobs may have run twice",
+                ))
+                .await;
             }
         }
         Ok(())
@@ -270,6 +279,13 @@ impl KafkaQueue {
             // The lease lapsed and somebody else may now hold it. Whatever we
             // were doing on this partition, we were doing it alongside them.
             tracing::warn!(topic, partition, "lost the lease on this partition mid-flight");
+            crate::reporting::report(lease_lost(
+                topic,
+                partition,
+                "lost the lease on this partition mid-flight — another worker may have read \
+                 from it alongside this one, and run the same jobs",
+            ))
+            .await;
             held.remove(&key);
         }
 
@@ -329,7 +345,10 @@ impl KafkaQueue {
         // Only the first write needs the TTL; the rest are increments on a key
         // that already has one.
         if attempts == 1 {
-            let _ = self.cache.put_string(&key, "1", Some(ATTEMPTS_TTL)).await;
+            if let Err(e) = self.cache.put_string(&key, "1", Some(ATTEMPTS_TTL)).await {
+                // The count still works; the key just never expires.
+                crate::reporting::report(attempts_failed("kafka_attempts_ttl", position, &e)).await;
+            }
         }
 
         Ok(attempts.max(1) as u32)
@@ -337,7 +356,11 @@ impl KafkaQueue {
 
     /// Forget the attempt count for a job that is done with.
     async fn forget_attempts(&self, position: &KafkaPosition) {
-        let _ = self.cache.forget(&attempts_key(&self.group, position)).await;
+        // Harmless to the queue — offsets are never reused, and the key has a
+        // TTL — but a cache refusing writes is worth hearing about.
+        if let Err(e) = self.cache.forget(&attempts_key(&self.group, position)).await {
+            crate::reporting::report(attempts_failed("kafka_forget_attempts", position, &e)).await;
+        }
     }
 
     /// Move past the job at `position`, whatever became of it.
@@ -388,6 +411,91 @@ fn failed_topic_name(prefix: &str, queue: &str) -> String {
 /// and says nothing about having done so before.
 fn attempt_number(recorded: u32, delivered: u32) -> u32 {
     recorded.saturating_add(delivered).max(1)
+}
+
+/// Read a fetched record as a job, or say why it is being skipped.
+fn decode_record(
+    position: &KafkaPosition,
+    value: &[u8],
+) -> std::result::Result<QueuedJob, Box<QueueMessageDiscarded>> {
+    serde_json::from_slice(value).map_err(|e| {
+        Box::new(
+            QueueMessageDiscarded::new(
+                Exception::from_std(&e),
+                "kafka",
+                position.topic.clone(),
+                Some(position.to_string()),
+            )
+            .with_extra("partition", position.partition)
+            .with_extra("offset", position.offset),
+        )
+    })
+}
+
+/// Records retention removed before this group read them: a discard of a
+/// range, with no one message to name.
+fn lost_to_retention(
+    topic: &str,
+    partition: i32,
+    from: i64,
+    earliest: i64,
+) -> QueueMessageDiscarded {
+    QueueMessageDiscarded::new(
+        Exception::message(
+            ErrorKind::Internal,
+            format!(
+                "jobs at offsets {from}..{earliest} of partition {partition} were removed by \
+                 retention before a worker read them"
+            ),
+        ),
+        "kafka",
+        topic,
+        None,
+    )
+    .with_extra("partition", partition)
+    .with_extra("from", from)
+    .with_extra("earliest", earliest)
+}
+
+/// A partition lease that lapsed under a worker that thought it held it.
+fn lease_lost(topic: &str, partition: i32, why: &str) -> QueueOperationFailed {
+    QueueOperationFailed::new(
+        Exception::message(ErrorKind::Conflict, why),
+        Some("kafka".to_string()),
+        Some(topic.to_string()),
+        "kafka_lease",
+        None,
+    )
+    .with_extra("partition", partition)
+}
+
+/// A delivery-count write the cache refused.
+fn attempts_failed(
+    operation: &str,
+    position: &KafkaPosition,
+    error: &Error,
+) -> QueueOperationFailed {
+    QueueOperationFailed::new(
+        crate::reporting::snapshot(error),
+        Some("kafka".to_string()),
+        Some(position.topic.clone()),
+        operation,
+        None,
+    )
+    .with_extra("position", position.to_string())
+}
+
+/// A failed job that could not be written to its dead-letter topic, and so
+/// was kept nowhere.
+fn dead_letter_failed(job: &QueuedJob, topic: &str, error: &Error) -> QueueOperationFailed {
+    QueueOperationFailed::new(
+        crate::reporting::snapshot(error),
+        Some("kafka".to_string()),
+        Some(job.queue.clone()),
+        "dead_letter",
+        Some(job.id.clone()),
+    )
+    .with_extra("topic", topic)
 }
 
 /// The lock name one partition's lease is held under.
@@ -480,6 +588,8 @@ impl Queue for KafkaQueue {
                         earliest,
                         "jobs were lost to retention before a worker read them"
                     );
+                    crate::reporting::report(lost_to_retention(&topic, partition, from, earliest))
+                        .await;
                     self.commit(&topic, partition, earliest).await?;
                     continue;
                 };
@@ -490,9 +600,9 @@ impl Queue for KafkaQueue {
 
                 let position = message.position();
 
-                let mut job: QueuedJob = match serde_json::from_slice(&message.value) {
+                let mut job: QueuedJob = match decode_record(&position, &message.value) {
                     Ok(job) => job,
-                    Err(e) => {
+                    Err(discarded) => {
                         // Not a job. Skipping it is the only option that keeps
                         // the partition moving, and a log keeps the record
                         // itself, so nothing is actually lost by doing so.
@@ -500,9 +610,10 @@ impl Queue for KafkaQueue {
                             topic,
                             partition,
                             offset = position.offset,
-                            error = %e,
+                            error = %discarded.exception,
                             "skipping a record on a job topic that is not a job"
                         );
+                        crate::reporting::report(*discarded).await;
                         self.advance_past(&position).await?;
                         continue;
                     }
@@ -585,6 +696,7 @@ impl Queue for KafkaQueue {
                     error = %e,
                     "could not record a failed job — create the topic to keep them"
                 );
+                crate::reporting::report(dead_letter_failed(job, &failed, &e)).await;
             }
 
             self.advance_past(&position).await
@@ -817,6 +929,67 @@ mod tests {
 
         assert!(position_of(&retry).is_err(), "the retry is a new record, not the old one");
         assert!(position_of(&job).is_ok());
+    }
+
+    #[test]
+    fn a_record_that_is_not_a_job_becomes_a_discard_naming_its_position() {
+        let position = KafkaPosition { topic: "jobs.default".into(), partition: 3, offset: 41 };
+        let discarded = *decode_record(&position, b"not json").unwrap_err();
+
+        assert_eq!(discarded.connection, "kafka");
+        assert_eq!(discarded.queue, "jobs.default");
+        assert_eq!(discarded.message_id, Some(position.to_string()));
+        assert_eq!(discarded.meta.extra["partition"], 3);
+        assert_eq!(discarded.meta.extra["offset"], 41);
+
+        let body = serde_json::to_vec(&job()).unwrap();
+        assert_eq!(decode_record(&position, &body).unwrap().id, "job-1");
+    }
+
+    #[test]
+    fn records_lost_to_retention_are_a_discard_of_the_range() {
+        let discarded = lost_to_retention("jobs.default", 0, 100, 250);
+
+        assert_eq!(discarded.queue, "jobs.default");
+        assert_eq!(discarded.message_id, None);
+        assert_eq!(discarded.meta.extra["from"], 100);
+        assert_eq!(discarded.meta.extra["earliest"], 250);
+        assert!(discarded.exception.message.contains("100..250"));
+    }
+
+    #[test]
+    fn a_lost_lease_and_a_lost_dead_letter_are_queue_operation_failures() {
+        let lease = lease_lost("jobs.default", 2, "expired");
+        assert_eq!(lease.operation, "kafka_lease");
+        assert_eq!(lease.exception.status, 409);
+        assert_eq!(lease.meta.extra["partition"], 2);
+
+        let error = Error::service_unavailable("UNKNOWN_TOPIC_OR_PARTITION");
+        let dead = dead_letter_failed(&job(), "jobs.default.failed", &error);
+        assert_eq!(dead.operation, "dead_letter");
+        assert_eq!(dead.queue.as_deref(), Some("default"));
+        assert_eq!(dead.job_id.as_deref(), Some("job-1"));
+        assert_eq!(dead.meta.extra["topic"], "jobs.default.failed");
+        assert_eq!(dead.exception.message, "UNKNOWN_TOPIC_OR_PARTITION");
+
+        let position = KafkaPosition { topic: "jobs".into(), partition: 0, offset: 1 };
+        let forgot = attempts_failed("kafka_forget_attempts", &position, &error);
+        assert_eq!(forgot.operation, "kafka_forget_attempts");
+        assert_eq!(forgot.queue.as_deref(), Some("jobs"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_skipped_record_reaches_the_process_wide_reporter() {
+        let capture = rainier_events::report::capture();
+        let position =
+            KafkaPosition { topic: "kafka-discard-test".into(), partition: 0, offset: 7 };
+        crate::reporting::report(*decode_record(&position, b"{").unwrap_err()).await;
+
+        assert!(capture.reports().into_iter().any(|r| matches!(
+            &r.failure,
+            rainier_events::Failure::QueueMessageDiscarded(d) if d.queue == "kafka-discard-test"
+        )));
     }
 
     #[test]

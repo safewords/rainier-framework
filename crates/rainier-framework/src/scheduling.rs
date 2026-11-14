@@ -22,9 +22,11 @@ use chrono::Utc;
 use rainier_cache::LockManager;
 use rainier_console::{exit, io, Arguments, Command, Console};
 use rainier_container::Application;
+use rainier_events::report::{ConfigurationFailed, FailureEvent as _, ScheduledTaskFailed};
+use rainier_events::Exception;
 use rainier_queue::{Job, QueueManager};
 use rainier_scheduler::{Schedule, ScheduledTask, Task};
-use rainier_support::{BoxFuture, Error, Result};
+use rainier_support::{BoxFuture, Error, ErrorKind, Result};
 
 /// A [`Task`] that dispatches a queued job.
 ///
@@ -65,6 +67,13 @@ impl<J: Job + Clone> Task for JobTask<J> {
 /// console at run time, so a typo is a failure of that occurrence rather than
 /// of the boot — which is the trade for being able to name a command the
 /// scheduler crate cannot see.
+///
+/// A failing run is reported **twice**, as two different events: the console
+/// reports the command's own error as a
+/// [`CommandFailed`](rainier_events::report::CommandFailed), and the
+/// scheduler reports the occurrence as a [`ScheduledTaskFailed`] whose
+/// `meta.extra["command"]` is the command's name — the same string as the
+/// `CommandFailed`'s `command` — so a listener for both can link them.
 pub struct CommandTask {
     name: String,
     argv: Vec<String>,
@@ -96,7 +105,11 @@ impl Task for CommandTask {
             if code == exit::SUCCESS {
                 Ok(())
             } else {
-                Err(Error::internal(format!("`{}` exited with {code}", self.name)))
+                // The command's name rides along in the details, which is how
+                // the scheduler's report names the command it ran.
+                Err(Error::internal(format!("`{}` exited with {code}", self.name)).with_details(
+                    serde_json::json!({ COMMAND_DETAIL: self.name, "exit_code": code }),
+                ))
             }
         })
     }
@@ -142,16 +155,35 @@ impl ScheduleExt for Schedule {
     }
 }
 
-/// Task timings into the application's metrics registry, with the
-/// `telemetry` feature and a registry bound; nothing otherwise.
-fn record(app: &Application, summary: &rainier_scheduler::RunSummary) {
+/// The key in a [`CommandTask`] failure's details naming the command.
+const COMMAND_DETAIL: &str = "command";
+
+/// What one scheduler pass leaves behind: each failed task reported through
+/// the application's reporter, and — with the `telemetry` feature and a
+/// registry bound — task timings into the metrics registry.
+///
+/// A failed task is reported as a [`ScheduledTaskFailed`], the task's own
+/// error, kind and cause chain included; a [`CommandTask`]'s carries the
+/// command's name in `meta.extra["command"]`. Skipped tasks are not failures
+/// and are not reported.
+async fn record(app: &Application, summary: &rainier_scheduler::RunSummary) {
     #[cfg(feature = "telemetry")]
     if let Ok(metrics) = app.resolve::<rainier_metrics::Metrics>() {
         crate::instrumentation::record_schedule(&metrics, summary);
     }
 
-    #[cfg(not(feature = "telemetry"))]
-    let _ = (app, summary);
+    for (name, error) in &summary.errors {
+        let command = error
+            .details()
+            .and_then(|details| details.get(COMMAND_DETAIL))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let mut failure = ScheduledTaskFailed::new(Arc::clone(error), name.as_str());
+        if let Some(command) = command {
+            failure = failure.with_extra("command", command);
+        }
+        crate::reporting::report_failure(app, failure).await;
+    }
 }
 
 /// `schedule:run` — run whatever is due this minute, then exit.
@@ -191,7 +223,9 @@ impl Command for ScheduleRunCommand {
         assert_locks_are_shared(app)?;
 
         let summary = schedule.run_due(app, &locks, Utc::now()).await;
-        record(app, &summary);
+        record(app, &summary).await;
+        #[cfg(feature = "lookout")]
+        crate::lookout::flush(app).await;
 
         if summary.considered() == 0 {
             println!("Nothing is due.");
@@ -247,7 +281,9 @@ impl Command for ScheduleWorkCommand {
 
         if args.flag("once") {
             let summary = schedule.run_due(app, &locks, Utc::now()).await;
-            record(app, &summary);
+            record(app, &summary).await;
+            #[cfg(feature = "lookout")]
+            crate::lookout::flush(app).await;
             return Ok(if summary.has_failures() { exit::FAILURE } else { exit::SUCCESS });
         }
 
@@ -262,7 +298,7 @@ impl Command for ScheduleWorkCommand {
             tokio::time::sleep(until_next_minute()).await;
 
             let summary = schedule.run_due(app, &locks, Utc::now()).await;
-            record(app, &summary);
+            record(app, &summary).await;
             if summary.considered() > 0 {
                 tracing::info!(
                     ran = summary.ran.len(),
@@ -403,7 +439,10 @@ pub fn assert_locks_are_shared(app: &Application) -> Result<()> {
 /// The counterpart to [`assert_locks_are_shared`]: every process gets told,
 /// and only the one whose guarantees are at stake refuses. Silence is not an
 /// option in either — a guard that fails open with no message is not a guard.
-pub fn warn_if_locks_are_not_shared(app: &Application) {
+///
+/// Returns the warning as a [`ConfigurationFailed`] (setting `cache.stores`)
+/// for the caller to report; boot does.
+pub fn warn_if_locks_are_not_shared(app: &Application) -> Option<ConfigurationFailed> {
     match lock_complaint(app) {
         Ok(Some(complaint)) => {
             // At `error` in production, because there it is a real one: the
@@ -415,10 +454,17 @@ pub fn warn_if_locks_are_not_shared(app: &Application) {
             } else {
                 tracing::warn!("{complaint} To fix: {ADVICE}.");
             }
+            Some(
+                ConfigurationFailed::new(
+                    Exception::message(ErrorKind::Internal, complaint),
+                    "cache.stores",
+                )
+                .with_extra("refuses_to_run", app.is_production()),
+            )
         }
-        Ok(None) => {}
+        Ok(None) => None,
         // Nothing is bound, so there is no schedule to be wrong about.
-        Err(_) => {}
+        Err(_) => None,
     }
 }
 

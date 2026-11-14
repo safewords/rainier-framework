@@ -48,6 +48,7 @@ use std::time::Duration;
 
 use hmac::{Hmac, KeyInit, Mac};
 use rainier_cache::Cache;
+use rainier_events::report::{report, WebhookFailed};
 use rainier_events::Dispatcher;
 use rainier_http::{Request, Response, StatusCode};
 use rainier_support::{BoxFuture, Error, ErrorKind, Result};
@@ -409,6 +410,13 @@ impl Webhooks {
                 // Released so Stripe's retry is handled rather than skipped.
                 if let Err(release) = cache.forget(&key).await {
                     tracing::error!(event = %event.id, error = %release, "could not release a stripe webhook claim");
+                    report(WebhookFailed::new(
+                        release,
+                        "stripe",
+                        Some(event.id.clone()),
+                        "release_claim",
+                    ))
+                    .await;
                 }
             }
             return Err(error);
@@ -424,6 +432,11 @@ impl Webhooks {
 
     /// Handle a request: `200` handled or duplicate, `400` refused, `500`
     /// when a listener failed so Stripe retries.
+    ///
+    /// Either failure becomes a response rather than an error, so both are
+    /// also reported as a [`WebhookFailed`]: operation `"verify"` for a
+    /// refused delivery, `"receive"` for a failed listener or deduplication
+    /// store.
     pub async fn handle(&self, request: &Request) -> Response {
         match self.receive(request.body(), request.header(SIGNATURE_HEADER)).await {
             Ok(Outcome::Handled(id)) => {
@@ -434,11 +447,20 @@ impl Webhooks {
             ),
             Err(error) if error.kind() == ErrorKind::BadRequest => {
                 tracing::warn!(error = %error.message(), "stripe webhook refused");
-                Response::json(&serde_json::json!({ "error": error.message() }))
-                    .with_status(StatusCode::BAD_REQUEST)
+                let response = Response::json(&serde_json::json!({ "error": error.message() }))
+                    .with_status(StatusCode::BAD_REQUEST);
+                // The id is unverified here, so it is not claimed as the event's.
+                report(WebhookFailed::new(error, "stripe", None::<String>, "verify")).await;
+                response
             }
             Err(error) => {
                 tracing::error!(error = %error.message(), "stripe webhook listener failed");
+                // Past verification, so the payload's id is the event's.
+                // A listener, or the deduplication store, failed.
+                let event_id = serde_json::from_slice::<Value>(request.body())
+                    .ok()
+                    .and_then(|body| body.get("id").and_then(Value::as_str).map(str::to_string));
+                report(WebhookFailed::new(error, "stripe", event_id, "receive")).await;
                 // The listener's message stays in the log: Stripe's dashboard
                 // shows this body to whoever looks.
                 Response::json(&serde_json::json!({ "error": "webhook handling failed" }))
@@ -697,6 +719,52 @@ mod tests {
         let retried = handler(Arc::new(request(body, Some(signature)))).await;
         assert_eq!(retried.status(), StatusCode::OK);
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    fn webhook_failures(
+        capture: &rainier_events::report::Capture,
+        operation: &str,
+    ) -> Vec<WebhookFailed> {
+        use rainier_events::report::{Failure, FailureKind};
+        capture
+            .of_kind(FailureKind::Webhook)
+            .into_iter()
+            .filter_map(|f| match f {
+                Failure::Webhook(w) if w.operation == operation => Some(w),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_failing_listener_and_a_refused_delivery_are_reported() {
+        let capture = rainier_events::report::capture();
+        let events = Arc::new(Dispatcher::new());
+        events.listen(|_: Arc<InvoicePaymentFailed>| async {
+            Err(Error::internal("billing-test: the mailer is down"))
+        });
+        let webhooks = Webhooks::new(WebhookVerifier::new(SECRET), events);
+
+        let body = payload("evt_billing_test_1", "invoice.payment_failed");
+        let signature = sign_payload(SECRET, now(), &body);
+        let failed = webhooks.handle(&request(body.clone(), Some(signature))).await;
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let received: Vec<_> = webhook_failures(&capture, "receive")
+            .into_iter()
+            .filter(|w| w.event_id.as_deref() == Some("evt_billing_test_1"))
+            .collect();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].provider, "stripe");
+        assert_eq!(received[0].exception.message, "billing-test: the mailer is down");
+
+        let forged = sign_payload("whsec_attacker", now(), &body);
+        let before = webhook_failures(&capture, "verify").len();
+        let refused = webhooks.handle(&request(body, Some(forged))).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let verify = webhook_failures(&capture, "verify");
+        assert!(verify.len() > before, "the refused delivery was not reported");
+        assert!(verify.iter().all(|w| w.event_id.is_none()));
     }
 
     #[test]

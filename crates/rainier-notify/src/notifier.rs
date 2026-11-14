@@ -4,7 +4,8 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rainier_support::Result;
+use rainier_events::report::{report, Exception, NotificationFailed};
+use rainier_support::{Error, ErrorKind, Result};
 
 use crate::channel::Channel;
 use crate::notification::{Delivery, Notifiable, Notification, Receipt, Sent};
@@ -157,6 +158,15 @@ impl Notifier {
                     channel = type_name,
                     "the notification selected a channel that is not registered"
                 );
+                report(NotificationFailed::new(
+                    Exception::message(
+                        ErrorKind::Internal,
+                        format!("the notification selected `{type_name}`, which is not registered"),
+                    ),
+                    type_name,
+                    rendered.notification,
+                ))
+                .await;
                 receipt.outcomes.push((type_name, Sent::NotRegistered));
                 continue;
             };
@@ -188,6 +198,8 @@ impl Notifier {
                         error = %e.message(),
                         "the notification failed on this channel"
                     );
+                    report(NotificationFailed::new(snapshot(&e), name, rendered.notification))
+                        .await;
                     receipt.outcomes.push((name, Sent::Failed(e)));
                 }
             }
@@ -227,6 +239,20 @@ impl std::fmt::Debug for Notifier {
 /// failure.
 fn wants_a_route(channel: &str) -> bool {
     !matches!(channel, "log" | "memory" | "database" | "broadcast")
+}
+
+/// A report's copy of an error the receipt keeps: everything but the error
+/// value itself, which is not `Clone`.
+fn snapshot(error: &Error) -> Exception {
+    Exception {
+        details: error.details().cloned(),
+        sources: error
+            .source_error()
+            .map(|source| source.chain().map(ToString::to_string).collect())
+            .unwrap_or_default(),
+        backtrace: error.backtrace().map(ToString::to_string),
+        ..Exception::message(error.kind(), error.message())
+    }
 }
 
 #[cfg(test)]
@@ -320,6 +346,59 @@ mod tests {
         assert_eq!(receipt.failures(), vec!["broken"]);
         assert!(captured.sent_to("user.welcome", "7"), "the other channel still ran");
         assert!(receipt.into_result().is_ok(), "one failure is not a failed send");
+    }
+
+    /// The `NotificationFailed` reports for one notification name.
+    fn notification_failures(
+        capture: &rainier_events::report::Capture,
+        notification: &str,
+    ) -> Vec<NotificationFailed> {
+        use rainier_events::report::{Failure, FailureKind};
+        capture
+            .of_kind(FailureKind::Notification)
+            .into_iter()
+            .filter_map(|f| match f {
+                Failure::Notification(n) if n.notification == notification => Some(n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    struct Reported(Channels);
+
+    impl Notification<User> for Reported {
+        fn notification_name(&self) -> &'static str {
+            "notify-test.reported"
+        }
+        fn via(&self, _: &User) -> Channels {
+            self.0.clone()
+        }
+        fn to_text(&self, _: &User) -> Option<String> {
+            Some("hello".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_or_unregistered_channel_is_reported_on_the_bus() {
+        let capture = rainier_events::report::capture();
+        let notifier = Notifier::new().with(BrokenChannel);
+
+        notifier
+            .send(
+                &user(),
+                &Reported(Channels::new().with::<BrokenChannel>().with::<MemoryChannel>()),
+            )
+            .await
+            .unwrap();
+
+        let failures = notification_failures(&capture, "notify-test.reported");
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        let broken = failures.iter().find(|f| f.channel == "broken").unwrap();
+        assert_eq!(broken.exception.message, "the pigeon did not come back");
+        assert!(
+            failures.iter().any(|f| f.channel.ends_with("MemoryChannel")),
+            "the unregistered channel is named by its type: {failures:?}"
+        );
     }
 
     #[tokio::test]

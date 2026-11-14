@@ -32,6 +32,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rainier_events::report::{report, CacheFailed};
 use rainier_middleware::{Hit, RateLimitStore};
 use rainier_support::{BoxFuture, Result};
 
@@ -93,8 +94,15 @@ impl RateLimitStore for CacheRateLimiter {
                 // rather than a duration: the point is when it ends, and every
                 // later reader is asking at a different time.
                 let ends_at = now_millis() + window.as_millis() as u64;
-                let _ =
-                    self.cache.add(&deadline, ends_at.to_string().as_bytes(), Some(window)).await;
+                // Without it, later hits fall back to a full window for their
+                // `Retry-After`; the count itself is still right.
+                if let Err(e) =
+                    self.cache.add(&deadline, ends_at.to_string().as_bytes(), Some(window)).await
+                {
+                    tracing::warn!(key, error = %e, "could not record a rate limit window's end");
+                    report(CacheFailed::new(e, "rate_limiter", Some(deadline), "put_deadline"))
+                        .await;
+                }
                 Some(ends_at)
             } else {
                 read_millis(self.cache.get(&deadline).await?)

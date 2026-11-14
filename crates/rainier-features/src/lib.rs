@@ -193,6 +193,12 @@ pub fn compute(env: &[(String, String)], sources: &str) -> Report {
         want(&mut report, "telemetry", "TELEMETRY_ENABLED=true".into());
     }
 
+    // The same for Lookout: `LOOKOUT_ENABLED` without the feature compiled in
+    // turns nothing on — there is no recorder, no dashboard and no span.
+    if get("LOOKOUT_ENABLED").is_some_and(|on| on == "true" || on == "1") {
+        want(&mut report, "lookout", "LOOKOUT_ENABLED=true".into());
+    }
+
     // The add-ins are named, never inferred. Each is a decision about what the
     // product does — it bills, it issues tokens — and an application commonly
     // keeps the code for one behind its own `#[cfg(feature = ...)]`, so the
@@ -250,6 +256,7 @@ pub const ADDINS: &[&str] = &[
     "captcha",
     "notify-discord",
     "telemetry",
+    "lookout",
 ];
 
 /// The environment file a sizing run should read — strictly.
@@ -378,6 +385,14 @@ mod tests {
         assert!(computed("TELEMETRY_ENABLED=true").features.contains("telemetry"));
         assert!(computed("TELEMETRY_ENABLED=1").features.contains("telemetry"));
         assert!(!computed("TELEMETRY_ENABLED=false").features.contains("telemetry"));
+    }
+
+    #[test]
+    fn asking_for_lookout_builds_it_in() {
+        assert!(computed("LOOKOUT_ENABLED=true").features.contains("lookout"));
+        assert!(computed("LOOKOUT_ENABLED=1").features.contains("lookout"));
+        assert!(!computed("LOOKOUT_ENABLED=false").features.contains("lookout"));
+        assert!(!computed("LOOKOUT_ENABLED=true").features.contains("telemetry"), "no exporter");
     }
 
     #[test]

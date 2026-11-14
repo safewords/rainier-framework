@@ -92,6 +92,19 @@ let response = app.send(
 `app.resolve::<PostRepository>()?` reaches the container, for the half of a
 feature test that asserts on state rather than on a response.
 
+`app.reported()` is every failure the application [reported](errors.md#reporting)
+since the harness was built, as `ExceptionReported`; `app.reported_of::<F>()`
+is the ones of one type — `app.reported_of::<HttpRequestFailed>()` — with their
+own fields to assert on; and `app.assert_nothing_reported()` fails the test if
+there was one. Everything is reported, a `404` included, so a test that
+expects one does not want `assert_nothing_reported`.
+
+A failure reported **process-wide** — by a cache, a queue driver, a failing
+listener — reaches a `TestApp` only if its application was installed
+process-wide, and one booted `without_facades()` is not. Take a
+`rainier_framework::report::capture()` in the test for those; see
+[testing reports](errors.md#testing-reports).
+
 ### `TestResponse`
 
 The body is read on construction, so every assertion takes `&self` and chains,

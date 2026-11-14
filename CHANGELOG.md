@@ -12,6 +12,119 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Lookout, the diagnostics suite** (`rainier-lookout`, `rainier-framework`
+  feature `lookout`, mirrored by `rainier`). Every request, job, console
+  command and scheduled task is recorded as a batch of the queries, cache
+  calls, outbound requests, jobs, mail, events, logs and failures it caused,
+  with slow-entry thresholds, N+1 detection, per-route/guard/user scope and
+  per-watcher sampling, and browsed at `/_lookout`. See `docs/lookout.md`.
+  - **Wired in at boot** from `LOOKOUT_*` (an invalid value fails the boot),
+    adjusted with `Rainier::with_lookout(|config| …)`: the recorder's
+    `tracing` layer joins the framework's subscriber, its middleware sits just
+    inside `Trace`, it listens on the event bus, reads the guard and user from
+    the `Authenticated` marker on the response, and its background writer
+    starts after boot; `Lookout` and `Arc<dyn Store>` are bound in the
+    container. Disabled, nothing is bound or mounted.
+  - **Storage**: in memory, Lookout's own tables on any connection
+    (`rainier_framework::lookout::migrations()`, opt-in like the queue's), or a
+    ring buffer in any cache store.
+  - **The dashboard** is mounted outside every middleware group, open in
+    `local` and elsewhere behind the dashboard guard plus a `viewLookout`
+    ability on the application's `Gate` (`Rainier::with_lookout_viewers::<U>()`);
+    anyone else gets the router's own 404.
+  - **`lookout:prune`, `lookout:clear`, `lookout:status`** in
+    `rainier_framework::console`; `lookout::flush` and `lookout::shutdown` for
+    the process's last batches.
+  - **The feature** turns on every component's spans without the OTLP
+    exporter; `cargo rainier features` maps `LOOKOUT_ENABLED=true` to it.
+  - **`RUST_LOG` is now a per-layer filter** on the framework's log lines and
+    exporter (`TelemetrySettings::subscriber`, `install_logging_with`,
+    `install_with`), so a layer beside them sees spans the log filter drops.
+    The log output is unchanged.
+  - Example: `cargo run -p rainier-framework --example lookout --features lookout`.
+- **Every failure on the event bus** (`rainier-events`, `rainier-http`,
+  `rainier-server`, `rainier-queue`, `rainier-console`, `rainier-scheduler`,
+  `rainier-framework`, and the crates that swallow failures). The framework no
+  longer decides which failures matter: everything it would otherwise swallow
+  — beyond a `tracing` line — is published as a typed event, and the
+  application subscribes to what it cares about. See
+  `docs/errors.md#reporting`.
+  - **The catalogue** (`rainier-events`, `rainier_events::report`). One event
+    struct per kind of failure — `HttpRequestFailed`, `WebSocketFailed`,
+    `ServerFailed`, `MiddlewareFailed`, `AuthFailed`, `SessionFailed`,
+    `OAuthFailed`, `AccountFailed`, `JobAttemptFailed`,
+    `QueueMessageDiscarded`, `QueueOperationFailed`, `CommandFailed`,
+    `ScheduledTaskFailed`, `ListenerFailed`, `BackgroundTaskFailed`,
+    `BroadcastFailed`, `NotificationFailed`, `MailFailed`, `PublishFailed`,
+    `WebhookFailed`, `CacheFailed`, `DatabaseFailed`, `FilesystemFailed`,
+    `IntegrationFailed`, `TelemetryFailed`, `ConfigurationFailed`,
+    `ApplicationFailed` — each with
+    fixed typed fields, an `exception: Exception` and a `meta: ReportMeta`,
+    built with `X::new(exception, fields…)` and implementing `FailureEvent`
+    (`with_extra`). `Failure` is the catalogue as an enum and `FailureKind`
+    without data. `Exception` is a `Clone` snapshot of an `Error`, a
+    `std::error::Error` or a panic: kind, status, the error's own message,
+    details, cause chain, backtrace, and the original `Arc<Error>`
+    (`Exception::from_ref` copies all but that).
+    `ReportMeta` carries a per-report `id`, `reported_at_ms`, `pid`, `host`
+    and free-form `extra`. Everything but the original error is
+    `Serialize + Deserialize`, for forwarding to another process.
+  - **`Reporter`** (`rainier-events`). `report(failure)` dispatches the typed
+    event and then the catch-all `ExceptionReported { failure }`, both with
+    `dispatch_quietly`, so a failing listener never changes the outcome of
+    what failed. **Everything is reported by default, 4xx included**;
+    `dont_report(ErrorKind)` (never a panic) and `ignore(FailureKind)` filter.
+    `with_context(|kind, meta| …)` adds context; a failure's own `extra`
+    wins. `report_error(e)` reports an `ApplicationFailed`.
+  - **The process-wide reporter** (`rainier-events`). `report::install`,
+    `uninstall`, `installed`, `report`, `report_error` and `report_detached`
+    (spawned, for code that is not `async`) — how a cache, a queue driver or a
+    session store with no handle to the application reports. `capture()`
+    collects them in a test. A listener that fails under `dispatch_quietly`
+    is reported as a `ListenerFailed`, except a listener of a failure event.
+  - **Who reports what.** The HTTP kernel, every error response and caught
+    panic (`HttpRequestFailed`; `IntoResponse` for `Error` attaches
+    `OriginalError(Arc<Error>)` so the report keeps the kind and cause chain);
+    the server and WebSocket upgrade (`ServerFailed`, `WebSocketFailed`); the
+    queue worker, every failed attempt, released or failed for good, a panic
+    as a panic (`JobAttemptFailed`; `Worker::with_connection` names the
+    connection, and a worker without `with_reporter` falls back to the
+    process-wide reporter; `JobFailed` and `JobReleased` gain `exception`); queue drivers (`QueueMessageDiscarded`,
+    `QueueOperationFailed`); `Console::run`, a command's `Err` or panic —
+    resumed afterwards (`CommandFailed`); `schedule:run` / `schedule:work`
+    (`ScheduledTaskFailed`; `RunSummary` gains `errors`). In
+    `rainier-framework`: `kafka::publish_events` (`PublishFailed`), the Kafka
+    relay (`BroadcastFailed`), `ModelCache` (`CacheFailed`, store
+    `model_cache`), captcha verification (`IntegrationFailed`, service
+    `captcha:<provider>`), session delivery keys (`SessionFailed`), a
+    panicking health check and `queue:work`'s signal handler
+    (`BackgroundTaskFailed`), the worker's metrics endpoint
+    (`TelemetryFailed`), and configuration boot carried on past — a missing or
+    unusable `APP_KEY`, CORS no preflight reaches, per-process rate limits and
+    scheduler locks, a symlink out of `public/`, a bare `--option`
+    (`ConfigurationFailed`). The other crates report their own; the table in
+    `docs/errors.md` lists every emitter.
+  - **A failing scheduled command is reported twice, linked.** The console's
+    `CommandFailed` carries the command's own error; the scheduler's
+    `ScheduledTaskFailed` carries `meta.extra["command"]`, equal to the
+    `CommandFailed`'s `command`.
+  - **Wired at boot** (`rainier-framework`). `Rainier::boot` builds one
+    `Reporter` over the application's dispatcher, binds it, hands it to the
+    kernel (`queue:work` to the worker), and — unless built
+    `without_facades()` — installs it process-wide; the last application
+    booted wins. Every report carries `app` and `environment` in
+    `meta.extra`. `Rainier::with_reporting(|reporter| …)` filters and adds
+    context. `rainier_framework::report(&app, e)` (`ApplicationFailed`),
+    `report_failure(&app, failure)` and the `Report` facade report from
+    application code. The catalogue is re-exported as
+    `rainier_framework::report`, with `Exception`, `ExceptionReported`,
+    `Failure`, `FailureEvent`, `FailureKind`, `ReportMeta` and `Reporter` at
+    the root. `TestApp::reported()`, `TestApp::reported_of::<F>()` and
+    `TestApp::assert_nothing_reported()` assert on what a test caused.
+  - `cors::warn_if_cors_cannot_answer_a_preflight`,
+    `limits::warn_if_rate_limits_are_not_shared` and
+    `scheduling::warn_if_locks_are_not_shared` now return the warning as an
+    `Option<ConfigurationFailed>`, which boot reports.
 - **Row-change notification** (`rainier-orm`, `rainier-database`). Every write a
   statement builder or `rainier_orm::repo` / `Query` makes now reports a
   `RowChange` — table, kind, and the primary keys it touched when it names

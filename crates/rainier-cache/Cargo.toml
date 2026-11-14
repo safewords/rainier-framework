@@ -13,6 +13,9 @@ rainier-support = { workspace = true }
 # implements it over the cache, which keeps `rainier-middleware` depending on
 # `rainier-http` and nothing else.
 rainier-middleware = { workspace = true }
+# Failures the cache works around — an unreadable value, a lost write — are
+# reported on the bus rather than only logged.
+rainier-events = { workspace = true }
 # The connectors behind the `redis-driver`, `memcached` and `dynamodb` stores.
 # Compiled only when one of them is on.
 rainier-drivers = { workspace = true, optional = true }

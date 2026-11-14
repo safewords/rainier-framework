@@ -1,0 +1,52 @@
+[package]
+name = "rainier-lookout"
+description = "Lookout: Rainier's opt-in diagnostics suite — requests, queries, jobs, cache, failures and more, recorded per request, scoped by route and guard, browsable at /_lookout."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# The dashboard's source ships; its dependencies never do. `assets/dist` is
+# what the crate compiles in.
+exclude = ["frontend/node_modules"]
+
+[dependencies]
+rainier-support = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The `database` store: Lookout's own tables, through the ORM.
+rainier-database = { workspace = true }
+rainier-orm = { workspace = true }
+# The `cache` store: a ring buffer in the application's cache.
+rainier-cache = { workspace = true }
+# The stores mark their own work `rainier.lookout.internal` so Lookout does not
+# record itself.
+tracing = { workspace = true }
+# The dashboard and its JSON API (`http`): routes an application mounts. The
+# dashboard's Vue app is prebuilt into `assets/dist/` (see `frontend/`), so
+# building the crate never needs Node.
+rainier-http = { workspace = true }
+rainier-routing = { workspace = true }
+# `lookout:prune`, `lookout:clear`, `lookout:status` (`commands`). The
+# container only because `Command::handle` is given the `Application`.
+rainier-console = { workspace = true }
+rainier-container = { workspace = true }
+# The recorder: a `tracing` layer over the framework's spans, a bounded channel
+# to a background writer, listeners on the event bus, and a global middleware.
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+rainier-events = { workspace = true }
+rainier-middleware = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# The middleware test runs a real kernel and router, with their spans on.
+rainier-server = { workspace = true, features = ["telemetry"] }
+# The conformance suite runs the database store against a real in-memory SQLite.
+rainier-database = { workspace = true, features = ["sea-orm-executor"] }
+rainier-drivers = { workspace = true, features = ["sea-orm-executor"] }
+
+[lints]
+workspace = true

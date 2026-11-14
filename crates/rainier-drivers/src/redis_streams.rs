@@ -299,13 +299,21 @@ fn claim_reply(reply: &Value) -> Option<StreamEntry> {
 }
 
 /// The first `[id, [field, value, …]]` pair, as an entry.
+///
+/// An entry with no `body` field — written by something else, or (Redis 6.2)
+/// claimed after `XTRIM` removed its data, which comes back as `[id, nil]` —
+/// is still handed over, with an **empty** body. Skipping it looked safer and
+/// was not: the read had already delivered it to the group, so it sat in the
+/// pending list forever, unacknowledged, re-claimed by every `XAUTOCLAIM` in
+/// place of a real abandoned job, and reported nowhere. An empty body is not a
+/// job, so the queue discards it, acknowledges it, and reports the discard.
 fn entries(value: &Value) -> Option<StreamEntry> {
     let Value::Array(entries) = value else { return None };
 
     entries.iter().find_map(|entry| {
         let Value::Array(parts) = entry else { return None };
         let id = as_string(parts.first()?)?;
-        let body = field(parts.get(1)?, BODY)?;
+        let body = parts.get(1).and_then(|fields| field(fields, BODY)).unwrap_or_default();
 
         Some(StreamEntry { id, body })
     })
@@ -399,9 +407,10 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_missing_its_body_field_is_skipped() {
-        // Something else wrote to this stream. Better to see nothing than to
-        // hand the queue a job it will fail to parse on every redelivery.
+    fn an_entry_missing_its_body_field_is_handed_over_empty() {
+        // Something else wrote to this stream. Reading it delivered it to the
+        // group, so returning nothing would leave it pending forever; an empty
+        // body is something the queue discards, acknowledges and reports.
         let reply = Value::Array(vec![Value::Array(vec![
             bulk("queue:default"),
             Value::Array(vec![Value::Array(vec![
@@ -410,7 +419,21 @@ mod tests {
             ])]),
         ])]);
 
-        assert_eq!(read_reply(&reply), None);
+        assert_eq!(read_reply(&reply), Some(StreamEntry { id: "1-0".into(), body: Vec::new() }));
+    }
+
+    #[test]
+    fn a_claimed_entry_whose_data_was_trimmed_is_handed_over_empty() {
+        // Redis 6.2's `XAUTOCLAIM` returns an entry `XTRIM` removed as
+        // `[id, nil]`. It is still pending, and only an acknowledgement
+        // clears it.
+        let reply = Value::Array(vec![
+            bulk("0-0"),
+            Value::Array(vec![Value::Array(vec![bulk("2-0"), Value::Nil])]),
+            Value::Array(vec![]),
+        ]);
+
+        assert_eq!(claim_reply(&reply), Some(StreamEntry { id: "2-0".into(), body: Vec::new() }));
     }
 
     #[test]

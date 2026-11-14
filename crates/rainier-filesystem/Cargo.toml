@@ -9,6 +9,7 @@ description = "File storage for Rainier: a Filesystem port with local, in-memory
 
 [dependencies]
 rainier-support = { workspace = true }
+rainier-events = { workspace = true }
 # The AWS connector behind the `s3` disk. Compiled only with that feature.
 rainier-drivers = { workspace = true, optional = true }
 

@@ -7,6 +7,9 @@
 
 use std::sync::Arc;
 
+use rainier_events::report::{report, AuthFailed};
+use rainier_events::Exception;
+use rainier_http::OriginalError;
 use rainier_http::{FromRequest, IntoResponse, Request, Response};
 use rainier_middleware::{Middleware, MiddlewareStack, Next};
 use rainier_support::{BoxedFuture, Error, Result};
@@ -107,12 +110,34 @@ impl<U: Authenticatable> Authenticate<U> {
         MiddlewareStack::new().resolved(|auth: Arc<AuthManager<U>>| Self::new(auth))
     }
 
+    /// The guard this middleware asks, by name, for a report.
+    fn guard_name(&self) -> String {
+        self.guard.clone().unwrap_or_else(|| self.auth.default_name().to_string())
+    }
+
     /// [`resolved`](Self::resolved) with a named guard — `->middleware('auth:api')`.
     pub fn resolved_with_guard(guard: impl Into<String>) -> MiddlewareStack {
         let guard = guard.into();
         MiddlewareStack::new()
             .resolved(move |auth: Arc<AuthManager<U>>| Self::with_guard(auth, guard.clone()))
     }
+}
+
+/// Who [`Authenticate`] let through, left on the **response**.
+///
+/// For code outside the route that wants to know who a request was for after
+/// it was handled — a diagnostics recorder, an access log — without asking the
+/// guard again. The request, where [`AuthenticatedUser`] lives, has been
+/// consumed by then.
+///
+/// Deliberately not a span field: spans are exported, and who made a request
+/// is not something to hand an OpenTelemetry backend by default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authenticated {
+    /// The guard that authenticated the request.
+    pub guard: String,
+    /// The user's [`auth_identifier`](Authenticatable::auth_identifier).
+    pub user_id: String,
 }
 
 #[async_trait::async_trait]
@@ -140,12 +165,18 @@ impl<U: Authenticatable> Middleware for Authenticate<U> {
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "could not read the token's abilities");
-                        return e.into_response();
+                        return report_and_render(e, self.guard_name(), "abilities").await;
                     }
                 }
 
+                let identified =
+                    Authenticated { guard: self.guard_name(), user_id: user.auth_identifier() };
                 request.extensions_mut().insert(AuthenticatedUser(Arc::new(user)));
-                next.run(request).await
+                let mut response = next.run(request).await;
+                // The request is gone by the time anything outside the route
+                // sees the outcome; the response is what survives.
+                response.extensions_mut().insert(identified);
+                response
             }
             Ok(None) => Error::unauthenticated("Unauthenticated.").into_response(),
             // A guard failure is a 500, not a 401: the user may well be
@@ -153,7 +184,7 @@ impl<U: Authenticatable> Middleware for Authenticate<U> {
             // sends them to a login page which will also fail.
             Err(e) => {
                 tracing::error!(error = %e, "the authentication guard failed");
-                e.into_response()
+                report_and_render(e, self.guard_name(), "user").await
             }
         }
     }
@@ -276,6 +307,18 @@ impl Middleware for RequireAbility {
                 "`RequireAbility` ran without `Authenticate` before it, so the request has no \
                  abilities to check — refusing"
             );
+            report(AuthFailed::new(
+                Exception::message(
+                    rainier_support::ErrorKind::Internal,
+                    format!(
+                        "`RequireAbility` ran without `Authenticate` before it (required: {})",
+                        self.required.join(", ")
+                    ),
+                ),
+                "abilities",
+                "require_ability",
+            ))
+            .await;
             return Error::unauthorized("This action is unauthorized.").into_response();
         };
 
@@ -293,6 +336,24 @@ impl Middleware for RequireAbility {
     fn name(&self) -> &'static str {
         "RequireAbility"
     }
+}
+
+/// Report a guard's error as an [`AuthFailed`], and render it as the
+/// response.
+///
+/// The error becomes the response — the kernel reports that as a failed
+/// request too — but only this report says it was the *guard* that failed,
+/// and which one. Rendered first, so the report can share the whole error the
+/// response keeps in its extensions rather than a copy of its message.
+async fn report_and_render(error: Error, guard: String, operation: &str) -> Response {
+    let fallback = Exception::message(error.kind(), error.message());
+    let response = error.into_response();
+    let exception = match response.extensions().get::<OriginalError>() {
+        Some(OriginalError(original)) => Exception::from_shared(Arc::clone(original)),
+        None => fallback,
+    };
+    report(AuthFailed::new(exception, guard, operation)).await;
+    response
 }
 
 /// Rejects *authenticated* requests — the `guest` middleware, for a login page
@@ -316,7 +377,13 @@ impl<U: Authenticatable> Middleware for RedirectIfAuthenticated<U> {
             Ok(Some(_)) => rainier_http::Redirect::to(self.to.clone()).into_response(),
             // A guard failure here is not a reason to block a login attempt —
             // failing open to the login page is the safe direction.
-            Ok(None) | Err(_) => next.run(request).await,
+            Ok(None) => next.run(request).await,
+            Err(e) => {
+                tracing::warn!(error = %e, "the authentication guard failed; treating as a guest");
+                let guard = self.auth.default_name().to_string();
+                report(AuthFailed::new(e, guard, "redirect_if_authenticated")).await;
+                next.run(request).await
+            }
         }
     }
 
@@ -404,6 +471,26 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_of(response).await, "7");
+    }
+
+    #[tokio::test]
+    async fn the_response_says_who_was_authenticated_and_by_which_guard() {
+        let response = Pipeline::new()
+            .through(Authenticate::new(manager(false)))
+            .then(reveal_user)
+            .run(bearer("good"))
+            .await;
+        assert_eq!(
+            response.extensions().get::<Authenticated>(),
+            Some(&Authenticated { guard: "api".into(), user_id: "7".into() })
+        );
+
+        let rejected = Pipeline::new()
+            .through(Authenticate::new(manager(false)))
+            .then(reveal_user)
+            .run(bearer("bad"))
+            .await;
+        assert!(rejected.extensions().get::<Authenticated>().is_none());
     }
 
     #[tokio::test]

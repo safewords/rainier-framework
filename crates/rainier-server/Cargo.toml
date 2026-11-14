@@ -13,6 +13,8 @@ rainier-http = { workspace = true }
 rainier-middleware = { workspace = true }
 rainier-routing = { workspace = true }
 rainier-container = { workspace = true }
+# Exception reporting — `Kernel::with_reporter`.
+rainier-events = { workspace = true }
 rainier-websocket = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }

@@ -11,6 +11,8 @@ repository.workspace = true
 rainier-support = { workspace = true }
 rainier-http = { workspace = true }
 rainier-server = { workspace = true }
+# Reporting a debug flag that was overridden in production.
+rainier-events = { workspace = true }
 
 serde_json = { workspace = true }
 tracing = { workspace = true }

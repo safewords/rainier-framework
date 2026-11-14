@@ -67,8 +67,8 @@ pub use impersonate::{
     impersonator_id, is_impersonating, ForbidImpersonation, Impersonation, IMPERSONATOR_KEY,
 };
 pub use middleware::{
-    AbilitiesRequestExt, Authenticate, AuthenticatedUser, RedirectIfAuthenticated, RequireAbility,
-    TokenAbilities,
+    AbilitiesRequestExt, Authenticate, Authenticated, AuthenticatedUser, RedirectIfAuthenticated,
+    RequireAbility, TokenAbilities,
 };
 pub use rainier_crypt::hash::{Argon2Hasher, HashDriver, HashManager, Hasher, LegacyVerifier};
 #[cfg(feature = "bcrypt")]

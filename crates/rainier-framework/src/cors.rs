@@ -29,8 +29,11 @@
 
 use std::sync::Arc;
 
+use rainier_events::report::{ConfigurationFailed, FailureEvent as _};
+use rainier_events::Exception;
 use rainier_middleware::Middleware;
 use rainier_routing::CompiledRouter;
+use rainier_support::ErrorKind;
 
 /// The label [`HandleCors`](rainier_middleware::HandleCors) reports.
 ///
@@ -50,13 +53,16 @@ const CORS: &str = "HandleCors";
 /// Silent when the global stack carries one, whether or not a group does too:
 /// an application may legitimately want a second, narrower policy on a group,
 /// and the global one is what answers the preflight either way.
+///
+/// Returns the warning as a [`ConfigurationFailed`] (setting `cors`) for the
+/// caller to report; boot does.
 pub fn warn_if_cors_cannot_answer_a_preflight(
     global: &[Arc<dyn Middleware>],
     router: &CompiledRouter,
-) {
+) -> Option<ConfigurationFailed> {
     if global.iter().any(|stage| stage.name().contains(CORS)) {
         // A preflight is answered before routing. Nothing to say.
-        return;
+        return None;
     }
 
     let mounted: Vec<String> = router
@@ -70,7 +76,7 @@ pub fn warn_if_cors_cannot_answer_a_preflight(
         // No policy anywhere. An application that serves no browser from
         // another origin does not need one, and guessing that it does would be
         // a warning on every API that is only ever called by a server.
-        return;
+        return None;
     }
 
     tracing::warn!(
@@ -83,6 +89,20 @@ pub fn warn_if_cors_cannot_answer_a_preflight(
          registry.global(HandleCors::for_origins([..]).allow_credentials(true)).",
         mounted.len()
     );
+    Some(
+        ConfigurationFailed::new(
+            Exception::message(
+                ErrorKind::Internal,
+                format!(
+                    "{} route(s) carry a CORS policy that no preflight can reach; register it \
+                     on the global stack",
+                    mounted.len()
+                ),
+            ),
+            "cors",
+        )
+        .with_extra("routes", mounted),
+    )
 }
 
 #[cfg(test)]
@@ -113,10 +133,9 @@ mod tests {
         });
 
         assert!(router.describe()[0].middleware.iter().any(|s| s.contains(CORS)));
-        // The condition the warning fires on, asserted directly — `tracing`
-        // output is not capturable here, so the test pins the inputs that
-        // reach it.
-        warn_if_cors_cannot_answer_a_preflight(&[], &router);
+        let warning = warn_if_cors_cannot_answer_a_preflight(&[], &router).expect("a warning");
+        assert_eq!(warning.setting, "cors");
+        assert_eq!(warning.meta.extra["routes"][0], "GET|HEAD /api/posts");
     }
 
     #[test]
@@ -129,7 +148,7 @@ mod tests {
         // A second, narrower policy on a group is a legitimate arrangement:
         // the global one still answers the preflight.
         assert!(global.iter().any(|stage| stage.name().contains(CORS)));
-        warn_if_cors_cannot_answer_a_preflight(&global, &router);
+        assert!(warn_if_cors_cannot_answer_a_preflight(&global, &router).is_none());
     }
 
     #[test]
@@ -143,6 +162,6 @@ mod tests {
         });
 
         assert!(!router.describe()[0].middleware.iter().any(|s| s.contains(CORS)));
-        warn_if_cors_cannot_answer_a_preflight(&[], &router);
+        assert!(warn_if_cors_cannot_answer_a_preflight(&[], &router).is_none());
     }
 }

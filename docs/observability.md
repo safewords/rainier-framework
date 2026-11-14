@@ -614,6 +614,13 @@ let settings = TelemetrySettings::from_config(&config);
 settings.install_logging(&app.environment(), &env.string("RUST_LOG", "info"));
 ```
 
+`RUST_LOG` filters the log lines (and, with `telemetry`, the exporter) as a
+**per-layer** filter rather than one over the whole subscriber, so a layer
+installed beside them with `install_logging_with` — [Lookout's](lookout.md#the-subscriber)
+— still sees the `info` spans a `warn` filter keeps out of the log.
+`TelemetrySettings::subscriber` builds the same subscriber without installing
+it.
+
 It returns whether it installed one. `false` means a subscriber was already set
 — by the application, or by an earlier boot in the same test binary — and that
 one is left alone, because replacing somebody else's logging configuration is

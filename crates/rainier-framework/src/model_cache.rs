@@ -51,6 +51,13 @@
 //! A cache that is down, slow to answer, or holding something that does not
 //! decode is a miss: the row comes from the database. Nothing here makes a read
 //! fail that would have succeeded without it.
+//!
+//! Each failure worked around — a read, a write, an invalidation, a generation
+//! that could not be read or advanced, a cached row that did not decode — is
+//! reported as a [`CacheFailed`] with store `model_cache`, the key when there
+//! is one, and `meta.extra["table"]`, through the process-wide reporter. An
+//! application that does not want them ignores
+//! [`FailureKind::Cache`](rainier_events::FailureKind::Cache).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -61,6 +68,8 @@ use std::time::{Duration, Instant};
 
 use rainier_cache::Cache;
 use rainier_database::{ChangeKind, ChangedKeys, Database, RowChange};
+use rainier_events::report::{CacheFailed, FailureEvent as _};
+use rainier_events::Exception;
 use rainier_orm::Entity;
 use rainier_support::Result;
 use serde::de::DeserializeOwned;
@@ -231,15 +240,19 @@ where
                 inner.stats.tombstoned.fetch_add(1, Ordering::Relaxed);
                 return load().await;
             }
-            Ok(Some(bytes)) => {
-                if let Ok(row) = serde_json::from_slice::<M>(&bytes) {
+            Ok(Some(bytes)) => match serde_json::from_slice::<M>(&bytes) {
+                Ok(row) => {
                     inner.stats.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(Some(row));
                 }
-            }
+                // A row cached by another version of the model, usually:
+                // a miss, and replaced once its TTL runs out.
+                Err(e) => report(inner.table, Some(key), "decode", Exception::from_std(&e)).await,
+            },
             Ok(None) => {}
             Err(e) => {
                 tracing::debug!(error = %e.message(), table = inner.table, "model cache unreachable; reading the database");
+                report(inner.table, Some(key), "get", e).await;
                 return load().await;
             }
         }
@@ -250,7 +263,9 @@ where
             if let Ok(bytes) = serde_json::to_vec(row) {
                 // Set-if-absent: a tombstone written since this read began
                 // wins, and the row this read saw is not put back.
-                let _ = inner.cache.add(&entry, &bytes, Some(inner.config.ttl)).await;
+                if let Err(e) = inner.cache.add(&entry, &bytes, Some(inner.config.ttl)).await {
+                    report(inner.table, Some(key), "fill", e).await;
+                }
             }
         }
         Ok(loaded)
@@ -302,11 +317,15 @@ where
             let ttl = Some(inner.config.ttl);
             // A plain put: the pointer is checked on every use, so a stale one
             // costs a miss, never a wrong row.
-            let _ = inner.cache.put(&pointer, key.as_bytes(), ttl).await;
+            if let Err(e) = inner.cache.put(&pointer, key.as_bytes(), ttl).await {
+                report(inner.table, Some(index_key.as_str()), "fill_index", e).await;
+            }
             inner.mark_hot(&key);
             let entry = inner.entry_key(inner.generation(false).await, &key);
             if let Ok(bytes) = serde_json::to_vec(row) {
-                let _ = inner.cache.add(&entry, &bytes, ttl).await;
+                if let Err(e) = inner.cache.add(&entry, &bytes, ttl).await {
+                    report(inner.table, Some(key.as_str()), "fill", e).await;
+                }
             }
         }
         Ok(loaded)
@@ -400,7 +419,10 @@ impl Inner {
                 String::from_utf8(bytes).ok().and_then(|s| s.trim().parse::<i64>().ok())
             }
             Ok(None) => Some(0),
-            Err(_) => None,
+            Err(e) => {
+                report(self.table, None, "read_generation", e).await;
+                None
+            }
         };
         let Ok(mut local) = self.generation.lock() else { return shared.unwrap_or(0) };
         if let Some(value) = shared {
@@ -417,6 +439,7 @@ impl Inner {
         let entry = self.entry_key(self.generation(true).await, key);
         if let Err(e) = self.cache.put(&entry, TOMBSTONE, Some(self.config.tombstone_ttl)).await {
             tracing::warn!(error = %e.message(), table = self.table, key, "model cache: a changed row was not invalidated; it expires with its TTL");
+            report(self.table, Some(key), "invalidate", e).await;
         }
         self.stats.invalidated.fetch_add(1, Ordering::Relaxed);
     }
@@ -431,6 +454,7 @@ impl Inner {
             }
             Err(e) => {
                 tracing::warn!(error = %e.message(), table = self.table, "model cache: a bulk write could not retire cached rows; they expire with their TTL");
+                report(self.table, None, "advance_generation", e).await;
             }
         }
         self.stats.generations.fetch_add(1, Ordering::Relaxed);
@@ -450,6 +474,15 @@ impl Inner {
             ChangedKeys::Unknown => self.advance_generation().await,
         }
     }
+}
+
+/// Report a cache failure the model cache worked around.
+async fn report(table: &str, key: Option<&str>, operation: &str, exception: impl Into<Exception>) {
+    rainier_events::report::report(
+        CacheFailed::new(exception, "model_cache", key.map(str::to_string), operation)
+            .with_extra("table", table),
+    )
+    .await;
 }
 
 #[cfg(all(test, feature = "sea-orm-executor"))]
@@ -600,6 +633,31 @@ mod tests {
             .expect("rename");
         assert_eq!(read_by_name(&db, &cache, "ana").await, None);
         assert_eq!(read_by_name(&db, &cache, "anna").await.expect("anna").id, 1);
+    }
+
+    #[tokio::test]
+    async fn a_row_that_does_not_decode_is_a_miss_and_is_reported() {
+        use rainier_events::report::Failure;
+
+        let capture = rainier_events::report::capture();
+        let (db, cache) = world().await;
+        read(&db, &cache, 1).await; // cold
+        let entry = cache.inner.entry_key(cache.inner.generation(false).await, "1");
+        cache.inner.cache.put(&entry, b"not json", None).await.unwrap();
+
+        assert_eq!(read(&db, &cache, 1).await.map(|m| m.id), Some(1));
+
+        let failed: Vec<_> = capture
+            .reports()
+            .into_iter()
+            .filter_map(|r| match r.failure {
+                Failure::Cache(f) if f.store == "model_cache" && f.operation == "decode" => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].key.as_deref(), Some("1"));
+        assert_eq!(failed[0].meta.extra["table"], "members");
     }
 
     #[tokio::test]

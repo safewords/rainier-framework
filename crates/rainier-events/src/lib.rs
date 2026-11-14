@@ -1,8 +1,9 @@
 //! # rainier-events
 //!
 //! Rainier's hook system: a typed event [`Dispatcher`], the [`Listener`] and
-//! [`WildcardListener`] contracts, and [`EventSubscriber`] for grouping a
-//! feature's wiring.
+//! [`WildcardListener`] contracts, [`EventSubscriber`] for grouping a
+//! feature's wiring, and [`Reporter`] / [`ExceptionReported`] for exception
+//! reporting (see [`report`]).
 //!
 //! This is the *decoupling* seam of the framework. Where the container answers
 //! "who provides this?", events answer "who cares that this happened?" — and
@@ -48,6 +49,10 @@
 
 pub mod dispatcher;
 pub mod event;
+pub mod report;
 
 pub use dispatcher::Dispatcher;
 pub use event::{Event, EventSubscriber, Listener, WildcardListener};
+pub use report::{
+    Exception, ExceptionReported, Failure, FailureEvent, FailureKind, ReportMeta, Reporter,
+};

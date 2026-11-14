@@ -1,15 +1,28 @@
-//! The HTTP [`Kernel`] — global middleware, dispatch, and error rendering.
+//! The HTTP [`Kernel`] — global middleware, dispatch, error rendering and
+//! exception reporting.
 //!
 //! The kernel is where the global middleware stack lives and
 //! where an exception becomes a response. It is one seam: everything
 //! between "a request exists" and "a response exists", with the transport on
 //! one side and the router on the other.
+//!
+//! A failure is handled twice, for two audiences. The [`ExceptionRenderer`]
+//! decides what the *client* sees. A [`Reporter`], when one is set with
+//! [`Kernel::with_reporter`], decides whether *operators* hear about it: the
+//! kernel hands it every error response and every caught panic, and the
+//! reporter puts each on the event bus as an [`HttpRequestFailed`] (and an
+//! [`ExceptionReported`](rainier_events::ExceptionReported)). Everything is
+//! reported by default, client errors included; the reporter's
+//! [`dont_report`](Reporter::dont_report) and [`ignore`](Reporter::ignore)
+//! are the only filters.
 
 use std::sync::Arc;
 
-use rainier_http::{http, RenderedError, Request, Response, StatusCode};
+use rainier_events::report::HttpRequestFailed;
+use rainier_events::{Exception, Failure, Reporter};
+use rainier_http::{http, OriginalError, RenderedError, Request, Response, StatusCode};
 use rainier_middleware::{Destination, Middleware, MiddlewareRegistry, Pipeline, ReadyPipeline};
-use rainier_routing::CompiledRouter;
+use rainier_routing::{CompiledRouter, MatchedRoute};
 use rainier_support::{BoxedFuture, Error, Result};
 
 /// Turns an error into the response a client sees.
@@ -91,10 +104,21 @@ impl Destination for RouterDestination {
     }
 }
 
+/// Marks a response the kernel rendered from a caught panic, which it has
+/// already reported — so [`Kernel::handle_request`] does not report it a
+/// second time should a custom renderer have attached a [`RenderedError`].
+#[derive(Debug, Clone, Copy)]
+struct PanicReported;
+
 /// The HTTP kernel.
+///
+/// Runs the global middleware and the router, catches panics, renders errors
+/// through its [`ExceptionRenderer`], and — with a [`Reporter`] set — reports
+/// them.
 pub struct Kernel {
     pipeline: ReadyPipeline,
     renderer: Arc<dyn ExceptionRenderer>,
+    reporter: Option<Reporter>,
     debug: bool,
 }
 
@@ -119,6 +143,7 @@ impl Kernel {
         Self {
             pipeline: Pipeline::new().through_all(global).then_arc(destination),
             renderer: Arc::new(DefaultExceptionRenderer),
+            reporter: None,
             debug: false,
         }
     }
@@ -143,6 +168,29 @@ impl Kernel {
         self
     }
 
+    /// Report failures through `reporter`.
+    ///
+    /// Every error response [`handle_request`](Self::handle_request) sees and
+    /// every panic [`handle`](Self::handle) catches is offered to the
+    /// reporter as an [`HttpRequestFailed`] naming the method, the path (never
+    /// the query string) and the matched route's pattern. Everything is
+    /// reported by default — a `404` included — unless the reporter was told
+    /// to [`dont_report`](Reporter::dont_report) that kind; a listener that
+    /// fails never changes the response.
+    ///
+    /// Without one, failures go to the process-wide reporter
+    /// ([`rainier_events::report::install`]), if one is installed — and are
+    /// only logged otherwise.
+    pub fn with_reporter(mut self, reporter: Reporter) -> Self {
+        self.reporter = Some(reporter);
+        self
+    }
+
+    /// The reporter failures are reported through, if one is set.
+    pub fn reporter(&self) -> Option<&Reporter> {
+        self.reporter.as_ref()
+    }
+
     /// Disclose internal error messages and panic details to the client.
     ///
     /// Never in production: the messages this reveals are exactly the ones an
@@ -163,6 +211,10 @@ impl Kernel {
     /// bringing down the process — or, worse, poisoning a shared lock and
     /// taking every later request with it — is not an acceptable failure mode
     /// for a web framework.
+    ///
+    /// The panic is reported here, with a [reporter](Self::with_reporter) set.
+    /// A returned error is not: that is reported by
+    /// [`handle_request`](Self::handle_request), which the server calls.
     pub async fn handle(&self, request: Request) -> Response {
         #[cfg(feature = "telemetry")]
         {
@@ -179,6 +231,7 @@ impl Kernel {
 
     async fn handle_untraced(&self, request: Request) -> Response {
         let expects_json = request.expects_json();
+        let method = request.method().as_str().to_string();
         let path = request.path().to_string();
 
         let outcome = std::panic::AssertUnwindSafe(self.pipeline.run(request));
@@ -187,6 +240,30 @@ impl Kernel {
             Err(panic) => {
                 let detail = panic_message(&panic);
                 tracing::error!(path = %path, panic = %detail, "a handler panicked");
+
+                // Taken from the thread-local a panic hook filled in at the
+                // `panic!` site. `catch_unwind` gives us the payload and
+                // nothing else — by the time we are here the stack has
+                // already unwound, so without the hook this is `None` and
+                // the error page shows a panic with no stack.
+                //
+                // Same thread: `catch_unwind` returns on the thread that
+                // panicked. See `rainier_support::panic_backtrace`.
+                //
+                // Taken once — taking clears it — and shared by the report and
+                // the rendered error.
+                let backtrace =
+                    rainier_support::panic_backtrace::take_panic_backtrace().map(|b| b.to_string());
+
+                // The route is unknown: the router's `MatchedRoute` would have
+                // ridden out on the response, and there is no response.
+                self.report(
+                    Exception::panic(detail.clone(), backtrace.clone()),
+                    method,
+                    path,
+                    None,
+                )
+                .await;
 
                 let error = RenderedError {
                     status: 500,
@@ -198,16 +275,7 @@ impl Kernel {
                     details: None,
                     disclosable: false,
                     kind: Some("Panic".to_string()),
-                    // Taken from the thread-local a panic hook filled in at the
-                    // `panic!` site. `catch_unwind` gives us the payload and
-                    // nothing else — by the time we are here the stack has
-                    // already unwound, so without the hook this is `None` and
-                    // the error page shows a panic with no stack.
-                    //
-                    // Same thread: `catch_unwind` returns on the thread that
-                    // panicked. See `rainier_support::panic_backtrace`.
-                    backtrace: rainier_support::panic_backtrace::take_panic_backtrace()
-                        .map(|b| b.to_string()),
+                    backtrace,
                 };
                 // The request was consumed by the pipeline, so render against
                 // a stand-in that preserves only what the renderer needs.
@@ -216,7 +284,9 @@ impl Kernel {
                 } else {
                     Request::builder().build()
                 };
-                return self.renderer.render(&stand_in, &error, self.debug);
+                let mut rendered = self.renderer.render(&stand_in, &error, self.debug);
+                rendered.extensions_mut().insert(PanicReported);
+                return rendered;
             }
         };
 
@@ -227,15 +297,32 @@ impl Kernel {
     ///
     /// Split from [`handle`](Self::handle) because the re-render needs the
     /// request, which the pipeline consumed. The server calls this one.
+    ///
+    /// Every error response is offered to the [reporter](Self::with_reporter)
+    /// here — whether or not its message is disclosable, since which errors
+    /// are worth reporting is the reporter's policy, not the renderer's.
     pub async fn handle_request(&self, request: Request) -> Response {
-        // Snapshot what the renderer needs before the pipeline takes the
-        // request.
+        // Snapshot what the renderer and the reporter need before the
+        // pipeline takes the request.
         let expects_json = request.expects_json();
+        let method = request.method().as_str().to_string();
+        let path = request.path().to_string();
         let response = self.handle(request).await;
 
         let Some(error) = response.extensions().get::<RenderedError>().cloned() else {
             return response;
         };
+
+        // `handle` already reported a panic.
+        if response.extensions().get::<PanicReported>().is_none() {
+            let exception = match response.extensions().get::<OriginalError>() {
+                Some(OriginalError(original)) => Exception::from_shared(Arc::clone(original)),
+                None => exception_from_rendered(&error),
+            };
+            let route =
+                response.extensions().get::<MatchedRoute>().map(|matched| matched.uri.clone());
+            self.report(exception, method, path, route).await;
+        }
 
         if error.disclosable && expects_json {
             // Already JSON, already safe to show: nothing to re-render.
@@ -254,6 +341,50 @@ impl Kernel {
 
         let rendered = self.renderer.render(&stand_in, &error, self.debug);
         carry_over_headers(&response, rendered)
+    }
+
+    /// Offer a failed request to the reporter.
+    async fn report(
+        &self,
+        exception: Exception,
+        method: String,
+        path: String,
+        route: Option<String>,
+    ) {
+        self.report_failure(HttpRequestFailed::new(exception, method, path, route)).await;
+    }
+
+    /// Report any failure through the kernel's reporter, or the process-wide
+    /// one when the kernel has none. The server reports through this too —
+    /// accept failures, unreadable bodies — so they reach the same bus.
+    pub(crate) async fn report_failure(&self, failure: impl Into<Failure>) {
+        match &self.reporter {
+            Some(reporter) => {
+                reporter.report(failure).await;
+            }
+            None => {
+                rainier_events::report::report(failure).await;
+            }
+        }
+    }
+}
+
+/// An [`Exception`] from the rendering snapshot alone, for an error response
+/// that carries no [`OriginalError`] — one a handler built by hand.
+///
+/// The kind is lost: [`RenderedError::kind`] is a display label, not
+/// something to parse back, so [`Reporter::dont_report`] cannot filter it
+/// (a [`Reporter::ignore`] of the whole kind still can).
+fn exception_from_rendered(error: &RenderedError) -> Exception {
+    Exception {
+        kind: None,
+        status: error.status,
+        message: error.message.clone(),
+        details: error.details.clone(),
+        sources: Vec::new(),
+        backtrace: error.backtrace.clone(),
+        panic: false,
+        error: None,
     }
 }
 
@@ -334,6 +465,7 @@ impl std::fmt::Debug for Kernel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Kernel")
             .field("middleware", &self.pipeline.stage_names())
+            .field("reporter", &self.reporter)
             .field("debug", &self.debug)
             .finish()
     }
@@ -682,6 +814,245 @@ mod tests {
         let body = body_of(kernel_for(router).handle_request(get("/bad")).await).await;
         assert!(!body.contains("<script>"), "{body}");
         assert!(body.contains("&lt;script&gt;"), "{body}");
+    }
+
+    // --- exception reporting ----------------------------------------------
+
+    use rainier_events::{Dispatcher, ExceptionReported};
+    use rainier_support::ErrorKind;
+    use std::sync::Mutex;
+
+    type Seen = Arc<Mutex<Vec<ExceptionReported>>>;
+
+    /// The `index`th report, which must be a failed request.
+    fn request_failure(seen: &[ExceptionReported], index: usize) -> HttpRequestFailed {
+        match &seen[index].failure {
+            Failure::HttpRequest(failed) => failed.clone(),
+            other => panic!("expected a failed request, got {other:?}"),
+        }
+    }
+
+    /// A real dispatcher with a listener that collects every report.
+    fn collecting() -> (Arc<Dispatcher>, Seen) {
+        let events = Arc::new(Dispatcher::new());
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        events.listen(move |reported: Arc<ExceptionReported>| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push((*reported).clone());
+                Ok(())
+            }
+        });
+        (events, seen)
+    }
+
+    fn failing_router() -> Router {
+        let mut router = Router::new();
+        router
+            .get("/posts/{post}", || async {
+                Err::<&'static str, Error>(
+                    Error::internal("db password is hunter2")
+                        .with_source(std::io::Error::other("connection refused")),
+                )
+            })
+            .name("posts.show");
+        router
+    }
+
+    #[tokio::test]
+    async fn a_server_error_is_reported_with_its_origin_and_real_message() {
+        let (events, seen) = collecting();
+        let kernel = kernel_for(failing_router()).with_reporter(Reporter::new(events));
+        assert!(kernel.reporter().is_some());
+
+        let response = kernel.handle_request(api_get("/posts/42?token=secret")).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_of(response).await;
+        assert!(!body.contains("hunter2"), "reporting must not change what the client sees");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let reported = request_failure(&seen, 0);
+        assert_eq!(reported.exception.message, "db password is hunter2");
+        assert_eq!(reported.exception.kind, Some(ErrorKind::Internal));
+        assert_eq!(reported.exception.status, 500);
+        assert_eq!(reported.exception.sources, vec!["connection refused"]);
+        assert!(!reported.exception.panic);
+        assert!(reported.exception.error.is_some(), "the original error rides along");
+        assert_eq!(reported.method, "GET");
+        assert_eq!(reported.path, "/posts/42", "never the query string");
+        assert_eq!(reported.route.as_deref(), Some("/posts/{post}"));
+        assert!(!reported.meta.id.is_empty(), "stamped by the reporter");
+    }
+
+    #[tokio::test]
+    async fn a_server_error_rendered_as_html_is_reported_too() {
+        let (events, seen) = collecting();
+        let kernel = kernel_for(failing_router()).with_reporter(Reporter::new(events));
+
+        kernel.handle_request(get("/posts/1")).await;
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_client_error_is_reported_by_default() {
+        let (events, seen) = collecting();
+
+        // Disclosable JSON — the early-return path in `handle_request` — and
+        // HTML, the re-rendering path.
+        let kernel = kernel_for(Router::new()).with_reporter(Reporter::new(events));
+        let response = kernel.handle_request(api_get("/nope")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        kernel.handle_request(get("/nope")).await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "a 404 is reported by default");
+        let reported = request_failure(&seen, 0);
+        assert_eq!(reported.exception.kind, Some(ErrorKind::NotFound));
+        assert_eq!(reported.exception.status, 404);
+        assert_eq!(reported.method, "GET");
+        assert_eq!(reported.path, "/nope");
+        assert_eq!(reported.route, None);
+    }
+
+    #[tokio::test]
+    async fn dont_report_silences_a_client_error() {
+        let (events, seen) = collecting();
+        let kernel = kernel_for(Router::new())
+            .with_reporter(Reporter::new(events).dont_report(ErrorKind::NotFound));
+
+        let response = kernel.handle_request(api_get("/nope")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "the response is unchanged");
+        kernel.handle_request(get("/nope")).await;
+        assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_panic_is_reported_exactly_once() {
+        let (events, seen) = collecting();
+        let mut router = Router::new();
+        router.get("/panic", panics_immediately);
+        let kernel = kernel_for(router).with_reporter(Reporter::new(events));
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let response = kernel.handle_request(api_get("/panic")).await;
+        std::panic::set_hook(previous);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let reported = request_failure(&seen, 0);
+        assert!(reported.exception.panic);
+        assert_eq!(reported.exception.message, "something went very wrong");
+        assert_eq!(reported.exception.status, 500);
+        assert_eq!(reported.method, "GET");
+        assert_eq!(reported.path, "/panic");
+        assert_eq!(reported.route, None);
+    }
+
+    #[tokio::test]
+    async fn a_panic_is_reported_once_even_when_the_renderer_marks_it_as_an_error() {
+        // A renderer that renders through `Error::into_response` leaves a
+        // `RenderedError` on the panic response; that must not be reported as
+        // a second failure.
+        struct ViaError;
+        impl ExceptionRenderer for ViaError {
+            fn render(&self, _: &Request, error: &RenderedError, _: bool) -> Response {
+                use rainier_http::IntoResponse;
+                Error::internal(error.message.clone()).into_response()
+            }
+        }
+
+        let (events, seen) = collecting();
+        let mut router = Router::new();
+        router.get("/panic", panics_after_awaiting);
+        let kernel = kernel_for(router)
+            .with_renderer(Arc::new(ViaError))
+            .with_reporter(Reporter::new(events));
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        kernel.handle_request(api_get("/panic")).await;
+        std::panic::set_hook(previous);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].exception().panic);
+    }
+
+    #[tokio::test]
+    async fn handle_called_directly_still_reports_a_panic() {
+        let (events, seen) = collecting();
+        let mut router = Router::new();
+        router.get("/panic", panics_immediately);
+        let kernel = kernel_for(router).with_reporter(Reporter::new(events));
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        kernel.handle(get("/panic")).await;
+        std::panic::set_hook(previous);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].exception().panic);
+    }
+
+    #[tokio::test]
+    async fn a_failing_reporting_listener_does_not_change_the_response() {
+        let (events, seen) = collecting();
+        events.listen(|_: Arc<ExceptionReported>| async { Err(Error::internal("tracker down")) });
+
+        let plain = kernel_for(failing_router());
+        let reporting = kernel_for(failing_router()).with_reporter(Reporter::new(events));
+
+        let expected = plain.handle_request(api_get("/posts/1")).await;
+        let actual = reporting.handle_request(api_get("/posts/1")).await;
+        assert_eq!(actual.status(), expected.status());
+        assert_eq!(actual.header("content-type"), expected.header("content-type"));
+        assert_eq!(body_of(actual).await, body_of(expected).await);
+        assert_eq!(seen.lock().unwrap().len(), 1, "the other listener still ran");
+    }
+
+    #[tokio::test]
+    async fn without_a_reporter_nothing_changes() {
+        let kernel = kernel_for(failing_router());
+        assert!(kernel.reporter().is_none());
+
+        let response = kernel.handle_request(api_get("/posts/1")).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_of(response).await.contains("Server Error"));
+    }
+
+    #[tokio::test]
+    async fn a_hand_built_error_response_is_reported_from_its_snapshot() {
+        let (events, seen) = collecting();
+        let mut router = Router::new();
+        router.get("/manual", || async {
+            let mut response = Response::text("nope").with_status(StatusCode::BAD_GATEWAY);
+            response.extensions_mut().insert(RenderedError {
+                status: 502,
+                message: "upstream said no".into(),
+                details: None,
+                disclosable: false,
+                kind: Some("Status(502)".into()),
+                backtrace: None,
+            });
+            response
+        });
+        let kernel = kernel_for(router).with_reporter(Reporter::new(events));
+
+        kernel.handle_request(get("/manual")).await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let reported = request_failure(&seen, 0);
+        assert_eq!(reported.exception.message, "upstream said no");
+        assert_eq!(reported.exception.status, 502);
+        assert_eq!(reported.exception.kind, None);
+        assert!(reported.exception.error.is_none());
+        assert_eq!(reported.route.as_deref(), Some("/manual"));
     }
 
     // --- body reading ------------------------------------------------------

@@ -131,6 +131,18 @@ impl Arguments {
             tracing::warn!(
                 "`--{name}` was given with no value; write `--{name}=value`. Ignoring it."
             );
+            // The operator's setting was thrown away, so it is reported too —
+            // through the process-wide reporter, since an `Arguments` has no
+            // handle to the application. A no-op when none is installed.
+            rainier_events::report::report_detached(
+                rainier_events::report::ConfigurationFailed::new(
+                    rainier_events::Exception::message(
+                        rainier_support::ErrorKind::BadRequest,
+                        format!("`--{name}` was given with no value and was ignored"),
+                    ),
+                    format!("--{name}"),
+                ),
+            );
         }
         value
     }

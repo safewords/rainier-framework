@@ -158,6 +158,16 @@ impl TrustProxies {
                 let parsed = Cidr::parse(network);
                 if parsed.is_none() {
                     tracing::warn!(%network, "ignoring an unparseable trusted proxy");
+                    #[cfg(not(target_arch = "wasm32"))]
+                    rainier_events::report::report_detached(
+                        rainier_events::report::ConfigurationFailed::new(
+                            rainier_events::Exception::message(
+                                rainier_support::ErrorKind::Internal,
+                                format!("ignoring an unparseable trusted proxy: {network}"),
+                            ),
+                            "trusted_proxies",
+                        ),
+                    );
                 }
                 parsed
             })

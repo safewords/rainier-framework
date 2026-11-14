@@ -103,6 +103,7 @@ and the runnable example for each.
 | [OAuth Server](oauth-server.md) | `oauth-server` | Issuing tokens: authorization code with PKCE, refresh rotation, client credentials, password, personal access tokens, scopes, revocation, and the guard that accepts them | `oauth_server` |
 | [Compatibility](compat.md) | `compat-php`, `compat-php-oauth`, `compat-php-webauthn` | Running beside the stack you are migrating from: its serialization, encrypted cookies, sessions, cache, CSRF tokens, OAuth tokens and passkeys | `compat_php` |
 | [Passive instrumentation](observability.md#passive-instrumentation) | `telemetry` | A span for every request, query, cache call, job, mail and event; queue wait and throughput metrics; trace context across HTTP and the queue — no application code | `telemetry` |
+| [Lookout](lookout.md) | `lookout` | A per-request diagnostics dashboard: every query, cache call, job, outbound call and failure of each request, job and command, with slow-query and N+1 detection — in memory, the database or the cache, behind a gate that answers 404 | `lookout` |
 | [Human Checks](captcha.md) | `captcha` | Turnstile, hCaptcha and reCAPTCHA tokens verified server-side | `captcha` |
 | [Notifications: Discord](notifications.md#discord) | `notify-discord` | A Discord channel, by webhook or bot | `notify_discord` |
 | [Impersonation](authentication.md#impersonation) | — | Acting as another user, with a policy, and routes it is refused on | `impersonation` |
@@ -233,7 +234,7 @@ concept as you know it, and where it lives here.
 | flash data | [flash data](sessions.md#flash-data) |
 | trusted proxies | [`groups::trust_local_proxies()`](middleware.md#trustproxies) |
 | generating the application key | `cargo run -- key:generate` |
-| an instrumentation dashboard | [metrics and tracing](observability.md), and your own dashboards |
+| an instrumentation dashboard | [Lookout](lookout.md) per request; [metrics and tracing](observability.md) across services |
 | generated API documentation | [a document generated from the router and the rules](observability.md#openapi) |
 | cache get / put | [the cache](cache.md) |
 | encrypting a string | [ciphers](encryption.md#ciphers) — five of them |

@@ -53,9 +53,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rainier_events::report::{report_detached, SessionFailed};
+use rainier_events::Exception;
 use rainier_http::{Cookie, Method, Request, Response, SameSite, StatusCode};
 use rainier_middleware::{Middleware, Next};
-use rainier_support::Result;
+use rainier_support::{ErrorKind, Result};
 use serde_json::json;
 
 use crate::middleware::SessionRequestExt;
@@ -240,6 +242,13 @@ impl VerifyCsrfToken {
             tracing::error!(
                 "VerifyCsrfToken ran without a session; refusing — put it inside StartSession"
             );
+            report_detached(SessionFailed::new(
+                Exception::message(
+                    ErrorKind::Internal,
+                    "VerifyCsrfToken ran without a session — put it inside StartSession",
+                ),
+                "csrf_verify",
+            ));
             return false;
         };
         let Some(presented) = self.presented(request) else {
@@ -266,6 +275,7 @@ impl VerifyCsrfToken {
             Ok(value) => value,
             Err(e) => {
                 tracing::error!(error = %e, "could not seal the XSRF-TOKEN cookie");
+                report_detached(SessionFailed::new(e, "csrf_seal"));
                 return response;
             }
         };
