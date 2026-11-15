@@ -12,7 +12,7 @@ import StackTrace from '../components/StackTrace.vue'
 import StatTile from '../components/StatTile.vue'
 import TimeAgo from '../components/TimeAgo.vue'
 import { api } from '../api.js'
-import { absolute, ago, count, duration } from '../format.js'
+import { absolute, ago, count, duration, issueRoute } from '../format.js'
 
 const props = defineProps({ id: { type: String, required: true } })
 
@@ -179,7 +179,7 @@ const columns = [
           </label>
           <span v-if="kase.severity_pinned" class="text-xs text-zinc-500 dark:text-zinc-400">pinned</span>
           <RouterLink
-            :to="{ name: 'issue', params: { type: 'exception' }, query: { key: kase.key } }"
+            :to="issueRoute('exception', kase.key)"
             class="ml-auto text-sm text-indigo-600 hover:underline dark:text-indigo-400"
           >Issue drill-down →</RouterLink>
         </div>

@@ -139,6 +139,13 @@ With no `keep_batch_if`, a batch is kept when `APP_ENV=local`, or — anywhere
 else — when it has an exception, something slow, a failed job or a monitored
 tag. Production keeps the interesting batches and lets the rest go.
 
+**Kept or not, every batch in scope is counted.** The ones the rule lets go
+are not stored, but their entries are rolled into the aggregates like any
+other, so a route's count, throughput and p50 to p99 describe every request
+to it — not only the slow and failed ones that were kept. (Before this, the
+aggregates were rolled from kept batches only, which made every percentile
+read high in production.) A batch out of scope is counted nowhere.
+
 ### Thresholds
 
 Each watcher has a `slow_ms`, and per-pattern `slow_overrides` keyed by a glob
@@ -177,10 +184,9 @@ awaited it, so those frames are where the call came from. Only spans over
 their slow threshold are traced, because a capture walks the stack; fast ones
 cost nothing. `LOOKOUT_CAPTURE_CODE_TRACES=false` turns it off.
 
-The request pays only for the walk, and for at most
-`MAX_CODE_TRACES_PER_BATCH` (16) of them per batch — a request running the
-same slow query five hundred times gets sixteen traces, not five hundred
-walks. Turning the addresses into function names, which costs several times
+The request pays only for the walk, once per family — a request running the
+same slow query five hundred times gets one trace, not five hundred walks —
+and for at most `MAX_CODE_TRACES_PER_BATCH` (16) families per batch. Turning the addresses into function names, which costs several times
 the walk, is the background writer's job, on a blocking thread, just before
 the batch is stored.
 
@@ -309,9 +315,15 @@ on a refused request, which is the next point.
   range, graphs over time with a forecast, the insights, and the slowest and
   most frequent of each type.
 - **Every row drills in.** A route, query, job, exception or outgoing call
-  opens its own page: its series over time with the forecast, p50/p95/p99 from
-  the raw occurrences, a duration histogram, every occurrence linking to its
-  batch's waterfall, and the code trace or stack.
+  opens its own page — `/issues/{type}/{id}`, where the id is the family's
+  [`family_id`](#the-json-api), sixteen hex digits rather than its SQL — with
+  its series over time and the forecast, p50/p95/p99 from the raw
+  occurrences, a duration histogram, every occurrence linking to its batch's
+  waterfall, and the code trace or stack. A link of the earlier form,
+  `/issues/{type}?key=…`, still opens.
+- **The waterfall** draws each span once. A slow one carries a `slow` pill
+  (and `N+1` or `failed` where it is that) on its own row, instead of a
+  second row for the derived slow entry.
 - **Requests** and **Jobs** — one page each, grouped by route and by job
   class. Totals at the top (count, throughput, average, maximum, time spent
   and p50/p90/p95/p99 over everything), then a row per route or job class
@@ -445,7 +457,8 @@ shape.
 | `DELETE` | `/api/batches` | delete everything — needs `X-Lookout: 1` |
 | `GET` | `/api/batches/{id}` | one batch, with its entries |
 | `GET` | `/api/entries/{type}` | entries of one type across batches — `key` (one family), `q` (text in the summary or key; reads at most five pages), `before`, `limit` |
-| `GET` | `/api/aggregates/{type}` | rolled-up counts and durations, with `average_us`, `p50_us`, `p90_us`, `p95_us`, `p99_us` and the `histogram` (`{slot: count}`) — `period` (60, 600, 3600), `since`, `order` (`count`, `average`, `max`) |
+| `GET` | `/api/families/{type}/{id}` | the key a family id names — `{"id", "key"}`, or `404`. The id is `family_id(type, key)`: FNV-1a over the type, a newline and the key, sixteen hex digits, so the dashboard can make one without asking |
+| `GET` | `/api/aggregates/{type}` | rolled-up counts and durations, with `average_us`, `p50_us`, `p90_us`, `p95_us`, `p99_us`, the `histogram` (`{slot: count}`) and the row's `family_id` — `period` (60, 600, 3600), `since`, `order` (`count`, `average`, `max`) |
 | `GET` | `/api/series/{type}` | one zero-filled point per bucket from `since` to now, each with `count`, `average_us`, `max_us` and, where the bucket kept a histogram, `p50_us`, `p90_us`, `p95_us` and `p99_us` — `period` (default: a dozen points or more), `key`, `keys` (that many busiest keys' own series), `forecast` (buckets) |
 | `GET` | `/api/insights` | what changed since the previous window — `window`, `min`, `change`, `forecast`, `limit` |
 | `GET` | `/api/cases` | cases — `status` (`open`, `resolved`, `ignored`, `all`), `severity` (minimum), `q`, `limit` |
@@ -490,12 +503,22 @@ database store needs the prune.
   mounts nothing and adds no layer or middleware. Without the feature none of
   it is compiled.
 - **On, nothing waits on it.** The request path appends entries to an
-  in-memory buffer. A closed batch is handed to a **bounded channel**
+  in-memory buffer. When the request or job ends, its batch is handed, as it
+  is, to a **bounded channel**
   (`ingest.channel_capacity`, 10 000) with `try_send`; when the channel is
   full the batch is **dropped and counted** — `Lookout::dropped()` — and the
   request is never held up.
 - **A background writer** drains the channel every `ingest.flush_interval_ms`
-  (1 s) or as soon as `ingest.flush_batch_size` (500) batches are waiting. Its
+  (1 s) or as soon as `ingest.flush_batch_size` (500) batches are waiting.
+  Everything after the hand-off is its work, after the response has gone:
+  the keep rule, slow and N+1 detection, sorting, summaries, rolling every
+  batch into the aggregates, symbolising code traces, and the store write.
+  Every finished request goes through the channel now, kept or not, because
+  every one is counted; one that would overflow it is dropped from the
+  counts too, and counted in `Lookout::dropped()`. The counts of batches not
+  kept are added up in the writer and written every 10 seconds (or with a
+  kept batch, or on flush and shutdown), so a busy service rewrites its
+  aggregates a few times a minute rather than every second. Its
   own store traffic runs inside a span marked `rainier.lookout.internal`, so
   the database or cache store's queries are not recorded. A failing store is
   logged at most once per interval, never reported on the bus.
@@ -503,11 +526,11 @@ database store needs the prune.
   `truncated:<n>` tag.
 - **What a request pays** on its own thread, measured by the
   `hot_path_cost` test in `crates/rainier-lookout/tests` (release build, Apple
-  M-series, a request of twenty queries and three cache calls): about 19 µs
-  with Lookout on, kept or not, and 1.4 µs with the feature built but
-  `LOOKOUT_ENABLED=false`. A slow query adds a stack walk for its code trace
-  (above), about 10 µs, for at most sixteen a batch. A batch the production
-  keep rule drops is dropped before the N+1 search and everything after it.
+  M-series, a request of twenty queries and three cache calls): about 17 µs
+  with Lookout on, kept or not — the span bookkeeping, under a microsecond a
+  span — and 1.4 µs with the feature built but `LOOKOUT_ENABLED=false`. A slow
+  query adds a stack walk for its code trace (above), about 10 µs, once per
+  query shape: twenty slow queries of five shapes cost about 73 µs.
   `cache_store_cost` in the same directory measures what the cache store
   costs the cache per write and per dashboard read.
 - **Spans below `RUST_LOG`.** Lookout needs `info` spans whatever the log

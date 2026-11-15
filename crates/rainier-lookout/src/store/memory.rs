@@ -77,8 +77,17 @@ impl Store for MemoryStore {
     }
 
     fn store(&self, batches: Vec<Batch>) -> BoxFuture<'_, Result<()>> {
+        self.store_counting(batches, Vec::new())
+    }
+
+    fn store_counting(
+        &self,
+        batches: Vec<Batch>,
+        counted: Vec<Aggregate>,
+    ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            let rolled = rollup(&batches);
+            let mut rolled = rollup(&batches);
+            rolled.extend(counted);
             let seen = occurrences(&batches);
             let mut state = self.lock();
             for occurrence in &seen {

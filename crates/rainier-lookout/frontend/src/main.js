@@ -25,7 +25,8 @@ const router = createRouter({
     { path: '/entries/:type', name: 'entries', component: Entries, props: true },
     { path: '/status', name: 'status', component: Status },
     // One family of one type: ?key=<family key>
-    { path: '/issues/:type', name: 'issue', component: Issue, props: true },
+    // `/issues/:type/:id`; `/issues/:type?key=…`, the earlier form, still works.
+    { path: '/issues/:type/:id?', name: 'issue', component: Issue, props: true },
     { path: '/jobs', name: 'jobs', component: Timing, props: { type: 'job' } },
     { path: '/requests', name: 'requests', component: Timing, props: { type: 'request' } },
     { path: '/cases', name: 'cases', component: Cases },

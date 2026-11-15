@@ -87,6 +87,25 @@ pub trait Store: Send + Sync + 'static {
     /// Persist batches. Also rolls their entries into aggregates.
     fn store(&self, batches: Vec<Batch>) -> BoxFuture<'_, Result<()>>;
 
+    /// Persist `batches`, and add `counted` to the aggregates as well.
+    ///
+    /// `counted` is the roll-up of the batches the keep rule did not keep —
+    /// most requests in production. They are not stored, but every one of
+    /// them is in the counts and percentiles; without this a route's numbers
+    /// would describe only its slow and failed runs. `batches` may be empty
+    /// when `counted` is not.
+    ///
+    /// The default stores `batches` and drops `counted`: a store of your own
+    /// should override it, or its aggregates describe only kept batches.
+    fn store_counting(
+        &self,
+        batches: Vec<Batch>,
+        counted: Vec<Aggregate>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let _ = counted;
+        self.store(batches)
+    }
+
     /// Newest first.
     fn batches(&self, query: BatchQuery) -> BoxFuture<'_, Result<Vec<BatchSummary>>>;
 

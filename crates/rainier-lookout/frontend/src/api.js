@@ -68,6 +68,7 @@ export const api = {
   // params: status (open|resolved|ignored), severity (minimum: low|medium|high|critical), q, limit
   cases: (params) => request('GET', '/cases', params),
   kase: (id) => request('GET', `/cases/${path(id)}`),
+  family: (type, id) => request('GET', `/families/${path(type)}/${path(id)}`),
   // action: resolve | reopen | ignore | severity (with severity), note optional
   actOnCase: (id, body) => request('POST', `/cases/${path(id)}`, null, { 'X-Lookout': '1' }, body),
   status: () => request('GET', '/status'),

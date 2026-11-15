@@ -658,9 +658,9 @@ const TRACED: &[EntryType] = &[
 /// dropped, inside the poll of the code that awaited it, so those frames are
 /// where the query or the call came from.
 ///
-/// Only over the slow threshold, at most [`MAX_CODE_TRACES_PER_BATCH`] a
-/// batch, and only walked here: the writer symbolises it, off the request's
-/// thread.
+/// Only over the slow threshold, once per family (one query shape, one
+/// route) and at most [`MAX_CODE_TRACES_PER_BATCH`] a batch, and only walked
+/// here: the writer symbolises it, off the request's thread.
 ///
 /// [`MAX_CODE_TRACES_PER_BATCH`]: crate::recorder::MAX_CODE_TRACES_PER_BATCH
 fn code_trace(config: &LookoutConfig, batch: &BatchCell, entry: &Entry) -> Option<Backtrace> {
@@ -669,7 +669,7 @@ fn code_trace(config: &LookoutConfig, batch: &BatchCell, entry: &Entry) -> Optio
     }
     let duration = entry.duration_us?;
     let threshold = crate::recorder::slow_threshold_ms(config, entry)?;
-    if duration < threshold.saturating_mul(1000) || !batch.claim_trace() {
+    if duration < threshold.saturating_mul(1000) || !batch.claim_trace(entry.family_key()) {
         return None;
     }
     Some(Backtrace::force_capture())

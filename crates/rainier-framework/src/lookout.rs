@@ -364,6 +364,17 @@ impl Store for DeferredStore {
         }
     }
 
+    fn store_counting(
+        &self,
+        batches: Vec<Batch>,
+        counted: Vec<rainier_lookout::entry::Aggregate>,
+    ) -> BoxFuture<'_, Result<()>> {
+        match self.get() {
+            Ok(store) => store.store_counting(batches, counted),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
+    }
+
     fn batches(&self, query: BatchQuery) -> BoxFuture<'_, Result<Vec<BatchSummary>>> {
         match self.get() {
             Ok(store) => store.batches(query),

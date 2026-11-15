@@ -15,9 +15,13 @@ import TimeAgo from '../components/TimeAgo.vue'
 import { api } from '../api.js'
 import { caseId, count, duration, percentile, TYPES } from '../format.js'
 
-const props = defineProps({ type: { type: String, required: true } })
+const props = defineProps({ type: { type: String, required: true }, id: { type: String, default: '' } })
 const route = useRoute()
-const key = computed(() => (typeof route.query.key === 'string' ? route.query.key : ''))
+// The family's key: from `?key=` (the earlier links), or looked up from the
+// short id in the path.
+const resolved = ref('')
+const resolving = ref(false)
+const key = computed(() => (typeof route.query.key === 'string' && route.query.key) || resolved.value)
 
 const RANGES = [
   { key: '1h', label: '1h', minutes: 60 },
@@ -39,7 +43,7 @@ const more = ref(false)
 const error = ref(null)
 
 const kase = ref(null)
-const id = computed(() => (props.type === 'exception' && key.value ? caseId(key.value) : null))
+const caseKey = computed(() => (props.type === 'exception' && key.value ? caseId(key.value) : null))
 
 async function loadSeries() {
   if (!key.value) return
@@ -89,9 +93,9 @@ async function loadMore() {
 }
 
 async function loadCase() {
-  if (!id.value) return
+  if (!caseKey.value) return
   try {
-    const answer = await api.kase(id.value)
+    const answer = await api.kase(caseKey.value)
     kase.value = answer.data
   } catch {
     // No case (a 404) or none yet: the page stands without one.
@@ -99,7 +103,20 @@ async function loadCase() {
   }
 }
 
-onMounted(() => {
+async function resolveKey() {
+  if (!props.id || typeof route.query.key === 'string') return
+  resolving.value = true
+  try {
+    resolved.value = (await api.family(props.type, props.id)).data.key
+  } catch (e) {
+    error.value = e
+  } finally {
+    resolving.value = false
+  }
+}
+
+onMounted(async () => {
+  await resolveKey()
   loadSeries()
   loadEntries()
   loadCase()
@@ -203,8 +220,12 @@ const columns = [
     >← {{ TYPES[type] || type }}</RouterLink>
 
     <template v-if="!key">
-      <h1 class="text-xl font-semibold">No family chosen</h1>
-      <p class="text-sm text-zinc-500 dark:text-zinc-400">This page needs a <code class="font-mono">?key=</code> naming the family to show.</p>
+      <ErrorBox v-if="error" :error="error" />
+      <p v-else-if="resolving" class="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
+      <template v-else>
+        <h1 class="text-xl font-semibold">No family chosen</h1>
+        <p class="text-sm text-zinc-500 dark:text-zinc-400">This page needs a family id in its path.</p>
+      </template>
     </template>
 
     <template v-else>

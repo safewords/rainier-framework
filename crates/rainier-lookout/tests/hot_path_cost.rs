@@ -138,7 +138,7 @@ async fn what_recording_costs_a_request() {
 /// writer, not the request — and one batch walks at most
 /// `MAX_CODE_TRACES_PER_BATCH` stacks however many slow queries it runs.
 #[tokio::test]
-async fn slow_queries_get_code_traces_up_to_the_cap() {
+async fn slow_queries_get_one_code_trace_per_shape() {
     use rainier_lookout::recorder::MAX_CODE_TRACES_PER_BATCH;
     use rainier_lookout::Store as _;
 
@@ -158,7 +158,9 @@ async fn slow_queries_get_code_traces_up_to_the_cap() {
         .filter(|e| e.entry_type == EntryType::Query)
         .filter_map(|e| e.content.get("code.trace"))
         .collect();
-    assert_eq!(traces.len(), MAX_CODE_TRACES_PER_BATCH.min(20), "{traces:?}");
+    // Twenty slow queries of five shapes: one stack per shape, not twenty —
+    // a loop running the same query captures its stack once.
+    assert_eq!(traces.len(), SHAPES.len().min(MAX_CODE_TRACES_PER_BATCH), "{traces:?}");
     let functions: Vec<&str> = traces[0]
         .as_array()
         .unwrap()

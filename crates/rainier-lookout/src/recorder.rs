@@ -84,6 +84,15 @@ pub const MAX_ENTRIES_PER_BATCH: usize = 2_000;
 /// five hundred stack walks would only make it slower.
 pub const MAX_CODE_TRACES_PER_BATCH: usize = 16;
 
+/// How often the writer writes the counts of batches it did not keep, when no
+/// kept batch has carried them sooner. A minute's bucket is finished a few
+/// seconds late; the store is not rewritten on every tick.
+const COUNTS_EVERY: Duration = Duration::from_secs(10);
+
+/// Combine the waiting counts once they grow past this many rows, so a burst
+/// between writes holds one row per family rather than one per request.
+const COUNTS_COMBINE_AT: usize = 4096;
+
 /// How long a failed request's batch waits for its failure report.
 const PARK_FOR: Duration = Duration::from_millis(250);
 
@@ -154,6 +163,8 @@ impl Lookout {
                 parked: Mutex::new(Vec::new()),
                 identify: RwLock::new(None),
                 last_store_error: Mutex::new(None),
+                counts: Mutex::new(Vec::new()),
+                counts_written: Mutex::new(Instant::now()),
             }),
         }
     }
@@ -227,12 +238,12 @@ impl Lookout {
                     _ = inner.wake.notified() => {}
                     _ = &mut stop_rx => {
                         inner.release_parked(Duration::ZERO);
-                        inner.drain_and_store().await;
+                        inner.drain_and_store(true).await;
                         break;
                     }
                 }
                 inner.release_parked(PARK_FOR);
-                inner.drain_and_store().await;
+                inner.drain_and_store(false).await;
             }
         });
         WriterHandle { stop: Some(stop_tx), task: Some(task) }
@@ -245,7 +256,7 @@ impl Lookout {
             return;
         }
         self.inner.release_parked(Duration::ZERO);
-        self.inner.drain_and_store().await;
+        self.inner.drain_and_store(true).await;
     }
 
     /// How many closed batches were dropped because the channel was full.
@@ -363,8 +374,10 @@ pub(crate) struct BatchCell {
     /// A fast "do not bother building entries" flag, mirrored from
     /// `Pending::rejected`.
     rejected: AtomicBool,
-    /// Code traces captured so far, against [`MAX_CODE_TRACES_PER_BATCH`].
-    traces: AtomicUsize,
+    /// The family hashes code traces were captured for, against
+    /// [`MAX_CODE_TRACES_PER_BATCH`]. One per family: a loop running the same
+    /// slow query twenty times captures its stack once.
+    traces: Mutex<HashSet<u64>>,
     /// What started it.
     pub(crate) kind: BatchKind,
 }
@@ -378,9 +391,14 @@ impl BatchCell {
         self.rejected.load(Ordering::Relaxed)
     }
 
-    /// Claim one of the batch's code traces; `false` once they are used up.
-    pub(crate) fn claim_trace(&self) -> bool {
-        self.traces.fetch_add(1, Ordering::Relaxed) < MAX_CODE_TRACES_PER_BATCH
+    /// Claim the batch's code trace for `family`: `false` if one was already
+    /// taken for it, or once [`MAX_CODE_TRACES_PER_BATCH`] are used up.
+    pub(crate) fn claim_trace(&self, family: &str) -> bool {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        family.hash(&mut hasher);
+        let mut taken = self.traces.lock().unwrap_or_else(|e| e.into_inner());
+        taken.len() < MAX_CODE_TRACES_PER_BATCH && taken.insert(hasher.finish())
     }
 }
 
@@ -473,6 +491,10 @@ pub(crate) struct Inner {
     parked: Mutex<Vec<(Instant, Pending)>>,
     identify: RwLock<Option<IdentifyHook>>,
     last_store_error: Mutex<Option<Instant>>,
+    /// Aggregates of batches counted but not kept, waiting to be written.
+    counts: Mutex<Vec<crate::entry::Aggregate>>,
+    /// When `counts` was last written.
+    counts_written: Mutex<Instant>,
 }
 
 thread_local! {
@@ -559,7 +581,7 @@ impl Inner {
         let cell = Arc::new(BatchCell {
             state: Mutex::new(Some(pending)),
             rejected: AtomicBool::new(rejected),
-            traces: AtomicUsize::new(0),
+            traces: Mutex::new(HashSet::new()),
             kind,
         });
         self.open.lock().unwrap_or_else(|e| e.into_inner()).insert(id, Arc::downgrade(&cell));
@@ -833,16 +855,18 @@ impl Inner {
         }
     }
 
-    /// Finalize and hand to the writer.
+    /// Hand to the writer, as it is.
+    ///
+    /// All a request or job pays at its end: deciding whether to keep it,
+    /// sorting, summarising and rolling it into the aggregates all happen on
+    /// the writer, after the response has gone. Its duration is fixed here,
+    /// so time spent waiting in the channel is not counted as its own.
     fn finish(&self, mut pending: Pending) {
-        let mut traces = std::mem::take(&mut pending.traces);
-        if let Some(batch) = finalize(&self.config, pending, self.host.clone()) {
-            if !traces.is_empty() {
-                let kept: HashSet<&str> = batch.entries.iter().map(|e| e.id.as_str()).collect();
-                traces.retain(|(id, _)| kept.contains(id.as_str()));
-            }
-            self.send(Closed { batch, traces });
+        if pending.duration_us.is_none() {
+            pending.duration_us =
+                Some(u64::try_from(pending.started.elapsed().as_micros()).unwrap_or(u64::MAX));
         }
+        self.send(Closed { pending })
     }
 
     /// `try_send`; full means dropped and counted.
@@ -863,7 +887,13 @@ impl Inner {
     // --- writing ----------------------------------------------------------
 
     /// Drain the channel into the store, `flush_batch_size` at a time.
-    async fn drain_and_store(&self) {
+    /// Drain the channel into the store, `flush_batch_size` at a time.
+    ///
+    /// Counts of the batches not kept are added up here and written every
+    /// [`COUNTS_EVERY`], with a kept batch when there is one, or when
+    /// `force` (a flush, shutdown) says now — so a busy service writes its
+    /// aggregates a few times a minute, not once per tick.
+    async fn drain_and_store(&self, force: bool) {
         let mut waiting = Vec::new();
         {
             let mut rx = self.rx.lock().await;
@@ -871,22 +901,63 @@ impl Inner {
                 waiting.push(batch);
             }
         }
-        if waiting.is_empty() {
-            return;
-        }
         let _ = self.queued.try_update(Ordering::Relaxed, Ordering::Relaxed, |q| {
             Some(q.saturating_sub(waiting.len()))
         });
         let size = self.config.ingest.flush_batch_size.max(1);
         let span = tracing::info_span!("lookout.write", rainier.lookout.internal = true);
+        let mut kept_any = false;
         while !waiting.is_empty() {
             let rest = waiting.split_off(waiting.len().min(size));
-            let chunk = resolve_code_traces(std::mem::replace(&mut waiting, rest)).await;
-            let result =
-                tracing::Instrument::instrument(self.store.store(chunk), span.clone()).await;
-            if let Err(error) = result {
-                self.log_store_error(&span, &error);
+            let chunk = std::mem::replace(&mut waiting, rest);
+            // On the writer's task, after the requests and jobs have ended.
+            let (kept, counted) = sort_closed(&self.config, &self.host, chunk);
+            {
+                let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+                counts.extend(counted);
+                if counts.len() > COUNTS_COMBINE_AT {
+                    let all = std::mem::take(&mut *counts);
+                    *counts = crate::aggregate::combine(all);
+                }
             }
+            if kept.is_empty() {
+                continue;
+            }
+            kept_any = true;
+            let kept = resolve_code_traces(kept).await;
+            let counted = self.take_counts();
+            self.write(&span, kept, counted).await;
+        }
+        let due = {
+            let last = self.counts_written.lock().unwrap_or_else(|e| e.into_inner());
+            last.elapsed() >= COUNTS_EVERY
+        };
+        if !kept_any && (force || due) {
+            let counted = self.take_counts();
+            if !counted.is_empty() {
+                self.write(&span, Vec::new(), counted).await;
+            }
+        }
+    }
+
+    /// The counts added up since the last write, combined, and the clock reset.
+    fn take_counts(&self) -> Vec<crate::entry::Aggregate> {
+        *self.counts_written.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        let all = std::mem::take(&mut *self.counts.lock().unwrap_or_else(|e| e.into_inner()));
+        crate::aggregate::combine(all)
+    }
+
+    async fn write(
+        &self,
+        span: &tracing::Span,
+        kept: Vec<Batch>,
+        counted: Vec<crate::entry::Aggregate>,
+    ) {
+        let result =
+            tracing::Instrument::instrument(self.store.store_counting(kept, counted), span.clone())
+                .await;
+        if let Err(error) = result {
+            self.log_store_error(span, &error);
         }
     }
 
@@ -905,11 +976,42 @@ impl Inner {
     }
 }
 
-/// A kept batch on its way to the writer, with the stacks of its code traces
-/// still to be symbolised.
+/// A finished request or job on its way to the writer, not yet finalized:
+/// whether it is kept, and its summary, are decided there.
 pub(crate) struct Closed {
+    pending: Pending,
+}
+
+/// A kept batch with the stacks of its code traces still to be symbolised.
+struct Kept {
     batch: Batch,
     traces: Vec<(String, Arc<Backtrace>)>,
+}
+
+/// Finalize what came off the channel: the batches to keep, with their
+/// traces, and the roll-up of the entries of the ones not kept.
+fn sort_closed(
+    config: &LookoutConfig,
+    host: &Option<String>,
+    closed: Vec<Closed>,
+) -> (Vec<Kept>, Vec<crate::entry::Aggregate>) {
+    let mut kept = Vec::new();
+    let mut counted: Vec<Entry> = Vec::new();
+    for Closed { mut pending } in closed {
+        let mut traces = std::mem::take(&mut pending.traces);
+        match finalize(config, pending, host.clone()) {
+            Finalized::Kept(batch) => {
+                let batch = *batch;
+                if !traces.is_empty() {
+                    let ids: HashSet<&str> = batch.entries.iter().map(|e| e.id.as_str()).collect();
+                    traces.retain(|(id, _)| ids.contains(id.as_str()));
+                }
+                kept.push(Kept { batch, traces });
+            }
+            Finalized::Counted(entries) => counted.extend(entries),
+        }
+    }
+    (kept, crate::aggregate::rollup_entries(&counted))
 }
 
 /// Turn each batch's captured stacks into `code.trace` frames.
@@ -918,14 +1020,14 @@ pub(crate) struct Closed {
 /// address in it — costs several times what walking it did, so it happens
 /// here, on the writer's side of the channel and on a blocking thread, rather
 /// than in the request that captured it.
-async fn resolve_code_traces(closed: Vec<Closed>) -> Vec<Batch> {
+async fn resolve_code_traces(closed: Vec<Kept>) -> Vec<Batch> {
     if closed.iter().all(|c| c.traces.is_empty()) {
         return closed.into_iter().map(|c| c.batch).collect();
     }
-    let resolve = |closed: Vec<Closed>| -> Vec<Batch> {
+    let resolve = |closed: Vec<Kept>| -> Vec<Batch> {
         closed
             .into_iter()
-            .map(|Closed { mut batch, traces }| {
+            .map(|Kept { mut batch, traces }| {
                 if traces.is_empty() {
                     return batch;
                 }
@@ -1009,11 +1111,22 @@ fn fill_from_root(pending: &mut Pending, root: &Entry) {
 
 /// Everything that happens when a batch closes, in one pure function: scope,
 /// watchers, slow, N+1, the keep rule. `None` means "not kept".
+/// What became of a finished request or job.
+pub(crate) enum Finalized {
+    /// Kept: stored whole, and rolled into the aggregates. Boxed: one is
+    /// moved per finished batch, and most are the small variant.
+    Kept(Box<Batch>),
+    /// Not kept, but counted: these entries are rolled into the aggregates,
+    /// so a route's numbers cover every request and not only the slow ones.
+    /// Empty for a batch out of scope, which is counted nowhere.
+    Counted(Vec<Entry>),
+}
+
 pub(crate) fn finalize(
     config: &LookoutConfig,
     mut pending: Pending,
     host: Option<String>,
-) -> Option<Batch> {
+) -> Finalized {
     let scope = &config.scope;
     let has_exception = pending.entries.iter().any(|e| e.entry_type == EntryType::Exception);
 
@@ -1060,7 +1173,12 @@ pub(crate) fn finalize(
         // Failures are never lost to scope or sampling: keep them, with the
         // root entry for context, and nothing else.
         if !has_exception {
-            return None;
+            if out_of_scope {
+                return Finalized::Counted(Vec::new());
+            }
+            // Sampled out: whatever it did record is still traffic.
+            pending.entries.retain(|e| config.watcher(e.entry_type).enabled);
+            return Finalized::Counted(pending.entries);
         }
         let root_type = root_entry_type(pending.kind);
         let mut seen_root = false;
@@ -1091,7 +1209,7 @@ pub(crate) fn finalize(
             && !pending.failed_job
             && !pending.entries.iter().any(|e| e.tags.iter().any(|t| t == "slow"))
         {
-            return None;
+            return Finalized::Counted(pending.entries);
         }
         derive_n_plus_one(config, &mut pending.entries);
     }
@@ -1165,7 +1283,11 @@ pub(crate) fn finalize(
             Some(rule) => rule(&batch),
             None => config.local || has_exception || has_slow || pending.failed_job,
         };
-    keep.then_some(batch)
+    if keep {
+        Finalized::Kept(Box::new(batch))
+    } else {
+        Finalized::Counted(batch.entries)
+    }
 }
 
 /// The entry type a batch's root span records as.
@@ -1541,6 +1663,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_requests_are_counted_though_not_kept() {
+        // Production: nothing slow or failed, so the keep rule stores none of
+        // them — but every one is in the counts, or a route's percentiles
+        // would describe only its slow runs.
+        use crate::store::Store as _;
+        let rig = rig(production());
+        for _ in 0..3 {
+            request("/posts/1", 200, || query("SELECT 1"));
+        }
+        rig.lookout.flush().await;
+
+        assert!(rig.store.all().is_empty(), "none kept");
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let count = |rows: Vec<crate::entry::Aggregate>| rows.iter().map(|r| r.count).sum::<u64>();
+        let requests = rig.store.aggregate_rows(EntryType::Request, 60, since).await.unwrap();
+        assert_eq!(count(requests.clone()), 3, "every request counted: {requests:?}");
+        assert!(requests.iter().all(|r| !r.histogram.is_empty()), "and timed");
+        let queries = rig.store.aggregate_rows(EntryType::Query, 60, since).await.unwrap();
+        assert_eq!(count(queries), 3, "and every query in them");
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_requests_are_neither_kept_nor_counted() {
+        use crate::store::Store as _;
+        let config = production().scope(Scope {
+            routes: Patterns { include: vec![], exclude: vec!["posts.*".into()] },
+            ..LookoutConfig::default().scope
+        });
+        let rig = rig(config);
+        request("/posts/1", 200, || query("SELECT 1"));
+        rig.lookout.flush().await;
+
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert!(rig.store.aggregate_rows(EntryType::Request, 60, since).await.unwrap().is_empty());
+        assert!(rig.store.aggregate_rows(EntryType::Query, 60, since).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn slow_overrides_glob_over_the_family_key() {
         let config = production().watch(EntryType::Query, |mut w| {
             w.slow_ms = Some(0);
@@ -1894,6 +2054,14 @@ mod tests {
         ) -> rainier_support::BoxFuture<'_, rainier_support::Result<()>> {
             query("INSERT INTO lookout_batches VALUES (?)");
             self.0.store(batches)
+        }
+        fn store_counting(
+            &self,
+            batches: Vec<Batch>,
+            counted: Vec<crate::entry::Aggregate>,
+        ) -> rainier_support::BoxFuture<'_, rainier_support::Result<()>> {
+            query("INSERT INTO lookout_batches VALUES (?)");
+            self.0.store_counting(batches, counted)
         }
         fn batches(
             &self,

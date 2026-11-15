@@ -296,14 +296,14 @@ impl DatabaseStore {
         Ok(deleted)
     }
 
-    async fn write(&self, batches: Vec<Batch>) -> Result<()> {
+    async fn write(&self, batches: Vec<Batch>, counted: Vec<Aggregate>) -> Result<()> {
         // The last write of an id within one call wins, as it would across calls.
         let mut unique: BTreeMap<String, Batch> = BTreeMap::new();
         for batch in batches {
             unique.insert(keyed(&batch.id), batch);
         }
         if unique.is_empty() {
-            return Ok(());
+            return self.roll_up(aggregate::combine(counted)).await;
         }
         let batches: Vec<Batch> = unique.into_values().collect();
 
@@ -337,7 +337,9 @@ impl DatabaseStore {
         self.insert_all(&tag_rows, TagRow::columns().len()).await?;
         self.insert_all(&entry_rows, EntryRow::columns().len()).await?;
 
-        self.roll_up(&batches).await?;
+        let mut rolled = aggregate::rollup(&batches);
+        rolled.extend(counted);
+        self.roll_up(aggregate::combine(rolled)).await?;
         self.observe_cases(&batches).await
     }
 
@@ -398,8 +400,9 @@ impl DatabaseStore {
         }
     }
 
-    async fn roll_up(&self, batches: &[Batch]) -> Result<()> {
-        let rolled = aggregate::rollup(batches);
+    /// Add `rolled` — one row per (bucket, period, type, key) — to the stored
+    /// aggregates.
+    async fn roll_up(&self, rolled: Vec<Aggregate>) -> Result<()> {
         let rows: Vec<AggregateRow> = rolled.iter().map(AggregateRow::from_aggregate).collect();
         if rows.is_empty() {
             return Ok(());
@@ -690,7 +693,15 @@ impl Store for DatabaseStore {
     }
 
     fn store(&self, batches: Vec<Batch>) -> BoxFuture<'_, Result<()>> {
-        Box::pin(self.write(batches).instrument(internal("store")))
+        Box::pin(self.write(batches, Vec::new()).instrument(internal("store")))
+    }
+
+    fn store_counting(
+        &self,
+        batches: Vec<Batch>,
+        counted: Vec<Aggregate>,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(self.write(batches, counted).instrument(internal("store")))
     }
 
     fn batches(&self, query: BatchQuery) -> BoxFuture<'_, Result<Vec<BatchSummary>>> {

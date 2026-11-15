@@ -1,6 +1,7 @@
 <script setup>
 import { computed } from 'vue'
 import { duration } from '../format.js'
+import Pill from './Pill.vue'
 
 const props = defineProps({
   batch: { type: Object, required: true },
@@ -67,9 +68,20 @@ const total = computed(() => {
   return Math.max(1, props.batch.duration_us || 0, ...ends)
 })
 
+// A derived "slow" entry repeats the span it points at. The span itself
+// carries a pill instead, so a slow query is one row, not two.
+const shown = computed(() => props.batch.entries.filter((e) => e.type !== 'slow'))
+
+const PILLS = [
+  { tag: 'slow', label: 'slow', tone: 'warn' },
+  { tag: 'n_plus_one', label: 'N+1', tone: 'bad' },
+  { tag: 'failed', label: 'failed', tone: 'bad' },
+]
+const pillsFor = (entry) => PILLS.filter((p) => (entry.tags || []).includes(p.tag))
+
 const rows = computed(() =>
-  tree(props.batch.entries).map(([i, depth]) => {
-    const entry = props.batch.entries[i]
+  tree(shown.value).map(([i, depth]) => {
+    const entry = shown.value[i]
     const left = Math.min(99.5, (offset(entry) / total.value) * 100)
     const width = Math.min(100 - left, Math.max(0.4, ((entry.duration_us || 0) / total.value) * 100))
     return { entry, depth, left, width }
@@ -100,6 +112,7 @@ const ticks = computed(() => [0, 1, 2, 3, 4].map((q) => duration(Math.round((tot
         >
           <span class="min-w-0 truncate text-[13px]" :class="INDENT[Math.min(row.depth, 8)]" :title="row.entry.summary">
             <span class="mr-1.5 inline-block w-20 text-[10px] font-bold tracking-wide text-zinc-400 uppercase dark:text-zinc-500">{{ row.entry.type }}</span>
+            <Pill v-for="p in pillsFor(row.entry)" :key="p.tag" :tone="p.tone" class="mr-1.5 align-middle">{{ p.label }}</Pill>
             <span class="font-mono text-zinc-800 dark:text-zinc-200">{{ row.entry.summary }}</span>
           </span>
           <span class="relative col-span-2 row-start-2 h-3 overflow-hidden rounded bg-zinc-100 md:col-span-1 md:row-start-auto dark:bg-zinc-800">

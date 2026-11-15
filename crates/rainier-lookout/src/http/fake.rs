@@ -40,8 +40,17 @@ impl Store for FakeStore {
     }
 
     fn store(&self, batches: Vec<Batch>) -> BoxFuture<'_, Result<()>> {
+        self.store_counting(batches, Vec::new())
+    }
+
+    fn store_counting(
+        &self,
+        batches: Vec<Batch>,
+        counted: Vec<crate::entry::Aggregate>,
+    ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             self.aggregates.lock().unwrap().extend(rollup(&batches));
+            self.aggregates.lock().unwrap().extend(counted);
             self.batches.lock().unwrap().extend(batches);
             Ok(())
         })

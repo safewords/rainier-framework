@@ -201,6 +201,7 @@ fn routes_are_named_under_lookout() {
             "lookout.api.cases",
             "lookout.api.clear",
             "lookout.api.entries",
+            "lookout.api.family",
             "lookout.api.insights",
             "lookout.api.series",
             "lookout.api.status",
@@ -583,6 +584,33 @@ async fn draws_a_zero_filled_series_with_a_forecast_and_per_key_series() {
     let body = answer.json();
     for field in ["type", "since", "keys"] {
         assert!(body["errors"][field].is_array(), "{field}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_family_id_resolves_to_its_key_and_aggregates_carry_it() {
+    use crate::entry::family_id;
+    let router = app(sample());
+
+    let id = family_id(EntryType::Query, "select * from posts");
+    let body = get(&router, &format!("/_lookout/api/families/query/{id}")).await.json();
+    assert_eq!(body["data"]["key"], "select * from posts", "{body}");
+    assert_eq!(body["data"]["id"], id.as_str());
+
+    // An exception's family, too: from the aggregates or the entries.
+    let id = family_id(EntryType::Exception, "Boom@app");
+    let body = get(&router, &format!("/_lookout/api/families/exception/{id}")).await.json();
+    assert_eq!(body["data"]["key"], "Boom@app", "{body}");
+
+    // The same SQL under another type is another family.
+    let other = family_id(EntryType::Cache, "select * from posts");
+    let answer = get(&router, &format!("/_lookout/api/families/cache/{other}")).await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+
+    let rows = get(&router, "/_lookout/api/aggregates/query").await.json();
+    for row in rows["data"].as_array().unwrap() {
+        let key = row["key"].as_str().unwrap();
+        assert_eq!(row["family_id"], family_id(EntryType::Query, key).as_str(), "{row}");
     }
 }
 

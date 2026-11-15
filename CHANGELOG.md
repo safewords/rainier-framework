@@ -28,6 +28,14 @@ the release as a whole and names the crate it landed in.
   `/api/series/{type}` carries `p50_us`, `p90_us`, `p95_us` and `p99_us` from
   its bucket's histogram (across every key in it), and the Requests and Jobs
   time charts draw p90, p95 and p99 beside the average.
+- **Short, stable ids for every family** (`rainier-lookout`): `family_id`,
+  sixteen hex digits, on aggregate rows and in the dashboard's URLs
+  (`/issues/query/107acb4d18704a6e` rather than the SQL), and
+  `GET /api/families/{type}/{id}` to turn one back into its key. Links of the
+  earlier `?key=` form still open.
+- **`Store::store_counting`** (`rainier-lookout`): stores the kept batches
+  and adds the aggregates of the ones only counted. The built-in stores
+  implement it; the default, for a store of your own, drops the counted ones.
 - **`with_lookout_viewers_where_async`** (`rainier-framework`): a Lookout
   viewer predicate that can await — for an application whose administrators
   are a group in a table rather than a claim on the request.
@@ -630,6 +638,26 @@ the release as a whole and names the crate it landed in.
   at its old paths, and its `bcrypt` feature forwards.
 
 ### Fixed
+
+- **Lookout's aggregates count every request and job, not only the kept
+  ones** (`rainier-lookout`). They were rolled up from stored batches, and in
+  production the keep rule stores only slow, failed and monitored ones — so
+  a route's count was a fraction of its traffic and its p50 to p99 read as if
+  every request were slow. Every batch in scope is now counted; only the
+  kept ones are stored.
+- **Lookout does nothing on a request's or job's behalf after it ends**
+  (`rainier-lookout`). The batch was finalized — the keep rule, slow and N+1
+  detection, sorting, summaries — as its root span closed, which for a span
+  the Lookout middleware opened is before the response is written. Now the
+  raw batch is handed to the writer and all of that happens there: about
+  17 µs a request on its own thread, from 20 µs, and a request with slow
+  queries no longer pays for the slow detection.
+- **One code trace per query shape** (`rainier-lookout`): twenty slow runs
+  of the same query walk the stack once, not up to sixteen times — 73 µs
+  for twenty slow queries of five shapes, from 209 µs.
+- **The waterfall shows a slow span once** (`rainier-lookout`), with a
+  `slow` pill on its own row (and `N+1` or `failed` where it applies),
+  instead of a second row for the derived slow entry.
 
 - **A WebSocket client that left without closing is now noticed, and leaving
   is no longer reported as a failure** (`rainier-server`, `rainier-websocket`).

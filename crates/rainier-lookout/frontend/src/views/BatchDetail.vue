@@ -11,7 +11,7 @@ import StackTrace from '../components/StackTrace.vue'
 import TimeAgo from '../components/TimeAgo.vue'
 import Waterfall from '../components/Waterfall.vue'
 import { api } from '../api.js'
-import { absolute, caseId, duration, hasTag } from '../format.js'
+import { absolute, caseId, duration, hasTag, issueRoute } from '../format.js'
 
 const props = defineProps({ id: { type: String, required: true } })
 
@@ -206,7 +206,7 @@ onMounted(async () => {
               <Pill v-if="failure.kind" tone="bad">{{ failure.kind }}</Pill>
               <span class="flex-1" />
               <RouterLink
-                :to="{ name: 'issue', params: { type: 'exception' }, query: { key: failure.key } }"
+                :to="issueRoute('exception', failure.key)"
                 class="text-sm text-indigo-600 hover:underline dark:text-indigo-400"
               >Issue →</RouterLink>
               <RouterLink
@@ -229,7 +229,7 @@ onMounted(async () => {
           </div>
           <div v-if="entry.family_hash && entry.type !== 'exception'">
             <RouterLink
-              :to="{ name: 'issue', params: { type: entry.type }, query: { key: entry.family_hash } }"
+              :to="issueRoute(entry.type, entry.family_hash)"
               class="text-sm text-indigo-600 hover:underline dark:text-indigo-400"
             >Every {{ entry.type }} like this →</RouterLink>
           </div>

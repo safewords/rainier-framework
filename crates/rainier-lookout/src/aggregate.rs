@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeZone, Utc};
 
-use crate::entry::{Aggregate, Batch, EntryType};
+use crate::entry::{Aggregate, Batch, Entry, EntryType};
 
 /// (bucket start, period, type, key).
 type BucketKey = (DateTime<Utc>, u32, EntryType, String);
@@ -113,9 +113,15 @@ pub fn bucket_start(at: DateTime<Utc>, period_s: u32) -> DateTime<Utc> {
 /// falling back to its summary. Exceptions are counted even without a
 /// duration.
 pub fn rollup(batches: &[Batch]) -> Vec<Aggregate> {
+    rollup_entries(batches.iter().flat_map(|b| &b.entries))
+}
+
+/// Roll entries into aggregates, as [`rollup`] does for whole batches — for
+/// the entries of a batch that was counted but not kept.
+pub fn rollup_entries<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> Vec<Aggregate> {
     let mut acc: BTreeMap<BucketKey, Totals> = BTreeMap::new();
-    for batch in batches {
-        for entry in &batch.entries {
+    {
+        for entry in entries {
             if !AGGREGATED.contains(&entry.entry_type) {
                 continue;
             }
@@ -148,6 +154,25 @@ pub fn rollup(batches: &[Batch]) -> Vec<Aggregate> {
             Aggregate { bucket_start, period_s, entry_type, key, count, sum_us, max_us, histogram }
         })
         .collect()
+}
+
+/// `rows` with each (bucket, period, type, key) appearing once, merged.
+///
+/// What a store writes when aggregates arrive from two sources at once — the
+/// batches it keeps and the batches only counted — so no statement names a
+/// row twice.
+pub fn combine(rows: Vec<Aggregate>) -> Vec<Aggregate> {
+    let mut out: BTreeMap<BucketKey, Aggregate> = BTreeMap::new();
+    for row in rows {
+        let key = (row.bucket_start, row.period_s, row.entry_type, row.key.clone());
+        match out.get_mut(&key) {
+            Some(existing) => merge(existing, &row),
+            None => {
+                out.insert(key, row);
+            }
+        }
+    }
+    out.into_values().collect()
 }
 
 /// Merge `incoming` into `existing`, as a store does when a bucket already

@@ -144,9 +144,18 @@ export function totals(points) {
   return { count: n, sum_us: sum, max_us: max, average_us: n ? Math.floor(sum / n) : 0 }
 }
 
-/** The drill-down page for one family of one type. */
+/**
+ * A family's short, stable id — the server's `family_id`: FNV-1a over the
+ * type, a newline and the key. What a URL carries instead of the key, which
+ * for a query is its SQL.
+ */
+export function familyId(type, key) {
+  return caseId(`${type}\n${key ?? ''}`)
+}
+
+/** The drill-down page for one family of one type, by id. */
 export function issueRoute(type, key) {
-  return { name: 'issue', params: { type }, query: { key } }
+  return { name: 'issue', params: { type, id: familyId(type, key) } }
 }
 
 /** An entry's family key: its fingerprint, or its summary when it has none. */

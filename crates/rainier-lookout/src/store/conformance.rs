@@ -315,6 +315,7 @@ pub async fn run(store: &dyn Store) {
     exceptions_become_cases_that_can_be_closed(store).await;
     aggregates_roll_up_and_order(store).await;
     aggregates_merge_across_writes_into_one_bucket(store).await;
+    counted_aggregates_add_without_storing_batches(store).await;
     prune_cuts_batches_and_aggregates_independently(store).await;
     clear_removes_everything(store).await;
 }
@@ -801,6 +802,36 @@ pub async fn aggregates_merge_across_writes_into_one_bucket(store: &dyn Store) {
         vec![(4, 1_150, 700)],
         "[{name}] the ten-minute bucket holds all four"
     );
+}
+
+/// `store_counting` adds the counted aggregates — with no batch to store, and
+/// alongside batches that are — and stores none of the counted batches.
+pub async fn counted_aggregates_add_without_storing_batches(store: &dyn Store) {
+    let name = store.name();
+    seed(store, Vec::new()).await;
+    let request =
+        |id: &str, s, us| entry(id, 0, EntryType::Request, "posts.index", at(s, 0), Some(us));
+
+    let counted = crate::aggregate::rollup_entries(&[request("c1", 5, 200)]);
+    store.store_counting(Vec::new(), counted).await.expect("count only");
+    assert!(ids(store, BatchQuery::default()).await.is_empty(), "[{name}] counted, not stored");
+
+    let mut kept = batch("k1", BatchKind::Request, at(15, 0));
+    kept.entries = vec![request("k1", 15, 400)];
+    let counted = crate::aggregate::rollup_entries(&[request("c2", 25, 600)]);
+    store.store_counting(vec![kept], counted).await.expect("store and count");
+    assert_eq!(ids(store, BatchQuery::default()).await, vec!["k1"], "[{name}] only the kept one");
+
+    let minute = store
+        .aggregates(agg_query(EntryType::Request, 60, at(0, 0), AggregateOrder::Count, 10))
+        .await
+        .expect("aggregates");
+    assert_eq!(
+        minute.iter().map(|a| (a.count, a.sum_us, a.max_us)).collect::<Vec<_>>(),
+        vec![(3, 1_200, 600)],
+        "[{name}] kept and counted together"
+    );
+    assert_eq!(minute[0].histogram.values().sum::<u64>(), 3, "[{name}] all three timed");
 }
 
 /// Prune removes old batches (their entries and tags too) and old aggregate

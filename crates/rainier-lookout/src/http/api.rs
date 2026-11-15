@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use crate::aggregate::{self, AGGREGATED};
 use crate::cases::{self, CaseAction, CaseSeverity};
 use crate::config::StoreKind;
-use crate::entry::{Aggregate, Entry, EntryType};
+use crate::entry::{family_id, Aggregate, Entry, EntryType};
 use crate::trends;
 
 fn page<T: serde::Serialize>(
@@ -112,11 +112,42 @@ fn aggregate_json(row: &Aggregate) -> Value {
     if let Value::Object(map) = &mut value {
         let average = row.sum_us.checked_div(row.count).unwrap_or(0);
         map.insert("average_us".into(), json!(average));
+        map.insert("family_id".into(), json!(family_id(row.entry_type, &row.key)));
         for (name, p) in [("p50_us", 50.0), ("p90_us", 90.0), ("p95_us", 95.0), ("p99_us", 99.0)] {
             map.insert(name.into(), json!(aggregate::percentile(&row.histogram, p, row.max_us)));
         }
     }
     value
+}
+
+/// `GET /api/families/{type}/{id}`: the key a [`family_id`] names.
+///
+/// From the aggregates of the retention window first — every family with a
+/// duration is in them — then from the newest entries of the type, for the
+/// derived ones (`slow`, `n_plus_one`) that are not aggregated.
+pub(crate) async fn family(state: Arc<Shared>, request: Req) -> Result<Response> {
+    let mut params = Params::new(request.query());
+    let entry_type = params.parse_type("type", request.route_param("type").unwrap_or_default());
+    params.finish()?;
+    let Some(entry_type) = entry_type else {
+        return Err(Error::internal("validated entry type missing"));
+    };
+    let id = request.route_param("id").unwrap_or_default().to_ascii_lowercase();
+    let found = |key: &str| Response::json(&json!({ "data": { "id": id, "key": key } }));
+
+    if AGGREGATED.contains(&entry_type) {
+        let days = i64::try_from(state.config.retention.aggregates_days).unwrap_or(i64::MAX);
+        let since = Utc::now() - chrono::Duration::days(days.min(3650));
+        let rows = state.store.aggregate_rows(entry_type, 3600, since).await?;
+        if let Some(row) = rows.iter().find(|r| family_id(entry_type, &r.key) == id) {
+            return Ok(found(&row.key));
+        }
+    }
+    let recent = state.store.entries(entry_type, None, 1000).await?;
+    if let Some(entry) = recent.iter().find(|e| family_id(entry_type, e.family_key()) == id) {
+        return Ok(found(entry.family_key()));
+    }
+    Err(Error::not_found("No such family."))
 }
 
 /// `GET /api/aggregates/{type}`.

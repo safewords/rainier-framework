@@ -237,6 +237,7 @@ pub fn routes(
             .get("/api/aggregates/{type}", guarded(&state, api::aggregates))
             .name("api.aggregates");
         router.get("/api/series/{type}", guarded(&state, api::series)).name("api.series");
+        router.get("/api/families/{type}/{id}", guarded(&state, api::family)).name("api.family");
         router.get("/api/insights", guarded(&state, api::insights)).name("api.insights");
         router.get("/api/cases", guarded(&state, api::cases)).name("api.cases");
         router.get("/api/cases/{id}", guarded(&state, api::case)).name("api.case");

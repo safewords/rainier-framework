@@ -163,6 +163,25 @@ impl Entry {
     }
 }
 
+/// A short, stable id for one family of one type — sixteen hex digits.
+///
+/// What the dashboard puts in a URL instead of the key itself, which for a
+/// query is its SQL. FNV-1a over `type`, a newline and `key`: the same
+/// function the dashboard's script computes, so either side can make one, and
+/// the same everywhere for the same family, across pods and restarts.
+///
+/// ```
+/// use rainier_lookout::entry::{family_id, EntryType};
+///
+/// let id = family_id(EntryType::Query, "SELECT 1");
+/// assert_eq!(id.len(), 16);
+/// assert_eq!(id, family_id(EntryType::Query, "SELECT 1"));
+/// assert_ne!(id, family_id(EntryType::Slow, "SELECT 1"));
+/// ```
+pub fn family_id(entry_type: EntryType, key: &str) -> String {
+    crate::cases::case_id(&format!("{}\n{key}", entry_type.as_str()))
+}
+
 /// What started a batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
