@@ -20,6 +20,8 @@ export const config = {
   // The server's insight thresholds (LOOKOUT_INSIGHTS_*); a viewer may
   // override each one per request.
   insights: insights(raw.insights),
+  // Whether "Live" may stream (LOOKOUT_STREAM); otherwise it polls.
+  stream: raw.stream !== false,
 }
 
 function insights(value) {

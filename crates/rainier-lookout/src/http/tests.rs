@@ -205,6 +205,7 @@ fn routes_are_named_under_lookout() {
             "lookout.api.insights",
             "lookout.api.series",
             "lookout.api.status",
+            "lookout.api.stream",
             "lookout.app",
             "lookout.assets.css",
             "lookout.assets.js",
@@ -616,6 +617,53 @@ async fn a_family_id_resolves_to_its_key_and_aggregates_carry_it() {
         let key = row["key"].as_str().unwrap();
         assert_eq!(row["family_id"], family_id(EntryType::Query, key).as_str(), "{row}");
     }
+}
+
+#[tokio::test]
+async fn the_stream_sends_a_batch_stored_after_the_viewer_connected() {
+    use futures_util::StreamExt as _;
+    use rainier_http::Body;
+
+    let store = sample();
+    let router = app(Arc::clone(&store));
+    let mut response = router
+        .dispatch(Request::builder().method(Method::GET).uri("/_lookout/api/stream").build())
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.header("content-type"), Some("text/event-stream"));
+    let Body::Stream(mut frames) = response.take_body() else { panic!("not a stream") };
+    async fn next<S, E>(frames: &mut S) -> String
+    where
+        S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+        E: std::fmt::Debug,
+    {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), frames.next())
+            .await
+            .expect("a frame within five seconds")
+            .expect("the stream is open")
+            .expect("not an error");
+        String::from_utf8_lossy(&frame).into_owned()
+    }
+
+    assert!(next(&mut frames).await.starts_with("retry:"), "it opens with a retry interval");
+    // The first read learns what is already stored, so this one is new.
+    tokio::time::sleep(stream::TAIL_EVERY + std::time::Duration::from_millis(200)).await;
+    let fresh = request("b3", "posts.store", 201, 20, Vec::new());
+    crate::store::Store::store(&*store, vec![fresh]).await.unwrap();
+
+    let frame = next(&mut frames).await;
+    assert!(frame.starts_with("event: batch\ndata: "), "{frame}");
+    assert!(frame.contains("\"id\":\"b3\""), "the new batch, and only it: {frame}");
+}
+
+#[tokio::test]
+async fn the_stream_is_a_404_when_streaming_is_off() {
+    let mut config = LookoutConfig::default().enabled(true);
+    config.dashboard.stream = false;
+    let mut router = Router::new();
+    router.merge(routes(sample(), Arc::new(config), LookoutGate::allow_all(), "production"));
+    let router = router.compile(&Container::new()).unwrap();
+    assert_eq!(get(&router, "/_lookout/api/stream").await.status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

@@ -84,6 +84,7 @@ fn render(state: &Shared) -> String {
         "store": state.store.name(),
         "version": version(),
         "insights": state.config.insights,
+        "stream": state.config.dashboard.stream,
     });
     let assets = attribute(&format!("{}/assets", state.base));
     let version = version();

@@ -330,6 +330,12 @@ pub struct Dashboard {
     pub ability: String,
     /// Whether the local environment skips the check.
     pub open_locally: bool,
+    /// Whether "Live" streams new batches to the browser as they are stored
+    /// (server-sent events at `{path}/api/stream`), rather than the page
+    /// re-asking every few seconds. On by default; `LOOKOUT_STREAM=false`
+    /// falls back to polling, for a proxy that buffers responses.
+    #[serde(default = "yes")]
+    pub stream: bool,
 }
 
 impl Default for Dashboard {
@@ -340,6 +346,7 @@ impl Default for Dashboard {
             guard: None,
             ability: "viewLookout".to_string(),
             open_locally: true,
+            stream: true,
         }
     }
 }
@@ -600,6 +607,7 @@ impl LookoutConfig {
     /// | `LOOKOUT_CAPTURE_REQUEST_HEADERS`, `…_REQUEST_BODY`, `…_RESPONSE_BODY`, `…_REQUEST_BODY_ON_EXCEPTION`, `…_CACHE_KEYS`, `…_MAIL`, `…_USER_ID`, `…_CLIENT_ERRORS`, `…_CODE_TRACES` | [`Capture`] | booleans |
     /// | `LOOKOUT_CAPTURE_MAX_BODY_BYTES` | [`Capture::max_body_bytes`] | a positive integer |
     /// | `LOOKOUT_MASK_SECRETS` | [`Redaction::mask_secrets`] | a boolean |
+    /// | `LOOKOUT_STREAM` | [`Dashboard::stream`] | a boolean |
     /// | `LOOKOUT_INSIGHTS_ENABLED` | [`InsightsConfig::enabled`](crate::trends::InsightsConfig) | a boolean |
     /// | `LOOKOUT_INSIGHTS_WINDOW_MINUTES` | the window compared with the one before | a positive integer |
     /// | `LOOKOUT_INSIGHTS_MIN_COUNT` | how many a key needs before it is reported | a positive integer |
@@ -694,11 +702,12 @@ impl LookoutConfig {
                 parse_positive("LOOKOUT_AGGREGATE_RETENTION_DAYS", &v)?;
         }
 
-        let flags: [(&str, &mut bool); 10] = [
+        let flags: [(&str, &mut bool); 11] = [
             ("LOOKOUT_CAPTURE_REQUEST_HEADERS", &mut config.capture.request_headers),
             ("LOOKOUT_CAPTURE_REQUEST_BODY", &mut config.capture.request_body),
             ("LOOKOUT_CAPTURE_RESPONSE_BODY", &mut config.capture.response_body),
             ("LOOKOUT_MASK_SECRETS", &mut config.redaction.mask_secrets),
+            ("LOOKOUT_STREAM", &mut config.dashboard.stream),
             (
                 "LOOKOUT_CAPTURE_REQUEST_BODY_ON_EXCEPTION",
                 &mut config.capture.request_body_on_exception,

@@ -73,6 +73,7 @@ use crate::store::Store;
 mod api;
 mod params;
 mod shell;
+pub(crate) mod stream;
 
 #[cfg(test)]
 pub(crate) mod fake;
@@ -181,6 +182,8 @@ pub(crate) struct Shared {
     /// The dashboard path, normalised: `/_lookout`, or `""` when mounted at
     /// the root.
     pub(crate) base: String,
+    /// The one tail of the store "Live" viewers share.
+    pub(crate) tail: Arc<stream::Tail>,
 }
 
 /// Declare the dashboard and its API on a new [`Router`], under
@@ -221,6 +224,7 @@ pub fn routes(
         gate,
         environment: environment.to_string(),
         base: base.clone(),
+        tail: stream::Tail::new(),
     });
 
     let group = GroupAttributes::new().prefix(base).name("lookout.");
@@ -243,6 +247,7 @@ pub fn routes(
         router.get("/api/cases/{id}", guarded(&state, api::case)).name("api.case");
         router.post("/api/cases/{id}", guarded(&state, api::act_on_case)).name("api.case.act");
         router.get("/api/status", guarded(&state, api::status)).name("api.status");
+        router.get("/api/stream", guarded(&state, stream::stream)).name("api.stream");
 
         // Declared last, so every route above wins: the app's own client
         // routes (`/batches/abc`) get the shell on a reload or a shared link.

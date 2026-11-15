@@ -4,13 +4,15 @@ import { useRoute, useRouter } from 'vue-router'
 
 import { api } from './api.js'
 import { config } from './config.js'
-import { createLive } from './live.js'
+import { createLive, createStream } from './live.js'
 
 const live = createLive()
+const stream = createStream(live)
 const now = ref(Date.now())
 const ticker = setInterval(() => (now.value = Date.now()), 10_000)
 onBeforeUnmount(() => clearInterval(ticker))
 provide('live', live)
+provide('stream', stream)
 provide('now', now)
 
 // Bumped after a clear, so the current view remounts and reloads.
@@ -197,7 +199,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
         class="hidden text-xs sm:inline"
         :class="notice.tone === 'ok' ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'"
       >{{ notice.text }}</span>
-      <button type="button" class="lk-btn" :aria-pressed="live" @click="live = !live">
+      <button
+        type="button"
+        class="lk-btn"
+        :aria-pressed="live"
+        :title="live ? (stream.connected.value ? 'Live: new batches stream in as they are stored' : 'Live: refreshing every few seconds') : 'Show new batches as they arrive'"
+        @click="live = !live"
+      >
         <span class="size-2 rounded-full" :class="live ? 'animate-pulse bg-emerald-500' : 'bg-zinc-400 dark:bg-zinc-600'" />
         Live
       </button>

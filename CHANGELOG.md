@@ -24,6 +24,14 @@ the release as a whole and names the crate it landed in.
   same figures per route or job class in the table, and the latest batches
   below. They replace the separate "Jobs (timing)" page and the Requests and
   Jobs batch tabs in the navigation; the filtered batch list is a link away.
+- **Lookout streams "Live"** (`rainier-lookout`): with the switch on, new
+  batches arrive as server-sent events from `/api/stream` about a second after
+  they are stored — on any replica, since one task per process tails the
+  store for every viewer and runs only while someone watches — and pages update
+  on them instead of re-asking every few seconds. The switch is remembered per
+  browser, so a viewer who left it on is subscribed again on their next visit.
+  `LOOKOUT_STREAM=false` falls back to polling, as does a browser whose stream
+  cannot connect.
 - **`docs/_sidebar.json`**: the website's table of contents, kept with the
   docs it orders, and a test (`docs_sidebar.rs`) that every page is in it
   once and every entry is a page. rainierframework.io builds its docs from
