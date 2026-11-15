@@ -133,6 +133,24 @@ impl SessionStore for DatabaseSessionStore {
         })
     }
 
+    /// One `UPDATE … WHERE id = ?`: a row deleted by a logout matches
+    /// nothing, so it cannot come back.
+    fn touch<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let now = Utc::now();
+            self.rows
+                .update_matching(
+                    Criteria::new().where_eq("id", id).where_gt("expires_at", now),
+                    vec![
+                        ("expires_at".into(), (now + self.lifetime).into()),
+                        ("updated_at".into(), now.into()),
+                    ],
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
     fn gc(&self) -> BoxFuture<'_, Result<u64>> {
         Box::pin(async move { self.prune().await })
     }

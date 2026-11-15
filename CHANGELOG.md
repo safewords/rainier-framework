@@ -700,6 +700,16 @@ the release as a whole and names the crate it landed in.
 
 ### Fixed
 
+- **A session that was only read is no longer written back** (`rainier-session`):
+  `StartSession` wrote every non-empty session back at the end of every
+  request, so a background request that read the session before a logout and
+  finished after it restored the session, and the visitor was signed in
+  again. Found by an end-to-end test of signing out while the page polled.
+  Unchanged sessions are now touched instead — the new
+  `SessionStore::touch` extends a stored session's expiry and never creates
+  one. The database and memory stores do it in place; the cache store and
+  any custom store read and rewrite only a session that is still there.
+
 - **A client hanging up an HTTP connection is no longer reported**
   (`rainier-server`). The accept loop reported every `serve_connection`
   error, and the ordinary ones — a request that ended before its body did,

@@ -101,6 +101,15 @@ impl Session {
         self.lock().dirty
     }
 
+    /// Whether the end of this request changes what is stored: something was
+    /// written, or flash data ages out or carries into the next request.
+    /// A session that only had its values read does not, and the middleware
+    /// then only [`touch`](crate::SessionStore::touch)es it.
+    pub fn needs_write(&self) -> bool {
+        let state = self.lock();
+        state.dirty || !state.flash_old.is_empty() || !state.flash_new.is_empty()
+    }
+
     // --- reading -----------------------------------------------------------
 
     /// A value, deserialised.

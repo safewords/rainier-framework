@@ -30,6 +30,29 @@ pub trait SessionStore: Send + Sync + 'static {
     /// Remove a session.
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>>;
 
+    /// Refresh the expiry of a session that is **still stored**, without
+    /// writing its data — what a request that only read its session does
+    /// at the end.
+    ///
+    /// Never creates one. A request that loaded the session before another
+    /// request logged it out must not write it back: that is how a logout
+    /// was undone by the page's own background polling, the poll finishing
+    /// after the logout and restoring the session it had read. A missing
+    /// session stays missing.
+    ///
+    /// The default reads and rewrites the session if it is there, which
+    /// leaves that race open only between the two calls. A store that can
+    /// extend an expiry in place (a database row, a map under a lock)
+    /// overrides it to close it.
+    fn touch<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if let Some(data) = self.read(id).await? {
+                self.write(id, &data).await?;
+            }
+            Ok(())
+        })
+    }
+
     /// Discard every expired session. Called periodically, not per request.
     fn gc(&self) -> BoxFuture<'_, Result<u64>> {
         Box::pin(async { Ok(0) })
@@ -146,6 +169,17 @@ impl SessionStore for MemorySessionStore {
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.entries.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+            Ok(())
+        })
+    }
+
+    fn touch<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let now = Utc::now();
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = entries.get_mut(id).filter(|entry| entry.expires_at > now) {
+                entry.expires_at = now + self.lifetime;
+            }
             Ok(())
         })
     }

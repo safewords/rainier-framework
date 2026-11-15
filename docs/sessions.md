@@ -200,6 +200,24 @@ fills with nothing.
 The consequence: a response only carries `Set-Cookie` once something has
 actually been written.
 
+### A session that was only read is not written back
+
+At the end of a request the session is written back only if something changed
+it: a value put, forgotten or flashed, a regenerated id, or flash data ageing
+out. A session that was only read is **touched** instead — its expiry is
+extended where it is stored, and its cookie renewed — and a touch never brings
+back a session that is no longer stored.
+
+That is what keeps a logout logged out. A signed-in page polls in the
+background; a poll that read the session just before the logout and finishes
+just after it used to write the whole session back, and the visitor was signed
+in again. Now the poll's touch finds nothing to extend.
+
+Keep the race in mind for a request that *does* write: one that changed the
+session and finishes after a logout still writes it back, as it always did.
+Logging out deletes the session; anything that writes to it should not run
+concurrently with that.
+
 ### A failing store does not fail the request
 
 If the store is unreachable, a visitor gets a fresh session and the page
@@ -319,6 +337,8 @@ pub trait SessionStore: Send + Sync + 'static {
     fn write(&self, id: &str, data: &SessionData) -> …<Result<()>>;
     fn destroy(&self, id: &str) -> …<Result<()>>;
     fn gc(&self) -> …<Result<u64>> { … }
+    // Extend a stored session's expiry; never create one.
+    fn touch(&self, id: &str) -> …<Result<()>> { … }
 
     // For a store that owns the cookie value rather than just an id.
     fn is_client_side(&self) -> bool { false }
@@ -327,7 +347,10 @@ pub trait SessionStore: Send + Sync + 'static {
 }
 ```
 
-The four required methods are the server-side shape. `encode`/`decode` exist so a
+The four required methods are the server-side shape. `touch` defaults to
+reading the session and writing it back if it is there; override it when your
+store can extend an expiry in place (`UPDATE … WHERE id = ?`, an `EXPIRE`),
+which closes the window between the two calls. `encode`/`decode` exist so a
 store can instead put the **whole session in the cookie** without the middleware
 needing to know which kind it has — which is how the cookie driver works, and how
 yours could.

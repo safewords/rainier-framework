@@ -237,6 +237,24 @@ impl Middleware for StartSession {
             return response;
         }
 
+        // Read and not changed: extend the stored session's life, and nothing
+        // more. Writing it back would restore it if another request had
+        // logged it out meanwhile — the page's background polling, finishing
+        // after the logout, undoing it. A client-side store has nothing
+        // stored to extend; its cookie is the session and is re-sent below.
+        if !session.needs_write() && !self.store.is_client_side() {
+            let id = session.id();
+            if let Err(e) = self.store.touch(&id).await {
+                tracing::error!(error = %e, "could not refresh the session's expiry");
+                report(SessionFailed::new(e, "touch")).await;
+                return response;
+            }
+            return match self.store.encode(&id, &SessionData::default()) {
+                Ok(value) => response.with_cookie(&self.cookie(&value)),
+                Err(_) => response,
+            };
+        }
+
         match self.save(&session).await {
             Ok(value) => response.with_cookie(&self.cookie(&value)),
             Err(e) => {
@@ -426,6 +444,87 @@ mod tests {
         assert_ne!(after, before);
         assert!(store.read(&before).await.unwrap().is_none(), "the old row must not linger");
         assert_eq!(store.read(&after).await.unwrap().unwrap().values["user_id"], 7);
+    }
+
+    #[tokio::test]
+    async fn a_request_that_only_read_the_session_cannot_undo_a_logout() {
+        // The page polls in the background while signed in. A poll that read
+        // the session before the logout and finishes after it used to write
+        // the session back whole, and the visitor was signed in again.
+        let (start, store) = middleware();
+        let first = run(&start, Request::builder().build(), |request| {
+            Box::pin(async move {
+                request.session().unwrap().put("user_id", 7u64).unwrap();
+                Response::text("ok")
+            })
+        })
+        .await;
+        let id = session_cookie(&first).unwrap();
+        let cookie = format!("rainier_session={id}");
+
+        let (read, logout_may_run) = tokio::sync::oneshot::channel::<()>();
+        let (logged_out, poll_may_finish) = tokio::sync::oneshot::channel::<()>();
+        let read = Mutex::new(Some(read));
+        let poll_may_finish = Arc::new(tokio::sync::Mutex::new(Some(poll_may_finish)));
+        let poll = {
+            let start = Arc::clone(&start);
+            let cookie = cookie.clone();
+            tokio::spawn(async move {
+                run(&start, Request::builder().header("cookie", &cookie).build(), move |request| {
+                    let user = request.session().unwrap().get::<u64>("user_id");
+                    let read = read.lock().unwrap().take();
+                    let wait = Arc::clone(&poll_may_finish);
+                    Box::pin(async move {
+                        assert_eq!(user, Some(7), "the poll saw the signed-in session");
+                        if let Some(read) = read {
+                            let _ = read.send(());
+                        }
+                        if let Some(wait) = wait.lock().await.take() {
+                            let _ = wait.await;
+                        }
+                        Response::text("ok")
+                    })
+                })
+                .await
+            })
+        };
+
+        logout_may_run.await.unwrap();
+        run(&start, Request::builder().header("cookie", &cookie).build(), |request| {
+            request.session().unwrap().invalidate();
+            Box::pin(async { Response::text("bye") })
+        })
+        .await;
+        logged_out.send(()).unwrap();
+        poll.await.unwrap();
+
+        assert!(store.read(&id).await.unwrap().is_none(), "the logged-out session stays gone");
+    }
+
+    #[tokio::test]
+    async fn a_session_that_was_only_read_has_its_expiry_extended() {
+        let (start, store) = middleware();
+        let first = run(&start, Request::builder().build(), |request| {
+            Box::pin(async move {
+                request.session().unwrap().put("user_id", 7u64).unwrap();
+                Response::text("ok")
+            })
+        })
+        .await;
+        let id = session_cookie(&first).unwrap();
+
+        let second = run(
+            &start,
+            Request::builder().header("cookie", &format!("rainier_session={id}")).build(),
+            |request| {
+                let _ = request.session().unwrap().get::<u64>("user_id");
+                Box::pin(async { Response::text("ok") })
+            },
+        )
+        .await;
+
+        assert_eq!(session_cookie(&second).as_deref(), Some(id.as_str()), "the cookie is renewed");
+        assert_eq!(store.read(&id).await.unwrap().unwrap().values["user_id"], 7, "the data stays");
     }
 
     #[tokio::test]
