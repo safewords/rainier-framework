@@ -12,11 +12,36 @@ use rainier_routing::Req;
 use super::Shared;
 use crate::rum::{self, ReplayUpload, Report, MAX_CALLS, MAX_REPORT_BYTES};
 
+/// A short fingerprint of `text`, for an ETag or a `?v=`.
+fn fingerprint(text: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// `GET {path}/rum.js`.
-pub(crate) async fn script(state: Arc<Shared>, _request: Req) -> Response {
-    Response::text(rum::script(&state.config.rum))
-        .with_content_type("application/javascript; charset=utf-8")
-        .with_header("cache-control", "public, max-age=3600")
+///
+/// Checked on every page load rather than cached for a time: a CDN in front
+/// may stretch a lifetime it is given — Cloudflare turned this script's hour
+/// into eight days — and a fix to the script must reach browsers on their
+/// next page. `private, no-cache` keeps it out of shared caches and makes the
+/// browser ask; the ETag makes the answer a `304` with no body while the
+/// script is unchanged.
+pub(crate) async fn script(state: Arc<Shared>, request: Req) -> Response {
+    let body = rum::script(&state.config.rum);
+    let etag = format!("\"{}\"", fingerprint(&body));
+    let fresh = request
+        .header("if-none-match")
+        .is_some_and(|tags| tags.split(',').any(|t| t.trim().trim_start_matches("W/") == etag));
+    let response = if fresh {
+        Response::new(StatusCode::NOT_MODIFIED)
+    } else {
+        Response::text(body).with_content_type("application/javascript; charset=utf-8")
+    };
+    response
+        .with_header("etag", &etag)
+        .with_header("cache-control", "private, no-cache")
         // Loaded by the frontend's pages, which are another origin.
         .with_header("cross-origin-resource-policy", "cross-origin")
         .with_header("x-content-type-options", "nosniff")
@@ -61,10 +86,13 @@ pub(crate) async fn ingest(state: Arc<Shared>, request: Req) -> Response {
 
 /// `GET {path}/rum-replay.js`: the session-replay recorder, loaded by the
 /// browser script only on a page that is going to record.
+///
+/// Asked for by its fingerprint (`?v=`, which `rum.js` adds), so it can be
+/// kept for good: a new recorder is a new URL.
 pub(crate) async fn recorder(_state: Arc<Shared>, _request: Req) -> Response {
     Response::text(rum::RECORDER)
         .with_content_type("application/javascript; charset=utf-8")
-        .with_header("cache-control", "public, max-age=86400")
+        .with_header("cache-control", "public, max-age=31536000, immutable")
         .with_header("cross-origin-resource-policy", "cross-origin")
         .with_header("x-content-type-options", "nosniff")
 }

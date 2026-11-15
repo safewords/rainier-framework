@@ -324,6 +324,20 @@ mod tests {
         let router = router.compile(&rainier_container::Container::new()).unwrap();
         let script = router.dispatch(get("/_lookout/rum.js")).await;
         assert_eq!(script.status().as_u16(), 200, "public, though the dashboard is gated");
+        // Asked about on every page load, and answered with no body while
+        // unchanged: a CDN must not keep an old script for days.
+        assert_eq!(script.header("cache-control"), Some("private, no-cache"));
+        let etag = script.header("etag").expect("an etag").to_string();
+        let again = router
+            .dispatch(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/_lookout/rum.js")
+                    .header("if-none-match", &etag)
+                    .build(),
+            )
+            .await;
+        assert_eq!(again.status().as_u16(), 304);
         let report = serde_json::json!({
             "page": { "url": "https://app.example.com/settings" },
             "device": { "connection": { "type": "4g" } },

@@ -346,12 +346,27 @@ pub(crate) fn script(rum: &Rum) -> String {
             },
             "except": replay.except,
             "maxBytes": replay.max_bytes,
+            "recorder": recorder_version(),
         },
         "sample": rum.sample_rate,
         "slowMs": rum.slow_ms,
         "metric": METRIC,
     });
     SCRIPT.replace("__LOOKOUT_RUM_SETTINGS__", &settings.to_string())
+}
+
+/// The recorder's fingerprint, for its URL: a new build is a new URL, so the
+/// browser may keep the old one for good.
+fn recorder_version() -> String {
+    use std::hash::{Hash, Hasher};
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            RECORDER.hash(&mut hasher);
+            format!("{:012x}", hasher.finish() & 0xffff_ffff_ffff)
+        })
+        .clone()
 }
 
 /// The browser half, with its settings left to fill in.

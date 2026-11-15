@@ -471,6 +471,10 @@ calling `api.example.com`:
    ```
 
    It finds where to report from its own URL, so the tag is all a page needs.
+   It is served `private, no-cache` with an ETag: the browser asks on each
+   page load and is answered `304` while it is unchanged, and a CDN keeps no
+   copy — so a fix reaches every browser on its next page, however long the
+   CDN would have stretched a cache lifetime.
    `data-sample="0.5"` or `data-slow-ms="500"` on the tag overrides the
    server's settings for that page. A frontend with a Content Security Policy
    allows the API's origin in `script-src`.

@@ -187,7 +187,7 @@
     if (typeof CompressionStream !== 'function') return
     replay.started = true
     var s = document.createElement('script')
-    s.src = new URL('rum-replay.js', self.href).href
+    s.src = new URL('rum-replay.js?v=' + (replaySettings.recorder || ''), self.href).href
     s.async = true
     s.onload = function () {
       if (!window.LookoutReplay) return
