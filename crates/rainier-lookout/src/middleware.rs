@@ -238,6 +238,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_route_named_in_bodies_except_keeps_no_body() {
+        let mut config = LookoutConfig::default().enabled(true).local(true);
+        config.capture.request_body = true;
+        config.capture.response_body = true;
+        config.capture.bodies_except = vec!["sessions.*".into()];
+        let store = Arc::new(MemoryStore::new(10));
+        let lookout = Lookout::new(config, store.clone());
+        let kernel = kernel(&lookout, Arc::new(Dispatcher::new()));
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+        kernel
+            .handle_request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/sessions")
+                    .json(&serde_json::json!({"email": "ada@example.com"}))
+                    .build(),
+            )
+            .await;
+        lookout.flush().await;
+        let batch = &store.all()[0];
+        assert_eq!(batch.route_name.as_deref(), Some("sessions.store"));
+        let root = &batch.entries[0].content;
+        assert!(
+            root.get("request.body").is_none() && root.get("response.body").is_none(),
+            "{root}"
+        );
+    }
+
+    #[tokio::test]
     async fn bodies_are_not_kept_unless_asked_for() {
         let config = LookoutConfig::default().enabled(true).local(true);
         let store = Arc::new(MemoryStore::new(10));

@@ -186,6 +186,13 @@ pub struct Capture {
     /// is ever parsed.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// Routes whose bodies are never kept, whatever the two switches above
+    /// say: globs over the route's name, else its pattern
+    /// (`api.chat.*`, `/v1/identity-documents/*`). For the endpoints that
+    /// carry what must not leave them — private messages, identity documents
+    /// — where redacting by field name is not enough.
+    #[serde(default)]
+    pub bodies_except: Vec<String>,
     /// Cache keys.
     pub cache_keys: bool,
     /// Mail subjects and recipients.
@@ -226,6 +233,7 @@ impl Default for Capture {
             request_body: false,
             response_body: false,
             max_body_bytes: default_max_body_bytes(),
+            bodies_except: Vec::new(),
             cache_keys: false,
             mail: false,
             user_id: false,
@@ -606,6 +614,7 @@ impl LookoutConfig {
     /// | `LOOKOUT_AGGREGATE_RETENTION_DAYS` | [`Retention::aggregates_days`] | a positive integer |
     /// | `LOOKOUT_CAPTURE_REQUEST_HEADERS`, `…_REQUEST_BODY`, `…_RESPONSE_BODY`, `…_REQUEST_BODY_ON_EXCEPTION`, `…_CACHE_KEYS`, `…_MAIL`, `…_USER_ID`, `…_CLIENT_ERRORS`, `…_CODE_TRACES` | [`Capture`] | booleans |
     /// | `LOOKOUT_CAPTURE_MAX_BODY_BYTES` | [`Capture::max_body_bytes`] | a positive integer |
+    /// | `LOOKOUT_CAPTURE_BODIES_EXCEPT` | [`Capture::bodies_except`] | comma-separated globs |
     /// | `LOOKOUT_MASK_SECRETS` | [`Redaction::mask_secrets`] | a boolean |
     /// | `LOOKOUT_STREAM` | [`Dashboard::stream`] | a boolean |
     /// | `LOOKOUT_INSIGHTS_ENABLED` | [`InsightsConfig::enabled`](crate::trends::InsightsConfig) | a boolean |
@@ -722,6 +731,10 @@ impl LookoutConfig {
             if let Some(v) = get(name) {
                 *slot = parse_bool(name, &v)?;
             }
+        }
+        if let Some(v) = get("LOOKOUT_CAPTURE_BODIES_EXCEPT") {
+            config.capture.bodies_except =
+                v.split(',').map(str::trim).filter(|p| !p.is_empty()).map(String::from).collect();
         }
         if let Some(v) = get("LOOKOUT_CAPTURE_MAX_BODY_BYTES") {
             config.capture.max_body_bytes =

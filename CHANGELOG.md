@@ -40,6 +40,9 @@ the release as a whole and names the crate it landed in.
   `LOOKOUT_CAPTURE_REQUEST_BODY` and `LOOKOUT_CAPTURE_RESPONSE_BODY` keep
   every kept request's bodies (up to `LOOKOUT_CAPTURE_MAX_BODY_BYTES`, 64
   KiB), shown under **Payload** on the batch page with the request headers.
+  `LOOKOUT_CAPTURE_BODIES_EXCEPT` names routes (globs over the route name or
+  pattern) whose bodies are never kept — private messages, identity
+  documents — whatever else is on.
   The request holds a slice of its own buffer; parsing and redaction happen on
   the writer, for kept batches only.
 - **Redaction hides more, and can be told what to hide** (`rainier-lookout`,

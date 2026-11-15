@@ -1307,12 +1307,22 @@ pub(crate) fn finalize(
     // The bodies: the request's when every one is captured, or when this one
     // failed; the response's when those are captured. Parsed and redacted
     // here, on the writer, and only for a batch that is kept.
+    // A route the application named as never having its bodies kept loses
+    // them here, before they are parsed — on a failure too.
+    let route = pending.route_name.as_deref().or(pending.route_pattern.as_deref());
+    let bodies_allowed = !route.is_some_and(|route| {
+        config.capture.bodies_except.iter().any(|p| crate::config::glob(p, route))
+    });
     let request_body = pending
         .request_body
         .take()
-        .filter(|_| config.capture.request_body || has_exception)
+        .filter(|_| bodies_allowed && (config.capture.request_body || has_exception))
         .map(|body| crate::redact::redact_body(&body, &config.redaction));
-    let response_body = pending.response_body.take().map(|body| body.redacted(&config.redaction));
+    let response_body = pending
+        .response_body
+        .take()
+        .filter(|_| bodies_allowed)
+        .map(|body| body.redacted(&config.redaction));
     if request_body.is_some() || response_body.is_some() {
         if let Some(root) = pending.entries.iter_mut().find(|e| e.entry_type == EntryType::Request)
         {
