@@ -672,7 +672,9 @@ async fn the_stream_pulses_when_requests_are_only_counted() {
     use futures_util::StreamExt;
     use rainier_http::Body;
 
-    let store = sample();
+    // Empty, so the only request in this minute is the one counted below:
+    // the sample's batches are stamped seconds ago, often this same minute.
+    let store = Arc::new(FakeStore::with(Vec::new()));
     let router = app(Arc::clone(&store));
     let mut response = router
         .dispatch(Request::builder().method(Method::GET).uri("/_lookout/api/stream").build())
