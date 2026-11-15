@@ -339,3 +339,32 @@ fn the_environment_is_read_through_the_framework_and_adjusted_in_order() {
     let error = configure(&bad, &Config::new(), Vec::new()).unwrap_err();
     assert!(error.message().contains("LOOKOUT_STORE"), "{}", error.message());
 }
+
+#[tokio::test]
+async fn outside_local_an_async_viewer_predicate_is_awaited() {
+    // The shape an application with group membership in a table needs: copy
+    // the id out, then ask something that has to be awaited.
+    let app = builder()
+        .with_lookout(on(false))
+        .with_lookout_viewers_where_async(|user: &User, _request: &rainier_http::Request| {
+            let admin = user.admin;
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                admin
+            })
+        })
+        .with_instance_arc(auth())
+        .boot()
+        .await
+        .unwrap();
+    let app = TestApp::new(app).unwrap();
+
+    TestApp::new(Arc::clone(app.app())).unwrap().get("/_lookout").await.assert_not_found();
+
+    let user = TestApp::new(Arc::clone(app.app())).unwrap().with_token("user-token");
+    user.get("/_lookout").await.assert_not_found();
+
+    let admin = TestApp::new(Arc::clone(app.app())).unwrap().with_token("admin-token");
+    admin.get("/_lookout").await.assert_ok();
+    admin.get("/_lookout/api/batches").await.assert_ok();
+}

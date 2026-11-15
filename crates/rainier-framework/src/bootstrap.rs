@@ -707,8 +707,30 @@ impl Rainier {
     /// is not consulted. A later call to either method replaces this one.
     #[cfg(feature = "lookout")]
     pub fn with_lookout_viewers_where<U: rainier_auth::Authenticatable>(
-        mut self,
+        self,
         allow: impl Fn(&U, &rainier_http::Request) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.with_lookout_viewers_where_async(move |user: &U, request: &rainier_http::Request| {
+            let allowed = allow(user, request);
+            Box::pin(async move { allowed })
+        })
+    }
+
+    /// Like [`with_lookout_viewers_where`](Self::with_lookout_viewers_where),
+    /// for a decision that needs to await something — a query for the user's
+    /// groups, say.
+    ///
+    /// `allow` is handed the user and the request and returns a `'static`
+    /// future: copy what it needs (an id) out of them before the `async`
+    /// block. Answer `false` when the check fails; the dashboard is refused,
+    /// never opened, when the answer cannot be had.
+    #[cfg(feature = "lookout")]
+    pub fn with_lookout_viewers_where_async<U: rainier_auth::Authenticatable>(
+        mut self,
+        allow: impl Fn(&U, &rainier_http::Request) -> rainier_support::BoxFuture<'static, bool>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         self.lookout_viewers = Some(crate::lookout::viewers::<U>(Some(Arc::new(allow))));
         self

@@ -66,6 +66,21 @@
 //! The predicate runs only for a viewer the guard authenticated, and sees the
 //! request with its session loaded.
 //!
+//! When the answer needs a query — group membership in a table, say — use the
+//! async form. It is handed the same two references and returns a `'static`
+//! future, so take what the query needs (an id) before the `async` block:
+//!
+//! ```ignore
+//! Rainier::new(".")
+//!     .with_lookout_viewers_where_async(|user: &User, _request: &Request| {
+//!         let id = user.id;
+//!         Box::pin(async move { groups().is_administrator(id).await.unwrap_or(false) })
+//!     })
+//! ```
+//!
+//! An error in it should answer `false`: the dashboard is refused, never
+//! opened, when the check cannot be made.
+//!
 //! # A subscriber of your own
 //!
 //! An application that installs its own subscriber (or boots
@@ -164,7 +179,12 @@ pub(crate) fn gate_environment(local: bool, environment: &str) -> String {
 pub(crate) type ViewerPredicate<U> = Arc<ViewerFn<U>>;
 
 /// The predicate itself, unshared.
-pub(crate) type ViewerFn<U> = dyn Fn(&U, &Request) -> bool + Send + Sync;
+///
+/// Asynchronous, so an application can ask its database; a synchronous
+/// predicate is wrapped into one by `with_lookout_viewers_where`. The future
+/// is `'static`: whatever it needs from the user or the request is taken
+/// before it starts.
+pub(crate) type ViewerFn<U> = dyn Fn(&U, &Request) -> BoxFuture<'static, bool> + Send + Sync;
 
 /// The access check for viewers of type `U`: authenticate with the
 /// dashboard's guard, then ask the bound `Gate<U>` for its ability — or,
@@ -244,7 +264,7 @@ async fn decide<U: Authenticatable>(
         Err(_) => return Err("the guard failed"),
     };
     let allowed = match predicate {
-        Some(predicate) => predicate(&user, request),
+        Some(predicate) => predicate(&user, request).await,
         None => match app.resolve::<Gate<U>>() {
             Ok(gate) => gate.allows::<()>(ability, &user, None),
             Err(_) => return Err("no Gate is bound"),

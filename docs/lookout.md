@@ -322,7 +322,8 @@ on a refused request, which is the next point.
   so a percentile is within about 9% of the true one, and never above the
   exact maximum), and histograms add across buckets and pods. Rows written
   before an upgrade have no histogram and show no percentiles until they age
-  out.
+  out. The time chart draws the average with p90, p95 and p99 per bucket, so
+  a tail that grows while the average holds still shows up over time.
 - **Cases** — see [below](#cases).
 - **Search** — the header's search box looks through batches, entries and
   cases.
@@ -414,6 +415,20 @@ the predicate; the predicate sees the request with its session loaded
 (read-only). No `Gate<User>` is needed, and the dashboard's `ability` is not
 consulted.
 
+When the answer takes a query — membership of an administrators group kept
+in a table — use the async form. It gets the same two references and returns
+a `'static` future, so copy what the query needs out first:
+
+```rust
+Rainier::new(".")
+    .with_lookout_viewers_where_async(|user: &User, _request: &Request| {
+        let id = user.id;
+        Box::pin(async move { groups().is_administrator(id).await.unwrap_or(false) })
+    })
+```
+
+Answer `false` on an error: a check that cannot be made refuses the viewer.
+
 `LookoutConfig::local` decides "local", not the raw `APP_ENV`: an application
 can turn it off in a local environment with `.local(false)`.
 
@@ -431,7 +446,7 @@ shape.
 | `GET` | `/api/batches/{id}` | one batch, with its entries |
 | `GET` | `/api/entries/{type}` | entries of one type across batches — `key` (one family), `q` (text in the summary or key; reads at most five pages), `before`, `limit` |
 | `GET` | `/api/aggregates/{type}` | rolled-up counts and durations, with `average_us`, `p50_us`, `p90_us`, `p95_us`, `p99_us` and the `histogram` (`{slot: count}`) — `period` (60, 600, 3600), `since`, `order` (`count`, `average`, `max`) |
-| `GET` | `/api/series/{type}` | one zero-filled point per bucket from `since` to now — `period` (default: a dozen points or more), `key`, `keys` (that many busiest keys' own series), `forecast` (buckets) |
+| `GET` | `/api/series/{type}` | one zero-filled point per bucket from `since` to now, each with `count`, `average_us`, `max_us` and, where the bucket kept a histogram, `p50_us`, `p90_us`, `p95_us` and `p99_us` — `period` (default: a dozen points or more), `key`, `keys` (that many busiest keys' own series), `forecast` (buckets) |
 | `GET` | `/api/insights` | what changed since the previous window — `window`, `min`, `change`, `forecast`, `limit` |
 | `GET` | `/api/cases` | cases — `status` (`open`, `resolved`, `ignored`, `all`), `severity` (minimum), `q`, `limit` |
 | `GET` | `/api/cases/{id}` | one case |

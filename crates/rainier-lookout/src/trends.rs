@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::aggregate::{bucket_start, AGGREGATED};
+use crate::aggregate::{add_histogram, bucket_start, percentile, Histogram, AGGREGATED};
 use crate::entry::{Aggregate, EntryType};
 
 /// One bucket of a series.
@@ -36,6 +36,19 @@ pub struct Point {
     pub max_us: u64,
     /// `sum_us / count`, or zero for an empty bucket.
     pub average_us: u64,
+    /// The median, in microseconds. Absent for an empty bucket, and for one
+    /// recorded before buckets kept a duration histogram.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_us: Option<u64>,
+    /// The 90th percentile, in microseconds; absent as `p50_us` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90_us: Option<u64>,
+    /// The 95th percentile, in microseconds; absent as `p50_us` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_us: Option<u64>,
+    /// The 99th percentile, in microseconds; absent as `p50_us` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p99_us: Option<u64>,
 }
 
 /// One projected bucket.
@@ -109,27 +122,42 @@ pub fn series(
 ) -> Vec<Point> {
     let first = bucket_start(since, period_s);
     let last = bucket_start(now, period_s);
-    let mut totals: BTreeMap<DateTime<Utc>, (u64, u64, u64)> = BTreeMap::new();
+    #[derive(Default)]
+    struct Bucket {
+        count: u64,
+        sum_us: u64,
+        max_us: u64,
+        histogram: Histogram,
+    }
+    let mut totals: BTreeMap<DateTime<Utc>, Bucket> = BTreeMap::new();
     for row in rows.iter().filter(|r| r.period_s == period_s) {
         if row.bucket_start < first || row.bucket_start > last {
             continue;
         }
         let slot = totals.entry(row.bucket_start).or_default();
-        slot.0 += row.count;
-        slot.1 = slot.1.saturating_add(row.sum_us);
-        slot.2 = slot.2.max(row.max_us);
+        slot.count += row.count;
+        slot.sum_us = slot.sum_us.saturating_add(row.sum_us);
+        slot.max_us = slot.max_us.max(row.max_us);
+        // Every key's histogram in the bucket, added: the percentiles of
+        // everything in it, not an average of each key's percentiles.
+        add_histogram(&mut slot.histogram, &row.histogram);
     }
     let step = Duration::seconds(i64::from(period_s.max(1)));
     let mut points = Vec::new();
     let mut at = first;
     while at <= last {
-        let (count, sum_us, max_us) = totals.get(&at).copied().unwrap_or_default();
+        let bucket = totals.remove(&at).unwrap_or_default();
+        let p = |q: f64| percentile(&bucket.histogram, q, bucket.max_us);
         points.push(Point {
             bucket_start: at,
-            count,
-            sum_us,
-            max_us,
-            average_us: sum_us.checked_div(count).unwrap_or(0),
+            count: bucket.count,
+            sum_us: bucket.sum_us,
+            max_us: bucket.max_us,
+            average_us: bucket.sum_us.checked_div(bucket.count).unwrap_or(0),
+            p50_us: p(50.0),
+            p90_us: p(90.0),
+            p95_us: p(95.0),
+            p99_us: p(99.0),
         });
         at += step;
     }
@@ -446,6 +474,37 @@ mod tests {
         assert_eq!(points[0].average_us, 200);
         assert_eq!(points[0].max_us, 400);
         assert_eq!(points[1].average_us, 0);
+        // Rows written before buckets kept a histogram have no percentiles,
+        // and neither does an empty bucket.
+        assert_eq!(points[0].p99_us, None);
+        assert_eq!(points[1].p50_us, None);
+    }
+
+    #[test]
+    fn a_series_carries_each_buckets_percentiles_across_its_keys() {
+        use crate::aggregate::slot;
+
+        // One bucket: 98 fast requests on one route, 2 slow on another. The
+        // percentiles are of the bucket's 100 requests together.
+        let mut fast = row(EntryType::Request, "a", 60, 98, 1_000);
+        fast.histogram.insert(slot(1_000), 98);
+        fast.max_us = 1_000;
+        let mut slow = row(EntryType::Request, "b", 60, 2, 500_000);
+        slow.histogram.insert(slot(500_000), 2);
+        slow.max_us = 500_000;
+
+        let points = series(&[fast, slow], 60, at(60), at(70));
+        assert_eq!(points.len(), 1);
+        let p = &points[0];
+        let near = |v: Option<u64>, want: u64| {
+            let v = v.expect("a percentile") as f64;
+            (v - want as f64).abs() / want as f64 <= 0.1
+        };
+        assert!(near(p.p50_us, 1_000), "{p:?}");
+        assert!(near(p.p90_us, 1_000), "{p:?}");
+        assert!(near(p.p95_us, 1_000), "{p:?}");
+        assert!(near(p.p99_us, 500_000), "{p:?}");
+        assert!(p.p99_us.unwrap() <= p.max_us);
     }
 
     #[test]

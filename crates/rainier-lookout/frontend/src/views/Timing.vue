@@ -139,7 +139,7 @@ const columns = computed(() => [
   { key: 'trend', label: 'Trend', title: `Count per bucket over the last ${range.value.key} (the 50 busiest)`, text: () => '' },
 ])
 
-// --- Chart: count and average time, with the forecast.
+// --- Chart: count, and time (average and percentiles), with the forecast.
 
 function chartParts() {
   const s = series.value
@@ -156,10 +156,22 @@ const countChart = computed(() => {
     { label: 'Forecast', color: 'amber', dashed: true, points: join((p) => p.count).concat(forecast.map((p) => ({ t: p.bucket_start, v: p.count }))) },
   ]
 })
+// Each bucket's own percentiles, from its histogram. A bucket recorded before
+// histograms were kept has none, so a line starts where the data does.
+const percentileLine = (label, color, field) => ({
+  label,
+  color,
+  points: chartParts()
+    .data.filter((p) => p.count > 0 && p[field] != null)
+    .map((p) => ({ t: p.bucket_start, v: p[field] })),
+})
 const timeChart = computed(() => {
   const { data, forecast, join } = chartParts()
   return [
-    { label: 'Avg time', color: 'indigo', points: data.filter((p) => p.count > 0).map((p) => ({ t: p.bucket_start, v: p.average_us })) },
+    { label: 'Avg', color: 'indigo', points: data.filter((p) => p.count > 0).map((p) => ({ t: p.bucket_start, v: p.average_us })) },
+    percentileLine('p90', 'emerald', 'p90_us'),
+    percentileLine('p95', 'amber', 'p95_us'),
+    percentileLine('p99', 'rose', 'p99_us'),
     { label: 'Forecast', color: 'indigo', dashed: true, points: join((p) => p.average_us).concat(forecast.map((p) => ({ t: p.bucket_start, v: p.average_us }))) },
   ]
 })
@@ -216,7 +228,7 @@ const bucketLabel = computed(() => {
 
     <section class="lk-card min-w-0">
       <header class="lk-card-header">
-        <h2 class="text-sm font-semibold">{{ kind.unit }} and average time</h2>
+        <h2 class="text-sm font-semibold">{{ kind.unit }} and time over the range</h2>
         <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">
           per {{ bucketLabel }} · dashed: forecast<template v-if="type === 'job' && !dispatches"> · includes dispatches</template>
         </span>
@@ -227,7 +239,7 @@ const bucketLabel = computed(() => {
           <LineChart :series="countChart" :format="(v) => count(v)" :height="140" />
         </div>
         <div>
-          <h3 class="lk-th mb-1">Average time</h3>
+          <h3 class="lk-th mb-1">Time: average, p90, p95 and p99</h3>
           <LineChart :series="timeChart" :format="time" :height="140" />
         </div>
       </div>

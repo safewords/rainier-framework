@@ -24,6 +24,13 @@ the release as a whole and names the crate it landed in.
   same figures per route or job class in the table, and the latest batches
   below. They replace the separate "Jobs (timing)" page and the Requests and
   Jobs batch tabs in the navigation; the filtered batch list is a link away.
+- **Percentiles over time** (`rainier-lookout`): each point of
+  `/api/series/{type}` carries `p50_us`, `p90_us`, `p95_us` and `p99_us` from
+  its bucket's histogram (across every key in it), and the Requests and Jobs
+  time charts draw p90, p95 and p99 beside the average.
+- **`with_lookout_viewers_where_async`** (`rainier-framework`): a Lookout
+  viewer predicate that can await — for an application whose administrators
+  are a group in a table rather than a claim on the request.
 
 - `Upsert::maximum` and `UpsertAction::Maximum` (`rainier-orm`): on a
   conflict, keep the larger of the stored and the inserted value.
