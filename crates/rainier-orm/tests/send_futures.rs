@@ -76,6 +76,7 @@ fn repo_crud_futures_are_send() {
     let widget = Widget { id: 0, name: "a".into(), active: true };
 
     assert_send(repo::insert(&exec, &widget));
+    assert_send(repo::insert_many(&exec, std::slice::from_ref(&widget)));
     assert_send(repo::upsert(&exec, &widget, &["name"], &["active"]));
     // The plan-based form holds an `OnConflict` — another `Rc<dyn Iden>` — while
     // it renders, so it has the same hazard as every statement above.

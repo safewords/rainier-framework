@@ -342,6 +342,66 @@ where
     Ok(affected)
 }
 
+/// [`insert`] for many rows: `INSERT … VALUES (…), (…), …`, one statement per
+/// chunk instead of one per row.
+///
+/// For an append — a snapshot, a batch of events — where a statement per row
+/// is a round trip per row. Each row renders as [`insert`] renders it, so an
+/// auto-increment key is left to the database and a shard key is not minted:
+/// a row that needs one still goes through [`insert`]. Rows are chunked so no
+/// statement exceeds a dialect's placeholder cap; each chunk is atomic on its
+/// own, the batch as a whole is not.
+///
+/// Returns rows affected. No rows is no statement and `0`.
+///
+/// # Errors
+///
+/// If the rows route to different shards, which no one statement can reach.
+pub async fn insert_many<E, X>(exec: &X, rows: &[E]) -> Result<u64>
+where
+    E: Entity,
+    X: Executor,
+{
+    let Some(first) = rows.first() else { return Ok(0) };
+    let columns = first.insert_values().len().max(1);
+    let per_statement = (MAX_BOUND_VALUES / columns).max(1);
+
+    let mut affected = 0;
+    for chunk in rows.chunks(per_statement) {
+        // Rendered before the await, as in `upsert_many_with`.
+        let (route, sql, params) = render_insert_many(exec.dialect(), chunk)?;
+        affected += exec.execute_routed(route, &sql, params).await?.rows_affected;
+        exec.rows_changed(RowChange::of_rows(ChangeKind::Insert, chunk)).await;
+    }
+    Ok(affected)
+}
+
+fn render_insert_many<E: Entity>(
+    dialect: crate::Dialect,
+    rows: &[E],
+) -> Result<(ShardRoute, String, Vec<sea_query::Value>)> {
+    let first = rows.first().expect("render_insert_many is given rows");
+    let pairs = first.insert_values();
+    let route = route_from_pairs::<E>(&pairs);
+
+    let mut stmt = Query::insert();
+    stmt.into_table(col(E::table()));
+    stmt.columns(pairs.iter().map(|(c, _)| col(c)));
+    for row in rows {
+        let pairs = row.insert_values();
+        if route_from_pairs::<E>(&pairs) != route {
+            return Err(crate::Error::msg(format!(
+                "insert_many into `{}` spans shards; one statement reaches one",
+                E::table()
+            )));
+        }
+        stmt.values_panic(pairs.into_iter().map(|(_, v)| SimpleExpr::from(Expr::val(v))));
+    }
+
+    let (sql, params) = dialect.build_query(&stmt);
+    Ok((route, sql, into_vec(params)))
+}
+
 fn render_upsert_many<E: Entity>(
     dialect: crate::Dialect,
     rows: &[E],

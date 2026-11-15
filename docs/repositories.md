@@ -526,6 +526,12 @@ auto-increment key is still the database's. Every database caps the
 placeholders in one statement (MySQL 65,535, SQLite 32,766): chunk so that
 rows × columns stays under it.
 
+`repo::insert_many(&db, &rows)` is that statement chunked for you, under
+30,000 bound values, and reported as a write once it succeeds. An empty
+slice is no statement and `0`. It does not mint a shard key; a row that
+needs one still goes through `repo::insert`. Rows that would land on
+different shards are refused, because one statement reaches one.
+
 Upserts batch the same way. `repo::upsert_many_with(&db, &rows, &plan)` is
 `upsert_with` for a slice — one `INSERT … VALUES (…), (…) ON CONFLICT` per few
 thousand rows, chunked under every dialect's cap for you — which is how a

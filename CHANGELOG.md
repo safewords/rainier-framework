@@ -12,6 +12,12 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **`repo::insert_many`** (`rainier-orm`): many rows of one entity in one
+  `INSERT … VALUES (…), (…)`, chunked under the placeholder cap and reported
+  as a write. An empty slice writes nothing. An auto-increment key stays the
+  database's, and a shard key is not minted — a row that needs one still goes
+  through `repo::insert`.
+
 - **Lookout percentiles over the whole range** (`rainier-lookout`): every
   aggregate bucket keeps a duration histogram, four slots per doubling, so
   `/api/aggregates` returns `p50_us`, `p90_us`, `p95_us` and `p99_us` per key
