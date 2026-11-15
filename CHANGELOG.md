@@ -24,6 +24,10 @@ the release as a whole and names the crate it landed in.
   same figures per route or job class in the table, and the latest batches
   below. They replace the separate "Jobs (timing)" page and the Requests and
   Jobs batch tabs in the navigation; the filtered batch list is a link away.
+- **`docs/_sidebar.json`**: the website's table of contents, kept with the
+  docs it orders, and a test (`docs_sidebar.rs`) that every page is in it
+  once and every entry is a page. rainierframework.io builds its docs from
+  `docs/` on `main`; `AGENTS.md` says what that means for a change.
 - **Lookout keeps request and response bodies, redacted** (`rainier-lookout`):
   `LOOKOUT_CAPTURE_REQUEST_BODY` and `LOOKOUT_CAPTURE_RESPONSE_BODY` keep
   every kept request's bodies (up to `LOOKOUT_CAPTURE_MAX_BODY_BYTES`, 64

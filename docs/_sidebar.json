@@ -1,0 +1,34 @@
+[
+  { "group": "Getting Started", "items": [
+    { "slug": "overview", "title": "Overview" },
+    "installation", "directory-structure", "configuration",
+    "architecture", "lifecycle", "container", "providers", "facades"
+  ] },
+  { "group": "The Basics", "items": [
+    "routing", "middleware", "controllers", "requests", "responses",
+    "views", "vite", "urls", "validation", "errors"
+  ] },
+  { "group": "Database", "items": [
+    "database", "models", "repositories", "relationships", "migrations", "pagination"
+  ] },
+  { "group": "Digging Deeper", "items": [
+    "console", "events", "queues", "scheduling", "mail", "notifications",
+    "broadcasting", "websockets", "kafka", "cache", "filesystem",
+    "http-client", "helpers", "scenarios"
+  ] },
+  { "group": "Security", "items": [
+    "authentication", "authorization", "hashing", "encryption", "sessions", "captcha"
+  ] },
+  { "group": "Observability", "items": [
+    "observability", "lookout"
+  ] },
+  { "group": "Testing", "items": [
+    "testing"
+  ] },
+  { "group": "Deployment", "items": [
+    "deployment", "kubernetes-jobs"
+  ] },
+  { "group": "Add-ins", "items": [
+    "add-ins", "accounts", "two-factor", "sso", "oauth-server", "billing", "compat"
+  ] }
+]
