@@ -564,6 +564,13 @@ for that moment, where one after another held one four times over.
 `all_concurrently_limited(n, …)`, so one request cannot take the whole
 [pool](#sizing-the-pool) from every other.
 
+**Give `all_concurrently` owned values, not borrows.** Mapping over
+`profiles.iter()` and capturing `&profile` in each future compiles where it is
+written, then fails at the route with "implementation of `Send` is not general
+enough": a future holding a borrow is not `Send` for every lifetime, which a
+handler's future has to be. Collect what each future needs first
+(`let ids: Vec<u64> = …`) and map over `ids.into_iter()`.
+
 **Not a transaction.** These are independent statements: when one fails the
 rest are dropped, but nothing that already ran is undone. Do not run writes
 this way that must succeed or fail together.
