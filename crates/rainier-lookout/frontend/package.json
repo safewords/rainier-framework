@@ -5,10 +5,12 @@
   "description": "The Lookout dashboard: a Vue 3 + Tailwind CSS app, built into ../assets/dist and compiled into the crate.",
   "type": "module",
   "scripts": {
-    "build": "vite build",
+    "build": "vite build && vite build --config vite.replay.config.js && node scripts/notices.mjs",
     "dev": "vite build --watch"
   },
   "devDependencies": {
+    "@rrweb/record": "2.2.0",
+    "@rrweb/replay": "2.2.0",
     "@tailwindcss/vite": "4.3.5",
     "@vitejs/plugin-vue": "6.0.11",
     "tailwindcss": "4.3.5",

@@ -51,6 +51,20 @@ the release as a whole and names the crate it landed in.
   every page that shows data (cases, issues, timing, status) refreshes on the
   news it shows, plus once a minute. The writer stores its counts every 2
   seconds instead of 10, and only when something was counted.
+- **Session replay** (`rainier-lookout`), off by default:
+  `LOOKOUT_RUM_REPLAY=true` lets a page record itself with rrweb, masked in
+  the browser — text as asterisks, no inputs, media as blank boxes,
+  `data-lookout-block` left out — keeping the last ~30 seconds in memory and
+  uploading only when an API request fails or is slow or the page throws.
+  Consent is required by default (`LookoutRum.allowReplay()`), pages can be
+  excluded (`LOOKOUT_RUM_REPLAY_EXCEPT`), and a recording is gzipped and
+  capped (`LOOKOUT_RUM_REPLAY_MAX_BYTES`). The dashboard plays it back on the
+  request's page; its CSP now allows inline styles, which the replayed page
+  needs, while still loading nothing from other hosts.
+- **Browser reports know the server's side** (`rainier-lookout`): responses'
+  `Server-Timing` carries the server's own time (`dur`) and the route
+  (`lookout-route`), so a report splits the wait and links to its route even
+  when the request's own batch was not kept.
 - **Who and what made a request, and how its browser saw it** (`rainier-lookout`,
   `rainier-framework`), each off by default:
   - `LOOKOUT_CAPTURE_USER`: the application describes the user with

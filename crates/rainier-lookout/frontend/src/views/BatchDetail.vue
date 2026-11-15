@@ -4,6 +4,7 @@ import { computed, onMounted, ref } from 'vue'
 import BatchStatus from '../components/BatchStatus.vue'
 import BrowserView from '../components/BrowserView.vue'
 import ClientCard from '../components/ClientCard.vue'
+import ReplayPlayer from '../components/ReplayPlayer.vue'
 import Empty from '../components/Empty.vue'
 import ErrorBox from '../components/ErrorBox.vue'
 import Flags from '../components/Flags.vue'
@@ -37,7 +38,11 @@ const client = computed(() => (rootContent.value.client && typeof rootContent.va
 
 // How the browser saw it (LOOKOUT_RUM): reports on the same trace. On a
 // browser batch, the request it describes, for the server's side of it.
-const browserReports = computed(() => related.value.filter((b) => b.kind === 'browser'))
+const isReplay = (b) => (b.tags || []).includes('replay')
+const browserReports = computed(() => related.value.filter((b) => b.kind === 'browser' && !isReplay(b)))
+// Session replays on the same trace (LOOKOUT_RUM_REPLAY): what the page
+// looked like before this request failed or was slow.
+const replays = computed(() => related.value.filter((b) => b.kind === 'browser' && isReplay(b)))
 const serverSide = computed(() => related.value.find((b) => b.kind === 'request') || null)
 
 const facts = computed(() => {
@@ -189,12 +194,23 @@ onMounted(async () => {
         :guard="batch.guard"
       />
       <ClientCard v-if="client" :client="client" />
-      <template v-if="batch.kind === 'browser'">
+      <template v-if="batch.kind === 'browser' && isReplay(batch)">
+        <ReplayPlayer :batch="batch" />
+      </template>
+      <template v-else-if="batch.kind === 'browser'">
+        <p v-if="!serverSide" class="text-sm text-zinc-500 dark:text-zinc-400">
+          The server's side of this request was not kept (only slow and failed requests are).
+          <template v-if="batch.route_name">
+            Its route:
+            <RouterLink :to="issueRoute('request', batch.route_name)" class="text-indigo-600 hover:underline dark:text-indigo-400">{{ batch.route_name }}</RouterLink>.
+          </template>
+        </p>
         <BrowserView :batch="batch" :server-us="serverSide ? serverSide.duration_us : null" />
       </template>
       <template v-else>
         <BrowserView v-for="report in browserReports" :key="report.id" :id="report.id" :server-us="batch.duration_us" />
       </template>
+      <ReplayPlayer v-for="r in (batch.kind === 'browser' && isReplay(batch) ? [] : replays)" :key="r.id" :id="r.id" />
 
       <section v-if="payload.length" class="lk-card">
         <header class="lk-card-header">

@@ -377,8 +377,8 @@ impl Lookout {
         if !rum.enabled || self.inner.is_dashboard_path(path) {
             return response;
         }
-        let Some(trace_id) = self.current_batch_id() else { return response };
-        for (name, value) in crate::rum::response_headers(rum, &trace_id) {
+        let Some((trace_id, server)) = self.rum_context() else { return response };
+        for (name, value) in crate::rum::response_headers(rum, &trace_id, Some(&server)) {
             // `Server-Timing` is a list: an application's own metrics stay.
             let value = match response.header(name) {
                 Some(existing) if name == "server-timing" => format!("{existing}, {value}"),
@@ -387,6 +387,20 @@ impl Lookout {
             response = response.with_header(name, &value);
         }
         response
+    }
+
+    /// The current batch's trace id, with its time so far and its route.
+    fn rum_context(&self) -> Option<(String, crate::rum::ServerSide)> {
+        let cell = self.inner.current_batch()?;
+        let state = cell.lock();
+        let pending = state.as_ref()?;
+        Some((
+            pending.trace_id.clone().unwrap_or_else(|| pending.id.clone()),
+            crate::rum::ServerSide {
+                duration_ms: pending.started.elapsed().as_secs_f64() * 1000.0,
+                route: pending.route_name.clone(),
+            },
+        ))
     }
 
     /// The id of the batch the calling code is running in, if any — its

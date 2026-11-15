@@ -109,13 +109,47 @@ pub fn verify(secret: &[u8], token: &str) -> Option<String> {
     bool::from(presented.as_bytes().ct_eq(expected.as_bytes())).then(|| trace_id.to_string())
 }
 
+/// The `Server-Timing` metric that names the route.
+pub const ROUTE_METRIC: &str = "lookout-route";
+
+/// What the server knows about a response as it leaves: its own time so far,
+/// and the route that answered.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ServerSide {
+    /// Milliseconds from the request's first byte to now.
+    pub duration_ms: f64,
+    /// The matched route's name, if it has one.
+    pub route: Option<String>,
+}
+
 /// The headers a response carries so the browser can report on it.
-pub fn response_headers(rum: &Rum, trace_id: &str) -> Vec<(&'static str, String)> {
+///
+/// With `server`, the token's metric carries the server's own time as `dur`
+/// — `Server-Timing`'s standard duration — and a second metric names the
+/// route, so every report can say how much of the wait was the server's and
+/// which route it was, even for a request whose own batch was not kept.
+pub fn response_headers(
+    rum: &Rum,
+    trace_id: &str,
+    server: Option<&ServerSide>,
+) -> Vec<(&'static str, String)> {
     if !rum.enabled || rum.secret.is_empty() {
         return Vec::new();
     }
-    let mut headers =
-        vec![("server-timing", format!("{METRIC};desc=\"{}\"", token(&rum.secret, trace_id)))];
+    let token = token(&rum.secret, trace_id);
+    let mut timing = match server {
+        Some(server) => format!("{METRIC};dur={:.1};desc=\"{token}\"", server.duration_ms),
+        None => format!("{METRIC};desc=\"{token}\""),
+    };
+    // A route name goes in a quoted string, so it must not be able to end it.
+    if let Some(route) = server.and_then(|s| s.route.as_deref()).filter(|r| {
+        !r.is_empty()
+            && r.len() <= 128
+            && r.bytes().all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+    }) {
+        timing.push_str(&format!(", {ROUTE_METRIC};desc=\"{route}\""));
+    }
+    let mut headers = vec![("server-timing", timing)];
     if !rum.origins.is_empty() {
         headers.push(("timing-allow-origin", rum.origins.join(", ")));
     }
@@ -200,19 +234,7 @@ pub(crate) fn batches(
     let rum = &config.rum;
     let page = bounded_map(&report.page, 2);
     let mut device = bounded_map(&report.device, 2);
-    if let Some(ua) = user_agent {
-        let agent = crate::client::parse_user_agent(ua);
-        if let Some((name, version)) = agent.browser {
-            device.insert("browser".into(), json!({ "name": name, "version": version }));
-        }
-        if let Some((name, version)) = agent.os {
-            device.entry("os").or_insert(json!({ "name": name, "version": version }));
-        }
-        device.entry("kind").or_insert(json!(agent.device.as_str()));
-    }
-    if let Some(address) = ip.and_then(|ip| crate::client::mask_ip(ip, config.capture.client_ip)) {
-        device.insert("ip".into(), json!(address));
-    }
+    describe_sender(config, &mut device, ip, user_agent);
     let page_path = page
         .get("url")
         .and_then(Value::as_str)
@@ -275,12 +297,23 @@ pub(crate) fn batches(
                 tags: vec!["browser".into()],
                 content: Value::Object(content),
             };
+            // The route the response named, for a link to its page. Only a
+            // name's characters: it is shown and filtered on, never trusted.
+            let route = call
+                .get("route")
+                .and_then(Value::as_str)
+                .filter(|r| {
+                    !r.is_empty()
+                        && r.len() <= 128
+                        && r.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-:/{}".contains(&b))
+                })
+                .map(str::to_string);
             Some(Batch {
                 id,
                 trace_id,
                 kind: BatchKind::Browser,
                 summary,
-                route_name: None,
+                route_name: route,
                 route_pattern: None,
                 method: None,
                 status,
@@ -303,7 +336,17 @@ pub(crate) fn batches(
 /// `data-sample` or `data-slow-ms` attribute on the tag overrides them for
 /// that page.
 pub(crate) fn script(rum: &Rum) -> String {
+    let replay = &rum.replay;
     let settings = json!({
+        "replay": {
+            "enabled": replay.enabled,
+            "consent": match replay.consent {
+                crate::config::ReplayConsent::Required => "required",
+                crate::config::ReplayConsent::Implied => "implied",
+            },
+            "except": replay.except,
+            "maxBytes": replay.max_bytes,
+        },
         "sample": rum.sample_rate,
         "slowMs": rum.slow_ms,
         "metric": METRIC,
@@ -313,6 +356,145 @@ pub(crate) fn script(rum: &Rum) -> String {
 
 /// The browser half, with its settings left to fill in.
 const SCRIPT: &str = include_str!("../assets/rum.js");
+
+/// The session-replay recorder (rrweb's), built from `frontend/` into
+/// `assets/dist/rum-replay.js`. Served only while replay is on, and loaded by
+/// the browser script only on a page that is going to record.
+pub(crate) const RECORDER: &str = include_str!("../assets/dist/rum-replay.js");
+
+/// A recording, as the script uploads it.
+#[derive(Debug, Default, Deserialize)]
+pub struct ReplayUpload {
+    #[serde(default)]
+    pub(crate) token: String,
+    /// What made the page send it: `slow`, `failed` or `error`.
+    #[serde(default)]
+    pub(crate) trigger: String,
+    #[serde(default)]
+    pub(crate) page: Map<String, Value>,
+    #[serde(default)]
+    pub(crate) device: Map<String, Value>,
+    /// The rrweb events, as JSON, gzipped, base64.
+    #[serde(default)]
+    pub(crate) replay: String,
+    /// How much time the recording covers, in milliseconds.
+    #[serde(default)]
+    pub(crate) ms: f64,
+}
+
+/// Turn an upload into a `browser` batch tagged `replay`, on the trace of the
+/// request whose token it carries — or `None` when it does not verify, is
+/// not a gzip, is too large, or comes from a page that must not be recorded.
+pub(crate) fn replay_batch(
+    config: &LookoutConfig,
+    upload: ReplayUpload,
+    ip: Option<IpAddr>,
+    user_agent: Option<&str>,
+) -> Option<Batch> {
+    use base64::Engine as _;
+    let rum = &config.rum;
+    if !rum.replay.enabled {
+        return None;
+    }
+    let trace_id = verify(&rum.secret, &upload.token)?;
+    if upload.replay.len() > rum.replay.max_bytes.saturating_mul(4) / 3 + 16 {
+        return None;
+    }
+    // Checked, not unpacked: a gzip's first two bytes, so what is stored is
+    // at least what the player expects. It is unpacked only in the viewer's
+    // browser, never here.
+    let head: String = upload.replay.chars().take(8).collect();
+    let magic = base64::engine::general_purpose::STANDARD.decode(head).ok()?;
+    if magic.get(..2) != Some(&[0x1f, 0x8b][..]) {
+        return None;
+    }
+    let page = bounded_map(&upload.page, 2);
+    let path = page
+        .get("url")
+        .and_then(Value::as_str)
+        .and_then(|u| u.split(['?', '#']).next())
+        .map(|u| u.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_else(|| u.to_string()))
+        .unwrap_or_else(|| "/".to_string());
+    // The server holds the line too: a page excluded here is not stored even
+    // from a script that recorded it anyway.
+    if rum.replay.except.iter().any(|glob| crate::config::glob(glob, &path)) {
+        return None;
+    }
+    let trigger = match upload.trigger.as_str() {
+        t @ ("slow" | "failed" | "error") => t.to_string(),
+        _ => "error".to_string(),
+    };
+    let mut device = bounded_map(&upload.device, 2);
+    describe_sender(config, &mut device, ip, user_agent);
+    let duration_us = (upload.ms.clamp(0.0, 10.0 * 60.0 * 1000.0) * 1000.0).round() as u64;
+
+    let id = crate::recorder::new_id();
+    let now = chrono::Utc::now();
+    let summary = format!("replay {path} ({trigger})");
+    let bytes = upload.replay.len() * 3 / 4;
+    let content = json!({
+        "kind": "replay",
+        "trigger": trigger,
+        "page": Value::Object(page),
+        "device": Value::Object(device),
+        "replay": upload.replay,
+        "bytes": bytes,
+    });
+    Some(Batch {
+        id: id.clone(),
+        trace_id,
+        kind: BatchKind::Browser,
+        summary: summary.clone(),
+        route_name: None,
+        route_pattern: None,
+        method: None,
+        status: None,
+        guard: None,
+        user_id: None,
+        duration_us,
+        has_exception: trigger == "error",
+        has_slow: trigger == "slow",
+        host: None,
+        started_at: now - chrono::Duration::microseconds(duration_us as i64),
+        tags: vec!["browser".into(), "replay".into()],
+        entries: vec![Entry {
+            id: crate::recorder::new_entry_id(),
+            batch_id: id,
+            entry_type: EntryType::Custom,
+            span_id: None,
+            parent_span_id: None,
+            family_hash: Some(format!("replay:{path}")),
+            summary,
+            occurred_at: now,
+            duration_us: Some(duration_us),
+            tags: vec!["replay".into()],
+            content,
+        }],
+    })
+}
+
+/// Add what the server itself knows about a report's sender: its browser and
+/// system from the user agent, and its address as far as it is kept.
+fn describe_sender(
+    config: &LookoutConfig,
+    device: &mut Map<String, Value>,
+    ip: Option<IpAddr>,
+    user_agent: Option<&str>,
+) {
+    if let Some(ua) = user_agent {
+        let agent = crate::client::parse_user_agent(ua);
+        if let Some((name, version)) = agent.browser {
+            device.insert("browser".into(), json!({ "name": name, "version": version }));
+        }
+        if let Some((name, version)) = agent.os {
+            device.entry("os").or_insert(json!({ "name": name, "version": version }));
+        }
+        device.entry("kind").or_insert(json!(agent.device.as_str()));
+    }
+    if let Some(address) = ip.and_then(|ip| crate::client::mask_ip(ip, config.capture.client_ip)) {
+        device.insert("ip".into(), json!(address));
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -332,19 +514,33 @@ mod tests {
     #[test]
     fn responses_name_their_batch_only_when_rum_is_on() {
         let off = Rum::default();
-        assert!(response_headers(&off, "t").is_empty());
+        assert!(response_headers(&off, "t", None).is_empty());
         let on = Rum {
             enabled: true,
             origins: vec!["https://app.example.com".into()],
             secret: b"key".to_vec(),
             ..Rum::default()
         };
-        let headers = response_headers(&on, "abc");
+        let headers = response_headers(&on, "abc", None);
         assert_eq!(
             headers[0],
             ("server-timing", format!("lookout;desc=\"{}\"", token(b"key", "abc")))
         );
         assert_eq!(headers[1], ("timing-allow-origin", "https://app.example.com".to_string()));
+
+        // With the server's side: its time, and the route that answered.
+        let server = ServerSide { duration_ms: 12.34, route: Some("posts.show".into()) };
+        let headers = response_headers(&on, "abc", Some(&server));
+        assert_eq!(
+            headers[0].1,
+            format!(
+                "lookout;dur=12.3;desc=\"{}\", lookout-route;desc=\"posts.show\"",
+                token(b"key", "abc")
+            )
+        );
+        // A route name that could break out of its quotes is left out.
+        let odd = ServerSide { duration_ms: 1.0, route: Some("a\"b".into()) };
+        assert!(!response_headers(&on, "abc", Some(&odd))[0].1.contains("lookout-route"));
     }
 
     #[test]
@@ -366,7 +562,8 @@ mod tests {
             "device": { "memory": 8, "connection": { "type": "4g", "rtt": 50 } },
             "calls": [
                 { "token": good, "url": "https://api.example.com/api/posts?page=2", "duration": 812.4,
-                  "dns": 0, "connect": 31.2, "waiting": 240.0, "download": 3.1, "protocol": "h2", "status": 200 },
+                  "dns": 0, "connect": 31.2, "waiting": 240.0, "download": 3.1, "protocol": "h2", "status": 200,
+                  "server": 61.5, "route": "posts.index" },
                 { "token": "trace2.0000000000000000", "url": "https://api.example.com/x", "duration": 5 },
                 { "token": token(b"key", "trace3"), "url": "https://api.example.com/_lookout/rum", "duration": 80 },
                 { "token": token(b"key", "trace4"), "url": "https://api.example.com/api/x", "initiator": "beacon", "duration": 80 },
@@ -382,6 +579,12 @@ mod tests {
         assert_eq!(batch.trace_id, "trace1", "on the request's own trace");
         assert_eq!(batch.summary, "browser /api/posts 200");
         assert_eq!(batch.duration_us, 812_400);
+        assert_eq!(
+            batch.route_name.as_deref(),
+            Some("posts.index"),
+            "the route the response named"
+        );
+        assert_eq!(batch.entries[0].content["timing"]["server"], 61.5);
         let content = &batch.entries[0].content;
         assert_eq!(content["url"], "https://api.example.com/api/posts", "no query");
         assert_eq!(content["timing"]["waiting"], 240.0);
@@ -390,5 +593,94 @@ mod tests {
         assert_eq!(content["device"]["browser"]["name"], "Safari");
         assert_eq!(content["device"]["kind"], "mobile");
         assert_eq!(batch.host.as_deref(), Some("https://app.example.com/feed"));
+    }
+
+    fn replay_config() -> LookoutConfig {
+        let mut config = LookoutConfig::default();
+        config.rum = Rum { enabled: true, secret: b"key".to_vec(), ..config.rum };
+        config.rum.replay.enabled = true;
+        config.rum.replay.except = vec!["/chats*".into()];
+        config
+    }
+
+    fn upload(token: &str, url: &str, replay: &str) -> ReplayUpload {
+        serde_json::from_value(json!({
+            "token": token, "trigger": "failed", "replay": replay, "ms": 14000.0,
+            "page": { "url": url }, "device": { "screen": "1920x1080" },
+        }))
+        .unwrap()
+    }
+
+    // `H4sI` is base64 for a gzip's first bytes, 1f 8b 08.
+    const GZIP: &str = "H4sIAAAAAAAAA4uOBQApu0wNAgAAAA==";
+
+    #[test]
+    fn a_replay_joins_its_request_trace_and_keeps_only_what_it_should() {
+        let config = replay_config();
+        let good = token(b"key", "trace9");
+        let batch = replay_batch(
+            &config,
+            upload(&good, "https://app.example.com/feed?x=1", GZIP),
+            None,
+            None,
+        )
+        .expect("a replay for a signed request");
+        assert_eq!(batch.trace_id, "trace9");
+        assert_eq!(batch.kind, BatchKind::Browser);
+        assert!(batch.tags.contains(&"replay".to_string()));
+        assert_eq!(batch.summary, "replay /feed (failed)");
+        assert_eq!(batch.duration_us, 14_000_000);
+        assert_eq!(batch.entries[0].content["kind"], "replay");
+        assert_eq!(batch.entries[0].content["replay"], GZIP);
+    }
+
+    #[test]
+    fn a_replay_is_refused_when_it_should_not_be_kept() {
+        let config = replay_config();
+        let good = token(b"key", "trace9");
+        let forged = "trace9.0000000000000000";
+        assert!(
+            replay_batch(&config, upload(forged, "https://a.example/feed", GZIP), None, None)
+                .is_none(),
+            "unsigned"
+        );
+        assert!(
+            replay_batch(&config, upload(&good, "https://a.example/chats/4", GZIP), None, None)
+                .is_none(),
+            "an excluded page, whatever the script did"
+        );
+        assert!(
+            replay_batch(
+                &config,
+                upload(&good, "https://a.example/feed", "eyJub3QiOiJnemlwIn0="),
+                None,
+                None
+            )
+            .is_none(),
+            "not a gzip"
+        );
+        let mut small = replay_config();
+        small.rum.replay.max_bytes = 4;
+        assert!(
+            replay_batch(&small, upload(&good, "https://a.example/feed", GZIP), None, None)
+                .is_none(),
+            "too large"
+        );
+        let mut off = replay_config();
+        off.rum.replay.enabled = false;
+        assert!(
+            replay_batch(&off, upload(&good, "https://a.example/feed", GZIP), None, None).is_none(),
+            "replay off"
+        );
+    }
+
+    #[test]
+    fn the_script_carries_the_replay_settings() {
+        let mut rum = replay_config().rum;
+        rum.replay.consent = crate::config::ReplayConsent::Implied;
+        let script = script(&rum);
+        assert!(script.contains("\"consent\":\"implied\""), "the page is told");
+        assert!(script.contains("\"except\":[\"/chats*\"]"));
+        assert!(!script.contains("__LOOKOUT_RUM_SETTINGS__"));
     }
 }

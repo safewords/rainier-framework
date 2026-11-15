@@ -87,6 +87,10 @@ Read at boot through the application's `Env` (so `.env` counts), with
 | `LOOKOUT_RUM_SAMPLE_RATE` | the fraction of page views that report | `0.0..=1.0` | `0.1` |
 | `LOOKOUT_RUM_SLOW_MS` | a request this slow in the browser is reported whatever the sample | milliseconds | `1000` |
 | `LOOKOUT_RUM_SECRET` | the key reports are signed with | a string | derived from `APP_KEY` |
+| `LOOKOUT_RUM_REPLAY` | [session replay](#session-replay), masked, around failures | a boolean | `false` |
+| `LOOKOUT_RUM_REPLAY_EXCEPT` | pages never recorded | comma-separated globs over the page's path | none |
+| `LOOKOUT_RUM_REPLAY_CONSENT` | whether a page records before it says the visitor agreed | `required`, `implied` | `required` |
+| `LOOKOUT_RUM_REPLAY_MAX_BYTES` | the most one recording may weigh, compressed | a positive integer | `262144` |
 | `LOOKOUT_CAPTURE_CLIENT_ERRORS` | record a request's 4xx as an exception ([below](#client-errors-are-not-failures)) | a boolean | `false` |
 | `LOOKOUT_CAPTURE_CODE_TRACES` | where a slow query or call came from ([below](#code-traces)) | a boolean | `true` |
 | `LOOKOUT_INSIGHTS_ENABLED` | the dashboard's [insights and forecasts](#insights-and-forecasts) | a boolean | `true` |
@@ -453,7 +457,9 @@ It is built for a frontend that is not this application — `app.example.com`
 calling `api.example.com`:
 
 1. **Every response names its batch.** Each carries
-   `Server-Timing: lookout;desc="<trace id>.<signature>"`, and
+   `Server-Timing: lookout;dur=<ms>;desc="<trace id>.<signature>", lookout-route;desc="<route>"`
+   — the server's own time so far, the signed trace id, and the route that
+   answered — and
    `Timing-Allow-Origin` listing `LOOKOUT_RUM_ORIGINS`. A browser shows a
    cross-origin response's detailed timing, and its `Server-Timing`, only to
    the origins `Timing-Allow-Origin` names — so the frontends must be listed.
@@ -474,8 +480,12 @@ calling `api.example.com`:
    (`LOOKOUT_RUM_SAMPLE_RATE`, decided once per page view), and any request
    slower than `LOOKOUT_RUM_SLOW_MS` from any page view.
 4. **Each reported request becomes a `browser` batch** on the request's
-   trace. It is listed under **Browser**, and the request's page shows it —
-   whether or not the request's own batch was kept.
+   trace. It is listed under **Browser**, and the request's page shows it.
+   In production most requests' own batches are not kept — only slow and
+   failed ones — so the report carries what the response said about the
+   server's side: its time, so the page can still split the wait into the
+   server's part and everything outside it, and its route, which the
+   report's page links to.
 
 A browser sending Global Privacy Control (`navigator.globalPrivacyControl`)
 reports nothing.
@@ -502,6 +512,51 @@ changes the request's own batch.
 The phases are zero when the browser withholds them: the response's
 `Timing-Allow-Origin` did not name the page's origin, or a reused connection
 had no DNS or handshake to measure. The page says which.
+
+### Session replay
+
+With `LOOKOUT_RUM_REPLAY=true` (and RUM on), a page can record itself, so
+the dashboard can play back what the visitor saw in the seconds before a
+request failed or was slow, or the page threw. It is off unless turned on,
+and built to keep as little as it can:
+
+- **Only around a problem.** The script keeps the last two stretches of the
+  page in the browser's memory — each from a full snapshot, a new one every
+  15 seconds — and uploads them only when a request to the API answers 4xx
+  or 5xx, takes longer than `LOOKOUT_RUM_SLOW_MS`, or the page throws. At
+  most three recordings a page view, thirty seconds apart. A page that never
+  goes wrong sends nothing.
+- **Masked as it is recorded**, in the browser, before anything leaves it:
+  every text node becomes asterisks, inputs are never read, images, video,
+  audio, canvases, frames and embedded objects become blank boxes of the
+  same size, and an element marked `data-lookout-block` is left out
+  entirely. What the replay shows is the page's shape and movement — where
+  things were, what changed, where the pointer went — not what it said.
+- **Not on every page.** `LOOKOUT_RUM_REPLAY_EXCEPT=/chats*,/settings/*`
+  names pages never recorded; the server refuses a recording of one even
+  from a script that made it anyway.
+- **Not without consent**, by default. The page records only after it calls
+  `window.LookoutRum.allowReplay()` — from the site's own consent prompt — or
+  sets `window.LookoutRumConsent = true` before the script loads.
+  `LOOKOUT_RUM_REPLAY_CONSENT=implied` records from the start, for an
+  internal tool or a site whose terms already cover it; that is the site's
+  decision to make. A browser sending Global Privacy Control records nothing.
+- **Small.** rrweb's recorder (`{path}/rum-replay.js`, 23 KB compressed) is
+  loaded only by a page that will record. A recording is gzipped in the
+  browser and refused above `LOOKOUT_RUM_REPLAY_MAX_BYTES` (256 KiB); a
+  masked page's thirty seconds is typically a few kilobytes to a few tens.
+- **Under the same rules as a report**: a listed origin, the sender's rate
+  (a recording counts as ten requests), and the token of a request this
+  application answered. It is stored as a `browser` batch tagged `replay` on
+  that request's trace, and kept as long as other batches.
+
+The request's page and the browser report's page show a **Replay** card: play,
+pause and seek through the recording. It is unpacked and drawn in the
+viewer's browser, in a sandboxed frame — the server never opens it, and
+nothing recorded runs: rrweb replays no scripts, and the dashboard's policy
+lets a recorded stylesheet load nothing from anywhere.
+
+A site that turns this on should say so in its privacy policy.
 
 ## The dashboard
 

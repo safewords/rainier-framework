@@ -45,12 +45,16 @@
   function bare(url) {
     return String(url).split('#')[0].split('?')[0]
   }
-  function tokenOf(entry) {
+  function metric(entry, name) {
     var timings = entry.serverTiming || []
     for (var i = 0; i < timings.length; i++) {
-      if (timings[i].name === settings.metric) return timings[i].description
+      if (timings[i].name === name) return timings[i]
     }
     return null
+  }
+  function tokenOf(entry) {
+    var m = metric(entry, settings.metric)
+    return m ? m.description : null
   }
 
   function call(entry, token) {
@@ -79,6 +83,11 @@
       decoded: entry.decodedBodySize,
       status: entry.responseStatus || undefined,
       at: round(entry.startTime),
+      // The server's own time, and the route that answered, as the response
+      // said in its Server-Timing — so the report can split the wait even
+      // when the request's own batch was not kept.
+      server: round((metric(entry, settings.metric) || {}).duration),
+      route: (metric(entry, settings.metric + '-route') || {}).description || undefined,
     }
   }
 
@@ -148,12 +157,120 @@
   // Lookout's own path on the API: the script and its reports are not
   // requests to report on.
   var own = self.href.replace(/rum\.js(\?.*)?$/, '')
+
+  // --- session replay (LOOKOUT_RUM_REPLAY) -----------------------------------
+  //
+  // Off unless the API turned it on, and then only on a page that is not
+  // excluded and whose visitor agreed (or where the site says consent is
+  // implied). The recorder keeps the last two stretches of the page in
+  // memory — each starting from a full snapshot, at most ~15 s apart — and
+  // sends them only when a request to the API fails or is slow, or the page
+  // throws. Everything is masked as it is recorded: text becomes asterisks,
+  // inputs are never read, images, video, canvases and frames are blank
+  // boxes, and anything marked data-lookout-block is left out entirely.
+  var replay = { on: false, started: false, segments: [[]], lastToken: null, sent: 0, lastSent: 0 }
+  var replaySettings = settings.replay || {}
+
+  function excluded(path) {
+    var globs = replaySettings.except || []
+    for (var i = 0; i < globs.length; i++) {
+      var pattern = new RegExp('^' + globs[i].split('*').map(function (part) {
+        return part.replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+      }).join('.*') + '$')
+      if (pattern.test(path)) return true
+    }
+    return false
+  }
+
+  function startReplay() {
+    if (!replaySettings.enabled || replay.started || excluded(location.pathname)) return
+    if (typeof CompressionStream !== 'function') return
+    replay.started = true
+    var s = document.createElement('script')
+    s.src = new URL('rum-replay.js', self.href).href
+    s.async = true
+    s.onload = function () {
+      if (!window.LookoutReplay) return
+      window.LookoutReplay.record({
+        emit: function (event, isCheckout) {
+          // A new stretch at each full snapshot; only the last two are kept.
+          if (isCheckout) {
+            replay.segments.push([])
+            if (replay.segments.length > 2) replay.segments.shift()
+          }
+          replay.segments[replay.segments.length - 1].push(event)
+        },
+        checkoutEveryNms: 15000,
+        maskAllInputs: true,
+        maskTextSelector: '*',
+        blockSelector: 'img,picture,video,audio,canvas,iframe,object,embed,svg image,[data-lookout-block]',
+        inlineImages: false,
+        recordCanvas: false,
+        collectFonts: false,
+        inlineStylesheet: true,
+        slimDOMOptions: 'all',
+        sampling: { mousemove: 100, scroll: 150, input: 'last' },
+      })
+      replay.on = true
+    }
+    document.head.appendChild(s)
+  }
+
+  function upload(trigger) {
+    if (!replay.on || !replay.lastToken) return
+    // A page that keeps failing sends a few recordings, not one per failure.
+    var now = Date.now()
+    if (replay.sent >= 3 || now - replay.lastSent < 30000) return
+    var events = [].concat.apply([], replay.segments)
+    if (events.length < 2) return
+    replay.sent++
+    replay.lastSent = now
+    var token = replay.lastToken
+    var ms = events[events.length - 1].timestamp - events[0].timestamp
+    var gzip = new Blob([JSON.stringify(events)]).stream().pipeThrough(new CompressionStream('gzip'))
+    new Response(gzip).arrayBuffer().then(function (buffer) {
+      if (buffer.byteLength > (replaySettings.maxBytes || 262144)) return
+      var bytes = new Uint8Array(buffer)
+      var binary = ''
+      for (var i = 0; i < bytes.length; i += 0x8000) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
+      }
+      var body = JSON.stringify({ token: token, trigger: trigger, page: page(), device: device(), replay: btoa(binary), ms: ms })
+      // A plain-text POST: no CORS preflight, like the beacon — but not a
+      // beacon, which browsers cap at 64 KB.
+      return fetch(settings.endpoint + '/replay', { method: 'POST', body: body, credentials: 'omit', mode: 'cors' })
+    }).catch(function () {
+      // A recording that could not be sent is simply lost.
+    })
+  }
+
+  window.LookoutRum = {
+    /** Let this page record for session replay, from the site's own consent prompt. */
+    allowReplay: function () {
+      replay.allowed = true
+      startReplay()
+    },
+  }
+  if (replaySettings.consent === 'implied' || window.LookoutRumConsent === true) {
+    window.LookoutRum.allowReplay()
+  }
+  addEventListener('error', function () {
+    upload('error')
+  })
+  addEventListener('unhandledrejection', function () {
+    upload('error')
+  })
+
   observe('resource', function (entry) {
     if (entry.name.indexOf(settings.origin) !== 0) return
     if (entry.initiatorType === 'beacon' || entry.name.indexOf(own) === 0) return
     var token = tokenOf(entry)
     if (!token) return
-    if (!sampled && !(entry.duration >= settings.slowMs)) return
+    replay.lastToken = token
+    var failed = entry.responseStatus >= 400
+    var slow = entry.duration >= settings.slowMs
+    if (failed || slow) upload(failed ? 'failed' : 'slow')
+    if (!sampled && !slow) return
     queue.push(call(entry, token))
     if (queue.length >= 20) flush()
   })

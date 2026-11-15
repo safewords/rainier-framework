@@ -237,7 +237,7 @@ async fn every_response_is_unindexed_and_the_shell_is_locked_down() {
     assert_eq!(
         page.header("content-security-policy"),
         Some(
-            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
              connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
         )
     );

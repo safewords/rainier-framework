@@ -285,9 +285,14 @@ mod tests {
         // The response names its batch, signed, for the browser to report on.
         let timing = answered.header("server-timing").expect("a Server-Timing header").to_string();
         assert_eq!(answered.header("timing-allow-origin"), Some("https://app.example.com"));
+        // `lookout;dur=…;desc="<token>", lookout-route;desc="me"`: the
+        // server's own time and the route ride along with the token.
+        assert!(timing.starts_with("lookout;dur="), "{timing}");
+        assert!(timing.ends_with(", lookout-route;desc=\"me\""), "{timing}");
         let token = timing
-            .strip_prefix("lookout;desc=\"")
-            .and_then(|t| t.strip_suffix('"'))
+            .split("desc=\"")
+            .nth(1)
+            .and_then(|t| t.split('"').next())
             .expect("the lookout metric")
             .to_string();
 

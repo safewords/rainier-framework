@@ -274,6 +274,57 @@ pub struct Rum {
     /// framework derives it from `APP_KEY` when this is unset.
     #[serde(skip)]
     pub secret: Vec<u8>,
+    /// Session replay: off unless turned on, and only with RUM on.
+    #[serde(default)]
+    pub replay: Replay,
+}
+
+/// Session replay: what the page looked like in the seconds before a request
+/// failed, was slow, or the page threw — recorded masked, kept only then.
+/// See `docs/lookout.md`, "Session replay".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Replay {
+    /// Whether pages may record at all.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Pages never recorded, whatever else is said: globs over the page's
+    /// path (`/chats*`, `/settings/*`).
+    #[serde(default)]
+    pub except: Vec<String>,
+    /// Whether a page records before it says the visitor agreed to it.
+    #[serde(default)]
+    pub consent: ReplayConsent,
+    /// The most one recording may weigh, compressed, in bytes.
+    #[serde(default = "default_replay_max_bytes")]
+    pub max_bytes: usize,
+}
+
+impl Default for Replay {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            except: Vec::new(),
+            consent: ReplayConsent::Required,
+            max_bytes: default_replay_max_bytes(),
+        }
+    }
+}
+
+fn default_replay_max_bytes() -> usize {
+    256 * 1024
+}
+
+/// When a page may start recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayConsent {
+    /// Only once the page calls `LookoutRum.allowReplay()` — from a consent
+    /// prompt, a setting, whatever the site asks the visitor with.
+    #[default]
+    Required,
+    /// From the start. For an internal tool, or a site whose terms already
+    /// cover it — a decision the site makes, not a default.
+    Implied,
 }
 
 impl std::fmt::Debug for Rum {
@@ -716,6 +767,10 @@ impl LookoutConfig {
     /// | `LOOKOUT_RUM_SAMPLE_RATE` | [`Rum::sample_rate`] | `0.0` to `1.0` |
     /// | `LOOKOUT_RUM_SLOW_MS` | [`Rum::slow_ms`] | an integer |
     /// | `LOOKOUT_RUM_SECRET` | [`Rum::secret`] (default: from `APP_KEY`) | a string |
+    /// | `LOOKOUT_RUM_REPLAY` | [`Replay::enabled`] | a boolean |
+    /// | `LOOKOUT_RUM_REPLAY_EXCEPT` | [`Replay::except`] | comma-separated globs over page paths |
+    /// | `LOOKOUT_RUM_REPLAY_CONSENT` | [`Replay::consent`] | `required` or `implied` |
+    /// | `LOOKOUT_RUM_REPLAY_MAX_BYTES` | [`Replay::max_bytes`] | a positive integer |
     /// | `LOOKOUT_INSIGHTS_ENABLED` | [`InsightsConfig::enabled`](crate::trends::InsightsConfig) | a boolean |
     /// | `LOOKOUT_INSIGHTS_WINDOW_MINUTES` | the window compared with the one before | a positive integer |
     /// | `LOOKOUT_INSIGHTS_MIN_COUNT` | how many a key needs before it is reported | a positive integer |
@@ -810,7 +865,8 @@ impl LookoutConfig {
                 parse_positive("LOOKOUT_AGGREGATE_RETENTION_DAYS", &v)?;
         }
 
-        let flags: [(&str, &mut bool); 14] = [
+        let flags: [(&str, &mut bool); 15] = [
+            ("LOOKOUT_RUM_REPLAY", &mut config.rum.replay.enabled),
             ("LOOKOUT_CAPTURE_USER", &mut config.capture.user),
             ("LOOKOUT_CAPTURE_CLIENT", &mut config.capture.client),
             ("LOOKOUT_RUM", &mut config.rum.enabled),
@@ -865,6 +921,27 @@ impl LookoutConfig {
         }
         if let Some(v) = get("LOOKOUT_RUM_SLOW_MS") {
             config.rum.slow_ms = parse_u64("LOOKOUT_RUM_SLOW_MS", &v)?;
+        }
+        if let Some(v) = get("LOOKOUT_RUM_REPLAY_EXCEPT") {
+            config.rum.replay.except =
+                v.split(',').map(str::trim).filter(|p| !p.is_empty()).map(String::from).collect();
+        }
+        if let Some(v) = get("LOOKOUT_RUM_REPLAY_CONSENT") {
+            config.rum.replay.consent = match v.to_ascii_lowercase().as_str() {
+                "required" => ReplayConsent::Required,
+                "implied" => ReplayConsent::Implied,
+                _ => {
+                    return Err(ConfigError::new(
+                        "LOOKOUT_RUM_REPLAY_CONSENT",
+                        v,
+                        "required or implied",
+                    ))
+                }
+            };
+        }
+        if let Some(v) = get("LOOKOUT_RUM_REPLAY_MAX_BYTES") {
+            config.rum.replay.max_bytes =
+                parse_positive("LOOKOUT_RUM_REPLAY_MAX_BYTES", &v)? as usize;
         }
         if let Some(v) = get("LOOKOUT_RUM_SECRET") {
             config.rum.secret = v.into_bytes();

@@ -258,6 +258,10 @@ pub fn routes(
         if state.config.rum.enabled {
             router.get("/rum.js", open(&state, rum::script)).name("rum.script");
             router.post("/rum", open(&state, rum::ingest)).name("rum.ingest");
+            if state.config.rum.replay.enabled {
+                router.get("/rum-replay.js", open(&state, rum::recorder)).name("rum.recorder");
+                router.post("/rum/replay", open(&state, rum::ingest_replay)).name("rum.replay");
+            }
         }
 
         // Declared last, so every route above wins: the app's own client

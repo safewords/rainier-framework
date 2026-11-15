@@ -66,9 +66,16 @@ const detailed = computed(() => phases.value.some((p) => p.key !== 'queued'))
 
 // The browser's total less the server's own time: the network both ways,
 // the queueing, the handshake — everything the server never sees.
+// The server's own time: from its kept batch when there is one, else as the
+// response told the browser in Server-Timing.
+const serverUs = computed(() => {
+  if (props.serverUs !== null) return props.serverUs
+  const told = timing.value.server
+  return typeof told === 'number' && isFinite(told) ? us(told) : null
+})
 const outside = computed(() => {
-  if (props.serverUs === null || !total.value) return null
-  return Math.max(0, us(total.value) - props.serverUs)
+  if (serverUs.value === null || !total.value) return null
+  return Math.max(0, us(total.value) - serverUs.value)
 })
 
 const versioned = (o) => (o && o.name ? [o.name, o.version].filter(Boolean).join(' ') : null)
@@ -81,7 +88,7 @@ const requestFacts = computed(() => {
   const t = timing.value
   return [
     ['In the browser', total.value ? duration(us(total.value)) : null],
-    ['On the server', props.serverUs !== null ? duration(props.serverUs) : null],
+    ['On the server', serverUs.value !== null ? duration(serverUs.value) : null],
     ['Outside the server', outside.value !== null ? duration(outside.value) : null],
     ['Protocol', t.protocol],
     ['Transferred', t.transfer === 0 && t.decoded > 0 ? 'from cache' : size(t.transfer)],

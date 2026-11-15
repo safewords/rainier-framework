@@ -25,12 +25,20 @@ pub(crate) static STYLESHEET: &[u8] =
 
 /// The Content-Security-Policy the dashboard is served with.
 ///
-/// Nothing inline and nothing from anywhere else: the app's script and
-/// stylesheet from this origin, `fetch` to this origin, no plugins, no
-/// framing, no form posts. An entry that smuggled markup past the app's
-/// text-only rendering still could not run a script.
+/// Nothing from anywhere else: the app's script and stylesheet from this
+/// origin, `fetch` to this origin, no plugins, no framing, no form posts. An
+/// entry that smuggled markup past the app's text-only rendering still could
+/// not run a script.
+///
+/// Styles may be inline. A session replay rebuilds the recorded page —
+/// its `style` attributes and `<style>` elements — in a sandboxed frame that
+/// inherits this policy, and without inline styles it draws an unstyled
+/// page. Nothing recorded can use that to reach anything: scripts stay
+/// same-origin (and rrweb replays none), and images, fonts and connections
+/// from any other host stay refused, so a recorded stylesheet cannot load or
+/// send anything.
 pub fn content_security_policy() -> &'static str {
-    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+    "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
      connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
 }
 
