@@ -73,6 +73,25 @@ It is **not** sent to the client, for the same reason a
 [5xx body is not](errors.md#what-the-client-is-told): an error message is
 written for you, not for whoever is connected.
 
+A client leaving is not an error. A read that ends in a close, a reset or a
+connection dropped without the closing handshake, and a handler that passes up
+a send's [gone-away error](#the-socket-handle) with `?`, end the connection at
+`DEBUG` and are not reported as failures.
+
+## Noticing a client that has gone
+
+A client that leaves without a close frame — a laptop lid, a phone moving
+between networks, a NAT that forgot the mapping — leaves a TCP connection that
+still looks open from the server. Nothing fails until the kernel gives up on an
+unacknowledged write, which takes many minutes, and every send meanwhile is
+queued for nobody.
+
+So the transport pings any connection it has not heard from for **25 s**, and
+closes one that has sent nothing — not even the pong every client returns on
+its own — for **70 s**. A write that cannot finish in that time ends the
+connection too. `on_close` runs as it does for any other ending. The ping keeps
+the connection under the 60 s idle timeout most proxies apply.
+
 ## The socket handle
 
 ```rust
@@ -92,7 +111,9 @@ one slow client, and one slow client must not hold up the task reading everyone
 else's messages.
 
 Sending to a socket that has gone away is an `Err`, not a panic and not a
-silent success — a registry holding stale handles finds out that way.
+silent success — a registry holding stale handles finds out that way. It is a
+**499**, not a 500: `rainier_websocket::is_disconnect(&error)` recognises it,
+and the transport closes quietly when a handler returns it.
 
 Because the handle is a channel, **a handler is tested by calling it**. No
 network:
@@ -189,9 +210,10 @@ composed into one design, see
 
 ## What is not here
 
-**No automatic reconnection or heartbeat policy.** Ping and pong are answered
-by the transport, so a connection stays alive; deciding that a client which has
-said nothing for five minutes should be disconnected is application policy, and
+**No reconnection or idle policy.** The transport pings and drops a client that
+has stopped answering, but one that answers pings and says nothing else is
+connected as far as it is concerned. Deciding that a client which has sent no
+message for five minutes should be disconnected is application policy, and
 `socket.close()` is how you express it.
 
 **No message size limit of its own.** The HTTP body limit does not apply to

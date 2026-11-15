@@ -624,6 +624,18 @@ the release as a whole and names the crate it landed in.
 
 ### Fixed
 
+- **A WebSocket client that left without closing is now noticed, and leaving
+  is no longer reported as a failure** (`rainier-server`, `rainier-websocket`).
+  Nothing ever timed out a client that stopped answering — a laptop shut, a
+  phone between networks — so the server went on queueing sends to it until
+  the kernel gave up on the TCP connection, many minutes later. The transport
+  now pings a connection that has been quiet for 25 s and closes one silent
+  for 70 s, and a write that cannot finish in that time ends it too. A send
+  to a socket that has gone away returns a 499 rather than a 500
+  (`is_disconnect` recognises it), and a handler passing that up, a reset,
+  a connection dropped without the closing handshake, or an upgrade the
+  client abandoned closes at `DEBUG` instead of being reported.
+
 - **An unreadable session is no longer replaced with an empty one**
   (`rainier-session`). `StartSession` treated a store *read failure* the same as
   a session that was not there: it started a fresh one. That session has a new

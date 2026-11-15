@@ -90,4 +90,4 @@ pub mod socket;
 
 pub use handler::{Matched, Rooms, WebSocketHandler, WebSocketRoutes};
 pub use message::Message;
-pub use socket::{instance_id, socket_from_identity, Outbound, Socket, SocketId};
+pub use socket::{instance_id, is_disconnect, socket_from_identity, Outbound, Socket, SocketId};

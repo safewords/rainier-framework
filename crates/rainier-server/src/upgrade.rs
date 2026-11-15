@@ -27,9 +27,11 @@
 //! already spawned for it.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame, Role};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
@@ -38,7 +40,40 @@ use tokio_tungstenite::WebSocketStream;
 use rainier_events::report::{report, WebSocketFailed};
 use rainier_events::Exception;
 use rainier_http::{Request, Response, StatusCode};
-use rainier_websocket::{Message, Outbound, Socket, SocketId, WebSocketHandler, WebSocketRoutes};
+use rainier_websocket::{
+    is_disconnect, Message, Outbound, Socket, SocketId, WebSocketHandler, WebSocketRoutes,
+};
+
+/// How the server tells a live connection from one whose client has gone.
+///
+/// A client that leaves without a close frame — a laptop lid, a phone moving
+/// between networks, a NAT that forgot the mapping — leaves a TCP connection
+/// that still looks open from here. Nothing fails until a write has sat
+/// unacknowledged long enough for the kernel to give up, which is many
+/// minutes, and every send in the meantime is queued for nobody.
+///
+/// So the server pings any connection it has not heard from for
+/// [`ping_every`](Self::ping_every), and closes one that has been silent —
+/// no frame, not even the pong every client sends back on its own — for
+/// [`give_up_after`](Self::give_up_after). A write that cannot complete in
+/// that time ends the connection too.
+#[derive(Debug, Clone, Copy)]
+pub struct Liveness {
+    /// How long a connection may be quiet before the server pings it.
+    pub ping_every: Duration,
+    /// How long a connection may be silent before it is taken as gone.
+    pub give_up_after: Duration,
+}
+
+impl Default for Liveness {
+    /// Ping after 25 s of quiet; give up after 70 s of silence — two missed
+    /// pongs and some slack. Under the 60 s idle timeout most proxies and
+    /// load balancers apply, so the pings keep those from cutting a quiet
+    /// but healthy connection.
+    fn default() -> Self {
+        Self { ping_every: Duration::from_secs(25), give_up_after: Duration::from_secs(70) }
+    }
+}
 
 /// Whether this request is asking to become a WebSocket.
 ///
@@ -120,8 +155,13 @@ pub async fn handle_upgrade(
             Ok(upgraded) => upgraded,
             Err(e) => {
                 tracing::debug!(error = %e, path, "the connection never finished upgrading");
-                // No socket yet, so no id.
-                report(WebSocketFailed::new(Exception::from_std(&e), "", path, "upgrade")).await;
+                // A client that went away between asking and the 101 —
+                // navigated off, lost its network — is not a failure.
+                if !(e.is_closed() || e.is_canceled() || e.is_incomplete_message()) {
+                    // No socket yet, so no id.
+                    report(WebSocketFailed::new(Exception::from_std(&e), "", path, "upgrade"))
+                        .await;
+                }
                 return;
             }
         };
@@ -133,7 +173,7 @@ pub async fn handle_upgrade(
         )
         .await;
 
-        run(handler, stream, path, params).await;
+        run(handler, stream, path, params, Liveness::default()).await;
     });
 
     Response::new(StatusCode::SWITCHING_PROTOCOLS)
@@ -153,6 +193,7 @@ async fn run<S>(
     stream: WebSocketStream<S>,
     path: String,
     params: Vec<(String, String)>,
+    liveness: Liveness,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -175,21 +216,54 @@ async fn run<S>(
     );
 
     if let Err(e) = connected.await {
-        tracing::warn!(socket = %id, path, error = %e, "on_connect failed; closing");
-        report(WebSocketFailed::new(e, id.to_string(), path.as_str(), "connect")).await;
+        if is_disconnect(&e) {
+            tracing::debug!(socket = %id, path, "the client left during on_connect");
+        } else {
+            tracing::warn!(socket = %id, path, error = %e, "on_connect failed; closing");
+            report(WebSocketFailed::new(e, id.to_string(), path.as_str(), "connect")).await;
+        }
         handler.on_close(&socket).await;
         let _ = writer.close().await;
         return;
     }
 
+    // A write that cannot finish in this long is to a client that has gone:
+    // its receive window is full and nothing is reading it.
+    macro_rules! write {
+        ($frame:expr) => {
+            matches!(
+                tokio::time::timeout(liveness.give_up_after, writer.send($frame)).await,
+                Ok(Ok(()))
+            )
+        };
+    }
+
+    let mut last_heard = tokio::time::Instant::now();
+    let mut ticker =
+        tokio::time::interval_at(last_heard + liveness.ping_every, liveness.ping_every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
+            // Liveness: ping a quiet connection, and let a silent one go.
+            _ = ticker.tick() => {
+                let quiet = last_heard.elapsed();
+                if quiet >= liveness.give_up_after {
+                    tracing::debug!(socket = %id, path, ?quiet, "the client stopped answering; closing");
+                    break;
+                }
+                if quiet >= liveness.ping_every && !write!(WsMessage::Ping(Default::default())) {
+                    break;
+                }
+            }
+
             // Whatever the handler queued, in the order it queued it.
             outgoing = queue.recv() => {
                 let Some(outgoing) = outgoing else { break };
                 match outgoing {
                     Outbound::Send(message) => {
-                        if writer.send(to_tungstenite(message)).await.is_err() {
+                        if !write!(to_tungstenite(message)) {
+                            tracing::debug!(socket = %id, path, "a write did not reach the client; closing");
                             break;
                         }
                     }
@@ -198,7 +272,7 @@ async fn run<S>(
                             code: CloseCode::Normal,
                             reason: reason.into(),
                         });
-                        let _ = writer.send(WsMessage::Close(frame)).await;
+                        let _ = write!(WsMessage::Close(frame));
                         break;
                     }
                 }
@@ -209,12 +283,12 @@ async fn run<S>(
                 let frame = match incoming {
                     Ok(frame) => frame,
                     Err(e) => {
-                        // A client that vanished mid-frame is routine — logged
-                        // quietly, but still reported: whether it matters is
-                        // the application's call. A connection that is simply
-                        // closed is not a failure at all.
+                        // A client that vanished — closed, reset, gone
+                        // without a closing handshake — is how connections
+                        // end, not a failure. Anything else is reported:
+                        // whether it matters is the application's call.
                         tracing::debug!(socket = %id, error = %e, "socket read failed");
-                        if !matches!(e, WsError::ConnectionClosed | WsError::AlreadyClosed) {
+                        if !is_routine_disconnect(&e) {
                             report(WebSocketFailed::new(
                                 Exception::from_std(&e),
                                 id.to_string(),
@@ -226,6 +300,8 @@ async fn run<S>(
                         break;
                     }
                 };
+                // Any frame at all, a pong included, says the client is there.
+                last_heard = tokio::time::Instant::now();
 
                 match from_tungstenite(frame) {
                     // Ping and pong are the transport's business; tungstenite
@@ -252,10 +328,16 @@ async fn run<S>(
                         #[cfg(feature = "telemetry")]
                         let handled = tracing::Instrument::instrument(handled, span);
                         if let Err(e) = handled.await {
-                            // Not sent to the client: an error message is
-                            // written for you, not for whoever is connected.
-                            tracing::warn!(socket = %id, path, error = %e, "on_message failed; closing");
-                            report(WebSocketFailed::new(e, id.to_string(), path.as_str(), "message")).await;
+                            if is_disconnect(&e) {
+                                // A send found the client gone; the handler
+                                // passed that up. The connection has ended.
+                                tracing::debug!(socket = %id, path, "the client left mid-message");
+                            } else {
+                                // Not sent to the client: an error message is
+                                // written for you, not for whoever is connected.
+                                tracing::warn!(socket = %id, path, error = %e, "on_message failed; closing");
+                                report(WebSocketFailed::new(e, id.to_string(), path.as_str(), "message")).await;
+                            }
                             break;
                         }
                         if closing {
@@ -268,12 +350,35 @@ async fn run<S>(
     }
 
     // Exactly once, however the loop ended — a clean close, a dropped
-    // connection, or a handler error. A registry that only cleaned up on a
-    // polite goodbye would leak an entry per closed laptop.
+    // connection, a silent one, or a handler error. A registry that only
+    // cleaned up on a polite goodbye would leak an entry per closed laptop.
     handler.on_close(&socket).await;
-    let _ = writer.close().await;
+    let _ = tokio::time::timeout(liveness.give_up_after, writer.close()).await;
 
     tracing::debug!(socket = %id, path, "socket closed");
+}
+
+/// Whether a read error is just the client going away.
+///
+/// A close, a reset, a connection dropped without the closing handshake: the
+/// ordinary ways a browser tab, a sleeping laptop or a phone between networks
+/// ends a connection. None of them is something the server did wrong.
+fn is_routine_disconnect(error: &WsError) -> bool {
+    use std::io::ErrorKind as Io;
+
+    match error {
+        WsError::ConnectionClosed | WsError::AlreadyClosed => true,
+        WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+        WsError::Io(io) => matches!(
+            io.kind(),
+            Io::ConnectionReset
+                | Io::ConnectionAborted
+                | Io::BrokenPipe
+                | Io::UnexpectedEof
+                | Io::TimedOut
+        ),
+        _ => false,
+    }
 }
 
 fn to_tungstenite(message: Message) -> WsMessage {
@@ -395,6 +500,7 @@ mod tests {
             server,
             "/ws/upgrade-test".to_string(),
             Vec::new(),
+            Liveness::default(),
         ));
         client.send(WsMessage::Text("hello".into())).await.unwrap();
         running.await.unwrap();
@@ -411,5 +517,148 @@ mod tests {
         assert_eq!(ours[0].stage, "message");
         assert!(!ours[0].socket.is_empty());
         assert_eq!(ours[0].exception.message, "upgrade-test: on_message refused");
+    }
+
+    /// Counts closes; answers a message by failing the way a send to a
+    /// departed client does.
+    #[derive(Default)]
+    struct Watches {
+        closed: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl WebSocketHandler for Watches {
+        async fn on_message(&self, _: &Socket, _: Message) -> rainier_support::Result<()> {
+            Err(rainier_support::Error::new(
+                rainier_support::ErrorKind::Status(rainier_websocket::socket::CLIENT_CLOSED),
+                "socket 1 has gone away",
+            ))
+        }
+
+        async fn on_close(&self, _: &Socket) {
+            self.closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn quick() -> Liveness {
+        Liveness {
+            ping_every: Duration::from_millis(40),
+            give_up_after: Duration::from_millis(150),
+        }
+    }
+
+    fn reports_for(capture: &rainier_events::report::Capture, path: &str) -> usize {
+        use rainier_events::report::Failure;
+        capture
+            .reports()
+            .into_iter()
+            .filter(|reported| matches!(&reported.failure, Failure::WebSocket(f) if f.path == path))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_answering_is_closed_and_not_reported() {
+        let capture = rainier_events::report::capture();
+        let (server, client) = tokio::io::duplex(4096);
+        let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        // Never read, so never answers a ping: a laptop with its lid shut.
+        let _client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+
+        let handler = Arc::new(Watches::default());
+        let finished = tokio::time::timeout(
+            Duration::from_secs(5),
+            run(handler.clone(), server, "/ws/silent".into(), Vec::new(), quick()),
+        )
+        .await;
+
+        assert!(finished.is_ok(), "the server should have let the silent client go");
+        assert_eq!(handler.closed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(reports_for(&capture, "/ws/silent"), 0, "silence is not a failure");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_answers_pings_stays_connected() {
+        let (server, client) = tokio::io::duplex(4096);
+        let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+
+        // Reading is what makes a client answer pings, as a browser does.
+        let pings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = pings.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(frame)) = client.next().await {
+                if frame.is_ping() {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+
+        let handler = Arc::new(Watches::default());
+        let running =
+            tokio::spawn(run(handler.clone(), server, "/ws/alive".into(), Vec::new(), quick()));
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(!running.is_finished(), "a client answering pings is alive");
+        assert!(pings.load(std::sync::atomic::Ordering::SeqCst) >= 3, "the server pinged it");
+        assert_eq!(handler.closed.load(std::sync::atomic::Ordering::SeqCst), 0);
+        running.abort();
+    }
+
+    #[tokio::test]
+    async fn a_send_to_a_departed_client_is_not_a_failure() {
+        let capture = rainier_events::report::capture();
+        let (server, client) = tokio::io::duplex(4096);
+        let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+
+        let handler = Arc::new(Watches::default());
+        let running = tokio::spawn(run(
+            handler.clone(),
+            server,
+            "/ws/departed".into(),
+            Vec::new(),
+            Liveness::default(),
+        ));
+        client.send(WsMessage::Text("hello".into())).await.unwrap();
+        running.await.unwrap();
+
+        assert_eq!(handler.closed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(reports_for(&capture, "/ws/departed"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_drops_the_connection_is_not_a_failure() {
+        let capture = rainier_events::report::capture();
+        let (server, client) = tokio::io::duplex(4096);
+        let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+
+        let handler = Arc::new(Watches::default());
+        let running = tokio::spawn(run(
+            handler.clone(),
+            server,
+            "/ws/dropped".into(),
+            Vec::new(),
+            Liveness::default(),
+        ));
+        // Gone without a close frame.
+        drop(client);
+        running.await.unwrap();
+
+        assert_eq!(handler.closed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(reports_for(&capture, "/ws/dropped"), 0);
+    }
+
+    #[test]
+    fn routine_disconnects_are_told_apart_from_faults() {
+        use std::io::{Error as IoError, ErrorKind as Io};
+
+        assert!(is_routine_disconnect(&WsError::ConnectionClosed));
+        assert!(is_routine_disconnect(&WsError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
+        )));
+        assert!(is_routine_disconnect(&WsError::Io(IoError::from(Io::ConnectionReset))));
+        assert!(is_routine_disconnect(&WsError::Io(IoError::from(Io::BrokenPipe))));
+        assert!(!is_routine_disconnect(&WsError::Utf8(String::new())));
+        assert!(!is_routine_disconnect(&WsError::Io(IoError::from(Io::PermissionDenied))));
     }
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use rainier_support::{Error, Result};
+use rainier_support::{Error, ErrorKind, Result};
 
 use crate::message::Message;
 
@@ -229,10 +229,35 @@ impl Socket {
         self.outbound.send(outbound).map_err(|_| {
             // The peer disconnected. Routine — a registry holding stale
             // handles finds out this way — so it is an error to handle, not a
-            // panic and not a silent success.
-            Error::internal(format!("socket {} has gone away", self.id))
+            // panic and not a silent success. But not a *server* error: 499,
+            // so a handler that passes it up with `?` has not failed, and the
+            // transport closes quietly instead of reporting it.
+            Error::new(
+                ErrorKind::Status(CLIENT_CLOSED),
+                format!("socket {} has gone away", self.id),
+            )
         })
     }
+}
+
+/// The status of the error a send to a disconnected socket returns — 499,
+/// "client closed request".
+pub const CLIENT_CLOSED: u16 = 499;
+
+/// Whether `error` only says the client has gone.
+///
+/// What a send to a socket whose connection has ended returns. A handler
+/// that propagates it with `?` is not at fault, and the transport treats it
+/// as the connection ending rather than as a failure.
+///
+/// ```
+/// use rainier_websocket::socket::is_disconnect;
+/// use rainier_support::Error;
+///
+/// assert!(!is_disconnect(&Error::internal("a real fault")));
+/// ```
+pub fn is_disconnect(error: &Error) -> bool {
+    error.status() == CLIENT_CLOSED
 }
 
 #[cfg(test)]
@@ -311,6 +336,8 @@ mod tests {
 
         let err = socket.send("hello").unwrap_err();
         assert!(err.message().contains("gone away"), "{}", err.message());
+        assert!(is_disconnect(&err), "a client leaving is not a server fault");
+        assert!(!err.kind().is_server_error());
         assert!(socket.is_closed());
     }
 
