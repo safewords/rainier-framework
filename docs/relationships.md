@@ -162,6 +162,9 @@ let posts = User::posts().for_one(&user, &*post_repo).await?;
 
 The one-off case — a show page for one user. Inside a loop this is the N+1 that
 `load` exists to prevent, so it is deliberately the longer-named method.
+Several different relations of one record, which `load` cannot combine into
+one query, can be loaded [in parallel](database.md#running-queries-in-parallel)
+instead of one after another.
 
 ---
 

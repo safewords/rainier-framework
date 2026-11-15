@@ -537,7 +537,11 @@ let outcome = db.execute(prepared).await?;      // rows_affected, last_insert_id
 params, route }`. That keeps shard routing and dialect rendering explicit at
 the framework seam — see below.
 
-## Independent queries at once
+## Running queries in parallel
+
+`concurrently!` and `all_concurrently` run queries in parallel — at the same
+time, on separate connections — instead of one after another. Laravel's
+`Concurrency::run` and JavaScript's `Promise.all` are the nearest equivalents.
 
 Every query a `Database` runs borrows a connection from the pool for as long as
 it runs. So queries that do not need each other's answers can run at the same

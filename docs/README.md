@@ -115,7 +115,7 @@ Run any example with `cargo run -p rainier-framework --example <name>
 
 | Page | What it covers |
 |---|---|
-| [Getting Started](database.md) | Connections, dialects, executors, raw SQL, and the `Send` story |
+| [Getting Started](database.md) | Connections, dialects, executors, raw SQL, running queries in parallel, and the `Send` story |
 | [Models](models.md) | `#[derive(Entity)]`, the `Model` trait, route keys, lifecycle hooks |
 | [Repositories](repositories.md) | The `Repository` contract, `EntityRepository`, `Criteria` |
 | [Relationships](relationships.md) | `has_many`, `belongs_to`, pivots, and why loading is a call |
@@ -212,6 +212,7 @@ concept as you know it, and where it lives here.
 | asserting into a JSON body | [`assert_json_path("a.b", "c")`](testing.md#testresponse) |
 | cache remember | [`cache.remember(key, ttl, closure)`](cache.md#remember) |
 | raw SQL with bindings | [`database.query(..).bind(id)`](database.md#databasequerysql) |
+| `Concurrency::run`, or queries in parallel | [`concurrently!` / `all_concurrently`](database.md#running-queries-in-parallel) |
 | a form method override | [`MethodOverride`](middleware.md#methodoverride) |
 | a queued listener | [`listen_queued::<E, J>()`](events.md#queued-listeners) |
 | an execution time limit | [`Timeout`](middleware.md#timeout), or `SERVER_REQUEST_TIMEOUT` |

@@ -1,5 +1,5 @@
-//! Running independent queries at the same time — [`concurrently!`] and
-//! [`all`].
+//! Running independent queries in parallel — at the same time, on separate
+//! connections — with [`concurrently!`] and [`all`].
 //!
 //! Every query a [`Database`](crate::Database) runs takes a connection from
 //! the pool for as long as it runs, and gives it back. So two queries that do

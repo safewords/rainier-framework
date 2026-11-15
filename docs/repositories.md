@@ -519,6 +519,9 @@ Things to know:
 
 ### Many rows at once
 
+Reads and writes that are independent of each other, rather than many rows of
+one, can instead [run in parallel](database.md#running-queries-in-parallel).
+
 `statement::insert_many(dialect, &rows)` writes a batch of one entity as a
 single `INSERT … VALUES (…), (…)` — a snapshot or an event batch without a
 round trip per row. Each row renders as `insert` renders it, so an
