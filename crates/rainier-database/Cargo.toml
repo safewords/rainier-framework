@@ -22,6 +22,10 @@ serde = { workspace = true }
 # same dependency the same way and for the same reason.
 tokio = { version = "1", default-features = false, features = ["rt"] }
 tracing = { workspace = true }
+# `try_join!` behind `concurrently!`, and the bounded stream behind
+# `concurrent::all`. The macro feature is a proc-macro, built for the host, so
+# it costs a wasm target nothing.
+futures-util = { workspace = true, features = ["std", "async-await", "async-await-macro"] }
 
 [features]
 default = []

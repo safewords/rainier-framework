@@ -24,6 +24,13 @@ the release as a whole and names the crate it landed in.
   same figures per route or job class in the table, and the latest batches
   below. They replace the separate "Jobs (timing)" page and the Requests and
   Jobs batch tabs in the navigation; the filtered batch list is a link away.
+- **Independent queries at once** (`rainier-database`, in the prelude):
+  `concurrently!(a, b, …)` runs a handful of queries at the same time, each on
+  its own pooled connection, and returns their values in order or the first
+  error; `all_concurrently(iter)` does a list, at most four at a time, in order
+  (`all_concurrently_limited(n, iter)` to choose). Against MariaDB, four
+  `SLEEP(0.2)` statements take 221 ms this way rather than 820 ms. See
+  `docs/database.md`, "Independent queries at once".
 - **Percentiles for each route and job class on its own page**
   (`rainier-lookout`): p50, p90, p95 and p99 over every run in the range, and
   p90, p95 and p99 over time beside the average. `/api/series/{type}` carries

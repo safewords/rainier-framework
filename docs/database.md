@@ -522,6 +522,55 @@ let outcome = db.execute(prepared).await?;      // rows_affected, last_insert_id
 params, route }`. That keeps shard routing and dialect rendering explicit at
 the framework seam — see below.
 
+## Independent queries at once
+
+Every query a `Database` runs borrows a connection from the pool for as long as
+it runs. So queries that do not need each other's answers can run at the same
+time, each on its own connection, and the wait is the slowest of them rather
+than all of them end to end. Awaiting them one by one, which is what plain
+`.await?` on each line does, gives that away:
+
+```rust
+use rainier_framework::prelude::*;
+
+// One after the other: four round trips.
+let unread = statuses.count_matching(unread.clone()).await?;
+let mine = profile_notifications.count_matching(mine).await?;
+
+// At once: the slower of the two. Results in the order written; the first
+// error is returned and the rest are dropped.
+let (unread, mine) = concurrently!(
+    statuses.count_matching(unread.clone()),
+    profile_notifications.count_matching(mine),
+)?;
+
+// A list of any length, at most four at a time, results in order.
+let profiles = all_concurrently(ids.iter().map(|&id| profiles.find(id))).await?;
+```
+
+Measured against MariaDB (`tests/concurrent_server.rs`): four `SLEEP(0.2)`
+statements take 820 ms one after the other, 221 ms through `concurrently!`, and
+eight through `all_concurrently` — four at a time — 428 ms.
+
+**Only independent queries.** A chain — the post, then its author, then the
+author's blocks — cannot run at once, because each needs the last one's
+answer. The cure for a chain is fewer queries: a join, or one
+`WHERE id IN (…)` for the whole page.
+
+**Connections are what it costs.** Four queries at once hold four connections
+for that moment, where one after another held one four times over.
+`concurrently!` is for a handful written out by hand; for a list, use
+`all_concurrently` (at most `concurrent::DEFAULT_LIMIT`, four, at a time) or
+`all_concurrently_limited(n, …)`, so one request cannot take the whole
+[pool](#sizing-the-pool) from every other.
+
+**Not a transaction.** These are independent statements: when one fails the
+rest are dropped, but nothing that already ran is undone. Do not run writes
+this way that must succeed or fail together.
+
+In Lookout each query is still its own span under the request, so the
+waterfall draws them overlapping — which is how to see that it worked.
+
 ## Sharding
 
 Rainier ORM routes by shard when the backend does:

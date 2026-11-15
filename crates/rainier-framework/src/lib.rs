@@ -268,6 +268,11 @@ pub mod prelude {
         BelongsTo, BelongsToMany, Criteria, Database, DatePart, EntityRepository, HasMany, HasOne,
         JoinKind, Model, Paginated, Projection, Related, RelatedCounts, Relation, Repository,
     };
+    // Independent queries at once: a handful by hand, or a bounded list.
+    pub use rainier_database::concurrent::{
+        all as all_concurrently, all_limited as all_concurrently_limited,
+    };
+    pub use rainier_database::concurrently;
     pub use rainier_orm::Entity;
 
     pub use rainier_auth::{

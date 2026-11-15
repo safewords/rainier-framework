@@ -64,6 +64,7 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod concurrent;
 pub mod connection;
 pub mod criteria;
 pub mod databases;
@@ -83,6 +84,7 @@ pub mod sticky;
 pub mod telemetry;
 pub mod testing;
 
+pub use concurrent::{all, all_limited};
 pub use connection::{ChangeSubscriber, Connection, Database};
 pub use criteria::{
     AggregateFn, Assignment, Comparison, Constraint, Criteria, DatePart, Derived, JoinKind,
@@ -124,6 +126,8 @@ pub mod reexport {
     pub use rainier_orm::sea_query::Value;
     pub use rainier_orm::{Dialect, ExecOutcome, Executor, Row, ShardRoute};
     pub use rainier_support::{BoxFuture, Error, LocalBoxFuture, Result};
+    // What `concurrently!` expands to.
+    pub use futures_util::try_join;
 }
 
 #[cfg(test)]

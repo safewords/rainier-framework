@@ -3960,6 +3960,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "futures-util",
  "rainier-drivers",
  "rainier-events",
  "rainier-orm",
