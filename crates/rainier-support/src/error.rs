@@ -14,7 +14,7 @@
 
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// The class of failure, which is also the HTTP status it renders as.
 ///
@@ -84,6 +84,8 @@ pub struct Error {
     details: Option<serde_json::Value>,
     source: Option<anyhow::Error>,
     backtrace: Option<Arc<Backtrace>>,
+    /// The backtrace as text, rendered the first time somebody asks.
+    rendered: OnceLock<String>,
 }
 
 impl Error {
@@ -102,14 +104,27 @@ impl Error {
     /// already-cached atomic read and an `Option` that is always `None` — and
     /// a developer gets the stack by exporting one variable, with no rebuild.
     ///
+    /// **A client error captures none in a release build**, even with
+    /// `RUST_BACKTRACE` set: a 404, a 401 or a failed validation is the
+    /// client's doing, and its stack says nothing worth the walk — tens of
+    /// microseconds, and several times that again to render it — on every
+    /// one of them. A debug build still captures one, for the debug error
+    /// page; [`with_kind`](Self::with_kind) captures one when it turns an
+    /// error into a server error.
+    ///
     /// `Arc`, because `Error` is cloned onto a `RenderedError` and moved
     /// between tasks, and a backtrace is comparatively large.
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        let backtrace = match Backtrace::capture() {
-            captured if captured.status() == BacktraceStatus::Captured => Some(Arc::new(captured)),
-            _ => None,
-        };
-        Self { kind, message: message.into(), details: None, source: None, backtrace }
+        let backtrace =
+            if kind.is_server_error() || cfg!(debug_assertions) { capture() } else { None };
+        Self {
+            kind,
+            message: message.into(),
+            details: None,
+            source: None,
+            backtrace,
+            rendered: OnceLock::new(),
+        }
     }
 
     /// 500 — an internal failure.
@@ -188,6 +203,12 @@ impl Error {
 
     /// Re-label the kind (and therefore the status) without losing the rest.
     pub fn with_kind(mut self, kind: ErrorKind) -> Self {
+        // A client error built in a release build has no stack; one that
+        // becomes a server error gets this one, the nearest there is.
+        if self.backtrace.is_none() && kind.is_server_error() && !self.kind.is_server_error() {
+            self.backtrace = capture();
+            self.rendered = OnceLock::new();
+        }
         self.kind = kind;
         self
     }
@@ -220,10 +241,23 @@ impl Error {
     /// The stack this error was constructed on, when one was captured.
     ///
     /// `None` unless `RUST_BACKTRACE` (or `RUST_LIB_BACKTRACE`) was set for
-    /// the process — see [`Error::new`]. Read by the debug error page in
+    /// the process, and for a client error in a release build — see
+    /// [`Error::new`]. Read by the debug error page in
     /// `rainier-debug`; nothing in a production path looks at it.
     pub fn backtrace(&self) -> Option<&Backtrace> {
         self.backtrace.as_deref()
+    }
+
+    /// [`backtrace`](Self::backtrace) rendered as text — symbolised once,
+    /// however many times it is asked for.
+    ///
+    /// Symbolising is most of a backtrace's cost, and one failed request asks
+    /// for the text two or three times: the rendered response, the failure
+    /// report, an auth failure's own report. Use this rather than
+    /// `backtrace().map(ToString::to_string)`.
+    pub fn backtrace_text(&self) -> Option<&str> {
+        let backtrace = self.backtrace.as_deref()?;
+        Some(self.rendered.get_or_init(|| backtrace.to_string()))
     }
 
     /// Adopt a backtrace captured somewhere else.
@@ -235,7 +269,16 @@ impl Error {
     /// `panic!`.
     pub fn with_backtrace(mut self, backtrace: Arc<Backtrace>) -> Self {
         self.backtrace = Some(backtrace);
+        self.rendered = OnceLock::new();
         self
+    }
+}
+
+/// A backtrace of the calling stack, when `RUST_BACKTRACE` asks for one.
+fn capture() -> Option<Arc<Backtrace>> {
+    match Backtrace::capture() {
+        captured if captured.status() == BacktraceStatus::Captured => Some(Arc::new(captured)),
+        _ => None,
     }
 }
 
@@ -338,6 +381,28 @@ impl<T> Context<T> for Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_backtrace_text_is_rendered_once_and_is_the_backtrace() {
+        let error = Error::internal("x").with_backtrace(Arc::new(Backtrace::force_capture()));
+        let first = error.backtrace_text().expect("adopted a stack");
+        assert_eq!(first, error.backtrace().expect("adopted a stack").to_string());
+        let again = error.backtrace_text().expect("adopted a stack");
+        assert!(std::ptr::eq(first, again), "rendered once, then reused");
+        let plain = Error::internal("y");
+        assert_eq!(plain.backtrace_text().is_some(), plain.backtrace().is_some());
+    }
+
+    #[test]
+    fn a_client_error_promoted_to_a_server_error_keeps_or_gains_a_stack() {
+        // With `RUST_BACKTRACE` unset nothing captures, so this only checks
+        // that promoting never loses the stack a client error had.
+        let error = Error::not_found("x");
+        let had = error.backtrace().is_some();
+        let promoted = error.with_kind(ErrorKind::Internal);
+        assert!(!had || promoted.backtrace().is_some());
+        assert_eq!(promoted.status(), 500);
+    }
 
     #[test]
     fn kinds_map_to_statuses() {

@@ -250,7 +250,7 @@ fn snapshot(error: &Error) -> Exception {
             .source_error()
             .map(|source| source.chain().map(ToString::to_string).collect())
             .unwrap_or_default(),
-        backtrace: error.backtrace().map(ToString::to_string),
+        backtrace: error.backtrace_text().map(str::to_string),
         ..Exception::message(error.kind(), error.message())
     }
 }

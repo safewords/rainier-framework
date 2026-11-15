@@ -463,7 +463,7 @@ impl IntoResponse for Error {
             kind: Some(format!("{:?}", self.kind())),
             // Rendered here, at the boundary, because this is the last place
             // that holds the `Error` itself.
-            backtrace: self.backtrace().map(|b| b.to_string()),
+            backtrace: self.backtrace_text().map(str::to_string),
         });
         response.extensions_mut().insert(OriginalError(Arc::new(self)));
         response

@@ -20,6 +20,9 @@ rainier-database = { workspace = true }
 rainier-orm = { workspace = true }
 # The `cache` store: a ring buffer in the application's cache.
 rainier-cache = { workspace = true }
+# Many cache commands at once — the connection multiplexes, so a write is a
+# few round trips rather than one per key — and the dashboard's fan-out.
+futures-util = { workspace = true, features = ["alloc"] }
 # The stores mark their own work `rainier.lookout.internal` so Lookout does not
 # record itself.
 tracing = { workspace = true }

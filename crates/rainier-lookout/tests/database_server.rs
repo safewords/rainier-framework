@@ -58,7 +58,7 @@ async fn the_database_store_conforms_on_a_real_server() {
 
         assert_eq!(
             DatabaseStore::migrations().run(&db).await.expect("migrate").len(),
-            4,
+            6,
             "[{scheme}]"
         );
         assert!(

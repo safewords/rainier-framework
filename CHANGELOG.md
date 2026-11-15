@@ -12,6 +12,8 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- `Upsert::maximum` and `UpsertAction::Maximum` (`rainier-orm`): on a
+  conflict, keep the larger of the stored and the inserted value.
 - **Lookout drills in, forecasts and keeps cases** (`rainier-lookout`).
   - Every dashboard row opens its own page — one route, query, job, exception
     or outgoing call — with its series over time, a forecast, p50/p95/p99, a
@@ -413,6 +415,60 @@ the release as a whole and names the crate it landed in.
   pinned in the tests.
 
 ### Changed
+
+- **Lookout's cache store no longer rewrites every bucket and case on every
+  write** (`rainier-lookout`). Each aggregate bucket used to be listed in one
+  `lookout:buckets` key and every case kept in one `lookout:cases` key, both
+  read and rewritten whole under the writers' lock on every flush — a day of
+  per-minute buckets was already 0.8 MB, a month about 25 MB, and 1000 cases
+  1.4 MB more, on every flush of every pod. Buckets are now listed per UTC
+  day (`buckets:{period}:{type}:{day}`, rewritten only when a bucket first
+  appears, and `buckets:days`), and each case is its own `case:{id}` key under
+  a small `cases:index`. Measured with the new `cache_store_cost` test (a full
+  ring of 1000 batches, a day of buckets, 1000 cases, 1 ms per command): a
+  flush with an exception went from 2.9 MB read and 2.9 MB written in 115 ms to
+  0.8 MB and 0.9 MB in 17 ms. The first write after the upgrade folds the old
+  keys in and deletes them; readers merge them until then.
+- **Lookout's cache store sends its commands concurrently** and reads less:
+  listing entries of a type read every batch in the ring one after another
+  (1001 commands, 16.8 MB, 2.6 s in that test) and now reads the newest few
+  at a time and stops once nothing older can hold a newer entry (17 commands,
+  0.7 MB, 8 ms). A case listing reads only the cases on the page (1.4 MB →
+  0.2 MB); insights read 8.4 MB → 0.25 MB, and the insights endpoint reads its
+  ten types at once.
+- **Lookout's code traces leave the request faster** (`rainier-lookout`).
+  The stack is still walked as a slow span closes, but symbolised by the
+  background writer on a blocking thread, and a batch walks at most
+  `MAX_CODE_TRACES_PER_BATCH` (16). A request of twenty slow queries spent
+  627 µs recording, 203 µs now (`hot_path_cost` test, release, macOS). A batch
+  the production keep rule drops is dropped before the N+1 search, and span
+  fields move into entries instead of being copied: an ordinary request went
+  from 22.5 µs to 19.1 µs, a kept one from 26.7 µs to 19.2 µs.
+- **Lookout's database store writes aggregates in one upsert**
+  (`rainier-lookout`, `rainier-orm`). The maximum used to be raised by a
+  guarded `UPDATE` per aggregate row after the upsert — dozens of statements a
+  flush; `Upsert::maximum` keeps the larger value in the upsert itself
+  (`GREATEST`, SQLite's `MAX`). A family's entries are one query on the new
+  index `(family_hash, type, occurred_at_us)` (migration
+  `rainier_lookout_0006_entries_family_index`); the second query, for entries
+  without a family hash, could not use an index and scanned every entry of the
+  type. Entries without a family hash are now hashed by their summary; ones
+  written before the upgrade are not found by their family and age out with
+  their batches.
+- **A client error no longer captures a backtrace in a release build**
+  (`rainier-support`). With `RUST_BACKTRACE=1` set in production — as the
+  images often set it — every 404, 401 and failed validation walked the stack
+  and then symbolised it two or three times (the rendered response, the
+  failure report, an auth failure's own report): about 160 µs per error on
+  Apple silicon, 220 µs on emulated x86-64, for a stack nobody reads. A debug
+  build still captures one for the debug page, and `Error::with_kind` captures
+  one when it turns an error into a server error. New
+  `Error::backtrace_text()` symbolises once however often it is asked; the
+  framework's reporters and `IntoResponse` use it, which takes a 500's three
+  renders from 160 µs to 107 µs. A 4xx's failure report, and so a Lookout
+  case for one, no longer carries a stack; such a case's fingerprint loses its
+  first application frame, so a 4xx case recorded before the upgrade is
+  opened again under a new id.
 
 - **Lookout no longer counts a request's client error as a failure**
   (`rainier-lookout`). A `404` or `422` answered to a request is recorded

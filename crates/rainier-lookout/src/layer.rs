@@ -42,6 +42,7 @@
 //! "never" disables the callsite for *every* layer of the subscriber, and
 //! Lookout must not switch off the application's logs or its exporter.
 
+use std::backtrace::Backtrace;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -122,10 +123,17 @@ impl FieldValue {
     fn to_json(&self) -> Value {
         match self {
             FieldValue::Str(s) => Value::String(s.clone()),
-            FieldValue::I64(n) => Value::from(*n),
-            FieldValue::U64(n) => Value::from(*n),
-            FieldValue::F64(n) => Value::from(*n),
-            FieldValue::Bool(b) => Value::Bool(*b),
+            other => other.clone().into_json(),
+        }
+    }
+
+    fn into_json(self) -> Value {
+        match self {
+            FieldValue::Str(s) => Value::String(s),
+            FieldValue::I64(n) => Value::from(n),
+            FieldValue::U64(n) => Value::from(n),
+            FieldValue::F64(n) => Value::from(n),
+            FieldValue::Bool(b) => Value::Bool(b),
         }
     }
 
@@ -362,17 +370,14 @@ where
         }
         let Some(span) = ctx.span(&id) else { return };
         let Some(state) = span.extensions_mut().remove::<SpanState>() else { return };
-        let entry = state.draft.map(|draft| {
-            let mut entry = build_entry(&self.inner.config, draft, state.entry_parent.clone());
-            if !state.root {
-                attach_code_trace(&self.inner.config, &mut entry);
-            }
-            entry
-        });
+        let entry = state
+            .draft
+            .map(|draft| build_entry(&self.inner.config, draft, state.entry_parent.clone()));
         if state.root {
             self.inner.close_batch(&state.batch, entry);
         } else if let Some(entry) = entry {
-            self.inner.push(&state.batch, entry);
+            let trace = code_trace(&self.inner.config, &state.batch, &entry);
+            self.inner.push_traced(&state.batch, entry, trace);
         }
     }
 
@@ -601,21 +606,22 @@ fn build_entry(config: &LookoutConfig, draft: Draft, parent: Option<String>) -> 
         }
     };
 
+    // The fields move into the content: nothing reads them after this.
     let mut content = Map::new();
-    for (name, value) in fields {
-        if name.starts_with("otel.") && *name != "otel.status_code" {
+    for (name, value) in draft.fields {
+        if name.starts_with("otel.") && name != "otel.status_code" {
             continue;
         }
-        if *name == "cache.key" && !config.capture.cache_keys {
+        if name == "cache.key" && !config.capture.cache_keys {
             continue;
         }
         if name.starts_with("mail.")
-            && !matches!(*name, "mail.transport" | "mail.recipients" | "mail.attachments")
+            && !matches!(name, "mail.transport" | "mail.recipients" | "mail.attachments")
             && !config.capture.mail
         {
             continue;
         }
-        content.insert((*name).to_string(), value.to_json());
+        content.insert(name.to_string(), value.into_json());
     }
     let mut content = Value::Object(content);
     redact_json(&mut content, &config.redaction);
@@ -647,28 +653,26 @@ const TRACED: &[EntryType] = &[
     EntryType::Custom,
 ];
 
-/// Add `code.trace` to a slow entry: the application's frames of the stack
-/// as its span closes. `on_close` runs as the instrumented future is dropped,
-/// inside the poll of the code that awaited it, so those frames are where the
-/// query or the call came from. Only over the slow threshold, because a
-/// capture walks the stack.
-fn attach_code_trace(config: &LookoutConfig, entry: &mut Entry) {
+/// The stack for a slow entry's `code.trace`: the application's frames of
+/// the stack as its span closes. `on_close` runs as the instrumented future is
+/// dropped, inside the poll of the code that awaited it, so those frames are
+/// where the query or the call came from.
+///
+/// Only over the slow threshold, at most [`MAX_CODE_TRACES_PER_BATCH`] a
+/// batch, and only walked here: the writer symbolises it, off the request's
+/// thread.
+///
+/// [`MAX_CODE_TRACES_PER_BATCH`]: crate::recorder::MAX_CODE_TRACES_PER_BATCH
+fn code_trace(config: &LookoutConfig, batch: &BatchCell, entry: &Entry) -> Option<Backtrace> {
     if !config.capture.code_traces || !TRACED.contains(&entry.entry_type) {
-        return;
+        return None;
     }
-    let (Some(duration), Some(threshold)) =
-        (entry.duration_us, crate::recorder::slow_threshold_ms(config, entry))
-    else {
-        return;
-    };
-    if duration < threshold.saturating_mul(1000) {
-        return;
+    let duration = entry.duration_us?;
+    let threshold = crate::recorder::slow_threshold_ms(config, entry)?;
+    if duration < threshold.saturating_mul(1000) || !batch.claim_trace() {
+        return None;
     }
-    let trace = std::backtrace::Backtrace::force_capture().to_string();
-    let frames = crate::watchers::exceptions::app_frames(&trace, 12);
-    if let (false, Value::Object(content)) = (frames.is_empty(), &mut entry.content) {
-        content.insert("code.trace".into(), Value::Array(frames));
-    }
+    Some(Backtrace::force_capture())
 }
 
 /// `host/path` with the parts of the path that identify something — numbers,

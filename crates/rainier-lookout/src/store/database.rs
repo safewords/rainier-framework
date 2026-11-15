@@ -38,10 +38,14 @@
 //!   Re-storing the same id cleans that up: a store first deletes every row of
 //!   the ids it is about to write, which is also how a replayed write
 //!   replaces rather than duplicates.
-//! - **The aggregate maximum is a guarded update.** The upsert increments
-//!   `count` and `sum_us`; `max_us` is then raised with
-//!   `UPDATE … SET max_us = ? WHERE <key> AND max_us < ?`. Both are atomic per
-//!   row, so two writers racing on one bucket lose nothing.
+//! - **Aggregates are one upsert.** It increments `count` and `sum_us` and
+//!   keeps the larger `max_us` (`GREATEST`, or SQLite's `MAX`) in the same
+//!   statement, atomic per row, so two writers racing on one bucket lose
+//!   nothing — and a write costs a statement per few hundred rows, not one
+//!   per row for the maximum as it once did.
+//! - **A family's entries are one indexed query**, on
+//!   `(family_hash, type, occurred_at_us)`. `family_hash` hashes the family
+//!   key, or the summary for an entry without one.
 //! - **Statements stay under a bind-parameter budget**
 //!   ([`with_max_bind_params`](DatabaseStore::with_max_bind_params), 900 by
 //!   default — under SQLite's historical 999). Cloudflare D1 allows 100.
@@ -52,7 +56,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-use rainier_database::{statement, Criteria, Database, Migrator, Subquery, Upsert};
+use rainier_database::{statement, Criteria, Database, Migrator, Step, Subquery, Upsert};
 use rainier_orm::Entity;
 use rainier_support::{BoxFuture, Error, Result};
 use tracing::Instrument as _;
@@ -221,6 +225,11 @@ impl DatabaseStore {
             .create_table::<TagRow>("rainier_lookout_0003_batch_tags")
             .create_table::<AggregateRow>("rainier_lookout_0004_aggregates")
             .create_table::<CaseRow>("rainier_lookout_0005_cases")
+            // A family's entries, newest first, straight off an index: the
+            // `family_hash` index alone found them and then sorted them all.
+            .add(Step::table("rainier_lookout_0006_entries_family_index", EntryRow::table(), |t| {
+                t.index(["family_hash", "type", "occurred_at_us"]);
+            }))
     }
 
     /// How many rows of `columns` columns fit one statement.
@@ -371,8 +380,11 @@ impl DatabaseStore {
         if rows.is_empty() {
             return Ok(());
         }
+        // Counts and sums add, the maximum keeps the larger: all three in the
+        // one statement, atomically per row.
         let plan = Upsert::on(["bucket_start", "period_s", "type", "key_hash"])
-            .increment(["count", "sum_us"]);
+            .increment(["count", "sum_us"])
+            .maximum(["max_us"]);
         for chunk in rows.chunks(self.rows_per_statement(AggregateRow::columns().len())) {
             self.db
                 .execute(statement::upsert_many_with::<AggregateRow>(
@@ -380,22 +392,6 @@ impl DatabaseStore {
                     chunk,
                     &plan,
                 )?)
-                .await?;
-        }
-        // Raise the maximum where this write's is larger. A fresh row already
-        // holds it, and the guard makes the update a no-op then.
-        for row in rows.iter().filter(|r| r.max_us > 0) {
-            self.db
-                .execute(statement::update_matching::<AggregateRow>(
-                    self.db.dialect(),
-                    &Criteria::new()
-                        .where_eq("bucket_start", row.bucket_start)
-                        .where_eq("period_s", row.period_s)
-                        .where_eq("type", row.entry_type.clone())
-                        .where_eq("key_hash", row.key_hash.clone())
-                        .where_lt("max_us", row.max_us),
-                    vec![("max_us".into(), row.max_us.into())],
-                ))
                 .await?;
         }
         Ok(())
@@ -514,9 +510,12 @@ impl DatabaseStore {
         .collect()
     }
 
-    /// One family's entries: those whose family key hashes to `key`'s hash
-    /// (the index) and is `key`, and those without a family key whose summary
-    /// is `key`. Two indexed queries, merged in Rust.
+    /// One family's entries: those whose family key — the family hash, or the
+    /// summary for an entry without one — hashes to `key`'s hash, which is
+    /// one indexed query, and is `key`.
+    ///
+    /// Rows written before `family_hash` held the summary's hash for an entry
+    /// without a family are not found; they age out with the batches.
     async fn family(
         &self,
         entry_type: EntryType,
@@ -539,26 +538,12 @@ impl DatabaseStore {
                 .order_by_desc("seq")
                 .limit(limit as u64)
         };
-        let mut rows: Vec<EntryRow> = self
-            .select::<EntryRow>(narrowed(Criteria::new().where_eq("family_hash", hash(key))))
+        self.select::<EntryRow>(narrowed(Criteria::new().where_eq("family_hash", hash(key))))
             .await?
             .into_iter()
-            .filter(|row| row.family_key.as_deref() == Some(key))
-            .collect();
-        rows.extend(
-            self.select::<EntryRow>(narrowed(
-                Criteria::new().where_null("family_key").where_eq("summary", key),
-            ))
-            .await?,
-        );
-        rows.sort_by(|a, b| {
-            b.occurred_at_us
-                .cmp(&a.occurred_at_us)
-                .then_with(|| b.batch_id.cmp(&a.batch_id))
-                .then_with(|| b.seq.cmp(&a.seq))
-        });
-        rows.truncate(limit);
-        rows.into_iter().map(EntryRow::into_entry).collect()
+            .filter(|row| row.family_key.as_deref().unwrap_or(&row.summary) == key)
+            .map(EntryRow::into_entry)
+            .collect()
     }
 
     async fn prune_rows(
@@ -791,7 +776,9 @@ impl EntryRow {
             entry_type: entry.entry_type.as_str().to_string(),
             span_id: entry.span_id.clone(),
             parent_span_id: entry.parent_span_id.clone(),
-            family_hash: entry.family_hash.as_deref().map(hash),
+            // Of the family key, so an entry without a family hash is found by
+            // its summary through the same index.
+            family_hash: Some(hash(entry.family_key())),
             family_key: entry.family_hash.clone(),
             summary: entry.summary.clone(),
             occurred_at_us: micros(entry.occurred_at),
@@ -919,6 +906,7 @@ mod tests {
                 "rainier_lookout_0003_batch_tags",
                 "rainier_lookout_0004_aggregates",
                 "rainier_lookout_0005_cases",
+                "rainier_lookout_0006_entries_family_index",
             ]
         );
     }
@@ -1005,7 +993,7 @@ mod tests {
                 .await
                 .expect("connect");
             let db = Database::new(executor);
-            assert_eq!(DatabaseStore::migrations().run(&db).await.unwrap().len(), 5);
+            assert_eq!(DatabaseStore::migrations().run(&db).await.unwrap().len(), 6);
             assert!(DatabaseStore::migrations().run(&db).await.unwrap().is_empty());
         }
 

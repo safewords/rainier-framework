@@ -54,7 +54,8 @@
 //! [`BatchKind::Other`] batch holding just that failure, so nothing reported
 //! is lost to scoping or sampling.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::backtrace::Backtrace;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -77,6 +78,11 @@ pub const INTERNAL_FIELD: &str = "rainier.lookout.internal";
 /// queries keeps the first ones and counts the rest in the batch's
 /// `truncated:<n>` tag.
 pub const MAX_ENTRIES_PER_BATCH: usize = 2_000;
+
+/// The most code traces one batch captures. A request that runs the same
+/// slow query five hundred times is told where it came from by a few of them;
+/// five hundred stack walks would only make it slower.
+pub const MAX_CODE_TRACES_PER_BATCH: usize = 16;
 
 /// How long a failed request's batch waits for its failure report.
 const PARK_FOR: Duration = Duration::from_millis(250);
@@ -357,6 +363,8 @@ pub(crate) struct BatchCell {
     /// A fast "do not bother building entries" flag, mirrored from
     /// `Pending::rejected`.
     rejected: AtomicBool,
+    /// Code traces captured so far, against [`MAX_CODE_TRACES_PER_BATCH`].
+    traces: AtomicUsize,
     /// What started it.
     pub(crate) kind: BatchKind,
 }
@@ -368,6 +376,11 @@ impl BatchCell {
 
     pub(crate) fn is_rejected(&self) -> bool {
         self.rejected.load(Ordering::Relaxed)
+    }
+
+    /// Claim one of the batch's code traces; `false` once they are used up.
+    pub(crate) fn claim_trace(&self) -> bool {
+        self.traces.fetch_add(1, Ordering::Relaxed) < MAX_CODE_TRACES_PER_BATCH
     }
 }
 
@@ -398,6 +411,9 @@ pub(crate) struct Pending {
     pub(crate) failed_job: bool,
     pub(crate) request_headers: Option<serde_json::Value>,
     pub(crate) request_body: Option<Vec<u8>>,
+    /// Stacks captured for entries' code traces, by entry id: walked on the
+    /// request's thread, symbolised later by the writer.
+    pub(crate) traces: Vec<(String, Arc<Backtrace>)>,
 }
 
 impl Pending {
@@ -425,6 +441,7 @@ impl Pending {
             failed_job: false,
             request_headers: None,
             request_body: None,
+            traces: Vec::new(),
         }
     }
 
@@ -446,8 +463,8 @@ pub(crate) struct Inner {
     paused: AtomicBool,
     dropped: AtomicU64,
     queued: AtomicUsize,
-    tx: mpsc::Sender<Batch>,
-    rx: tokio::sync::Mutex<mpsc::Receiver<Batch>>,
+    tx: mpsc::Sender<Closed>,
+    rx: tokio::sync::Mutex<mpsc::Receiver<Closed>>,
     wake: Notify,
     writer_started: AtomicBool,
     /// Open batches by id (and trace id), for [`Lookout::tag`].
@@ -542,6 +559,7 @@ impl Inner {
         let cell = Arc::new(BatchCell {
             state: Mutex::new(Some(pending)),
             rejected: AtomicBool::new(rejected),
+            traces: AtomicUsize::new(0),
             kind,
         });
         self.open.lock().unwrap_or_else(|e| e.into_inner()).insert(id, Arc::downgrade(&cell));
@@ -684,6 +702,11 @@ impl Inner {
 
     /// Add an entry to `cell`, unless it stopped buffering.
     pub(crate) fn push(&self, cell: &BatchCell, entry: Entry) {
+        self.push_traced(cell, entry, None);
+    }
+
+    /// [`push`](Self::push), with the stack its code trace is made from.
+    pub(crate) fn push_traced(&self, cell: &BatchCell, entry: Entry, trace: Option<Backtrace>) {
         if cell.is_rejected() && entry.entry_type != EntryType::Exception {
             return;
         }
@@ -691,7 +714,14 @@ impl Inner {
             if pending.rejected.is_some() && entry.entry_type != EntryType::Exception {
                 return;
             }
+            let id = trace.is_some().then(|| entry.id.clone());
+            let before = pending.entries.len();
             pending.push(entry);
+            if let (Some(id), Some(trace)) = (id, trace) {
+                if pending.entries.len() > before {
+                    pending.traces.push((id, Arc::new(trace)));
+                }
+            }
         }
     }
 
@@ -804,15 +834,20 @@ impl Inner {
     }
 
     /// Finalize and hand to the writer.
-    fn finish(&self, pending: Pending) {
+    fn finish(&self, mut pending: Pending) {
+        let mut traces = std::mem::take(&mut pending.traces);
         if let Some(batch) = finalize(&self.config, pending, self.host.clone()) {
-            self.send(batch);
+            if !traces.is_empty() {
+                let kept: HashSet<&str> = batch.entries.iter().map(|e| e.id.as_str()).collect();
+                traces.retain(|(id, _)| kept.contains(id.as_str()));
+            }
+            self.send(Closed { batch, traces });
         }
     }
 
     /// `try_send`; full means dropped and counted.
-    fn send(&self, batch: Batch) {
-        match self.tx.try_send(batch) {
+    fn send(&self, closed: Closed) {
+        match self.tx.try_send(closed) {
             Ok(()) => {
                 let queued = self.queued.fetch_add(1, Ordering::Relaxed) + 1;
                 if queued >= self.config.ingest.flush_batch_size {
@@ -846,7 +881,7 @@ impl Inner {
         let span = tracing::info_span!("lookout.write", rainier.lookout.internal = true);
         while !waiting.is_empty() {
             let rest = waiting.split_off(waiting.len().min(size));
-            let chunk = std::mem::replace(&mut waiting, rest);
+            let chunk = resolve_code_traces(std::mem::replace(&mut waiting, rest)).await;
             let result =
                 tracing::Instrument::instrument(self.store.store(chunk), span.clone()).await;
             if let Err(error) = result {
@@ -869,6 +904,59 @@ impl Inner {
         });
     }
 }
+
+/// A kept batch on its way to the writer, with the stacks of its code traces
+/// still to be symbolised.
+pub(crate) struct Closed {
+    batch: Batch,
+    traces: Vec<(String, Arc<Backtrace>)>,
+}
+
+/// Turn each batch's captured stacks into `code.trace` frames.
+///
+/// Symbolising a stack — finding the function, file and line of every
+/// address in it — costs several times what walking it did, so it happens
+/// here, on the writer's side of the channel and on a blocking thread, rather
+/// than in the request that captured it.
+async fn resolve_code_traces(closed: Vec<Closed>) -> Vec<Batch> {
+    if closed.iter().all(|c| c.traces.is_empty()) {
+        return closed.into_iter().map(|c| c.batch).collect();
+    }
+    let resolve = |closed: Vec<Closed>| -> Vec<Batch> {
+        closed
+            .into_iter()
+            .map(|Closed { mut batch, traces }| {
+                if traces.is_empty() {
+                    return batch;
+                }
+                let at: HashMap<&str, usize> =
+                    batch.entries.iter().enumerate().map(|(i, e)| (e.id.as_str(), i)).collect();
+                let found: Vec<(usize, Arc<Backtrace>)> = traces
+                    .into_iter()
+                    .filter_map(|(id, trace)| at.get(id.as_str()).map(|&i| (i, trace)))
+                    .collect();
+                for (i, trace) in found {
+                    let frames = crate::watchers::exceptions::app_frames(
+                        &trace.to_string(),
+                        CODE_TRACE_FRAMES,
+                    );
+                    if let (false, serde_json::Value::Object(content)) =
+                        (frames.is_empty(), &mut batch.entries[i].content)
+                    {
+                        content.insert("code.trace".into(), serde_json::Value::Array(frames));
+                    }
+                }
+                batch
+            })
+            .collect()
+    };
+    // Only a panic in the resolver loses these batches, and it has none to
+    // throw: the frames are parsed from text, not unwrapped.
+    tokio::task::spawn_blocking(move || resolve(closed)).await.unwrap_or_default()
+}
+
+/// How many of the application's frames a code trace keeps.
+const CODE_TRACE_FRAMES: usize = 12;
 
 /// Copy what the root span said onto the batch, where the middleware did not.
 fn fill_from_root(pending: &mut Pending, root: &Entry) {
@@ -992,6 +1080,19 @@ pub(crate) fn finalize(
         // though the batch itself stays.
         pending.entries.retain(|e| config.watcher(e.entry_type).enabled);
         derive_slow(config, &mut pending.entries);
+        // Most production requests end here: the default keep rule drops a
+        // batch with nothing slow, failed or monitored in it, so nothing
+        // below — the N+1 search, the sort, the summary — would be kept.
+        if config.keep.is_none()
+            && !config.local
+            && !monitored
+            && pending.kind != BatchKind::Other
+            && !has_exception
+            && !pending.failed_job
+            && !pending.entries.iter().any(|e| e.tags.iter().any(|t| t == "slow"))
+        {
+            return None;
+        }
         derive_n_plus_one(config, &mut pending.entries);
     }
 
@@ -1169,24 +1270,28 @@ fn derive_n_plus_one(config: &LookoutConfig, entries: &mut Vec<Entry>) {
     if !rule.enabled || !config.watcher(EntryType::NPlusOne).enabled {
         return;
     }
-    let mut runs: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    // Borrowed while grouping: only the runs that qualify copy their SQL.
+    let mut runs: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (i, entry) in entries.iter().enumerate() {
         if entry.entry_type != EntryType::Query {
             continue;
         }
         if let Some(sql) = &entry.family_hash {
-            runs.entry(sql.clone()).or_default().push(i);
+            runs.entry(sql.as_str()).or_default().push(i);
         }
     }
+    let runs: Vec<(String, Vec<usize>)> = runs
+        .into_iter()
+        .filter(|(_, indexes)| indexes.len() >= rule.min_repeats.max(2))
+        .filter(|(_, indexes)| {
+            let total: u64 = indexes.iter().filter_map(|&i| entries[i].duration_us).sum();
+            total >= rule.min_total_ms.saturating_mul(1000)
+        })
+        .map(|(sql, indexes)| (sql.to_string(), indexes))
+        .collect();
     let mut derived = Vec::new();
     for (sql, indexes) in runs {
-        if indexes.len() < rule.min_repeats.max(2) {
-            continue;
-        }
         let total: u64 = indexes.iter().filter_map(|&i| entries[i].duration_us).sum();
-        if total < rule.min_total_ms.saturating_mul(1000) {
-            continue;
-        }
         let ids: Vec<String> = indexes.iter().map(|&i| entries[i].id.clone()).collect();
         let first = &entries[indexes[0]];
         derived.push(Entry {

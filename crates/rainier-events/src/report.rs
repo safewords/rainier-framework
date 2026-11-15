@@ -154,7 +154,7 @@ impl Exception {
             message: error.message().to_string(),
             details: error.details().cloned(),
             sources,
-            backtrace: error.backtrace().map(ToString::to_string),
+            backtrace: error.backtrace_text().map(str::to_string),
             panic: false,
             error: Some(error),
         }
@@ -174,7 +174,7 @@ impl Exception {
             message: error.message().to_string(),
             details: error.details().cloned(),
             sources,
-            backtrace: error.backtrace().map(ToString::to_string),
+            backtrace: error.backtrace_text().map(str::to_string),
             panic: false,
             error: None,
         }

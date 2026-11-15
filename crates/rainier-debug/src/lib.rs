@@ -77,6 +77,8 @@
 //! That is the trade [`Error::new`](rainier_support::Error::new) makes:
 //! `Backtrace::capture()` returns `Disabled` without walking a frame when the
 //! variable is unset, so production pays nothing for a feature it never uses.
+//! A client error built in a release build captures no stack even with it
+//! set; in the debug build this page is for, it does.
 //!
 //! Source excerpts additionally need the source to be *on the machine*, at the
 //! path the debug info recorded. True when you `cargo run`; false inside a

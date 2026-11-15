@@ -96,6 +96,16 @@ pub enum UpsertAction {
     /// two is invisible: both render, both run, both report a row affected, and
     /// the only symptom is a total that is too low. See the module docs.
     Increment,
+    /// `col = <the larger of the stored and the inserted value>` — a running
+    /// maximum, kept in the same statement as the counters beside it instead
+    /// of a guarded `UPDATE` per row afterwards.
+    ///
+    /// | | rendered |
+    /// |---|---|
+    /// | MySQL | `n = GREATEST(n, VALUES(n))` |
+    /// | Postgres | `n = GREATEST("t"."n", "excluded"."n")` |
+    /// | SQLite | `n = MAX("t"."n", "excluded"."n")` |
+    Maximum,
 }
 
 /// An `INSERT … ON CONFLICT` plan: which columns collide, and what each updated
@@ -149,6 +159,17 @@ impl Upsert {
         S: Into<String>,
     {
         self.actions.extend(columns.into_iter().map(|c| (c.into(), UpsertAction::Increment)));
+        self
+    }
+
+    /// On a conflict, keep the **larger** of the stored value and the one
+    /// being inserted — a running maximum, atomically.
+    pub fn maximum<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.actions.extend(columns.into_iter().map(|c| (c.into(), UpsertAction::Maximum)));
         self
     }
 
@@ -253,6 +274,9 @@ impl Upsert {
                 UpsertAction::Increment => {
                     clause.value(Alias::new(column.as_str()), increment(dialect, table, column));
                 }
+                UpsertAction::Maximum => {
+                    clause.value(Alias::new(column.as_str()), maximum(dialect, table, column));
+                }
             }
         }
 
@@ -280,6 +304,25 @@ fn increment(dialect: Dialect, table: &str, column: &str) -> SimpleExpr {
             .add(Func::cust(Alias::new("VALUES")).arg(Expr::col(Alias::new(column)))),
         Dialect::Sqlite | Dialect::Postgres => Expr::col((Alias::new(table), Alias::new(column)))
             .add(Expr::col((Alias::new("excluded"), Alias::new(column)))),
+    }
+}
+
+/// `col = <the larger of stored and incoming>`, spelled for `dialect`: the
+/// two sides as [`increment`] spells them, under the dialect's two-argument
+/// maximum — `GREATEST` on MySQL and Postgres, the scalar `MAX` on SQLite.
+fn maximum(dialect: Dialect, table: &str, column: &str) -> SimpleExpr {
+    match dialect {
+        Dialect::MySql => Func::cust(Alias::new("GREATEST"))
+            .arg(Expr::col(Alias::new(column)))
+            .arg(Func::cust(Alias::new("VALUES")).arg(Expr::col(Alias::new(column))))
+            .into(),
+        Dialect::Sqlite | Dialect::Postgres => {
+            let name = if dialect == Dialect::Sqlite { "MAX" } else { "GREATEST" };
+            Func::cust(Alias::new(name))
+                .arg(Expr::col((Alias::new(table), Alias::new(column))))
+                .arg(Expr::col((Alias::new("excluded"), Alias::new(column))))
+                .into()
+        }
     }
 }
 
@@ -321,6 +364,39 @@ mod tests {
             sql(Dialect::Postgres, &plan),
             r#"INSERT INTO "t" ("a", "b", "n") VALUES ($1, $2, $3) "#.to_owned()
                 + r#"ON CONFLICT ("a", "b") DO UPDATE SET "n" = "t"."n" + "excluded"."n""#
+        );
+    }
+
+    #[test]
+    fn a_maximum_keeps_the_larger_of_stored_and_incoming() {
+        let plan = Upsert::on(["a", "b"]).increment(["n"]).maximum(["m"]);
+        let render = |dialect| {
+            let inserted = ["a", "b", "n", "m"];
+            let mut stmt = Query::insert();
+            stmt.into_table(Alias::new("t"));
+            stmt.columns(inserted.iter().map(|c| Alias::new(*c)));
+            stmt.values_panic(
+                [1_i64, 2, 5, 9].map(|v| SimpleExpr::from(Expr::val(Value::from(v)))),
+            );
+            stmt.on_conflict(plan.to_on_conflict(dialect, "t", &inserted).expect("renders"));
+            dialect.build_query(&stmt).0
+        };
+        assert!(
+            render(Dialect::MySql).ends_with(
+                "ON DUPLICATE KEY UPDATE `n` = `n` + VALUES(`n`), `m` = GREATEST(`m`, VALUES(`m`))"
+            ),
+            "{}",
+            render(Dialect::MySql)
+        );
+        assert!(
+            render(Dialect::Sqlite).ends_with(r#""m" = MAX("t"."m", "excluded"."m")"#),
+            "{}",
+            render(Dialect::Sqlite)
+        );
+        assert!(
+            render(Dialect::Postgres).ends_with(r#""m" = GREATEST("t"."m", "excluded"."m")"#),
+            "{}",
+            render(Dialect::Postgres)
         );
     }
 

@@ -165,7 +165,8 @@ is always recorded: there it is the application's fault.
 ### Code traces
 
 An exception carries its backtrace when the error captured one
-(`RUST_BACKTRACE=1`), and its content gains `frames`: the application's own
+(`RUST_BACKTRACE=1`; in a release build, server errors only — see
+[errors](errors.md)), and its content gains `frames`: the application's own
 frames — framework, runtime and standard-library frames left out — as
 `{"function", "file", "line"}`, innermost first.
 
@@ -175,6 +176,13 @@ runs as the instrumented future is dropped, inside the poll of the code that
 awaited it, so those frames are where the call came from. Only spans over
 their slow threshold are traced, because a capture walks the stack; fast ones
 cost nothing. `LOOKOUT_CAPTURE_CODE_TRACES=false` turns it off.
+
+The request pays only for the walk, and for at most
+`MAX_CODE_TRACES_PER_BATCH` (16) of them per batch — a request running the
+same slow query five hundred times gets sixteen traces, not five hundred
+walks. Turning the addresses into function names, which costs several times
+the walk, is the background writer's job, on a blocking thread, just before
+the batch is stored.
 
 Both need symbols. A stripped binary renders every frame as `<unknown>`, which
 gives no frames; function names need the symbol table, and files and lines
@@ -215,19 +223,49 @@ app.instance(
 );
 ```
 
-They create `lookout_batches`, `lookout_entries`, `lookout_batch_tags` and
-`lookout_aggregates`, named `rainier_lookout_0001…0004`. Times are `BIGINT`
-microseconds, so the same tables work on SQLite, D1, MySQL/MariaDB and
-Postgres.
+They create `lookout_batches`, `lookout_entries`, `lookout_batch_tags`,
+`lookout_aggregates` and `lookout_cases`, named `rainier_lookout_0001…0005`,
+and `rainier_lookout_0006_entries_family_index` adds an index on
+`lookout_entries (family_hash, type, occurred_at_us)` for a family's
+occurrences. Times are `BIGINT` microseconds, so the same tables work on
+SQLite, D1, MySQL/MariaDB and Postgres.
+
+A write is a handful of statements whatever it holds: a delete and a
+multi-row insert per table, and one upsert per few hundred aggregate rows
+that adds the counts and keeps the larger maximum in the same statement.
 
 ### The cache ring buffer
 
-Every key is prefixed `lookout:`: an `index` of the kept batches' summaries
-(newest first, at most `capacity`), one `batch:{id}` per batch, and the
-aggregate buckets. Writers serialise on a cache lock, so pods flushing at once
-do not lose each other's updates; readers take none. Every write rewrites the
-index, so keep the capacity in the low thousands. A store without an atomic
-`add` (Workers KV) cannot hold the lock — use one writer, or another store.
+Every key is prefixed `lookout:`:
+
+| Key | Holds |
+|---|---|
+| `index` | the kept batches' summaries, newest first, at most `capacity` |
+| `batch:{id}` | one batch |
+| `agg:{period}:{type}:{start}` | one aggregate bucket |
+| `buckets:{period}:{type}:{day}` | which buckets one UTC day has |
+| `buckets:days` | which of those day lists exist |
+| `case:{id}` | one case |
+| `cases:index` | every case's id, status, severity and last sighting |
+
+Writers serialise on a cache lock, so pods flushing at once do not lose each
+other's updates; readers take none. A write sends its commands concurrently —
+the connection multiplexes — and under the lock rewrites the index, the
+buckets its batches roll into, and the cases its exceptions touch with the
+small case index. A day's bucket list changes only when a bucket first
+appears. Every write still rewrites the index, so keep the capacity in the
+low thousands. Listing entries of a type reads the batches holding it newest
+first, a few at a time, and stops once no batch left could hold a newer one.
+
+A store without an atomic `add` (Workers KV) cannot hold the lock — use one
+writer, or another store.
+
+**From an earlier layout.** Before this release every bucket was listed in one
+`buckets` key and every case kept in one `cases` key, each read and written
+whole on every write — with a month of per-minute buckets, tens of megabytes a
+flush. The first write after an upgrade folds both into the keys above and
+deletes them; until then the dashboard reads them as well. Nothing needs to
+be run.
 
 ---
 
@@ -299,7 +337,8 @@ ignored case keeps counting and stays ignored. Changing a case is a `POST`
 that needs `X-Lookout: 1`, like clearing.
 
 The cache store keeps at most 1000 cases (open ones and the most recently
-seen first). The database store keeps them in `lookout_cases`, migration
+seen first), one key each, with a small index a listing filters and orders
+before reading only the cases on the page. The database store keeps them in `lookout_cases`, migration
 `rainier_lookout_0005_cases`; two pods folding the same case in the same
 instant can lose one occurrence's count, never the case.
 
@@ -438,6 +477,15 @@ database store needs the prune.
   logged at most once per interval, never reported on the bus.
 - A batch holds at most 2000 entries; the rest are counted in a
   `truncated:<n>` tag.
+- **What a request pays** on its own thread, measured by the
+  `hot_path_cost` test in `crates/rainier-lookout/tests` (release build, Apple
+  M-series, a request of twenty queries and three cache calls): about 19 µs
+  with Lookout on, kept or not, and 1.4 µs with the feature built but
+  `LOOKOUT_ENABLED=false`. A slow query adds a stack walk for its code trace
+  (above), about 10 µs, for at most sixteen a batch. A batch the production
+  keep rule drops is dropped before the N+1 search and everything after it.
+  `cache_store_cost` in the same directory measures what the cache store
+  costs the cache per write and per dashboard read.
 - **Spans below `RUST_LOG`.** Lookout needs `info` spans whatever the log
   filter says, so with Lookout on the framework's `RUST_LOG` filter is a
   per-layer filter on the log lines (and the exporter) rather than a global

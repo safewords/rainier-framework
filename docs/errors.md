@@ -550,6 +550,14 @@ one only when it is set, so that production pays nothing. It is read **once per
 process**, so setting it means restarting the application. Without it the page
 still renders, with the message and the request and no stack, and says so.
 
+Even with it set, a **client error (4xx) built in a release build captures
+none**: a 404 or a failed validation is the client's doing, and walking and
+symbolising its stack cost every one of them a couple of hundred microseconds
+for a stack nobody reads. A debug build — the one the debug page is for —
+still captures them, and [`Error::with_kind`] captures one when it turns an
+error into a server error. Read the stack as text with
+`Error::backtrace_text()`, which symbolises it once however often it is asked.
+
 ### It cannot render in production
 
 Three independent locks, because this page discloses precisely what an attacker
@@ -617,3 +625,4 @@ empty panel.
 
 [Whoops]: https://github.com/filp/whoops
 [`Error::new`]: https://docs.rs/rainier-support
+[`Error::with_kind`]: https://docs.rs/rainier-support

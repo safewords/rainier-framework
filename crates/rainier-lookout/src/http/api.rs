@@ -188,10 +188,14 @@ pub(crate) async fn insights(state: Arc<Shared>, request: Req) -> Result<Respons
     let period = config.period_s();
     let window = chrono::Duration::minutes(config.window_minutes as i64);
     let since = now - window - window - chrono::Duration::seconds(i64::from(period));
-    let mut rows = Vec::new();
-    for &entry_type in AGGREGATED {
-        rows.extend(state.store.aggregate_rows(entry_type, period, since).await?);
-    }
+    // One read per type, all at once.
+    let rows: Vec<Aggregate> = futures_util::future::try_join_all(
+        AGGREGATED.iter().map(|&entry_type| state.store.aggregate_rows(entry_type, period, since)),
+    )
+    .await?
+    .into_iter()
+    .flatten()
+    .collect();
     let found = trends::insights(&rows, &config, now, limit);
     Ok(Response::json(&json!({ "data": found, "config": config, "enabled": true })))
 }
