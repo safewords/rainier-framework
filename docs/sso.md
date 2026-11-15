@@ -108,7 +108,7 @@ sequenceDiagram
     A->>P: POST token (code + verifier)
     P-->>A: access token (+ ID token)
     A->>A: verify ID token: JWKS, iss, aud, exp, nonce
-    A->>A: login_with — find, link or create; guard.login
+    A->>A: login_with — find, link or create, then guard.login
 ```
 
 ## Declaring providers
@@ -157,7 +157,7 @@ person who clicks the button.
 | `base_url` | `github` / `gitlab`: a self-hosted instance |
 | `basic_auth` | authenticate to the token endpoint with HTTP Basic |
 
-Okta, Auth0, Keycloak, Authentik, Zitadel and safewords identity are all
+Okta, Auth0, Keycloak, Authentik, Zitadel and any other OpenID Connect provider are all
 `oidc` with their issuer URL.
 
 ## The two routes

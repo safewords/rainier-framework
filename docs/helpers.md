@@ -127,26 +127,53 @@ router.get("/health/version", || async { Response::json(&build_info!()) });
 ```
 
 ```json
-{ "name": "identity", "version": "2.4.1", "commit": "9f3c2ab…", "profile": "release" }
+{ "name": "shop", "version": "2.4.1", "commit": "9f3c2ab…", "profile": "release" }
 ```
 
 The macro expands **in your crate**, so the name and version are your
-package's, not Rainier's. The commit and build time come from the environment
-at compile time:
+package's, not Rainier's. The commit and build time are read from environment
+variables **of the `cargo build` that compiles your crate** — not of the
+running program, which may run somewhere that has never seen the source:
 
 | Field | Read from |
 |---|---|
 | `commit` | `GIT_SHA`, `GITHUB_SHA`, or `VERGEN_GIT_SHA` |
 | `built_at` | `BUILD_TIMESTAMP` or `SOURCE_DATE_EPOCH` |
 
-`GITHUB_SHA` is set by GitHub Actions already, so a CI build gets its commit
-with nothing added. Anywhere else it is one line:
+So whatever runs `cargo build` has to have one of them set. How depends on
+where you build:
 
-```dockerfile
-ARG GIT_SHA
-ENV GIT_SHA=$GIT_SHA
-RUN cargo build --release
-```
+- **On your machine, or any shell** — set it for that one command:
+
+  ```sh
+  GIT_SHA="$(git rev-parse HEAD)" cargo build --release
+  ```
+
+- **GitHub Actions** sets `GITHUB_SHA` on every job, so a `cargo build` run
+  directly in a workflow step gets its commit with nothing added. Other CI
+  systems have their own variable (`CI_COMMIT_SHA` on GitLab, for one): pass it
+  on as `GIT_SHA`.
+
+- **Inside a container build** the environment of the CI job does not reach
+  the compiler, and the build context usually leaves out `.git`, so
+  `git rev-parse` is not an option there either. Pass the commit in as a build
+  argument and make it an environment variable before the build step. With
+  Docker, in the `Dockerfile`'s build stage:
+
+  ```dockerfile
+  ARG GIT_SHA
+  ENV GIT_SHA=$GIT_SHA
+  RUN cargo build --release
+  ```
+
+  and when building the image:
+
+  ```sh
+  docker build --build-arg GIT_SHA="$(git rev-parse HEAD)" .
+  ```
+
+  This applies even under GitHub Actions: `GITHUB_SHA` is set on the job, not
+  inside `docker build`.
 
 A local `cargo run` has neither and reports `None` — absent from the JSON
 rather than `null`, because "this build was not told" is what actually
@@ -158,7 +185,7 @@ let info = build_info!();
 
 info.short_commit();      // Option<&str> — the first seven characters
 info.is_debug();          // worth asserting at boot in production
-info.summary();           // "identity 2.4.1 (9f3c2ab, release)" — for a log line
+info.summary();           // "shop 2.4.1 (9f3c2ab, release)" — for a log line
 ```
 
 ## What is not here
