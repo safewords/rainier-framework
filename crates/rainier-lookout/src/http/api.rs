@@ -186,6 +186,22 @@ pub(crate) async fn series(state: Arc<Shared>, request: Req) -> Result<Response>
     let points = trends::series(&rows, query.period_s, query.since, now);
     let forecast = trends::forecast(&points, query.period_s, query.forecast);
 
+    // Over the whole range: every bucket's histogram added, so p50 to p99
+    // cover every occurrence in it — not the stored ones, which in
+    // production are mostly the slow.
+    let first = aggregate::bucket_start(query.since, query.period_s);
+    let in_range: Vec<&Aggregate> =
+        rows.iter().filter(|r| r.period_s == query.period_s && r.bucket_start >= first).collect();
+    let mut histogram = aggregate::Histogram::new();
+    for row in &in_range {
+        aggregate::add_histogram(&mut histogram, &row.histogram);
+    }
+    let worst = in_range.iter().map(|r| r.max_us).max().unwrap_or(0);
+    let mut percentiles = Map::new();
+    for (name, p) in [("p50_us", 50.0), ("p90_us", 90.0), ("p95_us", 95.0), ("p99_us", 99.0)] {
+        percentiles.insert(name.into(), json!(aggregate::percentile(&histogram, p, worst)));
+    }
+
     let mut keys = Map::new();
     if query.keys > 0 {
         let mut totals: BTreeMap<&str, u64> = BTreeMap::new();
@@ -206,6 +222,7 @@ pub(crate) async fn series(state: Arc<Shared>, request: Req) -> Result<Response>
         "data": points,
         "forecast": forecast,
         "period": query.period_s,
+        "percentiles": percentiles,
         "keys": keys,
     })))
 }

@@ -317,8 +317,10 @@ on a refused request, which is the next point.
 - **Every row drills in.** A route, query, job, exception or outgoing call
   opens its own page — `/issues/{type}/{id}`, where the id is the family's
   [`family_id`](#the-json-api), sixteen hex digits rather than its SQL — with
-  its series over time and the forecast, p50/p95/p99 from the raw
-  occurrences, a duration histogram, every occurrence linking to its batch's
+  its series over time and the forecast, p50, p90, p95 and p99 over every
+  occurrence in the range (from the aggregates' histograms; the occurrences
+  stored, mostly the slow ones, only when the range predates histograms) and
+  p90, p95 and p99 per bucket on the time chart, a duration histogram, every occurrence linking to its batch's
   waterfall, and the code trace or stack. A link of the earlier form,
   `/issues/{type}?key=…`, still opens.
 - **The waterfall** draws each span once. A slow one carries a `slow` pill
@@ -459,7 +461,7 @@ shape.
 | `GET` | `/api/entries/{type}` | entries of one type across batches — `key` (one family), `q` (text in the summary or key; reads at most five pages), `before`, `limit` |
 | `GET` | `/api/families/{type}/{id}` | the key a family id names — `{"id", "key"}`, or `404`. The id is `family_id(type, key)`: FNV-1a over the type, a newline and the key, sixteen hex digits, so the dashboard can make one without asking |
 | `GET` | `/api/aggregates/{type}` | rolled-up counts and durations, with `average_us`, `p50_us`, `p90_us`, `p95_us`, `p99_us`, the `histogram` (`{slot: count}`) and the row's `family_id` — `period` (60, 600, 3600), `since`, `order` (`count`, `average`, `max`) |
-| `GET` | `/api/series/{type}` | one zero-filled point per bucket from `since` to now, each with `count`, `average_us`, `max_us` and, where the bucket kept a histogram, `p50_us`, `p90_us`, `p95_us` and `p99_us` — `period` (default: a dozen points or more), `key`, `keys` (that many busiest keys' own series), `forecast` (buckets) |
+| `GET` | `/api/series/{type}` | one zero-filled point per bucket from `since` to now, each with `count`, `average_us`, `max_us` and, where the bucket kept a histogram, `p50_us`, `p90_us`, `p95_us` and `p99_us`; `percentiles` holds the same four over the whole range — `period` (default: a dozen points or more), `key`, `keys` (that many busiest keys' own series), `forecast` (buckets) |
 | `GET` | `/api/insights` | what changed since the previous window — `window`, `min`, `change`, `forecast`, `limit` |
 | `GET` | `/api/cases` | cases — `status` (`open`, `resolved`, `ignored`, `all`), `severity` (minimum), `q`, `limit` |
 | `GET` | `/api/cases/{id}` | one case |

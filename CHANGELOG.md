@@ -24,6 +24,11 @@ the release as a whole and names the crate it landed in.
   same figures per route or job class in the table, and the latest batches
   below. They replace the separate "Jobs (timing)" page and the Requests and
   Jobs batch tabs in the navigation; the filtered batch list is a link away.
+- **Percentiles for each route and job class on its own page**
+  (`rainier-lookout`): p50, p90, p95 and p99 over every run in the range, and
+  p90, p95 and p99 over time beside the average. `/api/series/{type}` carries
+  `percentiles` over the whole range. The page used to work out p50, p95
+  and p99 from the stored runs, which in production are mostly the slow ones.
 - **Percentiles over time** (`rainier-lookout`): each point of
   `/api/series/{type}` carries `p50_us`, `p90_us`, `p95_us` and `p99_us` from
   its bucket's histogram (across every key in it), and the Requests and Jobs

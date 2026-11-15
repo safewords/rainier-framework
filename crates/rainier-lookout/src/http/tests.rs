@@ -577,6 +577,10 @@ async fn draws_a_zero_filled_series_with_a_forecast_and_per_key_series() {
     let total: u64 =
         body["data"].as_array().unwrap().iter().map(|p| p["count"].as_u64().unwrap()).sum();
     assert_eq!(total, 1);
+    // The range's percentiles, for that one key: its only run reads exactly.
+    for field in ["p50_us", "p90_us", "p95_us", "p99_us"] {
+        assert_eq!(body["percentiles"][field], 3_000, "{field}: {body}");
+    }
 
     let answer =
         get(&router, "/_lookout/api/series/log?period=60&since=2001-01-01T00:00:00Z&keys=99").await;

@@ -157,14 +157,41 @@ const occurrencesChart = computed(() => {
   }
   return out
 })
+// p50 to p99 over the whole range, from the series' histograms: every
+// occurrence counted, not the stored ones (mostly the slow, in production).
+// The occurrences loaded are the fallback for a range recorded before
+// buckets kept histograms.
+const rangePercentile = (field, q) => {
+  const fromSeries = series.value && series.value.percentiles ? series.value.percentiles[field] : null
+  if (typeof fromSeries === 'number') return { value: fromSeries, hint: `of ${count(totals.value.n)}` }
+  if (!durations.value.length) return { value: null, hint: 'no durations' }
+  return { value: percentile(durations.value, q), hint: `of ${durations.value.length} loaded` }
+}
+const pcts = computed(() => ({
+  p50: rangePercentile('p50_us', 50),
+  p90: rangePercentile('p90_us', 90),
+  p95: rangePercentile('p95_us', 95),
+  p99: rangePercentile('p99_us', 99),
+}))
+
+const percentileLine = (label, color, field) => ({
+  label,
+  color,
+  points: points.value.filter((p) => p.count > 0 && p[field] != null).map((p) => ({ t: p.bucket_start, v: p[field] })),
+})
 const averageChart = computed(() => {
   const busy = points.value.filter((p) => p.count > 0)
-  const out = [{ label: 'Average duration', color: 'amber', points: busy.map((p) => ({ t: p.bucket_start, v: p.average_us })) }]
+  const out = [
+    { label: 'Average', color: 'indigo', points: busy.map((p) => ({ t: p.bucket_start, v: p.average_us })) },
+    percentileLine('p90', 'emerald', 'p90_us'),
+    percentileLine('p95', 'amber', 'p95_us'),
+    percentileLine('p99', 'rose', 'p99_us'),
+  ]
   const lastBusy = busy[busy.length - 1]
   if (forecast.value.length && lastBusy) {
     out.push({
       label: 'Forecast',
-      color: 'amber',
+      color: 'indigo',
       dashed: true,
       points: [{ t: lastBusy.bucket_start, v: lastBusy.average_us }].concat(
         forecast.value.map((f) => ({ t: f.bucket_start, v: f.average_us })),
@@ -253,14 +280,15 @@ const columns = [
         <span v-if="seriesLoading" class="text-xs text-zinc-500 dark:text-zinc-400">Loading…</span>
       </div>
 
-      <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7">
+      <div class="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-8">
         <StatTile label="Occurrences" :value="series ? count(totals.n) : '—'" :hint="`last ${range}`" :tone="type === 'exception' && totals.n ? 'bad' : 'neutral'" />
         <StatTile label="Per minute" :value="series ? (totals.n / minutes).toFixed(totals.n / minutes >= 10 ? 0 : 2) : '—'" :hint="`over ${range}`" />
         <StatTile label="Average" :value="series && totals.avg !== null && hasTimes ? duration(totals.avg) : '—'" />
         <StatTile label="Worst" :value="series && hasTimes && totals.n ? duration(totals.worst) : '—'" :tone="totals.worst > 1_000_000 ? 'warn' : 'neutral'" />
-        <StatTile label="p50" :value="duration(percentile(durations, 50))" :hint="durations.length ? `of ${durations.length} loaded` : 'no durations'" />
-        <StatTile label="p95" :value="duration(percentile(durations, 95))" :hint="durations.length ? `of ${durations.length} loaded` : ''" />
-        <StatTile label="p99" :value="duration(percentile(durations, 99))" :hint="durations.length ? `of ${durations.length} loaded` : ''" />
+        <StatTile label="p50" :value="duration(pcts.p50.value)" :hint="pcts.p50.hint" />
+        <StatTile label="p90" :value="duration(pcts.p90.value)" :hint="pcts.p90.hint" />
+        <StatTile label="p95" :value="duration(pcts.p95.value)" :hint="pcts.p95.hint" />
+        <StatTile label="p99" :value="duration(pcts.p99.value)" :hint="pcts.p99.hint" />
       </div>
 
       <section class="lk-card">
@@ -280,7 +308,7 @@ const columns = [
               <LineChart :series="occurrencesChart" :x-domain="xDomain" :axis-width="56" :format="(v) => count(Math.round(v))" :height="150" />
             </div>
             <div v-if="hasTimes">
-              <h3 class="lk-th mb-1.5">Average duration</h3>
+              <h3 class="lk-th mb-1.5">Time: average, p90, p95 and p99</h3>
               <LineChart :series="averageChart" :x-domain="xDomain" :axis-width="56" :format="(v) => duration(Math.round(v))" :height="130" />
             </div>
           </div>
