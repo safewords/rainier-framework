@@ -13,6 +13,7 @@ import StatTile from '../components/StatTile.vue'
 import TimeAgo from '../components/TimeAgo.vue'
 import { api } from '../api.js'
 import { absolute, ago, count, duration, issueRoute } from '../format.js'
+import { usePolling } from '../live.js'
 
 const props = defineProps({ id: { type: String, required: true } })
 
@@ -61,8 +62,13 @@ async function loadEntries(key) {
   }
 }
 
+// Set once "Load more" has run, so a live reload does not replace the pages
+// read so far with the first.
+const paged = ref(false)
+
 async function loadMore() {
   if (!next.value || !kase.value) return
+  paged.value = true
   more.value = true
   try {
     const page = await api.entries('exception', { key: kase.value.key, limit: 200, before: next.value.before })
@@ -89,6 +95,24 @@ onMounted(async () => {
     loading.value = false
   }
 })
+
+// Its status, notes and occurrences move as exceptions arrive and as other
+// people act on it. Not while a note is being written: the form stays put.
+usePolling(
+  async () => {
+    if (pending.value || acting.value) return
+    try {
+      const answer = await api.kase(props.id)
+      kase.value = answer.data
+      loadSeries(kase.value.key)
+      if (!paged.value) loadEntries(kase.value.key)
+    } catch {
+      // Keep what is shown; the next refresh tries again.
+    }
+  },
+  10_000,
+  { on: 'both' },
+)
 
 function ask(action) {
   pending.value = action

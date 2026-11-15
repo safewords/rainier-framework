@@ -13,7 +13,7 @@ import StatTile from '../components/StatTile.vue'
 import { api } from '../api.js'
 import { config } from '../config.js'
 import { count, issueRoute, percent, RANGES, rate, since as sinceHours, time, totals, TYPES } from '../format.js'
-import { usePolling } from '../live.js'
+import { mergePulse, usePolling } from '../live.js'
 
 const CARDS = [
   { id: 'routes', title: 'Slowest routes', type: 'request', order: 'max', hint: 'by worst time', keyLabel: 'Route' },
@@ -143,7 +143,16 @@ async function load() {
 }
 
 onMounted(load)
-usePolling(load, 10_000)
+// The totals and charts move with every pulse, in place; the cards, the
+// failures and the insights reload at most every five seconds.
+usePolling(load, 10_000, {
+  on: 'both',
+  onPulse: (pulse) => {
+    mergePulse(series.request, pulse, 'request', range.period)
+    mergePulse(series.exception, pulse, 'exception', range.period)
+    mergePulse(series.job, pulse, 'job', range.period)
+  },
+})
 
 // --- Headline numbers.
 

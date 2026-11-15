@@ -75,7 +75,7 @@ Read at boot through the application's `Env` (so `.env` counts), with
 | `LOOKOUT_CAPTURE_REQUEST_BODY_ON_EXCEPTION` | | a boolean | `false` |
 | `LOOKOUT_CAPTURE_BODIES_EXCEPT` | routes whose bodies are never kept ([privacy](#privacy)) | comma-separated globs over the route name or pattern | none |
 | `LOOKOUT_MASK_SECRETS` | star out values that look like keys and tokens ([privacy](#privacy)) | a boolean | `true` |
-| `LOOKOUT_STREAM` | "Live" streams new batches ([live](#live)) instead of polling | a boolean | `true` |
+| `LOOKOUT_STREAM` | "Live" streams new batches and moving counts ([live](#live)) instead of polling | a boolean | `true` |
 | `LOOKOUT_CAPTURE_CACHE_KEYS` | | a boolean | `false` |
 | `LOOKOUT_CAPTURE_MAIL` | | a boolean | `false` |
 | `LOOKOUT_CAPTURE_USER_ID` | | a boolean | `false` |
@@ -442,18 +442,31 @@ instant can lose one occurrence's count, never the case.
 
 ### Live
 
-The **Live** switch in the header keeps the page current. With it on, new
-batches arrive as they are stored — server-sent events from
-`{path}/api/stream`, one summary per batch — and the page in front of you
-updates on them: a list puts the new batch on top, a chart refreshes its
-numbers, at most every few seconds. The switch is remembered per browser, so a
-viewer who left it on is subscribed again the next time they open Lookout, and
-it pauses while the tab is hidden.
+The **Live** switch in the header keeps every page current. With it on, the
+page listens to `{path}/api/stream`, server-sent events of two kinds:
 
-Every replica's batches arrive, not only the one serving the dashboard: one
-task per process reads the store's newest batches every second while anyone is
-watching and sends each viewer the ones it has not seen, and stops within a
-second of the last viewer leaving. A viewer that falls far behind is told to
+- **`batch`** — one summary for each batch the store keeps. Lists of batches,
+  entries and cases reload on it.
+- **`pulse`** — the newest buckets of the request, exception and job counts,
+  at each period the store rolls up (a minute, ten minutes, an hour), sent
+  whenever they move, at most every two seconds. Most requests are counted
+  and not kept, so on a healthy service this is the event that says
+  something happened. The dashboard's totals and charts take it in place,
+  without asking the server again; its cards, timing pages, issues and cases
+  reload on it at most every few seconds.
+
+Every page also reloads once a minute while connected, for anything no event
+announced. A page you have paged further down with **Load more** keeps its
+list and moves only its numbers, and a case with a note being written is left
+alone until it is sent. The switch is remembered per browser, so a viewer who
+left it on is subscribed again the next time they open Lookout, and it pauses
+while the tab is hidden.
+
+Every replica's batches and counts arrive, not only the one serving the
+dashboard: one task per process reads the store's newest batches every second,
+and the newest count buckets every two, while anyone is watching — a few small
+reads however many viewers there are — and sends each viewer what is new, and
+stops within a second of the last viewer leaving. A viewer that falls far behind is told to
 reload. A comment line every fifteen seconds keeps a proxy from closing a quiet
 connection; a proxy that buffers responses needs to pass `text/event-stream`
 through (nginx honours the `X-Accel-Buffering: no` the response sends).
@@ -617,9 +630,10 @@ database store needs the prune.
   Every finished request goes through the channel now, kept or not, because
   every one is counted; one that would overflow it is dropped from the
   counts too, and counted in `Lookout::dropped()`. The counts of batches not
-  kept are added up in the writer and written every 10 seconds (or with a
-  kept batch, or on flush and shutdown), so a busy service rewrites its
-  aggregates a few times a minute rather than every second. Its
+  kept are added up in the writer and written every 2 seconds (or with a
+  kept batch, or on flush and shutdown) — often enough for the dashboard's
+  [live](#live) numbers to trail the traffic by about that much, and never
+  once per request; an interval in which nothing was counted writes nothing. Its
   own store traffic runs inside a span marked `rainier.lookout.internal`, so
   the database or cache store's queries are not recorded. A failing store is
   logged at most once per interval, never reported on the bus.

@@ -85,7 +85,7 @@ watch([() => props.type, () => range.value.key], () => {
   batches.value = []
   load()
 }, { immediate: true })
-usePolling(load, 10_000)
+usePolling(load, 10_000, { on: 'counts' })
 
 function setQuery(patch) {
   router.replace({ query: { ...route.query, ...patch } })

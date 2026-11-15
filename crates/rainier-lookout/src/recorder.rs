@@ -85,9 +85,11 @@ pub const MAX_ENTRIES_PER_BATCH: usize = 2_000;
 pub const MAX_CODE_TRACES_PER_BATCH: usize = 16;
 
 /// How often the writer writes the counts of batches it did not keep, when no
-/// kept batch has carried them sooner. A minute's bucket is finished a few
-/// seconds late; the store is not rewritten on every tick.
-const COUNTS_EVERY: Duration = Duration::from_secs(10);
+/// kept batch has carried them sooner. Two seconds, so the dashboard's live
+/// numbers (the stream's `pulse`) trail the traffic by about that much; the
+/// store is still not rewritten on every request, only once per interval in
+/// which something was counted.
+const COUNTS_EVERY: Duration = Duration::from_secs(2);
 
 /// Combine the waiting counts once they grow past this many rows, so a burst
 /// between writes holds one row per family rather than one per request.

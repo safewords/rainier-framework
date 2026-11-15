@@ -9,7 +9,7 @@ import { createLive, createStream } from './live.js'
 const live = createLive()
 const stream = createStream(live)
 const now = ref(Date.now())
-const ticker = setInterval(() => (now.value = Date.now()), 10_000)
+const ticker = setInterval(() => (now.value = Date.now()), 1000)
 onBeforeUnmount(() => clearInterval(ticker))
 provide('live', live)
 provide('stream', stream)

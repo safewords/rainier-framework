@@ -651,9 +651,60 @@ async fn the_stream_sends_a_batch_stored_after_the_viewer_connected() {
     let fresh = request("b3", "posts.store", 201, 20, Vec::new());
     crate::store::Store::store(&*store, vec![fresh]).await.unwrap();
 
-    let frame = next(&mut frames).await;
+    // Storing a batch also moves the counts, so a pulse may come first.
+    let mut frame = next(&mut frames).await;
+    while frame.starts_with("event: pulse") {
+        frame = next(&mut frames).await;
+    }
     assert!(frame.starts_with("event: batch\ndata: "), "{frame}");
     assert!(frame.contains("\"id\":\"b3\""), "the new batch, and only it: {frame}");
+}
+
+#[tokio::test]
+async fn the_stream_pulses_when_requests_are_only_counted() {
+    // Most requests are counted and not kept. Nothing is stored that a
+    // `batch` event could announce, and the dashboard's numbers must still
+    // move: that is what the pulse is for.
+    use futures_util::StreamExt;
+    use rainier_http::Body;
+
+    let store = sample();
+    let router = app(Arc::clone(&store));
+    let mut response = router
+        .dispatch(Request::builder().method(Method::GET).uri("/_lookout/api/stream").build())
+        .await;
+    let Body::Stream(mut frames) = response.take_body() else { panic!("not a stream") };
+    async fn next<S, E>(frames: &mut S) -> String
+    where
+        S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+        E: std::fmt::Debug,
+    {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(8), frames.next())
+            .await
+            .expect("a frame in time")
+            .expect("the stream is open")
+            .expect("not an error");
+        String::from_utf8_lossy(&frame).into_owned()
+    }
+    assert!(next(&mut frames).await.starts_with("retry:"));
+
+    // The tail's first pulse only learns the numbers; this request is news.
+    tokio::time::sleep(stream::TAIL_EVERY + std::time::Duration::from_millis(200)).await;
+    let root = entry("c1", "r", EntryType::Request, "GET /posts 200", epoch(), 0, Some(9_000));
+    let counted = crate::aggregate::rollup(&[request("c1", "posts.index", 200, 0, vec![root])]);
+    crate::store::Store::store_counting(&*store, Vec::new(), counted).await.unwrap();
+
+    let frame = next(&mut frames).await;
+    assert!(frame.starts_with("event: pulse\ndata: "), "{frame}");
+    let data: Value =
+        serde_json::from_str(frame.trim_start_matches("event: pulse\ndata: ").trim()).unwrap();
+    let minute = data["request"]["60"].as_array().expect("the minute buckets");
+    assert_eq!(minute.last().unwrap()["count"], 1, "the counted request: {data}");
+    assert!(data["request"]["600"].is_array() && data["job"]["3600"].is_array(), "{data}");
+    assert!(
+        !store.batches.lock().unwrap().iter().any(|b| b.id == "c1"),
+        "counted, not kept: no batch event could have said so"
+    );
 }
 
 #[tokio::test]

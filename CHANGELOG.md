@@ -41,6 +41,16 @@ the release as a whole and names the crate it landed in.
   browser, so a viewer who left it on is subscribed again on their next visit.
   `LOOKOUT_STREAM=false` falls back to polling, as does a browser whose stream
   cannot connect.
+
+  The stream also sends a **`pulse`**: the newest request, exception and job
+  count buckets, at every rolled-up period, whenever they move (at most every
+  two seconds). The first version announced only kept batches, so on a
+  healthy service — where nearly every request is counted and not kept — the
+  dashboard's totals stood still while the stream was connected. The
+  dashboard now folds each pulse into its totals and charts in place, and
+  every page that shows data (cases, issues, timing, status) refreshes on the
+  news it shows, plus once a minute. The writer stores its counts every 2
+  seconds instead of 10, and only when something was counted.
 - **`docs/_sidebar.json`**: the website's table of contents, kept with the
   docs it orders, and a test (`docs_sidebar.rs`) that every page is in it
   once and every entry is a page. rainierframework.io builds its docs from

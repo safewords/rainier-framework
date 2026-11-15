@@ -6,6 +6,7 @@ import ErrorBox from '../components/ErrorBox.vue'
 import Pill from '../components/Pill.vue'
 import { api } from '../api.js'
 import { TYPES } from '../format.js'
+import { usePolling } from '../live.js'
 
 const status = ref(null)
 const error = ref(null)
@@ -32,13 +33,17 @@ const settings = computed(() => {
 
 const watchers = computed(() => (status.value ? Object.entries(status.value.watchers) : []))
 
-onMounted(async () => {
+async function load() {
   try {
     status.value = (await api.status()).data
+    error.value = null
   } catch (e) {
     error.value = e
   }
-})
+}
+
+onMounted(load)
+usePolling(load, 15_000, { on: 'both' })
 </script>
 
 <template>

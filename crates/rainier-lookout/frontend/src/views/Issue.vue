@@ -14,6 +14,7 @@ import StatTile from '../components/StatTile.vue'
 import TimeAgo from '../components/TimeAgo.vue'
 import { api } from '../api.js'
 import { caseId, count, duration, percentile, TYPES } from '../format.js'
+import { usePolling } from '../live.js'
 
 const props = defineProps({ type: { type: String, required: true }, id: { type: String, default: '' } })
 const route = useRoute()
@@ -77,8 +78,14 @@ async function loadEntries() {
   }
 }
 
+// Set once "Load more" has run: a live reload would replace the pages read so
+// far with the first, so from then the list stays as it is and only the
+// numbers above it move.
+const paged = ref(false)
+
 async function loadMore() {
   if (!next.value) return
+  paged.value = true
   more.value = true
   try {
     const page = await api.entries(props.type, { key: key.value, limit: 200, before: next.value.before })
@@ -122,6 +129,15 @@ onMounted(async () => {
   loadCase()
 })
 watch(range, loadSeries)
+usePolling(
+  () => {
+    loadSeries()
+    if (!paged.value) loadEntries()
+    loadCase()
+  },
+  10_000,
+  { on: 'both' },
+)
 
 const points = computed(() => (series.value && Array.isArray(series.value.data) ? series.value.data : []))
 const forecast = computed(() => (series.value && Array.isArray(series.value.forecast) ? series.value.forecast : []))
