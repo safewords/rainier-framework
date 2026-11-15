@@ -83,9 +83,24 @@ pub struct Error {
     message: String,
     details: Option<serde_json::Value>,
     source: Option<anyhow::Error>,
-    backtrace: Option<Arc<Backtrace>>,
-    /// The backtrace as text, rendered the first time somebody asks.
+    backtrace: Option<Arc<Stack>>,
+}
+
+/// A captured backtrace and its text, rendered the first time somebody asks.
+///
+/// Behind the one `Arc` so the cache costs `Error` nothing: every `Result` in
+/// an application carries an `Error`, and an inline `OnceLock<String>` (32
+/// bytes) pushed it past clippy's `result_large_err` limit.
+#[derive(Debug)]
+struct Stack {
+    backtrace: Arc<Backtrace>,
     rendered: OnceLock<String>,
+}
+
+impl Stack {
+    fn new(backtrace: Arc<Backtrace>) -> Arc<Self> {
+        Arc::new(Self { backtrace, rendered: OnceLock::new() })
+    }
 }
 
 impl Error {
@@ -117,14 +132,7 @@ impl Error {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         let backtrace =
             if kind.is_server_error() || cfg!(debug_assertions) { capture() } else { None };
-        Self {
-            kind,
-            message: message.into(),
-            details: None,
-            source: None,
-            backtrace,
-            rendered: OnceLock::new(),
-        }
+        Self { kind, message: message.into(), details: None, source: None, backtrace }
     }
 
     /// 500 — an internal failure.
@@ -207,7 +215,6 @@ impl Error {
         // becomes a server error gets this one, the nearest there is.
         if self.backtrace.is_none() && kind.is_server_error() && !self.kind.is_server_error() {
             self.backtrace = capture();
-            self.rendered = OnceLock::new();
         }
         self.kind = kind;
         self
@@ -245,7 +252,7 @@ impl Error {
     /// [`Error::new`]. Read by the debug error page in
     /// `rainier-debug`; nothing in a production path looks at it.
     pub fn backtrace(&self) -> Option<&Backtrace> {
-        self.backtrace.as_deref()
+        self.backtrace.as_deref().map(|stack| &*stack.backtrace)
     }
 
     /// [`backtrace`](Self::backtrace) rendered as text — symbolised once,
@@ -256,8 +263,8 @@ impl Error {
     /// report, an auth failure's own report. Use this rather than
     /// `backtrace().map(ToString::to_string)`.
     pub fn backtrace_text(&self) -> Option<&str> {
-        let backtrace = self.backtrace.as_deref()?;
-        Some(self.rendered.get_or_init(|| backtrace.to_string()))
+        let stack = self.backtrace.as_deref()?;
+        Some(stack.rendered.get_or_init(|| stack.backtrace.to_string()))
     }
 
     /// Adopt a backtrace captured somewhere else.
@@ -268,16 +275,17 @@ impl Error {
     /// error page for a panic would show the unwinding site rather than the
     /// `panic!`.
     pub fn with_backtrace(mut self, backtrace: Arc<Backtrace>) -> Self {
-        self.backtrace = Some(backtrace);
-        self.rendered = OnceLock::new();
+        self.backtrace = Some(Stack::new(backtrace));
         self
     }
 }
 
 /// A backtrace of the calling stack, when `RUST_BACKTRACE` asks for one.
-fn capture() -> Option<Arc<Backtrace>> {
+fn capture() -> Option<Arc<Stack>> {
     match Backtrace::capture() {
-        captured if captured.status() == BacktraceStatus::Captured => Some(Arc::new(captured)),
+        captured if captured.status() == BacktraceStatus::Captured => {
+            Some(Stack::new(Arc::new(captured)))
+        }
         _ => None,
     }
 }
@@ -381,6 +389,14 @@ impl<T> Context<T> for Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_stays_small_enough_to_return() {
+        // Clippy's `result_large_err` threshold: every application `Result`
+        // carries an `Error`, so outgrowing it fails their lint by the
+        // thousand.
+        assert!(std::mem::size_of::<Error>() <= 128, "{}", std::mem::size_of::<Error>());
+    }
 
     #[test]
     fn the_backtrace_text_is_rendered_once_and_is_the_backtrace() {
