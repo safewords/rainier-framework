@@ -371,15 +371,16 @@ impl PusherServer {
             let member = data.and_then(|d| d.get("channel_data")).and_then(Value::as_str);
 
             if !self.authorised(&self.socket_id_of(socket), &channel, presented, member) {
-                tracing::warn!(channel = %name, "refused a subscription with a bad signature");
-                report_detached(BroadcastFailed::new(
-                    Exception::message(
-                        ErrorKind::Unauthorized,
-                        "refused a subscription with a bad signature",
-                    ),
-                    Some(name.clone()),
-                    "subscribe",
-                ));
+                // A reconnect between authorising and subscribing presents the
+                // previous socket's signature. The client is already told with
+                // `pusher:error` 4009, and a real secret mismatch is the same
+                // refusal — `auth_present` is what separates "no signature"
+                // from "a signature for a socket this connection is not".
+                tracing::warn!(
+                    channel = %name,
+                    auth_present = presented.is_some(),
+                    "refused a subscription with a bad signature"
+                );
                 return socket.send(Message::text(Self::frame(
                     "pusher:error",
                     None,

@@ -696,6 +696,12 @@ the release as a whole and names the crate it landed in.
   a reset, a broken pipe, an unexpected end of file — are a closed browser,
   a cancelled request, or a load balancer dropping an idle keep-alive. Those
   stay a debug line. Anything else is still reported.
+- **A refused private-channel subscription is a warning, not an exception**
+  (`rainier-broadcast`). The signature is over the socket id this connection
+  was given, and a reconnect between authorising and subscribing presents
+  the previous one. The client already receives `pusher:error` 4009. The
+  warning says whether a signature was present, so a real mismatch is still
+  in the log.
 
 - **Lookout's aggregates count every request and job, not only the kept
   ones** (`rainier-lookout`). They were rolled up from stored batches, and in
