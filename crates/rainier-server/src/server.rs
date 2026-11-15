@@ -222,17 +222,19 @@ impl Server {
                 };
 
                 if let Err(e) = served {
-                    // A client disconnecting mid-response is routine, not an
-                    // error worth raising the log level for — but it is still
-                    // a failure, and whether it matters is the application's
-                    // call, so it is reported.
+                    // A browser tab closing, a cancelled request, or a
+                    // load balancer dropping an idle keep-alive. The debug
+                    // line is the record; reporting it counts every hang-up
+                    // as an exception.
                     tracing::debug!(error = %e, "connection closed");
-                    reporting
-                        .report_failure(ServerFailed::new(
-                            Exception::from_std(&e),
-                            "serve_connection",
-                        ))
-                        .await;
+                    if !client_went_away(&e) {
+                        reporting
+                            .report_failure(ServerFailed::new(
+                                Exception::from_std(&e),
+                                "serve_connection",
+                            ))
+                            .await;
+                    }
                 }
             });
         }
@@ -240,6 +242,31 @@ impl Server {
         tracing::info!("Rainier has stopped accepting connections");
         Ok(())
     }
+}
+
+/// A client that hung up, rather than a failure of the server.
+///
+/// `is_incomplete_message` is hyper's own name for a request or response that
+/// ended before its body did. The I/O kinds are the same close seen one layer
+/// down: the peer reset the socket, the write found it gone, or the read
+/// ended early.
+fn client_went_away(error: &hyper::Error) -> bool {
+    if error.is_incomplete_message() {
+        return true;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(next) = source {
+        if let Some(io) = next.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof => return true,
+                _ => {}
+            }
+        }
+        source = next.source();
+    }
+    false
 }
 
 /// Turn one hyper request into one hyper response.

@@ -690,6 +690,13 @@ the release as a whole and names the crate it landed in.
 
 ### Fixed
 
+- **A client hanging up an HTTP connection is no longer reported**
+  (`rainier-server`). The accept loop reported every `serve_connection`
+  error, and the ordinary ones — a request that ended before its body did,
+  a reset, a broken pipe, an unexpected end of file — are a closed browser,
+  a cancelled request, or a load balancer dropping an idle keep-alive. Those
+  stay a debug line. Anything else is still reported.
+
 - **Lookout's aggregates count every request and job, not only the kept
   ones** (`rainier-lookout`). They were rolled up from stored batches, and in
   production the keep rule stores only slow, failed and monitored ones — so
