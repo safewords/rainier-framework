@@ -3,7 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
 import DataTable from '../components/DataTable.vue'
-import DurationHistogram from '../components/DurationHistogram.vue'
+import DurationDistribution from '../components/DurationDistribution.vue'
 import Empty from '../components/Empty.vue'
 import ErrorBox from '../components/ErrorBox.vue'
 import LineChart from '../components/LineChart.vue'
@@ -156,6 +156,10 @@ const totals = computed(() => {
 
 const timed = computed(() => entries.value.filter((e) => typeof e.duration_us === 'number'))
 const durations = computed(() => timed.value.map((e) => e.duration_us))
+// Every occurrence in the range, from the aggregates — what the distribution
+// is drawn from when it is there, rather than the stored occurrences alone.
+const histogram = computed(() => (series.value && series.value.histogram) || null)
+const histogramCount = computed(() => Object.values(histogram.value || {}).reduce((a, n) => a + n, 0))
 const hasTimes = computed(() => durations.value.length > 0 || totals.value.sum > 0)
 
 // Two stacked charts over one x range — never two y-scales on one chart.
@@ -331,12 +335,17 @@ const columns = [
         </div>
       </section>
 
-      <section v-if="durations.length > 1" class="lk-card">
+      <section v-if="histogramCount > 1 || durations.length > 1" class="lk-card">
         <header class="lk-card-header">
           <h2 class="text-sm font-semibold">Durations</h2>
-          <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">{{ durations.length }} loaded occurrences, log scale</span>
+          <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">
+            <template v-if="histogramCount">{{ count(histogramCount) }} occurrences in range</template>
+            <template v-else>{{ durations.length }} stored occurrences</template>, smoothed, log scale
+          </span>
         </header>
-        <div class="p-4"><DurationHistogram :values="durations" /></div>
+        <div class="p-4">
+          <DurationDistribution :values="durations" :histogram="histogram" :max="totals.worst || null" />
+        </div>
       </section>
 
       <section v-if="exception" class="lk-card">

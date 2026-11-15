@@ -223,6 +223,9 @@ pub(crate) async fn series(state: Arc<Shared>, request: Req) -> Result<Response>
         "forecast": forecast,
         "period": query.period_s,
         "percentiles": percentiles,
+        // The durations themselves, every occurrence in the range, as
+        // `{ slot: count }` — what an issue page draws its distribution from.
+        "histogram": histogram,
         "keys": keys,
     })))
 }

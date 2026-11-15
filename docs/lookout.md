@@ -394,9 +394,21 @@ on a refused request, which is the next point.
   its series over time and the forecast, p50, p90, p95 and p99 over every
   occurrence in the range (from the aggregates' histograms; the occurrences
   stored, mostly the slow ones, only when the range predates histograms) and
-  p90, p95 and p99 per bucket on the time chart, a duration histogram, every occurrence linking to its batch's
+  p90, p95 and p99 per bucket on the time chart, the spread of its durations
+  (below), every occurrence linking to its batch's
   waterfall, and the code trace or stack. A link of the earlier form,
   `/issues/{type}?key=…`, still opens.
+- **The spread of durations** on an issue page is a smooth curve over a log
+  time axis, with p50, p90, p95 and p99 marked and, under the pointer, how
+  many occurrences took that long or less. It is drawn from the family's
+  histogram over the range — every occurrence, which `/api/series` returns as
+  `histogram` — and only for a range older than histograms from the
+  occurrences stored, which are mostly the slow ones and would overstate the
+  slow end. It is a kernel density estimate, a small Gaussian at each
+  occurrence added up, rather than one Gaussian fitted to them all: durations
+  bunch at the fast end with a long tail and often have two humps (the usual
+  case, and the case waiting on a lock or a disk), which a single bell would
+  hide.
 - **The waterfall** draws each span once. A slow one carries a `slow` pill
   (and `N+1` or `failed` where it is that) on its own row, instead of a
   second row for the derived slow entry.

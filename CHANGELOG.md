@@ -51,6 +51,11 @@ the release as a whole and names the crate it landed in.
   every page that shows data (cases, issues, timing, status) refreshes on the
   news it shows, plus once a minute. The writer stores its counts every 2
   seconds instead of 10, and only when something was counted.
+- **Lookout's duration chart is a distribution curve** (`rainier-lookout`): an
+  issue page's bar histogram is now a smooth density over a log time axis
+  with the percentiles marked, drawn from every occurrence in the range —
+  `/api/series` returns the range's merged `histogram` — instead of from the
+  stored occurrences, which in production are mostly the slow ones.
 - **`docs/_sidebar.json`**: the website's table of contents, kept with the
   docs it orders, and a test (`docs_sidebar.rs`) that every page is in it
   once and every entry is a page. rainierframework.io builds its docs from
