@@ -1,10 +1,14 @@
 # Deployment
 
-The sample project's defaults are chosen so a fresh clone runs with nothing
-installed. Several of them are wrong for production, deliberately and
-obviously. This is the list.
+The [sample project](installation.md#start-from-the-sample-project)'s defaults
+are chosen so a fresh clone runs with nothing installed. Several of them are
+wrong for production, deliberately and obviously. This is the list.
 
 ## The checklist
+
+Most of these are environment variables, set in `.env` locally and by your
+platform in production ([Configuration](configuration.md#env)); `server.trust_proxy`
+is a [config value set in code](configuration.md#settings-that-are-not-environment-variables).
 
 | Setting | Development default | Production |
 |---|---|---|
@@ -24,6 +28,12 @@ The framework's own defaults are already the safe ones — `app.env` is
 `.env` fails closed. It is the sample's `.env.example` that is tuned for
 development.
 
+The table names the framework's own variables. The sample project declares its
+queue connections and cache stores as [sections](configuration.md#sections-when-one-of-something-is-not-enough),
+so its `.env.example` selects them with `QUEUE_CONNECTION` and `CACHE_STORE`
+instead — variables its own `src/config/queue.rs` and `src/config/cache.rs`
+read — and setting `QUEUE_DRIVER` or `CACHE_DRIVER` beside them is refused.
+
 ## `APP_DEBUG=false`
 
 With debug on, [5xx error messages reach the client](errors.md#debug-mode), and
@@ -41,7 +51,9 @@ DATABASE_URL=postgres://user:pass@host/app
 SQLite in memory is **wiped on exit**, which is what makes it a good default
 and a catastrophic production setting.
 
-Run migrations as a deploy step rather than relying on boot:
+Run migrations as a deploy step rather than relying on boot. From a checkout
+that is `cargo run`; on a machine that has only the built binary, run the same
+commands on it directly (`app migrate`, where `app` is your binary's name):
 
 ```sh
 cargo run --release -- migrate --pretend    # check
@@ -84,12 +96,13 @@ Switching needs three things:
 cargo run --release -- queue:work --queue=high,default --max-jobs=1000
 ```
 
-`--max-jobs` makes the worker exit after N jobs so a supervisor restarts it.
+`--max-jobs` makes the worker exit after N jobs so a supervisor — systemd, a
+container restart policy, whatever keeps your processes running — restarts it.
 That is a cheap defence against a slow leak in a long-running process, and it
 costs a second of startup.
 
-Run `reclaim_expired()` periodically so jobs held by a worker that died become
-available again.
+Run [`reclaim_expired()`](queues.md#reclaiming) on the database queue
+periodically so jobs held by a worker that died become available again.
 
 `queue:work` exits non-zero if any job failed, which your supervisor should
 notice.
@@ -111,12 +124,13 @@ a copy of production data and emailing all of those customers.
 
 ## Behind a proxy
 
+Set `server.trust_proxy = true` in your [config code](configuration.md#settings-that-are-not-environment-variables),
+which [`serve`](console.md#serve) reads. If you build the server yourself
+rather than running `serve`, the same switch is on its options:
+
 ```rust
 ServerOptions::default().trust_forwarded_for(true)
 ```
-
-or `server.trust_proxy = true` in config, which [`serve`](console.md#serve)
-reads.
 
 Turn this on **only** when something you control terminates every connection.
 Otherwise any client can set `X-Forwarded-For` and forge its own IP — which
@@ -141,8 +155,8 @@ accept.
 cargo build --release
 ```
 
-The binary is self-contained apart from `resources/views/` and anything you
-read from `storage/`. Ship those alongside it, or point the builder at where
+The binary lands in `target/release/`. It is self-contained apart from
+`resources/views/`, `public/` and anything you read from `storage/`. Ship those alongside it, or point the builder at where
 they are:
 
 ```rust
@@ -175,18 +189,24 @@ Rainier::new(".").without_tracing()
 ```
 
 Nothing here writes log files or rotates them. `tracing_subscriber` writes to
-stdout, and collecting stdout is the platform's job — Docker, systemd, a
-sidecar.
+stdout, and collecting stdout is the platform's job — journald under systemd, a
+container runtime's log driver, a sidecar.
 
 ## Health checks
+
+Two routes, in your route file: `liveness` is any handler of your own that
+answers `200` without touching a dependency, and `health::endpoint` is the
+framework's dependency check, set up as [Observability](observability.md#health-checks)
+describes.
 
 ```rust
 router.get("/health", liveness);                          // no I/O
 router.get("/health/ready", health::endpoint);            // checks dependencies
 ```
 
-Point the orchestrator's **liveness** probe at the first and its **readiness**
-probe at the second. Pointing liveness at the dependency check restarts every
+If something probes your instances — a Kubernetes liveness and readiness
+probe, a load balancer's health check — point the **liveness** probe at the
+first and the **readiness** probe at the second. Pointing liveness at the dependency check restarts every
 replica when the database blips, which turns a degradation into an outage. See
 [Observability](observability.md#health-checks).
 
@@ -197,7 +217,9 @@ router.get("/health/version", || async { Response::json(&build_info!()) });
 ```
 
 Pass the commit into the build and the answer stops being "read the pipeline
-backwards":
+backwards". All `build_info!()` needs is `GIT_SHA` in the environment of
+`cargo build`. With Docker, that is three lines in the build stage of the
+Dockerfile and a build argument on the `docker build` command line:
 
 ```dockerfile
 ARG GIT_SHA
@@ -231,6 +253,11 @@ is CPU spent to produce the same bytes.
 
 ## Graceful shutdown
 
+`serve` already does this: it stops accepting on Ctrl-C or `SIGTERM` and
+finishes the requests in flight. If you run the server from your own `main`
+instead, where `kernel` is the HTTP kernel your boot built, the same looks
+like:
+
 ```rust
 let (tx, rx) = tokio::sync::watch::channel(false);
 tokio::spawn(async move {
@@ -242,13 +269,15 @@ Server::from_arc(kernel).run_until(rx).await?;
 ```
 
 For the worker, `worker.stop()` asks it to finish the current job and exit —
-which is what makes a deploy not lose work in flight.
+which is what makes a deploy not lose work in flight. `queue:work` calls it for
+you on `SIGTERM`.
 
 ## A reverse proxy
 
-There is no `public/` and no document root: `serve` **is** the server. Put
-nginx, Caddy or a CDN in front of it for TLS, static assets, and connection
-handling, and forward everything else.
+`serve` **is** the server, and it serves `public/` itself. It does not
+terminate TLS, so in production something usually sits in front of it — nginx,
+Caddy, a cloud load balancer or a CDN — for TLS and connection handling. With
+nginx, a site's `location` block forwarding everything:
 
 ```nginx
 location / {
@@ -263,8 +292,12 @@ With that in place, and only then, set `trust_proxy`.
 
 ## A container
 
-The sample project ships a working [`Dockerfile`][dockerfile]; this is what is
-in it and why.
+A container image is one way to ship the binary; the [Building](#building)
+section above is all a VM or a systemd unit needs. The sample project ships a
+working [`Dockerfile`][dockerfile], which additionally builds the front-end
+assets and [sizes the image](#sizing-the-image). What follows is a simpler
+two-stage version, saved as `Dockerfile` at the project root and built with
+`docker build -t my-app .`, and the decisions in it.
 
 ```dockerfile
 FROM rust:1.100.0-bookworm AS builder
@@ -339,6 +372,8 @@ can take an instance out of rotation without restarting it.
 
 ### `.dockerignore`
 
+At the project root, next to the `Dockerfile`:
+
 ```
 /target
 /.cargo
@@ -359,8 +394,9 @@ Do not bake `.env` into the image. Inject the real environment —
 
 ## Continuous integration
 
-The sample ships [a pipeline][ci]. The parts worth copying are the ones that
-assert **behaviour** rather than compilation:
+The sample ships [a pipeline][ci] for GitHub Actions; the steps below are from
+it, and the shell in each `run:` works unchanged in any CI. The parts worth
+copying are the ones that assert **behaviour** rather than compilation:
 
 ```yaml
 - name: migrate, refuse a rollback, migrate again
@@ -402,6 +438,9 @@ Two more worth having:
   find out before a deploy does.
 
 ## Sizing the image
+
+`cargo rainier` is a Cargo subcommand shipped in this repository; install it
+with `cargo install cargo-rainier --locked --git https://github.com/safewords/rainier-framework.git`.
 
 Cargo features are resolved before anything compiles, and a well-built
 application's driver `match`es are exhaustive — so every compiled driver is
@@ -446,7 +485,8 @@ one that silently under-builds, because an `s3` disk declared in a
 
 ## What to run
 
-Three process types, from one binary:
+Three process types, from one binary (`app` is the sample project's binary
+name; use yours):
 
 ```sh
 app serve                  # the web server

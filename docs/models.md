@@ -448,7 +448,8 @@ Derive `Serialize` and a model goes straight out as JSON:
 Ok(Response::json(&post))
 ```
 
-There is no `$hidden`. A model with a password hash in it **must not** be
+There is no `$hidden` (the PHP ORM convention for leaving fields out of
+serialisation). A model with a password hash in it **must not** be
 serialised directly — define a separate view struct:
 
 ```rust

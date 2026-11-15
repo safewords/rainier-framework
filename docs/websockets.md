@@ -2,11 +2,14 @@
 
 A connection that stays open, served on the same port as everything else.
 
+Paths are the sample project's; `Chat` is a [handler](#a-handler) of your own
+and `rooms` the `Rooms` it shares connections through.
+
 ```rust
-// routes/ws.rs
+// src/routes/ws.rs
 WebSocketRoutes::new().add("/ws/rooms/{room}", Chat { rooms })
 
-// bootstrap.rs
+// src/bootstrap.rs
 Rainier::new(".").with_websockets(routes::ws::routes(rooms))
 ```
 

@@ -29,6 +29,8 @@ flowchart LR
 
 ## `.env`
 
+A plain `KEY=value` file at the project root, one per machine or deployment:
+
 ```env
 APP_NAME="Rainier Sample"
 APP_ENV=local
@@ -112,6 +114,10 @@ down. Reading that as "unset" hands the deployment an in-process cache — the
 failure a closed set exists to prevent. **Delete the line; do not blank it.**
 
 ## The config repository
+
+In the examples below, `config` is the `&Config` your
+[`configure` function](#where-it-is-set) is handed; anywhere else,
+`Config::instance()` returns the same repository.
 
 ```rust
 config.set("posts.per_page", 15)?;
@@ -278,6 +284,9 @@ discover that `SESSION_DRIVER=redis` does nothing.
 
 ### Matching on one
 
+This is the shape of the framework's own session wiring; `lifetime`, `db`,
+`cache` and `crypt` are values built earlier in the same boot code:
+
 ```rust
 let store: Arc<dyn SessionStore> = match env.setting::<SessionDriver>("SESSION_DRIVER")? {
     SessionDriver::Memory => Arc::new(MemorySessionStore::new(lifetime)),
@@ -410,7 +419,7 @@ writing, that jobs wait for their transaction — while they do not.
 ## Where it is set
 
 ```rust
-// src/config/mod.rs — config/*.php
+// src/config/mod.rs
 pub fn configure(config: &Config, env: &Env) -> Result<()> {
     app::configure(config, env)?;
     cache::configure(config, env)?;
@@ -420,7 +429,7 @@ pub fn configure(config: &Config, env: &Env) -> Result<()> {
 ```
 
 ```rust
-// src/config/app.rs — config/app.php
+// src/config/app.rs
 use crate::config::keys::{APP_LOCALE, APP_NAME};
 
 pub fn configure(config: &Config, env: &Env) -> Result<()> {
@@ -431,7 +440,7 @@ pub fn configure(config: &Config, env: &Env) -> Result<()> {
 ```
 
 ```rust
-// src/config/cache.rs — config/cache.php
+// src/config/cache.rs
 use crate::config::keys::{CACHE_DRIVER, CACHE_PREFIX, CACHE_REDIS_URL};
 
 pub fn configure(config: &Config, env: &Env) -> Result<()> {
@@ -456,6 +465,9 @@ pub fn configure(config: &Config, env: &Env) -> Result<()> {
     Ok(())
 }
 ```
+
+and the boot code hands the entry point to the builder — in the sample
+project, `src/bootstrap.rs`:
 
 ```rust
 Rainier::new(".").configure(|c| {
@@ -562,8 +574,9 @@ do.
 ## Settings that are not environment variables
 
 Not every setting has an env var behind it, and it does not need one. `.env` is
-for values that **differ per deployment**. Anything else is a literal in
-`config.rs`.
+for values that **differ per deployment**. Anything else is a literal in your
+config module (`src/config/` in the sample project; `config.rs` below is
+shorthand for it).
 
 ```rust
 fn server(config: &Config) -> Result<()> {
@@ -634,7 +647,9 @@ Anywhere, through the [facade](facades.md):
 let per_page = Config::instance().get_or(POSTS_PER_PAGE, 15);
 ```
 
-Or from the container, which is what a service should do:
+Or from the container, which is what a service should do — this is a binding
+made in a [service provider](providers.md)'s `register`, where `app` is the
+application:
 
 ```rust
 app.singleton(|c: &Container| {
@@ -670,6 +685,8 @@ A parameter rather than a global, because a test wants captured mail and an
 in-memory queue while a running app wants neither — and because reading
 `APP_ENV` inside a test suite makes the suite depend on the developer's `.env`.
 
+Anywhere you hold the `Application` (`app`):
+
 ```rust
 app.environment();
 app.environment_is(&["local", "testing"]);
@@ -692,6 +709,8 @@ either.
 ## Testing configuration
 
 `Env::parse` builds one from a string, so a test needs no file:
+
+In a `#[cfg(test)]` module beside your `configure`:
 
 ```rust
 #[test]

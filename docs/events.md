@@ -3,6 +3,10 @@
 The dispatcher is Rainier's **hook bus** — the seam where something happens and
 something else reacts without either knowing about the other.
 
+Raising one works anywhere. Reacting is done on `events`, the `Dispatcher`
+handed to your listener registration at boot — see
+[Where listeners are registered](#where-listeners-are-registered):
+
 ```rust
 // Raise
 Event::instance().dispatch(PostPublished { post }).await?;
@@ -34,6 +38,9 @@ Keeping events next to the model they concern is a convention worth following
 — it puts the vocabulary of the domain in one file.
 
 ## Listening
+
+On the `Dispatcher` (`events`); `metrics::increment` stands for whatever
+metrics client you use:
 
 ```rust
 // Async — the usual form.

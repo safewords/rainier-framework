@@ -4,6 +4,9 @@ A notification is a **message to a recipient**, sent over whichever channels
 suit that recipient. A `Notification`, a `Notifiable`, and channels, in
 `rainier-notify`.
 
+Here `author` is a [`Notifiable`](#notifiable) — usually your user model — and
+`PostLive` a notification the application defines:
+
 ```rust
 Notify::instance().send(&author, &PostLive { post }).await?;
 ```
@@ -335,7 +338,7 @@ Behind the `notify-discord` feature. Two modes, because Discord has two:
 a **webhook** per recipient (a club or a team pasted one into its settings),
 or a **bot** the application runs, posting into channels it was invited to.
 
-> **Run it:** `cargo run -p rainier-framework --example notify_discord --features notify-discord`
+> **Run it** from a checkout of this repository: `cargo run -p rainier-framework --example notify_discord --features notify-discord`
 > — both modes, an embed, the exact JSON sent, and a rate limit, offline
 > ([`examples/notify_discord.rs`](../crates/rainier-framework/examples/notify_discord.rs)).
 

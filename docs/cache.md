@@ -2,6 +2,11 @@
 
 A cache port with the shape and the drivers you would expect.
 
+In the examples on this page, `cache` is a store: the application's default one
+is `Cache::instance().store()` (the [facade](facades.md)), or
+`app.resolve::<CacheManager>()?.store()` from the container. Which backend it
+is comes from [Configuring it](#configuring-it), below.
+
 ```rust
 use rainier_framework::cache::{Cache, CacheExt};
 use std::time::Duration;
@@ -89,7 +94,7 @@ exactly one caller may create.
 ```rust
 use rainier_framework::cache::LockManager;
 
-let locks = app.resolve::<LockManager>()?;
+let locks = app.resolve::<LockManager>()?;   // `app`: the Application
 
 let outcome = locks
     .lock("reports:nightly", Duration::from_secs(600))
@@ -264,6 +269,7 @@ if !driver.is_shared() {
 the "not built with that" error say which line to add to `Cargo.toml`.
 
 ```toml
+# Cargo.toml, [dependencies]
 rainier-framework = { git = "…", features = ["sea-orm-executor", "redis"] }
 ```
 
@@ -328,6 +334,8 @@ let connector = RedisConnector::open_with(
 ```
 
 ## Cloudflare Workers KV
+
+In `.env`, for an application built for a Cloudflare Worker:
 
 ```env
 CACHE_DRIVER=kv
@@ -401,6 +409,9 @@ the Redis its cache already names rather than composing a second URL that can
 drift from it. `StoreConfig::shared_redis()` (or `RedisStore::shared()` /
 `RedisClusterStore::shared()`) gives a `SharedRedis` to that server or cluster:
 
+Where `store_config` is the `StoreConfig` of the store you declared under
+[More than one store](#more-than-one-store):
+
 ```rust
 use rainier_framework::drivers::{redis_client as redis, RedisScript, SharedRedis};
 
@@ -434,7 +445,10 @@ let _: i64 = redis.eval(&BUMP, &["{stats:7}:today"], &["views", "3600"]).await?;
 ## Hot rows: `ModelCache`
 
 `ModelCache<M>` keeps the rows of one model that are being read often, and only
-those, in the application's cache, and drops each the moment it is written:
+those, in the application's cache, and drops each the moment it is written. Here `db`
+is the `Database`, `repo` a [repository](repositories.md) of `Post`, `users` a
+second `ModelCache<User>` built the same way, and `load` your own function that
+fetches a user by name:
 
 ```rust
 use rainier_framework::model_cache::ModelCache;
@@ -442,8 +456,8 @@ use rainier_framework::model_cache::ModelCache;
 let posts: ModelCache<Post> = ModelCache::new(Cache::instance().store(), &db);
 let post = posts.get(&id.to_string(), || async { repo.find(id.into()).await }).await?;
 // by another column, through a checked index:
-let profile = profiles
-    .get_by("username", &name, |p| p.id.to_string(), |p| p.username == name, || load(&name))
+let user = users
+    .get_by("username", &name, |u| u.id.to_string(), |u| u.username == name, || load(&name))
     .await?;
 ```
 
@@ -509,6 +523,7 @@ The [throttle](middleware.md#throttlerequests) keeps its windows here, the same
 way locks do:
 
 ```rust
+// `cache` here is the CacheManager, not a single store.
 let limits = CacheRateLimiter::new(Arc::clone(cache.store()));
 ```
 
@@ -535,6 +550,8 @@ continuing to knock.
 
 Two applications caching `user:1` on one Redis database read each other's
 values, and the symptom is a user seeing another application's data.
+
+With `redis` a `RedisCache` connected as under [Redis](#redis):
 
 ```rust
 use rainier_framework::cache::PrefixedCache;
@@ -564,6 +581,10 @@ for speed is wrong in it:
 
 ## Configuring it
 
+In `.env` or the process environment — one `CACHE_DRIVER` line, and the URL
+its driver needs. The Redis and Memcached drivers each need their cargo
+feature, as [above](#drivers):
+
 ```env
 CACHE_DRIVER=memory
 CACHE_DRIVER=redis
@@ -590,7 +611,7 @@ the same thing.
 
 One `CACHE_DRIVER` is one backend. Two — a shared Redis and a per-process
 scratch store — are a **section**: a `default` naming one entry, and each entry
-naming its own driver and settings.
+naming its own driver and settings. Declared in boot code:
 
 ```rust
 use rainier_framework::cache::{StoreConfig, Stores};
@@ -600,7 +621,8 @@ let stores = Stores::new("shared")
     .with("scratch", StoreConfig::memory());
 ```
 
-which is the same shape from the configuration tree, under `cache.stores`:
+which is the same shape from the [configuration tree](configuration.md#the-config-repository),
+under `cache.stores`:
 
 ```json
 {
@@ -694,7 +716,7 @@ No server and no configuration. `MemoryCache` also has `purge()` and `len()` for
 asserting on expiry, which the network drivers cannot offer.
 
 The Redis and Memcached tests in the framework are `#[ignore]`d and need a live
-server:
+server; from a checkout of this repository, with the server listening on its default port on `127.0.0.1`:
 
 ```sh
 cargo test -p rainier-cache --features redis -- --ignored

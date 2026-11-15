@@ -88,8 +88,7 @@ Error: nothing is bound for `app::services::PostService`
 
 ## The application
 
-`Application` is `Foundation\Application`: a container plus the things a
-running app needs around it. It `Deref`s to `Container`, so every method above
+`Application` is a container plus the things a running app needs around it. It `Deref`s to `Container`, so every method above
 works directly on it.
 
 ```rust

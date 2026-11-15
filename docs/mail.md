@@ -212,9 +212,14 @@ localhost and nothing else.
 
 ### Developing against a real SMTP server
 
+[Mailpit](https://mailpit.axllent.org) is a local SMTP server that catches
+everything sent to it and shows it in a web UI on port 8025. With Docker:
+
 ```sh
 docker run --rm -p 1025:1025 -p 8025:8025 axllent/mailpit
 ```
+
+and in `.env`:
 
 ```env
 MAIL_DRIVER=smtp

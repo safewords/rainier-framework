@@ -17,7 +17,7 @@ CBOR an authenticator speaks is read by a small strict decoder in the crate.
 
 ## Quick start
 
-> **Run it first:** `cargo run -p rainier-framework --example two_factor
+> **Run it first**, from a checkout of this repository: `cargo run -p rainier-framework --example two_factor
 > --features accounts,two-factor,passkeys` plays the whole thing offline —
 > TOTP on its own, then enrol → log out → log in → challenge → signed in, then
 > register a passkey and sign in with it — printing every request and answer.

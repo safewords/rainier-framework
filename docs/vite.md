@@ -6,6 +6,8 @@ source, Vite compiles them into `public/build`, and a template asks for an
 **entry** with a directive rather than hard-coding a filename that changes on
 every build.
 
+In a [template](views.md), typically the layout:
+
 ```html
 <head>
     @vite(['resources/css/app.css', 'resources/js/app.js'])
@@ -52,18 +54,23 @@ TemplateEngine::new("resources/views").with_vite(Vite::new("public"))
 `Vite::new` takes the web root; `with_build_dir` moves the `build` directory
 (and the URL prefix) if yours differs.
 
-On the JavaScript side, `vite.config.js` needs three things: the entries, a
+The JavaScript side needs Node.js and npm, a `package.json` with Vite in it,
+and a `vite.config.js` at the project root. That config needs three things: the entries, a
 manifest, and something to write `public/hot` while the dev server runs. The
 sample project carries the canonical config — a ~20-line inline plugin, no
 extra npm dependency.
 
 ## Serving the build
 
-Rainier is the web server, so the built files need a route. The sample
-project's `asset_controller` is the pattern: a `{path*}` wildcard route that
-resolves strictly inside `public/build`, sets the content type by extension,
-and marks responses `immutable` — safe because Vite content-hashes every
-filename, so a given URL's bytes never change.
+Rainier is the web server, and it already serves them: when `public/` exists
+under the project root, boot installs it as the router's fallback, so
+`public/build/assets/app-<hash>.js` is reachable at
+`/build/assets/app-<hash>.js` with no route of your own (see
+[Directory Structure](directory-structure.md#public-is-served-by-the-application)).
+Responses carry an `ETag` and answer `304` when unchanged. An application with
+a fallback of its own serves the directory itself with `PublicFiles`, whose
+`cached_for` can mark the hashed build files `immutable` — safe because Vite
+content-hashes every filename, so a given URL's bytes never change.
 
 ## What is deliberately absent
 

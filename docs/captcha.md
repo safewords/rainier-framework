@@ -3,7 +3,7 @@
 Behind the `captcha` feature: a form's widget token verified server-side,
 for Cloudflare Turnstile, hCaptcha or reCAPTCHA.
 
-> **Run it:** `cargo run -p rainier-framework --example captcha --features captcha`
+> **Run it** from a checkout of this repository: `cargo run -p rainier-framework --example captcha --features captcha`
 > — a form route behind `RequireCaptcha`, one refused and one accepted
 > submission through a compiled router, offline
 > ([`examples/captcha.rs`](../crates/rainier-framework/examples/captcha.rs)).

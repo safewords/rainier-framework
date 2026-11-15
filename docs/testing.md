@@ -1,5 +1,8 @@
 # Testing
 
+From the project root (`--workspace` when the project is a Cargo workspace of
+several crates):
+
 ```sh
 cargo test
 cargo test --workspace
@@ -28,6 +31,10 @@ something did *not* happen: forget to install the fake and it passes forever,
 for entirely the wrong reason, while the thing it was guarding quietly breaks.
 
 ## Feature tests
+
+`app` below is the application's library crate (the sample project's is named
+`app`; see [Directory Structure](directory-structure.md#srclibrs-and-srcmainrs)),
+and `boot` and `Mode` its boot function from `src/bootstrap.rs`:
 
 ```rust
 //! tests/feature.rs — the whole application, exercised from outside.

@@ -3,18 +3,23 @@
 ## Requirements
 
 - **Rust 1.100** or later. The workspace declares `rust-version = "1.100"`,
-  the toolchain CI builds with and the one every deployment runs, so that is
-  the floor for every feature. The third-party crates the drivers pull in all
+  the toolchain the framework's own CI builds with, so that is the floor for
+  every feature. Install it with [rustup](https://rustup.rs) if you do not
+  have it. The third-party crates the drivers pull in all
   ask for less (the highest is the AWS SDKs, at 1.94).
 
 - A database, or nothing at all — SQLite in memory is the default and needs no
   setup
+
+- Git, to clone the sample project
 
 ## Start from the sample project
 
 Do not start from an empty crate. [rainier-sample-project] is a complete,
 working application with the layout the rest of these pages assume, and it is
 what the framework is designed around.
+
+In a terminal:
 
 ```sh
 git clone https://github.com/safewords/rainier-sample-project.git my-app
@@ -25,17 +30,22 @@ cargo run -- app:seed      # a demo user and a few posts
 cargo run -- serve         # http://127.0.0.1:8000
 ```
 
-That works on a fresh clone with nothing installed, because it runs against
-SQLite in memory. Point `DATABASE_URL` at a file, MySQL or Postgres when you
-want the data to survive — nothing else in the app changes.
+That works on a fresh clone with nothing installed beyond Rust, because it
+runs against SQLite in memory. `.env` is the file of per-machine settings the
+application reads at boot; `.env.example` lists every one with a comment, and
+[Configuration](configuration.md#env) covers how it is read. Point
+`DATABASE_URL` in it at a file, MySQL or Postgres when you want the data to
+survive — nothing else in the app changes.
 
-Then rename it:
+Then rename it, in `Cargo.toml` at the project root:
 
 ```toml
 # Cargo.toml
 [package]
 name = "my-app"
 ```
+
+and the library and binary targets further down the same file:
 
 ```toml
 [lib]
@@ -49,6 +59,8 @@ path = "src/main.rs"
 
 ## Adding Rainier to an existing crate
 
+In the crate's `Cargo.toml`:
+
 ```toml
 [dependencies]
 rainier-framework = { git = "https://github.com/safewords/rainier-framework.git", features = [
@@ -59,6 +71,11 @@ rainier-framework = { git = "https://github.com/safewords/rainier-framework.git"
 # separate crate to version against.
 rainier-orm = { git = "https://github.com/safewords/rainier-framework.git" }
 
+# Both are also published on crates.io, and the release works in place of
+# the git lines — the form most other pages show:
+#   rainier-framework = { version = "2", features = ["sea-orm-executor"] }
+#   rainier-orm = "2"
+
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 serde = { version = "1", features = ["derive"] }
@@ -66,6 +83,11 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
 ```
+
+Then the smallest application, as `src/main.rs`. `Rainier::new(".")` takes the
+project root — where `.env`, `resources/` and `storage/` are looked for — and
+`run_from_env` reads the command line, so `cargo run -- serve` starts the HTTP
+server and `cargo run -- list` shows every other command:
 
 ```rust
 use rainier_framework::prelude::*;
@@ -101,7 +123,7 @@ framework re-exporting Rainier ORM is not enough to satisfy it.
 error[E0433]: failed to resolve: use of undeclared crate or module `rainier-orm`
 ```
 
-Add it to `[dependencies]` as shown above. Both must resolve to the **same
+Add it to `[dependencies]` in `Cargo.toml` as shown above. Both must resolve to the **same
 version**, which is why the sample project pins both to git and why the
 lockfile records both.
 
@@ -122,6 +144,7 @@ to Rainier ORM, so that impl is out of an application's reach. Rainier ships it
 behind the `sea-orm-executor` feature:
 
 ```toml
+# Cargo.toml, [dependencies]
 rainier-framework = { git = "…", features = ["sea-orm-executor"] }
 ```
 
@@ -136,11 +159,14 @@ rainier-framework = { git = "…", features = ["sea-orm-executor"] }
 | `d1-http` | Cloudflare D1 over HTTP |
 | `libsql-http` | libSQL / Turso over HTTP |
 
-Pick one. All are off by default, which is what keeps the crates usable from a
+Pick one, in the `features` list of the `rainier-framework` dependency. All
+are off by default, which is what keeps the crates usable from a
 wasm target — an application targeting a Worker drops `sea-orm-executor` and
 adds `d1-http`, and nothing else changes.
 
 ## Verify it works
+
+From the project root:
 
 ```sh
 cargo run -- list          # the command list
@@ -157,10 +183,11 @@ that works, the application is wired.
 `rust-analyzer` will want to build everything once — the first check is slow
 and every one after it is not.
 
-The workspace is clippy-clean, so it is worth keeping it that way:
+The framework's own workspace is clippy-clean, and the same check on your
+application keeps it that way:
 
 ```sh
-cargo clippy --workspace --all-targets
+cargo clippy --all-targets
 ```
 
 ## Next

@@ -3,6 +3,10 @@
 A session is a bag of values that follows a browser between requests, keyed by
 an unguessable id in a cookie.
 
+In a route file, with `groups::session()` standing for whichever
+[middleware group](middleware.md) starts the session (the sample project's is
+`kernel::web()`):
+
 ```rust
 router.get("/dashboard", dashboard).middleware(groups::session());
 ```

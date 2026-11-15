@@ -23,7 +23,8 @@ the `http-client` transport. The crate is `rainier-billing`, re-exported as
 ## Quick start
 
 A runnable version of everything below, offline against the fake transport:
-[`crates/rainier-framework/examples/billing_stripe.rs`](../crates/rainier-framework/examples/billing_stripe.rs).
+[`crates/rainier-framework/examples/billing_stripe.rs`](../crates/rainier-framework/examples/billing_stripe.rs),
+run from a checkout of this repository:
 
 ```sh
 cargo run -p rainier-framework --example billing_stripe --features billing-stripe

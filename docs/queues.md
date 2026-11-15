@@ -3,6 +3,10 @@
 Deferred work: a `Job` contract, a `Queue` port with three drivers, and a
 `Worker` that runs them.
 
+A job is a struct, conventionally one file per job under `src/app/jobs/`.
+`PostRepository` and the `PostLive` [mailable](mail.md) here are the
+application's own:
+
 ```rust
 use rainier_framework::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -29,9 +33,14 @@ impl Job for NotifyAuthor {
 }
 ```
 
+Dispatched from anywhere — a controller that has just published the post, say:
+
 ```rust
 Queue::instance().dispatch(NotifyAuthor { post_id }).await?;
 ```
+
+Nothing runs it until a queue is configured ([Drivers](#drivers)) and the job
+is [registered](#registering-jobs).
 
 ## A job crosses a process boundary
 
@@ -58,6 +67,9 @@ that keeps it so.
 
 ## Registering jobs
 
+In a [service provider](providers.md)'s `register`, where `app` is the
+application:
+
 ```rust
 let mut registry = JobRegistry::new();
 registry.register::<NotifyAuthor>();
@@ -74,7 +86,8 @@ wiring you cannot skip.
 
 When the framework builds the queue for you — `QUEUE_DRIVER`, or a `queues`
 section — declare it on the builder instead, because a provider runs *after*
-the queue is built:
+the queue is built. That is in your boot code (`src/bootstrap.rs` in the
+sample project):
 
 ```rust
 Rainier::new(".").with_jobs(JobRegistry::new().with::<NotifyAuthor>())
@@ -103,6 +116,7 @@ Queue::instance()
 To run one **now**, in-process — which is what a console command usually wants:
 
 ```rust
+// `manager`: the QueueManager; `container`: the application's Container.
 manager.dispatch_now(job, container).await?;
 ```
 
@@ -187,6 +201,7 @@ impl Job for SendInvoice {
 ```
 
 ```rust
+let queue = Queue::instance();
 queue.dispatch(RebuildSearchIndex).await?;   // Some(id)
 queue.dispatch(RebuildSearchIndex).await?;   // None — dropped
 ```
@@ -241,6 +256,8 @@ Selected by `QUEUE_DRIVER`, a
 end, and it is the one a deploy script wants: everything but `sync` needs a
 `queue:work` process or nothing happens.
 
+In `.env` or the process environment:
+
 ```env
 QUEUE_DRIVER=sync
 QUEUE_DRIVER=database
@@ -257,7 +274,8 @@ pointed at. Leave `QUEUE_DRIVER` unset and **no queue is built at all**.
 
 One `QUEUE_DRIVER` is one backend. Two — jobs on the database and a bulk lane on
 SQS — are a **section**: a `default` naming one entry, and each entry naming its
-own driver and settings.
+own driver and settings. In boot code, with `bulk_url` the SQS queue's URL read
+from the environment:
 
 ```rust
 use rainier_framework::queue::{ConnectionConfig, Connections, SqsConnection};
@@ -269,8 +287,8 @@ Rainier::new(".").with_queues(
 )
 ```
 
-which writes it to the `queues` key, so it can come from the configuration tree
-instead. Then `Queue::instance().pending(job)?.on_connection("bulk")` reaches
+which writes it to the `queues` key, so it can come from the
+[configuration tree](configuration.md#the-config-repository) instead. Then `Queue::instance().pending(job)?.on_connection("bulk")` reaches
 it, and a connection nobody declared is an error rather than the default —
 because falling back would push the job to a backend nobody named and hand the
 caller an id for it.
@@ -324,7 +342,8 @@ something else.
 
 The same three settings the [cache](cache.md#what-a-redis-store-waits-for-and-why-it-has-no-pool)
 has, for the same reason — the connection multiplexes, so there is nothing to
-pool and everything to time out:
+pool and everything to time out. One entry under the `queues` section's
+`connections`:
 
 ```json
 {
@@ -389,6 +408,9 @@ atomically because it executes commands one at a time. Queue behaviour is a
 *consequence* of that atomicity — two workers cannot take the same entry —
 rather than something Redis was built to be. That is a real property and this
 driver is built on it. It is not a broker's set of guarantees.
+
+Built by hand, with `connector` a `RedisConnector` as in
+[Cache](cache.md#drivers) — or selected from the environment, below:
 
 ```rust
 let queue = RedisQueue::connect(&connector).await?
@@ -460,10 +482,11 @@ weigh it more carefully here.
 ### `DatabaseQueue`
 
 ```rust
-let queue = DatabaseQueue::new(db).with_reservation(Duration::from_secs(90));
+let queue = DatabaseQueue::new(db).with_reservation(Duration::from_secs(90));   // db: the Database
 ```
 
-Two tables, contributed to your migrator:
+Two tables, contributed to your migrator (`src/database/migrations/mod.rs` in
+the sample project; see [Migrations](migrations.md)):
 
 ```rust
 Migrator::new()
@@ -494,7 +517,7 @@ stateDiagram-v2
 ### The optimistic claim
 
 Two workers polling the same table will both see the same candidate row. The
-claim is what stops them both running it:
+claim is what stops them both running it — from `DatabaseQueue`'s own source:
 
 ```rust
 let candidates = self.jobs.matching(
@@ -527,8 +550,9 @@ the same on SQLite, MySQL and Postgres.
 queue.reclaim_expired().await?;
 ```
 
-Releases every job whose reservation has lapsed, so a job held by a worker that
-died becomes available again. Run it periodically — a cron, or a startup step.
+On the `DatabaseQueue`. Releases every job whose reservation has lapsed, so a
+job held by a worker that died becomes available again. Run it periodically — a
+[scheduled task](scheduling.md), a cron job, or a startup step.
 
 ### Failed jobs
 
@@ -538,6 +562,9 @@ queue.retry_failed(&id).await?;
 ```
 
 ## The worker
+
+A separate process from the web server, started from the project root (or as
+`app queue:work` with the built binary):
 
 ```sh
 cargo run -- queue:work
@@ -555,7 +582,9 @@ cargo run -- queue:work --once
 Queues are tried in the order given: the worker takes everything from `high`
 before looking at `default`.
 
-Programmatically:
+Programmatically, with `queue`, `registry` and `container` the queue, the
+`JobRegistry` and the application's container, and `events` the event
+dispatcher:
 
 ```rust
 let worker = Worker::new(queue, registry, container)
@@ -607,6 +636,9 @@ rather than a fork of the worker:
 | `JobReleased` | returned for another attempt |
 | `JobFailed` | attempts exhausted |
 
+Registered where your other [listeners](events.md#where-listeners-are-registered)
+are; `metrics::increment` stands for whatever metrics client you use:
+
 ```rust
 events.listen(|e: Arc<JobFailed>| async move {
     metrics::increment("jobs.failed", &[("job", &e.job.name)]);
@@ -633,6 +665,8 @@ reported as `QueueMessageDiscarded` and `QueueOperationFailed`.
 
 ## Testing
 
+In a test, after booting the application as [Testing](testing.md) describes:
+
 ```rust
 let queue = QueueManager::fake();
 app.instance(queue);
@@ -654,6 +688,7 @@ call it on a real manager rather than passing vacuously. See
 To test the job's own logic, call `handle` with a context — no queue involved:
 
 ```rust
+// container: the application's Container; then the id, queue, attempt and max attempts.
 let context = Arc::new(JobContext::new(container, "id".into(), "mail".into(), 1, 3));
 NotifyAuthor { post_id: 1 }.handle(&context).await?;
 ```

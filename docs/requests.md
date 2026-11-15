@@ -16,7 +16,7 @@ pub async fn show(request: Req) -> Result<Response> {
 
 ## Input
 
-This is `$request->input()`, and it works the same way — **merged query string
+This is PHP frameworks' `$request->input()`, and it works the same way — **merged query string
 and body**, addressed by dotted path.
 
 ```rust

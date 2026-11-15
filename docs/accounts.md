@@ -18,7 +18,8 @@ a small trait.
 A complete, runnable version of everything below is
 [`examples/accounts.rs`](../crates/rainier-framework/examples/accounts.rs). It
 needs no database, mail server or network. It registers, logs out, logs back in,
-resets a forgotten password and verifies the address, printing each answer:
+resets a forgotten password and verifies the address, printing each answer.
+From a checkout of this repository:
 
 ```sh
 cargo run -p rainier-framework --example accounts --features accounts

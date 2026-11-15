@@ -1,7 +1,10 @@
 # Console
 
 The console is the command-line half of the framework. Your `main.rs` is the
-entry point, and it boots the same application an HTTP request would.
+entry point, and it boots the same application an HTTP request would. This is
+the sample project's, where `bootstrap::boot` is its boot function and
+`routes::console::commands()` its command list (see
+[Directory Structure](directory-structure.md)):
 
 ```rust
 // src/main.rs
@@ -19,6 +22,9 @@ async fn main() {
     std::process::exit(code);
 }
 ```
+
+From the project root — or, with the built binary, the same arguments after
+its name:
 
 ```sh
 cargo run -- list

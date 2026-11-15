@@ -32,6 +32,8 @@ example.
 
 ### Turning one on
 
+In the application's `Cargo.toml`:
+
 ```toml
 [dependencies]
 rainier-framework = { version = "2", features = ["accounts", "two-factor", "sso", "telemetry"] }
@@ -47,12 +49,14 @@ in step, not ten.
 
 ### Sizing a build
 
-`cargo rainier features` reads the deployment's environment file and prints
-the feature set to build with. Add-ins are **named**, not inferred, in
-`RAINIER_ADDINS`:
+[`cargo rainier features`](deployment.md#sizing-the-image) reads the
+deployment's environment file and prints the feature set to build with. The
+file is whatever you point `--env` at; `.env.build` is the sample project's
+name for it, holding driver selections and nothing secret. Add-ins are
+**named**, not inferred, in `RAINIER_ADDINS`:
 
 ```env
-# .env.build — read by the build, not by the running container
+# .env.build — read by the build, not by the running application
 RAINIER_ADDINS=accounts,two-factor,sso,billing-stripe
 ```
 
@@ -75,7 +79,8 @@ still asks for `telemetry` on its own, and `LOOKOUT_ENABLED=true` for `lookout`.
 
 Every add-in has one, under `crates/rainier-framework/examples/`, and every
 one runs **offline**: in-memory stores, the HTTP fake standing in for Stripe,
-GitHub or Discord, a generated key where a real one would be configured.
+GitHub or Discord, a generated key where a real one would be configured. Run
+them from a checkout of this repository:
 
 ```sh
 cargo run -p rainier-framework --example accounts --features accounts

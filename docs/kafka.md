@@ -3,10 +3,18 @@
 A partitioned log, wired into the three ports that can use one: broadcasting,
 sockets, and the queue.
 
+In `.env` or the deployment's environment (every variable is under
+[Configuration](#configuration)):
+
 ```env
 KAFKA_BROKERS=kafka-1:9092,kafka-2:9092
 KAFKA_GROUP=checkout
 ```
+
+Then at boot — a [service provider](providers.md)'s `boot`, say — with
+`config` the application's `Config`, `client` from
+`kafka::client(&config).await?`, and `rooms` the [websocket](websockets.md)
+`Rooms` from the container (`app.resolve::<Rooms>()?`):
 
 ```rust
 // Broadcasting over a topic instead of Redis pub/sub.
@@ -280,7 +288,8 @@ job becomes, the topic and cursor names, the partition a key belongs on, and
 the attempt arithmetic. Those are unit tests.
 
 Everything else is a claim about the log, so it is an integration test that
-skips unless a broker answers:
+skips unless a broker answers. From a checkout of this repository, with a
+broker on `localhost:9092` — Docker is one way to get one:
 
 ```sh
 docker run --rm -p 9092:9092 apache/kafka:3.9.0

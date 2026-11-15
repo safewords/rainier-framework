@@ -1,9 +1,13 @@
 # Observability
 
-Three optional things, each with its own section in `config/` — Prometheus
-metrics, an OpenAPI document, and OpenTelemetry tracing — plus [logs](#logs)
-and [health checks](#health-checks), which are not optional and only need
+Three optional things, each with its own section in the application's config
+module (`src/config/` in the sample project; see
+[Configuration](configuration.md#where-it-is-set)) — Prometheus metrics, an
+OpenAPI document, and OpenTelemetry tracing — plus [logs](#logs) and
+[health checks](#health-checks), which are not optional and only need
 deciding about.
+
+The switches, in `.env` or the process environment:
 
 ```env
 METRICS_ENABLED=true
@@ -39,7 +43,7 @@ is what shape the lines are.
 ## Metrics
 
 ```rust
-// config/metrics.rs
+// src/config/metrics.rs, inside its `configure(config, env)`
 config.set(METRICS_ENABLED, env.bool("METRICS_ENABLED", false))?;
 config.set(METRICS_PATH, env.string("METRICS_PATH", "/metrics"))?;
 ```
@@ -55,7 +59,7 @@ config.set(METRICS_PATH, env.string("METRICS_PATH", "/metrics"))?;
 Record your own alongside them:
 
 ```rust
-let metrics = resolve::<Metrics>()?;
+let metrics = app.resolve::<Metrics>()?;     // `app`: the Application
 metrics.counter("posts_published_total", "Posts published");
 metrics.increment("posts_published_total", labels([("author", "…")]));
 ```
@@ -83,6 +87,7 @@ route just before a route's own pipeline runs, so a group-level middleware can
 read the pattern and a global one cannot — it runs before anything is matched.
 
 ```rust
+// src/app/http/kernel.rs — the stack the `api` group's routes run through
 pub fn api(metrics: Option<Arc<Metrics>>) -> MiddlewareStack {
     let stack = MiddlewareStack::new();
     let stack = match metrics {
@@ -101,7 +106,7 @@ Placed globally it still works; every series is simply labelled `<unmatched>`.
 
 ### Guard the endpoint
 
-The sample serves `/api/metrics` unguarded because it is a sample. A real
+The sample project serves `/api/metrics` unguarded because it is a sample. A real
 deployment puts it behind whatever its admin routes are behind, or binds it to
 an interface only the scraper can reach. `METRICS_PATH` exists so you can also
 move it somewhere unguessable when neither is available.
@@ -118,7 +123,7 @@ no exemplars, no native histograms, no protobuf. A scrape needs none of them.
 ## OpenAPI
 
 ```rust
-// config/openapi.rs
+// src/config/openapi.rs, inside its `configure(config, env)`
 config.set(OPENAPI_ENABLED, env.bool("OPENAPI_ENABLED", false))?;
 config.set(OPENAPI_TITLE, "Rainier Sample API".to_string())?;
 config.set(OPENAPI_VERSION, "1.0.0".to_string())?;
@@ -131,7 +136,7 @@ parameters, and a `401` plus a security scheme on anything behind
 authentication. That half cannot drift — it is read from the routes being
 served.
 
-**Declared** in `routes/openapi.rs`: the summary, the tags, the request body
+**Declared** in `src/routes/openapi.rs` (the sample project's file for it): the summary, the tags, the request body
 and the responses.
 
 ```rust
@@ -195,7 +200,7 @@ Point either at `/openapi.json`; both take a URL.
 ## OpenTelemetry
 
 ```rust
-// config/telemetry.rs
+// src/config/telemetry.rs, inside its `configure(config, env)`
 config.set(TELEMETRY_ENABLED, env.bool("TELEMETRY_ENABLED", false))?;
 config.set(TELEMETRY_SERVICE_NAME, env.string("OTEL_SERVICE_NAME", "rainier-sample"))?;
 config.set(TELEMETRY_SAMPLE_RATIO, env.float("OTEL_TRACES_SAMPLER_ARG", 1.0))?;
@@ -227,6 +232,9 @@ tracing.
 
 ### Put it outermost
 
+In the function that registers your global middleware (the sample project's
+`src/app/http/kernel.rs`):
+
 ```rust
 pub fn register(registry: &MiddlewareRegistry, trace: Option<Trace>) {
     if let Some(trace) = trace {
@@ -251,8 +259,12 @@ trace at all.
 
 ### Exporting
 
+Doing it by hand — `rainier-telemetry` in `Cargo.toml`, and the subscriber
+installed in `main` before the application boots, with `endpoint` your
+collector's URL:
+
 ```toml
-rainier-telemetry = { version = "0.1", features = ["otlp"] }
+rainier-telemetry = { version = "2", features = ["otlp"] }
 ```
 
 ```rust
@@ -279,13 +291,13 @@ With `rainier-framework`'s `telemetry` feature none of this is needed — see
 
 ### Quick start
 
-**1. Build with the feature.**
+**1. Build with the feature**, in `Cargo.toml`.
 
 ```toml
 rainier-framework = { version = "2", features = ["telemetry"] }
 ```
 
-**2. Set two variables.** No code: at boot the framework installs the OTLP
+**2. Set two variables**, in `.env` or the deployment's environment. No code: at boot the framework installs the OTLP
 exporter beside its log subscriber and puts `Trace` outermost in the global
 middleware.
 
@@ -306,8 +318,11 @@ application's `Metrics`, bound as for the web process.
 WORKER_METRICS_ADDRESS=0.0.0.0:9100
 ```
 
-**4. Run a collector.** It receives OTLP on 4317 and forwards to whatever
-stores traces — Tempo and Jaeger both accept OTLP directly:
+**4. Run a collector.** This step and the next assume an OpenTelemetry
+Collector and Prometheus; any OTLP receiver and any Prometheus-compatible
+scraper does the same job. The collector receives OTLP on 4317 and forwards to
+whatever stores traces — Tempo and Jaeger both accept OTLP directly. Its
+configuration file:
 
 ```yaml
 # otel-collector.yaml
@@ -337,7 +352,8 @@ service:
 ```
 
 and point Prometheus at the web process's metrics path and each worker's
-`WORKER_METRICS_ADDRESS`:
+`WORKER_METRICS_ADDRESS`, in its `prometheus.yml` — the hostnames are whatever
+your web and worker processes are reachable at:
 
 ```yaml
 scrape_configs:
@@ -348,7 +364,7 @@ scrape_configs:
     static_configs: [{ targets: ["orders-worker:9100"] }]
 ```
 
-**5. Ask the questions.**
+**5. Ask the questions**, as PromQL in Prometheus or Grafana:
 
 ```promql
 # How long jobs wait before a worker picks them up — p95, per queue.
@@ -371,7 +387,8 @@ sum by (task) (increase(scheduler_task_runs_total{outcome="skipped_still_running
 **See it without any of that.** The `telemetry` example boots an
 application, serves one request that reads the cache, runs a query, calls
 another service and queues a job, processes the job, and prints every span
-and the queue metrics — no collector, no network:
+and the queue metrics — no collector, no network. From a checkout of this
+repository:
 
 ```sh
 cargo run -p rainier-framework --example telemetry --features telemetry
@@ -659,7 +676,7 @@ router.get("/health/ready", health::endpoint).name("health.ready");
     "cache":    { "status": "ok", "duration_ms": 1 },
     "database": { "status": "ok", "duration_ms": 3 }
   },
-  "build": { "name": "identity", "version": "2.4.1", "commit": "9f3c2ab", "profile": "release" }
+  "build": { "name": "shop", "version": "2.4.1", "commit": "9f3c2ab", "profile": "release" }
 }
 ```
 

@@ -13,13 +13,15 @@ pub async fn index() -> Result<Response> {
 }
 ```
 
+and routed to from a [route file](routing.md) such as `src/routes/web.rs`:
+
 ```rust
-router.get("/", HomeController::index).name("home");
+router.get("/", home_controller::index).name("home");
 ```
 
 Grouping them in a module named after the controller is a convention, not a
-requirement — it is what makes `home_controller::index` read like
-`HomeController@index`.
+requirement — it is what makes `home_controller::index` read like the
+`HomeController@index` of PHP frameworks.
 
 ## What an action may return
 

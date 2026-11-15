@@ -29,7 +29,7 @@ Letting users sign in *with* somebody else's accounts is [Single Sign-On](sso.md
 
 The whole flow — two clients, authorization code with PKCE, refresh rotation,
 client credentials, a personal access token, a scoped API route, revocation —
-runs offline in one example:
+runs offline in one example, from a checkout of this repository:
 
 ```sh
 cargo run -p rainier-framework --example oauth_server --features oauth-server

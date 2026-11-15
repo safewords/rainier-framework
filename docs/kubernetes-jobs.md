@@ -3,10 +3,14 @@
 Run a reserved queue job as a one-shot `batch/v1 Job` pod on Kubernetes
 instead of in the worker's own process.
 
-Behind the `kubernetes` feature on `rainier-framework`.
+This page is only for applications whose [queue workers](queues.md#the-worker)
+already run as pods in a Kubernetes cluster. Outside one, nothing here
+applies and every job runs in the worker as usual.
+
+Behind the `kubernetes` feature on `rainier-framework`, in `Cargo.toml`:
 
 ```toml
-rainier-framework = { ..., features = ["kubernetes"] }
+rainier-framework = { version = "2", features = ["sea-orm-executor", "kubernetes"] }
 ```
 
 ## The queue is still the authority
@@ -53,9 +57,10 @@ worker:
   limit and OOM-kills the pod, taking out every unrelated job it was
   draining. A one-shot pod sized to the file is bounded, exits cleanly,
   and never shares RAM with anything else.
-- **It handles sensitive content that must stay isolated.** CSAM review,
-  payment-card tokens, PII cross-border transfer. Pair the one-shot pod
-  with a narrowly-scoped `ServiceAccount` (IRSA), a tainted node pool
+- **It handles sensitive content that must stay isolated.** Medical
+  records, payment-card tokens, PII cross-border transfer. Pair the one-shot pod
+  with a narrowly-scoped `ServiceAccount` (bound to a cloud IAM role —
+  IRSA on AWS, or your cloud's equivalent), a tainted node pool
   (`nodeSelector`), and `emptyDir { medium: Memory }` for tempfiles —
   none of which the shared pool offers.
 - **Its CPU shape is spiky and would starve neighbors.** A one-off
@@ -79,21 +84,20 @@ use rainier_framework::queue::KubernetesJobSpec;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UploadConfirmedCsamToNcmec {
-    pub report_case_id: u64,
-    pub post_id: u64,
+pub struct UploadArchiveToPartner {
+    pub archive_id: u64,
 }
 
 #[async_trait]
-impl Job for UploadConfirmedCsamToNcmec {
-    const NAME: &'static str = "ncmec.upload-confirmed-csam";
-    const QUEUE: &'static str = "notifications";
+impl Job for UploadArchiveToPartner {
+    const NAME: &'static str = "partner.upload-archive";
+    const QUEUE: &'static str = "uploads";
     const TRIES: u32 = 5;
 
     fn kubernetes(&self) -> Option<KubernetesJobSpec> {
         Some(
             KubernetesJobSpec::new("4Gi", "6Gi", "250m", "1")
-                .with_service_account("ncmec-uploader-sa")
+                .with_service_account("partner-uploader-sa")
                 .with_node_selector("role", "sensitive-content")
                 .with_tmpfs_scratch()
                 .with_ttl_seconds_after_finished(0),
@@ -123,7 +127,7 @@ specifics on top:
 | `.with_service_account(..)` | `spec.template.spec.serviceAccountName`. **Always set this for sensitive-content jobs.** |
 | `.with_namespace(..)` | Namespace to create the Job in. Default: the worker's own namespace. |
 | `.with_node_selector(k, v)` | Chainable; pins the pod to tainted nodes. |
-| `.with_ttl_seconds_after_finished(n)` | How long the finished Job + its logs linger before GC. Default `60`; CSAM pods should set `0`. |
+| `.with_ttl_seconds_after_finished(n)` | How long the finished Job + its logs linger before GC. Default `60`; pods handling sensitive content should set `0`. |
 | `.with_tmpfs_scratch()` | Mounts `/scratch` as `emptyDir { medium: Memory }`. For pods whose tempfiles must never touch disk. |
 | `.with_backoff_limit(n)` | Kubernetes-side retries. **Default `0`.** Retries live in the queue worker — raising this gives Kubernetes a second attempt at the pod before `Job::TRIES` is consulted, which is almost never what you want. |
 
@@ -189,8 +193,8 @@ tries to create the Job, gets a `409 AlreadyExists`, and jumps straight
 to the watch loop. No duplicate pod; the uniqueness is enforced by the
 API server's own primary key.
 
-This matters for anything with external side effects — an NCMEC upload
-you do not want to make twice.
+This matters for anything with external side effects — an upload to a
+third party you do not want to make twice.
 
 ### Labels on every Job
 
@@ -199,7 +203,7 @@ For observability + ad-hoc queries, the dispatcher stamps:
 | Label | Value |
 |---|---|
 | `app.kubernetes.io/managed-by` | `rainier-queue` |
-| `rainier.job/name` | slug of `J::NAME` (`ncmec-upload-confirmed-csam`) |
+| `rainier.job/name` | slug of `J::NAME` (`partner-upload-archive`) |
 | `rainier.job/queued-id` | the queue row's id (slugified) |
 | `rainier.job/instance` | the derived `metadata.name` |
 
@@ -220,7 +224,7 @@ own image with:
 
 The payload rides in an env var, which has a per-pod 1 MiB cap on
 Kubernetes. The dispatcher rejects payloads over ~900 KiB. The intended
-use is passing identifiers (match ids, upload ids — tens of bytes); for
+use is passing identifiers (record ids, upload ids — tens of bytes); for
 larger payloads a ConfigMap-based variant would be needed (not
 implemented).
 
@@ -229,9 +233,16 @@ implemented).
 ### 1. Build and attach the dispatcher on the worker
 
 The dispatcher is a property of the pod that runs `queue:work`. The
-HTTP tier (octane/axum/whatever) does not need it — HTTP never launches
+HTTP tier (`serve`) does not need it — HTTP never launches
 Kubernetes Jobs under this design; it dispatches to the queue as usual
 and the worker is the one that executes.
+
+With the built-in `queue:work` command, bind the dispatcher in the
+container at boot — `app.instance(dispatcher)`, from a
+[service provider](providers.md) — and the command attaches it to every
+worker it starts. The function below is the same wiring for a worker you
+build by hand, with `queue`, `registry`, `container` and `worker_options`
+as in [Queues](queues.md#the-worker):
 
 ```rust
 use std::sync::Arc;
@@ -299,8 +310,9 @@ log tail, which is a diagnosis-quality bit, not a correctness one.
 
 ### 2. The CLI pre-check in `main`
 
-The pod runs your binary with the sentinel arg. `main` has to catch it
-**before** the application's own CLI parser runs:
+The pod runs your binary with the sentinel arg. `main` (`src/main.rs`) has to
+catch it **before** the application's own CLI parser runs. `boot` and
+`Mode` here are the sample project's, from `src/bootstrap.rs`:
 
 ```rust
 #[tokio::main]
@@ -363,7 +375,7 @@ exit code into `Ok(())` / `Err` and the queue handles the rest.
 
 ```rust
 Queue::instance().dispatch(job).await?;              // or
-Queue::instance().dispatch_on("notifications", job).await?;
+Queue::instance().dispatch_on("uploads", job).await?;
 Queue::instance().dispatch_after(TEN_MIN, job).await?;
 ```
 
@@ -382,9 +394,9 @@ work. For a job to actually run on Kubernetes you need:
   `queue:work` needs a `Role` with `create get list watch` on
   `jobs.batch` plus `get` on `pods/log` in the target namespace. The
   HTTP pod does not — it only dispatches to the queue.
-- **A `ServiceAccount` per sensitive job.** CSAM upload, payment
-  handling, etc. — a narrow IRSA role scoped to just the S3 buckets /
-  external endpoints the job touches. The spec names it; the SA has
+- **A `ServiceAccount` per sensitive job.** A third-party upload, payment
+  handling, etc. — a narrow cloud IAM role (IRSA on AWS) scoped to just the
+  storage buckets / external endpoints the job touches. The spec names it; the SA has
   to exist.
 - **Nodes with the taint the spec selects.** `nodeSelector:
   role=sensitive-content` pins the pod to nodes with the matching
@@ -410,7 +422,7 @@ work. For a job to actually run on Kubernetes you need:
   starting to run, depending on image pull cache and node scheduling.
   Jobs with sub-second time budgets belong in-process.
 - **Kubernetes API rate limits.** The worker creates one Job per
-  reserved opt-in row. A sudden flood (10k matches arriving at once)
+  reserved opt-in row. A sudden flood (10k uploads arriving at once)
   would be gated first by per-queue concurrency (`WorkerOptions::queue_limit`)
   and then by the API's rate limits. For high-volume opt-in jobs,
   pair with a KEDA-style ScaledJob operator rather than this

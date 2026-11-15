@@ -1,6 +1,8 @@
 # Task Scheduling
 
-One cron entry, and everything else in version control.
+One cron entry, and everything else in version control. The entry, in the
+crontab of each machine that runs the application — `/srv/app` is where the
+application is deployed and `./app` its built binary:
 
 ```cron
 * * * * * cd /srv/app && ./app schedule:run >> /dev/null 2>&1
@@ -30,6 +32,9 @@ pub fn schedule(schedule: &mut Schedule) {
         .on_one_server();
 }
 ```
+
+and the boot code (`src/bootstrap.rs` in the sample project) hands it to the
+builder:
 
 ```rust
 Rainier::new(".").with_schedule(routes::console::schedule)
@@ -291,7 +296,8 @@ Everything else is UTC.
 ```
 
 Runs whatever is due this minute and exits. Non-zero if any task failed, so a
-supervisor notices.
+supervisor notices. Cron is the Unix one; any scheduler that can run a command
+every minute does the same job.
 
 ### Without cron
 

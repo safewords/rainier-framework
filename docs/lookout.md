@@ -12,7 +12,8 @@ feature gives it; Lookout reads them in-process through a `tracing` layer, and
 listens on the event bus for what spans do not carry — failures, model changes,
 job outcomes. No application code opens anything for it.
 
-Run the example to see it end to end, offline:
+Run the example to see it end to end, offline, from a checkout of this
+repository:
 
 ```sh
 cargo run -p rainier-framework --example lookout --features lookout
@@ -22,16 +23,22 @@ cargo run -p rainier-framework --example lookout --features lookout
 
 ## Turning it on
 
+Add `lookout` to the framework's features in `Cargo.toml` (the dependency is
+declared as [Installation](installation.md#adding-rainier-to-an-existing-crate)
+shows):
+
 ```toml
 [dependencies]
-rainier-framework = { version = "2", features = ["lookout"] }
+rainier-framework = { version = "2", features = ["sea-orm-executor", "lookout"] }
 ```
+
+and switch it on in `.env` or the process environment:
 
 ```env
 LOOKOUT_ENABLED=true
 ```
 
-That is all a deployment needs. `cargo rainier features` turns the feature on
+That is all a deployment needs. [`cargo rainier features`](deployment.md#sizing-the-image) turns the feature on
 for an environment that sets `LOOKOUT_ENABLED=true`, as it does `telemetry`
 for `TELEMETRY_ENABLED=true`.
 
@@ -66,7 +73,9 @@ Read at boot through the application's `Env` (so `.env` counts), with
 | `LOOKOUT_CAPTURE_RESPONSE_BODY` | every kept request's response body, redacted | a boolean | `false` |
 | `LOOKOUT_CAPTURE_MAX_BODY_BYTES` | the most of a body kept | a positive integer | `65536` |
 | `LOOKOUT_CAPTURE_REQUEST_BODY_ON_EXCEPTION` | | a boolean | `false` |
+| `LOOKOUT_CAPTURE_BODIES_EXCEPT` | routes whose bodies are never kept ([privacy](#privacy)) | comma-separated globs over the route name or pattern | none |
 | `LOOKOUT_MASK_SECRETS` | star out values that look like keys and tokens ([privacy](#privacy)) | a boolean | `true` |
+| `LOOKOUT_STREAM` | "Live" streams new batches ([live](#live)) instead of polling | a boolean | `true` |
 | `LOOKOUT_CAPTURE_CACHE_KEYS` | | a boolean | `false` |
 | `LOOKOUT_CAPTURE_MAIL` | | a boolean | `false` |
 | `LOOKOUT_CAPTURE_USER_ID` | | a boolean | `false` |
@@ -87,7 +96,8 @@ its value and what it accepts in the message — the same as a misspelled
 ### In code
 
 The environment sets the scalars. Scope, per-watcher rules and the keep rule
-are about the application's own routes, so they are code:
+are about the application's own routes, so they are code, on the builder in
+your boot code:
 
 ```rust
 use rainier_framework::lookout::config::{Patterns, Scope, WatcherConfig};
@@ -211,9 +221,9 @@ span each comes from is catalogued in `rainier_lookout::layer`.
 
 | `LOOKOUT_STORE` | Where | For |
 |---|---|---|
-| `memory` | this process, the last 1000 batches | development, tests — per pod on Kubernetes |
+| `memory` | this process, the last 1000 batches | development, tests — each replica keeps its own |
 | `database` | Lookout's own four tables, on the named connection | anything shared and durable |
-| `cache` | a ring buffer of the last `LOOKOUT_CAPACITY` batches in the named cache store | Redis in production, with no migrations |
+| `cache` | a ring buffer of the last `LOOKOUT_CAPACITY` batches in the named cache store | a shared store such as Redis in production, with no migrations |
 
 The framework builds the store at boot from what it has already bound — the
 database manager, the cache manager — so `LOOKOUT_CONNECTION` and
@@ -223,7 +233,8 @@ Naming one that does not exist fails the boot.
 ### Migrations for the database store
 
 Like `DatabaseQueue::migrations()` and `DatabaseSessionStore::migrations()`,
-they are opt-in: merge them into the application's migrator.
+they are opt-in: merge them into the application's [migrator](migrations.md).
+Here `app_migrations()` stands for the application's own list:
 
 ```rust
 app.instance(
@@ -258,7 +269,7 @@ Every key is prefixed `lookout:`:
 | `case:{id}` | one case |
 | `cases:index` | every case's id, status, severity and last sighting |
 
-Writers serialise on a cache lock, so pods flushing at once do not lose each
+Writers serialise on a cache lock, so replicas flushing at once do not lose each
 other's updates; readers take none. A write sends its commands concurrently —
 the connection multiplexes — and under the lock rewrites the index, the
 buckets its batches roll into, and the cases its exceptions touch with the
@@ -295,6 +306,12 @@ Nothing that identifies a person is stored unless asked for:
 | `cache_keys` | cache keys |
 | `mail` | subjects and recipients |
 | `user_id` | the authenticated user's id — needed for user scoping and "top users" |
+
+Some routes carry nothing that may leave them — private messages, identity
+documents — and hiding fields by name is not enough there.
+`capture.bodies_except` (`LOOKOUT_CAPTURE_BODIES_EXCEPT=*chats.*,*kyc*`) names
+them by route name, or pattern for an unnamed route, with `*` globs: neither
+body of a matching request is ever kept, on a failure either.
 
 The batch page shows what was kept under **Payload**: request headers, request
 body and response body. A body is cut to `capture.max_body_bytes` (64 KiB) on
@@ -391,7 +408,7 @@ on a refused request, which is the next point.
   percentiles cover every request or run in the chosen range, not a sample:
   each aggregate bucket keeps a duration histogram (four slots per doubling,
   so a percentile is within about 9% of the true one, and never above the
-  exact maximum), and histograms add across buckets and pods. Rows written
+  exact maximum), and histograms add across buckets and replicas. Rows written
   before an upgrade have no histogram and show no percentiles until they age
   out. The time chart draws the average with p90, p95 and p99 per bucket, so
   a tail that grows while the average holds still shows up over time.
@@ -420,8 +437,29 @@ that needs `X-Lookout: 1`, like clearing.
 The cache store keeps at most 1000 cases (open ones and the most recently
 seen first), one key each, with a small index a listing filters and orders
 before reading only the cases on the page. The database store keeps them in `lookout_cases`, migration
-`rainier_lookout_0005_cases`; two pods folding the same case in the same
+`rainier_lookout_0005_cases`; two replicas folding the same case in the same
 instant can lose one occurrence's count, never the case.
+
+### Live
+
+The **Live** switch in the header keeps the page current. With it on, new
+batches arrive as they are stored — server-sent events from
+`{path}/api/stream`, one summary per batch — and the page in front of you
+updates on them: a list puts the new batch on top, a chart refreshes its
+numbers, at most every few seconds. The switch is remembered per browser, so a
+viewer who left it on is subscribed again the next time they open Lookout, and
+it pauses while the tab is hidden.
+
+Every replica's batches arrive, not only the one serving the dashboard: one
+task per process reads the store's newest batches every second while anyone is
+watching and sends each viewer the ones it has not seen, and stops within a
+second of the last viewer leaving. A viewer that falls far behind is told to
+reload. A comment line every fifteen seconds keeps a proxy from closing a quiet
+connection; a proxy that buffers responses needs to pass `text/event-stream`
+through (nginx honours the `X-Accel-Buffering: no` the response sends).
+
+`LOOKOUT_STREAM=false` turns streaming off, and so does a browser that cannot
+connect: either way the switch falls back to asking again every few seconds.
 
 ### Insights and forecasts
 
@@ -453,6 +491,9 @@ tell Lookout is there.
 The guard and the gate are generic over the application's user type, which
 the framework cannot name, so the application says it once and defines the
 ability on its gate:
+
+In boot code, with `User` your user model and `auth` the
+[`AuthManager<User>`](authentication.md) you built:
 
 ```rust
 Rainier::new(".")
@@ -488,7 +529,8 @@ consulted.
 
 When the answer takes a query — membership of an administrators group kept
 in a table — use the async form. It gets the same two references and returns
-a `'static` future, so copy what the query needs out first:
+a `'static` future, so copy what the query needs out first. `groups()` stands
+for your own lookup:
 
 ```rust
 Rainier::new(".")
@@ -544,7 +586,7 @@ when Lookout is not enabled.
 | `lookout:status` | the store, watchers, sampling, retention and how much is stored |
 
 Nothing prunes on its own — the framework does not schedule tasks for you.
-Schedule it:
+Schedule it, beside your other [scheduled commands](scheduling.md#a-console-command):
 
 ```rust
 schedule.command(console.clone(), "lookout:prune").daily();
@@ -676,7 +718,7 @@ tracing_subscriber::registry().with(lookout.layer()))`.
   cache read in a background task. Only failures get a batch of their own.
 - **Middleware groups are not part of the scope.** Nothing on a request or
   response says which group its route was registered in.
-- **The memory store is per process.** On several replicas each pod has its
+- **The memory store is per process.** On several replicas each has its
   own; use `database` or `cache` to see them together.
 - **The cache store's readers take no lock**, and stores without an atomic
   `add` cannot serialise writers; see [above](#the-cache-ring-buffer).

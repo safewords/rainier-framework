@@ -30,7 +30,7 @@ each behind a feature so an application pays only for the stack it is leaving.
 **See it run:** `crates/rainier-framework/examples/compat_php.rs` walks every
 row of that table offline — a PHP session adopted, a PHP-issued anti-forgery
 cookie accepted, a cache read, an object unserialized, a refresh token opened,
-a passkey read:
+a passkey read. From a checkout of this repository:
 
 ```sh
 cargo run -p rainier-framework --example compat_php \

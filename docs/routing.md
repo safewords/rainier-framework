@@ -8,14 +8,19 @@ Routes are declared in `src/routes/`. A route file is a **function taking a
 use rainier_framework::prelude::*;
 
 pub fn routes(router: &mut Router) {
-    router.get("/", HomeController::index).name("home");
+    router.get("/", home_controller::index).name("home");
     router.get("/health", || async { "ok" }).name("health");
 
-    router.post("/login", AuthController::login)
+    router.post("/login", auth_controller::login)
         .name("login")
         .middleware((kernel::web(), ThrottleRequests::per_minute(5)));
 }
 ```
+
+`home_controller` and `auth_controller` are [controller](controllers.md)
+modules, and `kernel::web()` the sample project's `web` middleware group from
+`src/app/http/kernel.rs`. The route functions are handed to the builder in the
+boot code:
 
 ```rust
 // src/bootstrap.rs

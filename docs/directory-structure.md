@@ -1,8 +1,10 @@
 # Directory Structure
 
-The sample project's layout maps one-for-one onto the conventional PHP MVC
-project layout. If you know where something lives in that tradition, you know
-where it lives here.
+This is the layout of [rainier-sample-project](https://github.com/safewords/rainier-sample-project),
+which the rest of these pages assume. The right-hand column maps it onto the
+conventional PHP MVC project layout Rainier is ported from — if you know where
+something lives in that tradition, you know where it lives here; if you do not,
+ignore the column.
 
 ```text
 my-app/
@@ -12,7 +14,7 @@ my-app/
 │   ├── main.rs                         the CLI binary     — the console entry point
 │   ├── lib.rs                          —                  — the module tree
 │   ├── bootstrap.rs                    bootstrap/app.php  — assembles and boots the app
-│   ├── config.rs                       config/*.php       — configuration, read from .env
+│   ├── config/                         config/*.php       — configuration, read from .env
 │   ├── app/
 │   │   ├── models/                     app/Models
 │   │   ├── http/
@@ -37,6 +39,7 @@ my-app/
 │       ├── openapi.rs                   —                  — what the router cannot know
 │       └── console.rs                  routes/console.php
 ├── resources/views/                    resources/views
+├── public/                             public             — files served as they sit on disk
 ├── storage/
 │   ├── logs/                           storage/logs
 │   └── mail/                           —                  — .eml files, in `file` mail mode
@@ -44,6 +47,8 @@ my-app/
 ```
 
 ## What goes where
+
+Paths are relative to `src/`.
 
 | To add a… | Write it in | And register it in |
 |---|---|---|
@@ -82,17 +87,20 @@ what the tests boot. Without the split, `tests/feature.rs` could not reach your
 application's own types — an integration test can only see a **library**
 target.
 
-### There is no `public/`
+### `public/` is served by the application
 
-There is no document root, because there is no web server in front of the
-application. `serve` **is** the server. Static assets are served by whatever is
-in front of it in production — nginx, Cloudflare, a CDN — or by a route you
-write.
+There is no separate web server needed in front: `serve` **is** the server.
+When a `public/` directory exists under the project root, the framework serves
+its files at the URL matching their path, as the router's fallback — so a
+route always wins over a file of the same name, and dotfiles and anything
+outside the directory are refused. A proxy or CDN in front can still serve them
+instead, if you have one.
 
-### There is no `config/` directory
+### `config/` is Rust, not data files
 
-Rainier's `config.rs` is one function per concern, all writing into the same
-dotted tree:
+`src/config/` is a Rust module with one `configure` function per concern, all
+writing into the same dotted tree. A single `config.rs` works the same way for
+a small application:
 
 ```rust
 pub fn configure(config: &Config, env: &Env) -> Result<()> {
@@ -108,8 +116,9 @@ fn posts(config: &Config, env: &Env) -> Result<()> {
 }
 ```
 
-Same dotted keys, one file. Split it into a module if it grows. See
-[Configuration](configuration.md).
+Same dotted keys. The sample project keeps one file per concern under
+`src/config/` (`app.rs`, `cache.rs`, `posts.rs`, …) called from `mod.rs`. See
+[Configuration](configuration.md#where-it-is-set).
 
 ### `database/migrations/mod.rs` lists the order
 

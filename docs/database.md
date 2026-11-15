@@ -15,6 +15,8 @@ Rainier adds the four things a framework needs on top:
 
 ## Connecting
 
+In `.env`, or the process environment ([Configuration](configuration.md#env)):
+
 ```env
 DATABASE_URL=sqlite::memory:
 DATABASE_URL=sqlite://storage/app.sqlite
@@ -31,7 +33,9 @@ accept every statement, migrate cleanly and answer every question about the
 application's own data with no rows.
 
 To build the connection yourself — a test double, or a backend no
-configuration file can describe — hand one over instead:
+configuration file can describe — hand one over instead, in the code that
+builds the application (`src/bootstrap.rs` in the sample project), with `url`
+the connection string you read yourself:
 
 ```rust
 use rainier_orm::{PoolConfig, SeaOrmExecutor};
@@ -54,6 +58,8 @@ An in-memory SQLite database exists only as long as its connection, so a pool
 of five would give you **five empty databases** and a test that fails
 depending on which connection it drew:
 
+Building the pool yourself, as above, that means:
+
 ```rust
 let pool = if url.starts_with("sqlite::memory:") {
     PoolConfig::serverless()      // max = 1
@@ -72,7 +78,8 @@ One `DATABASE_URL` is one database, which is right for nearly every
 application. A read replica, a reporting warehouse or a second database another
 system also writes to cannot be written down that way at all, so those are
 declared as a **section**: a `default` naming one entry, and each entry naming
-its own driver and settings.
+its own driver and settings. In boot code, with `secret` the password read
+from the environment:
 
 ```rust
 use rainier_database::{Databases, ServerDatabase, SqliteDatabase};
@@ -96,7 +103,8 @@ Rainier::new(".").with_databases(databases)
 ```
 
 which writes it to the `databases` key, so the same thing can come from the
-configuration tree instead:
+[configuration tree](configuration.md#the-config-repository) instead — set
+from your `configure` (with `config.merge`, say), in this shape:
 
 ```json
 {
@@ -178,7 +186,7 @@ ServerDatabase::mysql("app")
     .charset("utf8mb4")
     .collation("utf8mb4_unicode_ci")
     .strict(true)
-    .tls_ca("/etc/ssl/rds-combined-ca-bundle.pem")
+    .tls_ca("/etc/ssl/certs/db-ca.pem")
 ```
 
 | Setting | What it is for |
@@ -202,7 +210,7 @@ did before.
 out of range for its column instead of erroring — the `INSERT` returns success
 and the stored value is not the one that was sent. Left undeclared the server's
 own `sql_mode` decides, which is not a safe default so much as an unknown one: a
-managed database's parameter group is a place strict mode routinely gets turned
+managed database's server-side settings are a place strict mode routinely gets turned
 off. Declaring it settles it for every connection in the pool rather than for
 whichever one happened to be checked out.
 
@@ -215,7 +223,8 @@ nothing will dial.
 
 A connection may name a `read` role and a `write` role, each with its own hosts
 and, if it needs them, its own credentials. Everything a role does not name it
-takes from the connection around it, so the common case is short:
+takes from the connection around it, so the common case is short — one entry
+under `connections`:
 
 ```json
 {
@@ -250,6 +259,8 @@ which *this scope has already written* is worth remembering. Inside one, a write
 pins the connection and every read after it goes to the endpoint that put the
 row there.
 
+Here `posts` is a [repository](repositories.md) over a sticky connection:
+
 ```rust
 use rainier_framework::database::with_sticky_scope;
 
@@ -280,7 +291,8 @@ promise plus the staleness.
 
 A connection may declare a `pool`, and so may either of its roles. Every field
 is optional and an absent one keeps the value the connection would have had, so
-a declaration says only what it is changing:
+a declaration says only what it is changing (again one entry under
+`connections`):
 
 ```json
 {
@@ -424,7 +436,10 @@ rainier-framework = { git = "…", features = ["sea-orm-executor"] }
 ## Running SQL
 
 Most code goes through a [repository](repositories.md). Two lower levels are
-there when you need them.
+there when you need them. In the examples on the rest of this page, `database`
+and `db` are the `Database` handle — resolved from the container
+(`app.resolve::<Database>()?`) or taken as a constructor argument by the
+service that runs the query.
 
 ### `database.query(sql)`
 
@@ -530,25 +545,29 @@ time, each on its own connection, and the wait is the slowest of them rather
 than all of them end to end. Awaiting them one by one, which is what plain
 `.await?` on each line does, gives that away:
 
+In this example `posts`, `comments` and `users` are
+[repositories](repositories.md), `drafts` and `pending` are
+[`Criteria`](repositories.md#criteria), and `ids` is a `Vec<u64>`:
+
 ```rust
 use rainier_framework::prelude::*;
 
-// One after the other: four round trips.
-let unread = statuses.count_matching(unread.clone()).await?;
-let mine = profile_notifications.count_matching(mine).await?;
+// One after the other: two round trips.
+let draft_count = posts.count_matching(drafts.clone()).await?;
+let pending_count = comments.count_matching(pending.clone()).await?;
 
 // At once: the slower of the two. Results in the order written; the first
 // error is returned and the rest are dropped.
-let (unread, mine) = concurrently!(
-    statuses.count_matching(unread.clone()),
-    profile_notifications.count_matching(mine),
+let (draft_count, pending_count) = concurrently!(
+    posts.count_matching(drafts.clone()),
+    comments.count_matching(pending.clone()),
 )?;
 
 // A list of any length, at most four at a time, results in order.
-let profiles = all_concurrently(ids.iter().map(|&id| profiles.find(id))).await?;
+let authors = all_concurrently(ids.iter().map(|&id| users.find(id.into()))).await?;
 ```
 
-Measured against MariaDB (`tests/concurrent_server.rs`): four `SLEEP(0.2)`
+Measured against MariaDB (`crates/rainier-database/tests/concurrent_server.rs`): four `SLEEP(0.2)`
 statements take 820 ms one after the other, 221 ms through `concurrently!`, and
 eight through `all_concurrently` — four at a time — 428 ms.
 
@@ -565,7 +584,7 @@ for that moment, where one after another held one four times over.
 [pool](#sizing-the-pool) from every other.
 
 **Give `all_concurrently` owned values, not borrows.** Mapping over
-`profiles.iter()` and capturing `&profile` in each future compiles where it is
+`users.iter()` and capturing `&user` in each future compiles where it is
 written, then fails at the route with "implementation of `Send` is not general
 enough": a future holding a borrow is not `Send` for every lifetime, which a
 handler's future has to be. Collect what each future needs first
@@ -575,7 +594,7 @@ handler's future has to be. Collect what each future needs first
 rest are dropped, but nothing that already ran is undone. Do not run writes
 this way that must succeed or fail together.
 
-In Lookout each query is still its own span under the request, so the
+In [Lookout](lookout.md) each query is still its own span under the request, so the
 waterfall draws them overlapping — which is how to see that it worked.
 
 ## Sharding

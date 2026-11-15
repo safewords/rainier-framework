@@ -96,6 +96,9 @@ impl Broadcastable for OrderShipped {
 **Nothing is discovered**: implementing this makes an event broadcast*able*,
 and a listener still has to broadcast it.
 
+Registered with your other [listeners](events.md#where-listeners-are-registered),
+where `events` is the event dispatcher:
+
 ```rust
 events.listen(|event: Arc<PostPublished>| async move {
     Broadcast::instance().event(event.as_ref()).await
@@ -135,7 +138,7 @@ fetches what it needs, through a route you already authorise.
 
 ## Authorising subscriptions
 
-`routes/channels.rs`:
+`src/routes/channels.rs` in the sample project:
 
 ```rust
 pub fn channels() -> ChannelRegistry<User> {
@@ -213,6 +216,10 @@ Pusher client shows "denied" for a 403 and hangs on a 404.
 The default is the log deliberately: an application that has not configured a
 relay logs what it would have published rather than failing requests, and
 nothing reaches a browser by accident.
+
+Choosing one is boot code. Redis here, with `connector` a `RedisConnector`
+(see [Cache](cache.md#drivers)) and `key` and `secret` the Pusher-protocol
+app credentials your relay was configured with:
 
 ```rust
 Rainier::new(".").with_broadcasting(Broadcasting::new(Arc::new(

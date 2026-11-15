@@ -100,7 +100,8 @@ Rainier::new(".").with_middleware(kernel::register)
 router.get("/me", me).middleware(Authenticate::<User>::resolved_with_guard("api"));
 ```
 
-The name-based version is `->middleware('auth:api')`, looked up at runtime.
+The name-based version, as PHP frameworks write it, is
+`->middleware('auth:api')`, looked up at runtime.
 That lookup map is the only thing standing between a typo and a route that
 serves unguarded, and a dynamic language has no better option.
 

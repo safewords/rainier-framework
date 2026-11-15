@@ -34,6 +34,8 @@ endpoint, region and credentials. Two disks on two services have nothing to
 share, so they are declared as a **section**: a `default` naming one entry, and
 each entry naming its own driver.
 
+In boot code (`S3Disk` needs the `s3` cargo feature; see [Drivers](#drivers)):
+
 ```rust
 use rainier_framework::filesystem::{DiskConfig, Disks, S3Disk};
 
@@ -45,7 +47,7 @@ Rainier::new(".").with_disks(
 ```
 
 which writes it to the `filesystems` key, so the same thing can come from the
-configuration tree instead:
+[configuration tree](configuration.md#the-config-repository) instead:
 
 ```json
 {
