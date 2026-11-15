@@ -180,3 +180,40 @@ export function field(content, ...keys) {
   }
   return null
 }
+
+/**
+ * Add up aggregate histograms (`{ slot: count }`, as the API sends them).
+ * Rows written before histograms were kept have none and add nothing.
+ */
+export function mergeHistograms(histograms) {
+  const out = {}
+  for (const h of histograms) {
+    if (!h) continue
+    for (const [slot, n] of Object.entries(h)) out[slot] = (out[slot] || 0) + n
+  }
+  return out
+}
+
+/**
+ * The `p`th percentile, in microseconds, of a merged histogram — the same
+ * reading as the server's `aggregate::percentile`: slot `s ≥ 1` holds
+ * `[2^((s-1)/4), 2^(s/4))` µs; the nearest rank is placed inside its slot by
+ * how far into the slot's count it falls, and never above `max` (the
+ * slowest, known exactly). `null` when empty.
+ */
+export function histogramPercentile(histogram, p, max) {
+  const slots = Object.entries(histogram || {}).map(([s, n]) => [Number(s), n]).sort((a, b) => a[0] - b[0])
+  const total = slots.reduce((t, [, n]) => t + n, 0)
+  if (!total) return null
+  const rank = Math.max(1, Math.ceil((p / 100) * total))
+  let seen = 0
+  for (const [slot, n] of slots) {
+    if (seen + n >= rank) {
+      if (slot === 0) return 0
+      const value = Math.round(2 ** ((slot - 1 + (rank - seen) / n) / 4))
+      return typeof max === 'number' ? Math.min(value, max) : value
+    }
+    seen += n
+  }
+  return max ?? null
+}

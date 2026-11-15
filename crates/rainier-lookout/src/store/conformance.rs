@@ -769,6 +769,12 @@ pub async fn aggregates_merge_across_writes_into_one_bucket(store: &dyn Store) {
     assert_eq!(minute.len(), 1, "[{name}] one key: {minute:?}");
     let m = &minute[0];
     assert_eq!((m.count, m.sum_us, m.max_us), (4, 1_150, 700), "[{name}] merged across buckets");
+    let expected: crate::aggregate::Histogram =
+        [300u64, 100, 700, 50].into_iter().fold(Default::default(), |mut h, us| {
+            *h.entry(crate::aggregate::slot(us)).or_insert(0) += 1;
+            h
+        });
+    assert_eq!(m.histogram, expected, "[{name}] histograms merge across writes and buckets");
 
     let first_minute = store
         .aggregates(agg_query(EntryType::Request, 60, at(0, 0), AggregateOrder::Count, 10))
@@ -909,6 +915,7 @@ mod tests {
             count,
             sum_us,
             max_us: sum_us,
+            histogram: Default::default(),
         };
         let q = agg_query(EntryType::Query, 60, at(0, 0), AggregateOrder::Average, 10);
         let got =

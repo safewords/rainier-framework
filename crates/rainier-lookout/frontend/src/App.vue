@@ -29,13 +29,13 @@ const sections = [
     items: [
       { label: 'Dashboard', to: { name: 'dashboard' }, match: (r) => r.name === 'dashboard' },
       { label: 'Cases', to: { name: 'cases' }, match: (r) => r.name === 'cases' || r.name === 'case' },
+      { label: 'Requests', to: { name: 'requests' }, match: (r) => r.name === 'requests' || (r.name === 'batches' && (r.query.kind || 'request') === 'request') },
+      { label: 'Jobs', to: { name: 'jobs' }, match: (r) => r.name === 'jobs' || (r.name === 'batches' && r.query.kind === 'job') },
     ],
   },
   {
     title: 'Batches',
     items: [
-      ['request', 'Requests'],
-      ['job', 'Jobs'],
       ['command', 'Commands'],
       ['scheduled_task', 'Scheduled tasks'],
       ['other', 'Other'],
@@ -43,7 +43,7 @@ const sections = [
       label,
       to: { name: 'batches', query: { kind } },
       match: (r) => r.name === 'batches' && (r.query.kind || 'request') === kind,
-    })).concat([{ label: 'Jobs (timing)', to: { name: 'jobs' }, match: (r) => r.name === 'jobs' }]),
+    })),
   },
   {
     title: 'Entries',

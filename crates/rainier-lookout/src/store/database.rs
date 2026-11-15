@@ -1,6 +1,6 @@
 //! [`DatabaseStore`]: Lookout's own tables, with their own migrations.
 //!
-//! Five tables (batches, entries, batch tags, aggregates, cases), defined as ORM entities so the same code runs on every dialect
+//! Six tables (batches, entries, batch tags, aggregates and their histograms, cases), defined as ORM entities so the same code runs on every dialect
 //! Rainier supports (SQLite and D1, MySQL/MariaDB, Postgres):
 //!
 //! | Table | Key | Holds |
@@ -9,6 +9,7 @@
 //! | `lookout_entries` | `(batch_id, seq)` | one row per entry, its payload as JSON text |
 //! | `lookout_batch_tags` | `(batch_id, tag)` | one row per batch tag, so the tag filter is an indexed lookup |
 //! | `lookout_aggregates` | `(bucket_start, period_s, type, key_hash)` | rolled-up counts and durations |
+//! | `lookout_aggregate_histograms` | `(bucket_start, period_s, type, key_hash, slot)` | how many durations fell in each [`Histogram`](crate::aggregate::Histogram) slot, for percentiles |
 //! | `lookout_cases` | `id` (the fingerprint's hash) | one row per case: status and last seen as columns, the rest as JSON |
 //!
 //! Register [`DatabaseStore::migrations`] with the application's migrator.
@@ -42,7 +43,9 @@
 //!   keeps the larger `max_us` (`GREATEST`, or SQLite's `MAX`) in the same
 //!   statement, atomic per row, so two writers racing on one bucket lose
 //!   nothing — and a write costs a statement per few hundred rows, not one
-//!   per row for the maximum as it once did.
+//!   per row for the maximum as it once did. Histogram slots are rows of
+//!   their own, upserted the same way (`count = count + ?`), so percentiles
+//!   merge across writers as exactly as counts do.
 //! - **A family's entries are one indexed query**, on
 //!   `(family_hash, type, occurred_at_us)`. `family_hash` hashes the family
 //!   key, or the summary for an entry without one.
@@ -53,7 +56,7 @@
 //! Every statement runs inside a span carrying `rainier.lookout.internal =
 //! true`, so Lookout does not record its own queries.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
 use rainier_database::{statement, Criteria, Database, Migrator, Step, Subquery, Upsert};
@@ -163,6 +166,26 @@ struct AggregateRow {
     max_us: i64,
 }
 
+/// One histogram slot of an aggregate bucket, as a row: a separate table, so
+/// a slot's count is an atomic increment like the bucket's own.
+#[derive(Entity, Clone, Debug, PartialEq)]
+#[orm(table = "lookout_aggregate_histograms")]
+#[orm(index = "type, period_s, bucket_start")]
+struct HistogramRow {
+    /// Unix seconds.
+    #[orm(pk)]
+    bucket_start: i64,
+    #[orm(pk)]
+    period_s: i64,
+    #[orm(pk, column = "type")]
+    entry_type: String,
+    #[orm(pk)]
+    key_hash: String,
+    #[orm(pk)]
+    slot: i64,
+    count: i64,
+}
+
 /// A case, as a row: the fields a listing filters and orders by, and the rest
 /// as JSON.
 #[derive(Entity, Clone, Debug, PartialEq)]
@@ -230,6 +253,7 @@ impl DatabaseStore {
             .add(Step::table("rainier_lookout_0006_entries_family_index", EntryRow::table(), |t| {
                 t.index(["family_hash", "type", "occurred_at_us"]);
             }))
+            .create_table::<HistogramRow>("rainier_lookout_0007_aggregate_histograms")
     }
 
     /// How many rows of `columns` columns fit one statement.
@@ -375,11 +399,13 @@ impl DatabaseStore {
     }
 
     async fn roll_up(&self, batches: &[Batch]) -> Result<()> {
-        let rows: Vec<AggregateRow> =
-            aggregate::rollup(batches).iter().map(AggregateRow::from_aggregate).collect();
+        let rolled = aggregate::rollup(batches);
+        let rows: Vec<AggregateRow> = rolled.iter().map(AggregateRow::from_aggregate).collect();
         if rows.is_empty() {
             return Ok(());
         }
+        let slots: Vec<HistogramRow> =
+            rolled.iter().flat_map(HistogramRow::from_aggregate).collect();
         // Counts and sums add, the maximum keeps the larger: all three in the
         // one statement, atomically per row.
         let plan = Upsert::on(["bucket_start", "period_s", "type", "key_hash"])
@@ -388,6 +414,17 @@ impl DatabaseStore {
         for chunk in rows.chunks(self.rows_per_statement(AggregateRow::columns().len())) {
             self.db
                 .execute(statement::upsert_many_with::<AggregateRow>(
+                    self.db.dialect(),
+                    chunk,
+                    &plan,
+                )?)
+                .await?;
+        }
+        let plan = Upsert::on(["bucket_start", "period_s", "type", "key_hash", "slot"])
+            .increment(["count"]);
+        for chunk in slots.chunks(self.rows_per_statement(HistogramRow::columns().len())) {
+            self.db
+                .execute(statement::upsert_many_with::<HistogramRow>(
                     self.db.dialect(),
                     chunk,
                     &plan,
@@ -498,16 +535,34 @@ impl DatabaseStore {
         since: DateTime<Utc>,
     ) -> Result<Vec<Aggregate>> {
         let from = aggregate::bucket_start(since, period_s).timestamp();
-        self.select::<AggregateRow>(
+        let criteria = || {
             Criteria::new()
                 .where_eq("type", entry_type.as_str())
                 .where_eq("period_s", i64::from(period_s))
-                .where_gte("bucket_start", from),
+                .where_gte("bucket_start", from)
+        };
+        let (rows, slots) = futures_util::future::try_join(
+            self.select::<AggregateRow>(criteria()),
+            self.select::<HistogramRow>(criteria()),
         )
-        .await?
-        .into_iter()
-        .map(AggregateRow::into_aggregate)
-        .collect()
+        .await?;
+        let mut histograms: HashMap<(i64, String), aggregate::Histogram> = HashMap::new();
+        for row in slots {
+            let slot = u16::try_from(row.slot).unwrap_or(u16::MAX);
+            *histograms
+                .entry((row.bucket_start, row.key_hash))
+                .or_default()
+                .entry(slot)
+                .or_insert(0) += unsigned(row.count);
+        }
+        rows.into_iter()
+            .map(|row| {
+                let histogram = histograms
+                    .remove(&(row.bucket_start, row.key_hash.clone()))
+                    .unwrap_or_default();
+                row.into_aggregate().map(|a| Aggregate { histogram, ..a })
+            })
+            .collect()
     }
 
     /// One family's entries: those whose family key — the family hash, or the
@@ -588,12 +643,17 @@ impl DatabaseStore {
                     .await?;
                 break;
             }
+            self.delete::<HistogramRow>(
+                Criteria::new().where_lte("bucket_start", last.bucket_start),
+            )
+            .await?;
             // Whole buckets at a time: at most one bucket beyond the chunk.
             self.delete::<AggregateRow>(
                 Criteria::new().where_lte("bucket_start", last.bucket_start),
             )
             .await?;
         }
+        self.delete::<HistogramRow>(Criteria::new().where_lt("bucket_start", cutoff)).await?;
         self.delete::<CaseRow>(Criteria::new().where_lt("last_seen_us", micros(aggregates_before)))
             .await?;
         Ok(pruned)
@@ -605,6 +665,7 @@ impl DatabaseStore {
             TagRow::table(),
             BatchRow::table(),
             AggregateRow::table(),
+            HistogramRow::table(),
             CaseRow::table(),
         ] {
             self.db.statement(&format!("DELETE FROM {table}")).await?;
@@ -828,6 +889,21 @@ impl AggregateRow {
             count: unsigned(self.count),
             sum_us: unsigned(self.sum_us),
             max_us: unsigned(self.max_us),
+            histogram: Default::default(),
+        })
+    }
+}
+
+impl HistogramRow {
+    fn from_aggregate(a: &Aggregate) -> impl Iterator<Item = Self> + '_ {
+        let key_hash = hash(&a.key);
+        a.histogram.iter().map(move |(&slot, &count)| Self {
+            bucket_start: a.bucket_start.timestamp(),
+            period_s: i64::from(a.period_s),
+            entry_type: a.entry_type.as_str().to_string(),
+            key_hash: key_hash.clone(),
+            slot: i64::from(slot),
+            count: signed(count),
         })
     }
 }
@@ -907,6 +983,7 @@ mod tests {
                 "rainier_lookout_0004_aggregates",
                 "rainier_lookout_0005_cases",
                 "rainier_lookout_0006_entries_family_index",
+                "rainier_lookout_0007_aggregate_histograms",
             ]
         );
     }
@@ -993,7 +1070,7 @@ mod tests {
                 .await
                 .expect("connect");
             let db = Database::new(executor);
-            assert_eq!(DatabaseStore::migrations().run(&db).await.unwrap().len(), 6);
+            assert_eq!(DatabaseStore::migrations().run(&db).await.unwrap().len(), 7);
             assert!(DatabaseStore::migrations().run(&db).await.unwrap().is_empty());
         }
 

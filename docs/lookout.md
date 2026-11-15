@@ -312,8 +312,17 @@ on a refused request, which is the next point.
   opens its own page: its series over time with the forecast, p50/p95/p99 from
   the raw occurrences, a duration histogram, every occurrence linking to its
   batch's waterfall, and the code trace or stack.
-- **Jobs** — per-job runs, throughput, average, maximum, total time and share,
-  with a trend for each.
+- **Requests** and **Jobs** — one page each, grouped by route and by job
+  class. Totals at the top (count, throughput, average, maximum, time spent
+  and p50/p90/p95/p99 over everything), then a row per route or job class
+  with the same figures — count, per minute, average, p50, p90, p95, p99,
+  maximum, total time, share and trend — and the latest batches below. The
+  percentiles cover every request or run in the chosen range, not a sample:
+  each aggregate bucket keeps a duration histogram (four slots per doubling,
+  so a percentile is within about 9% of the true one, and never above the
+  exact maximum), and histograms add across buckets and pods. Rows written
+  before an upgrade have no histogram and show no percentiles until they age
+  out.
 - **Cases** — see [below](#cases).
 - **Search** — the header's search box looks through batches, entries and
   cases.
@@ -421,7 +430,7 @@ shape.
 | `DELETE` | `/api/batches` | delete everything — needs `X-Lookout: 1` |
 | `GET` | `/api/batches/{id}` | one batch, with its entries |
 | `GET` | `/api/entries/{type}` | entries of one type across batches — `key` (one family), `q` (text in the summary or key; reads at most five pages), `before`, `limit` |
-| `GET` | `/api/aggregates/{type}` | rolled-up counts and durations — `period` (60, 600, 3600), `since`, `order` (`count`, `average`, `max`) |
+| `GET` | `/api/aggregates/{type}` | rolled-up counts and durations, with `average_us`, `p50_us`, `p90_us`, `p95_us`, `p99_us` and the `histogram` (`{slot: count}`) — `period` (60, 600, 3600), `since`, `order` (`count`, `average`, `max`) |
 | `GET` | `/api/series/{type}` | one zero-filled point per bucket from `since` to now — `period` (default: a dozen points or more), `key`, `keys` (that many busiest keys' own series), `forecast` (buckets) |
 | `GET` | `/api/insights` | what changed since the previous window — `window`, `min`, `change`, `forecast`, `limit` |
 | `GET` | `/api/cases` | cases — `status` (`open`, `resolved`, `ignored`, `all`), `severity` (minimum), `q`, `limit` |

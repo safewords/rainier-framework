@@ -12,6 +12,19 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Lookout percentiles over the whole range** (`rainier-lookout`): every
+  aggregate bucket keeps a duration histogram, four slots per doubling, so
+  `/api/aggregates` returns `p50_us`, `p90_us`, `p95_us` and `p99_us` per key
+  over every occurrence in the range, to within about 9%. The database store
+  keeps the slots in a new `lookout_aggregate_histograms` table (migration
+  `rainier_lookout_0007_aggregate_histograms`), incremented atomically like
+  the counts; the memory and cache stores keep them in the aggregate.
+- **Lookout Requests and Jobs pages**: one page each, grouped by route and by
+  job class, with totals and p50/p90/p95/p99 over everything at the top, the
+  same figures per route or job class in the table, and the latest batches
+  below. They replace the separate "Jobs (timing)" page and the Requests and
+  Jobs batch tabs in the navigation; the filtered batch list is a link away.
+
 - `Upsert::maximum` and `UpsertAction::Maximum` (`rainier-orm`): on a
   conflict, keep the larger of the stored and the inserted value.
 - **Lookout drills in, forecasts and keeps cases** (`rainier-lookout`).

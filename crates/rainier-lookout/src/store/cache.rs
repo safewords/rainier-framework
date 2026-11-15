@@ -1223,6 +1223,7 @@ mod tests {
             count: 3,
             sum_us: 30,
             max_us: 20,
+            histogram: Default::default(),
         };
         let start = at(0, 0).timestamp();
         cache

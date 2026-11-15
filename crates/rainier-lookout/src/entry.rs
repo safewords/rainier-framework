@@ -313,4 +313,9 @@ pub struct Aggregate {
     pub sum_us: u64,
     /// Worst duration, in microseconds.
     pub max_us: u64,
+    /// How the durations were spread, for percentiles: see
+    /// [`Histogram`](crate::aggregate::Histogram). Empty for rows written
+    /// before histograms were kept, and for exceptions without a duration.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub histogram: crate::aggregate::Histogram,
 }

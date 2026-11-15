@@ -425,6 +425,7 @@ mod tests {
             count,
             sum_us,
             max_us: sum_us,
+            histogram: Default::default(),
         }
     }
 

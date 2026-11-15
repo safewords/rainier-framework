@@ -10,7 +10,7 @@ import BatchDetail from './views/BatchDetail.vue'
 import Entries from './views/Entries.vue'
 import Status from './views/Status.vue'
 import Issue from './views/Issue.vue'
-import Jobs from './views/Jobs.vue'
+import Timing from './views/Timing.vue'
 import Cases from './views/Cases.vue'
 import CaseDetail from './views/CaseDetail.vue'
 import Search from './views/Search.vue'
@@ -26,7 +26,8 @@ const router = createRouter({
     { path: '/status', name: 'status', component: Status },
     // One family of one type: ?key=<family key>
     { path: '/issues/:type', name: 'issue', component: Issue, props: true },
-    { path: '/jobs', name: 'jobs', component: Jobs },
+    { path: '/jobs', name: 'jobs', component: Timing, props: { type: 'job' } },
+    { path: '/requests', name: 'requests', component: Timing, props: { type: 'request' } },
     { path: '/cases', name: 'cases', component: Cases },
     { path: '/cases/:id', name: 'case', component: CaseDetail, props: true },
     // ?q=<text>

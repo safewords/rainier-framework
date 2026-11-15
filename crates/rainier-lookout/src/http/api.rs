@@ -16,7 +16,7 @@ use super::params::{self, Params};
 use super::{Shared, CLEAR_HEADER};
 use std::collections::BTreeMap;
 
-use crate::aggregate::AGGREGATED;
+use crate::aggregate::{self, AGGREGATED};
 use crate::cases::{self, CaseAction, CaseSeverity};
 use crate::config::StoreKind;
 use crate::entry::{Aggregate, Entry, EntryType};
@@ -105,12 +105,16 @@ pub(crate) async fn entries(state: Arc<Shared>, request: Req) -> Result<Response
     Ok(Response::json(&json!({ "data": found, "next": next })))
 }
 
-/// One aggregate row as the API shows it: the stored fields plus the average.
+/// One aggregate row as the API shows it: the stored fields plus the average
+/// and the p50/p90/p95/p99 read off its histogram (`null` without one).
 fn aggregate_json(row: &Aggregate) -> Value {
     let mut value = serde_json::to_value(row).unwrap_or(Value::Null);
     if let Value::Object(map) = &mut value {
         let average = row.sum_us.checked_div(row.count).unwrap_or(0);
         map.insert("average_us".into(), json!(average));
+        for (name, p) in [("p50_us", 50.0), ("p90_us", 90.0), ("p95_us", 95.0), ("p99_us", 99.0)] {
+            map.insert(name.into(), json!(aggregate::percentile(&row.histogram, p, row.max_us)));
+        }
     }
     value
 }
