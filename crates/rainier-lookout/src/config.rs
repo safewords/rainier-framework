@@ -215,6 +215,85 @@ pub struct Capture {
     /// (`debug = "line-tables-only"`). On by default.
     #[serde(default = "yes")]
     pub code_traces: bool,
+    /// Who made the request, beyond the id: a name, an address, an avatar,
+    /// whatever the application describes with
+    /// [`Lookout::describe_user`](crate::Lookout::describe_user). Off, a
+    /// description given is dropped.
+    #[serde(default)]
+    pub user: bool,
+    /// What made the request: the client's address, browser, operating
+    /// system and device (from `User-Agent` and client hints), the page it
+    /// came from (`Origin`, `Referer`) and its language. Read from headers the
+    /// request carries anyway; the user agent is parsed on the writer.
+    #[serde(default)]
+    pub client: bool,
+    /// How much of the client's address [`client`](Self::client) keeps.
+    #[serde(default)]
+    pub client_ip: ClientIp,
+}
+
+/// How much of a client's address is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientIp {
+    /// The network, not the host: `203.0.113.0/24`, `2001:db8:1::/48`. Enough
+    /// to tell one ISP or office from another, not to find a person.
+    #[default]
+    Partial,
+    /// The whole address.
+    Full,
+    /// None of it.
+    None,
+}
+
+/// Real user monitoring: how requests looked from the browser that made
+/// them. See `docs/lookout.md`, "Real user monitoring".
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Rum {
+    /// Whether to serve the browser script, accept its reports and mark
+    /// responses so a report can name the request it is about.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The origins of the pages allowed to report — the frontends, which on
+    /// a split frontend are not this application's own
+    /// (`https://example.com`). Also the origins the browser is allowed to
+    /// show detailed timing to (`Timing-Allow-Origin`). Empty means none: a
+    /// report needs an origin listed here.
+    #[serde(default)]
+    pub origins: Vec<String>,
+    /// The fraction of requests a browser reports, `0.0..=1.0`. A request
+    /// slower than [`slow_ms`](Self::slow_ms) in the browser is reported
+    /// whatever this says.
+    #[serde(default = "default_rum_sample")]
+    pub sample_rate: f64,
+    /// Report every request that took at least this long in the browser.
+    #[serde(default = "default_rum_slow_ms")]
+    pub slow_ms: u64,
+    /// The key reports are signed with, so one can only describe a request
+    /// this application answered. Every replica needs the same one; the
+    /// framework derives it from `APP_KEY` when this is unset.
+    #[serde(skip)]
+    pub secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for Rum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rum")
+            .field("enabled", &self.enabled)
+            .field("origins", &self.origins)
+            .field("sample_rate", &self.sample_rate)
+            .field("slow_ms", &self.slow_ms)
+            .field("secret", &if self.secret.is_empty() { "unset" } else { "set" })
+            .finish()
+    }
+}
+
+fn default_rum_sample() -> f64 {
+    0.1
+}
+
+fn default_rum_slow_ms() -> u64 {
+    1000
 }
 
 fn yes() -> bool {
@@ -239,6 +318,9 @@ impl Default for Capture {
             user_id: false,
             client_errors: false,
             code_traces: true,
+            user: false,
+            client: false,
+            client_ip: ClientIp::Partial,
         }
     }
 }
@@ -438,6 +520,9 @@ pub struct LookoutConfig {
     /// When the dashboard calls a change an insight, and how far it forecasts.
     #[serde(default)]
     pub insights: crate::trends::InsightsConfig,
+    /// Real user monitoring: off unless turned on.
+    #[serde(default)]
+    pub rum: Rum,
 }
 
 impl std::fmt::Debug for LookoutConfig {
@@ -460,6 +545,7 @@ impl std::fmt::Debug for LookoutConfig {
             .field("keep", &self.keep.is_some())
             .field("local", &self.local)
             .field("insights", &self.insights)
+            .field("rum", &self.rum)
             .finish()
     }
 }
@@ -501,6 +587,11 @@ impl Default for LookoutConfig {
             keep: None,
             local: false,
             insights: crate::trends::InsightsConfig::default(),
+            rum: Rum {
+                sample_rate: default_rum_sample(),
+                slow_ms: default_rum_slow_ms(),
+                ..Rum::default()
+            },
         }
     }
 }
@@ -617,6 +708,14 @@ impl LookoutConfig {
     /// | `LOOKOUT_CAPTURE_BODIES_EXCEPT` | [`Capture::bodies_except`] | comma-separated globs |
     /// | `LOOKOUT_MASK_SECRETS` | [`Redaction::mask_secrets`] | a boolean |
     /// | `LOOKOUT_STREAM` | [`Dashboard::stream`] | a boolean |
+    /// | `LOOKOUT_CAPTURE_USER` | [`Capture::user`] | a boolean |
+    /// | `LOOKOUT_CAPTURE_CLIENT` | [`Capture::client`] | a boolean |
+    /// | `LOOKOUT_CAPTURE_CLIENT_IP` | [`Capture::client_ip`] | `partial`, `full` or `none` |
+    /// | `LOOKOUT_RUM` | [`Rum::enabled`] | a boolean |
+    /// | `LOOKOUT_RUM_ORIGINS` | [`Rum::origins`] | comma-separated origins |
+    /// | `LOOKOUT_RUM_SAMPLE_RATE` | [`Rum::sample_rate`] | `0.0` to `1.0` |
+    /// | `LOOKOUT_RUM_SLOW_MS` | [`Rum::slow_ms`] | an integer |
+    /// | `LOOKOUT_RUM_SECRET` | [`Rum::secret`] (default: from `APP_KEY`) | a string |
     /// | `LOOKOUT_INSIGHTS_ENABLED` | [`InsightsConfig::enabled`](crate::trends::InsightsConfig) | a boolean |
     /// | `LOOKOUT_INSIGHTS_WINDOW_MINUTES` | the window compared with the one before | a positive integer |
     /// | `LOOKOUT_INSIGHTS_MIN_COUNT` | how many a key needs before it is reported | a positive integer |
@@ -711,7 +810,10 @@ impl LookoutConfig {
                 parse_positive("LOOKOUT_AGGREGATE_RETENTION_DAYS", &v)?;
         }
 
-        let flags: [(&str, &mut bool); 11] = [
+        let flags: [(&str, &mut bool); 14] = [
+            ("LOOKOUT_CAPTURE_USER", &mut config.capture.user),
+            ("LOOKOUT_CAPTURE_CLIENT", &mut config.capture.client),
+            ("LOOKOUT_RUM", &mut config.rum.enabled),
             ("LOOKOUT_CAPTURE_REQUEST_HEADERS", &mut config.capture.request_headers),
             ("LOOKOUT_CAPTURE_REQUEST_BODY", &mut config.capture.request_body),
             ("LOOKOUT_CAPTURE_RESPONSE_BODY", &mut config.capture.response_body),
@@ -735,6 +837,37 @@ impl LookoutConfig {
         if let Some(v) = get("LOOKOUT_CAPTURE_BODIES_EXCEPT") {
             config.capture.bodies_except =
                 v.split(',').map(str::trim).filter(|p| !p.is_empty()).map(String::from).collect();
+        }
+        if let Some(v) = get("LOOKOUT_CAPTURE_CLIENT_IP") {
+            config.capture.client_ip = match v.to_ascii_lowercase().as_str() {
+                "partial" => ClientIp::Partial,
+                "full" => ClientIp::Full,
+                "none" => ClientIp::None,
+                _ => {
+                    return Err(ConfigError::new(
+                        "LOOKOUT_CAPTURE_CLIENT_IP",
+                        v,
+                        "partial, full or none",
+                    ))
+                }
+            };
+        }
+        if let Some(v) = get("LOOKOUT_RUM_ORIGINS") {
+            config.rum.origins = v
+                .split(',')
+                .map(|o| o.trim().trim_end_matches('/'))
+                .filter(|o| !o.is_empty())
+                .map(String::from)
+                .collect();
+        }
+        if let Some(v) = get("LOOKOUT_RUM_SAMPLE_RATE") {
+            config.rum.sample_rate = parse_rate("LOOKOUT_RUM_SAMPLE_RATE", &v)?;
+        }
+        if let Some(v) = get("LOOKOUT_RUM_SLOW_MS") {
+            config.rum.slow_ms = parse_u64("LOOKOUT_RUM_SLOW_MS", &v)?;
+        }
+        if let Some(v) = get("LOOKOUT_RUM_SECRET") {
+            config.rum.secret = v.into_bytes();
         }
         if let Some(v) = get("LOOKOUT_CAPTURE_MAX_BODY_BYTES") {
             config.capture.max_body_bytes =

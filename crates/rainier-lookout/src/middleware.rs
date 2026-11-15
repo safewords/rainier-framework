@@ -53,7 +53,7 @@ impl Middleware for LookoutMiddleware {
             inner.before_request(&request);
             let response = next.run(request).await;
             inner.after_response(&response);
-            return response;
+            return self.lookout.mark_for_rum(response);
         }
 
         // No server span around us: open one, so the request has a batch.
@@ -73,7 +73,7 @@ impl Middleware for LookoutMiddleware {
             lookout.inner.before_request(&request);
             let response = next.run(request).await;
             lookout.inner.after_response(&response);
-            response
+            lookout.mark_for_rum(response)
         };
         let response = tracing::Instrument::instrument(work, span.clone()).await;
         span.record("http.response.status_code", response.status().as_u16());
@@ -119,6 +119,25 @@ mod tests {
             })
             .name("posts.show");
         router.get("/health", || async { "ok" }).name("health");
+        {
+            // What an application's authentication path does: say who it is.
+            let lookout = lookout.clone();
+            router
+                .get("/me", move || {
+                    let lookout = lookout.clone();
+                    async move {
+                        lookout.describe_user(
+                            None,
+                            crate::LookoutUser::new("42")
+                                .name("Ada Lovelace")
+                                .email("ada@example.com")
+                                .with("plan", "pro"),
+                        );
+                        "me"
+                    }
+                })
+                .name("me");
+        }
         router
             .post("/sessions", || async {
                 Response::json(&serde_json::json!({
@@ -198,6 +217,98 @@ mod tests {
         let exception =
             boom.entries.iter().find(|e| e.entry_type == EntryType::Exception).expect("exception");
         assert_eq!(exception.content["type"], "HttpRequest");
+    }
+
+    #[tokio::test]
+    async fn who_and_what_made_a_request_and_how_its_browser_saw_it() {
+        let mut config = LookoutConfig::default().enabled(true).local(true);
+        config.capture.user_id = true;
+        config.capture.user = true;
+        config.capture.client = true;
+        config.rum.enabled = true;
+        config.rum.origins = vec!["https://app.example.com".into()];
+        config.rum.secret = b"test-key".to_vec();
+        let store = Arc::new(MemoryStore::new(10));
+        let lookout = Lookout::new(config.clone(), store.clone());
+        let kernel = kernel(&lookout, Arc::new(Dispatcher::new()));
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+
+        let ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1";
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("/me")
+            .header("user-agent", ua)
+            .header("origin", "https://app.example.com")
+            .header("referer", "https://app.example.com/settings?tab=security")
+            .header("accept-language", "en-GB,en;q=0.8")
+            .build();
+        request.extensions_mut().insert(rainier_http::ClientIp("203.0.113.77".parse().unwrap()));
+        let answered = kernel.handle_request(request).await;
+        assert_eq!(answered.status().as_u16(), 200);
+        lookout.flush().await;
+
+        // The response names its batch, signed, for the browser to report on.
+        let timing = answered.header("server-timing").expect("a Server-Timing header").to_string();
+        assert_eq!(answered.header("timing-allow-origin"), Some("https://app.example.com"));
+        let token = timing
+            .strip_prefix("lookout;desc=\"")
+            .and_then(|t| t.strip_suffix('"'))
+            .expect("the lookout metric")
+            .to_string();
+
+        let batches = store.all();
+        let me = &batches[0];
+        assert_eq!(me.user_id.as_deref(), Some("42"), "the described user is the batch's user");
+        assert_eq!(crate::rum::verify(b"test-key", &token).as_deref(), Some(me.trace_id.as_str()));
+        let root = &me.entries[0].content;
+        assert_eq!(root["user"]["name"], "Ada Lovelace", "{root}");
+        assert_eq!(root["user"]["email"], "ada@example.com");
+        assert_eq!(root["user"]["extra"]["plan"], "pro");
+        let client = &root["client"];
+        assert_eq!(client["ip"], "203.0.113.0/24", "{client}");
+        assert_eq!(client["browser"]["name"], "Safari");
+        assert_eq!(client["os"]["name"], "iOS");
+        assert_eq!(client["device"], "mobile");
+        assert_eq!(client["referer"], "https://app.example.com/settings");
+        assert_eq!(client["language"], "en-GB");
+
+        // The page reports how the browser saw it, and the report joins the
+        // request's trace as a browser batch.
+        let mut router = Router::new();
+        router.merge(crate::routes(
+            store.clone(),
+            Arc::new(config),
+            crate::LookoutGate::deny_all(),
+            "production",
+        ));
+        let router = router.compile(&rainier_container::Container::new()).unwrap();
+        let script = router.dispatch(get("/_lookout/rum.js")).await;
+        assert_eq!(script.status().as_u16(), 200, "public, though the dashboard is gated");
+        let report = serde_json::json!({
+            "page": { "url": "https://app.example.com/settings" },
+            "device": { "connection": { "type": "4g" } },
+            "calls": [{ "token": token, "url": "https://api.example.com/me", "duration": 412.5,
+                        "waiting": 180.0, "protocol": "h2", "status": 200 }],
+        })
+        .to_string();
+        let post = |origin: &str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_lookout/rum")
+                .header("origin", origin)
+                .header("content-type", "text/plain")
+                .body(report.clone())
+                .build()
+        };
+        assert_eq!(router.dispatch(post("https://evil.example")).await.status().as_u16(), 204);
+        assert_eq!(store.all().len(), 1, "an origin not listed stores nothing");
+        assert_eq!(router.dispatch(post("https://app.example.com")).await.status().as_u16(), 204);
+        let all = store.all();
+        let browser = all.iter().find(|b| b.kind == BatchKind::Browser).expect("a browser batch");
+        assert_eq!(browser.trace_id, me.trace_id, "on the request's trace");
+        assert_eq!(browser.duration_us, 412_500);
+        assert_eq!(browser.entries[0].content["timing"]["waiting"], 180.0);
     }
 
     #[tokio::test]

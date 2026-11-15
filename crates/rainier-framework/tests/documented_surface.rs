@@ -576,3 +576,19 @@ async fn kafka_from_config(
 fn the_documented_surface_exists() {
     // Every function above had to compile for this to run at all.
 }
+
+/// `docs/lookout.md` — describing who made a request.
+#[cfg(feature = "lookout")]
+#[allow(dead_code, reason = "compiling is the point")]
+fn describing_who_made_a_request(lookout: &rainier_framework::lookout::Lookout) {
+    use rainier_framework::lookout::{describe_user, LookoutUser};
+
+    describe_user(
+        LookoutUser::new("42")
+            .name("Ada Lovelace")
+            .email("ada@example.com")
+            .avatar_url("https://example.com/ada.png")
+            .with("plan", "pro"),
+    );
+    lookout.describe_user(None, LookoutUser::new("42"));
+}

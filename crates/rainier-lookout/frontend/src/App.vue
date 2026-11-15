@@ -41,6 +41,7 @@ const sections = [
       ['command', 'Commands'],
       ['scheduled_task', 'Scheduled tasks'],
       ['other', 'Other'],
+      ['browser', 'Browser'],
     ].map(([kind, label]) => ({
       label,
       to: { name: 'batches', query: { kind } },

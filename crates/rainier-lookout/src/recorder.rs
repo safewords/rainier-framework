@@ -314,6 +314,69 @@ impl Lookout {
         }
     }
 
+    /// Say who the request the calling code is running in was made by — or,
+    /// with `batch`, the open batch with that id.
+    ///
+    /// Kept on the request when [`Capture::user`](crate::config::Capture::user)
+    /// is on, and shown on its page; ignored otherwise, so an application can
+    /// describe its users unconditionally and leave the decision to
+    /// configuration. Call it where the request is authenticated, with what is
+    /// already loaded there: Lookout looks nothing up. If the batch has no
+    /// user id yet, this one becomes it. Returns whether a batch was found.
+    ///
+    /// ```no_run
+    /// # fn after_authenticating(lookout: &rainier_lookout::Lookout) {
+    /// use rainier_lookout::LookoutUser;
+    ///
+    /// lookout.describe_user(None, LookoutUser::new("42").name("Ada").email("ada@example.com"));
+    /// # }
+    /// ```
+    pub fn describe_user(&self, batch: Option<&str>, user: crate::user::LookoutUser) -> bool {
+        if !self.inner.config.capture.user && !self.inner.config.capture.user_id {
+            return false;
+        }
+        let cell = match batch {
+            None => self.inner.current_batch(),
+            Some(id) => self
+                .inner
+                .open
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(id)
+                .and_then(Weak::upgrade),
+        };
+        let Some(cell) = cell else { return false };
+        let mut state = cell.lock();
+        let Some(pending) = state.as_mut() else { return false };
+        if pending.user_id.is_none() {
+            pending.user_id = Some(user.id.clone());
+        }
+        if self.inner.config.capture.user {
+            pending.user = Some(user);
+        }
+        true
+    }
+
+    /// With real user monitoring on, add the headers that let the browser
+    /// report on `response`: its batch's signed trace id in `Server-Timing`,
+    /// and `Timing-Allow-Origin` for the frontends. See [`crate::rum`].
+    pub(crate) fn mark_for_rum(&self, mut response: Response) -> Response {
+        let rum = &self.inner.config.rum;
+        if !rum.enabled {
+            return response;
+        }
+        let Some(trace_id) = self.current_batch_id() else { return response };
+        for (name, value) in crate::rum::response_headers(rum, &trace_id) {
+            // `Server-Timing` is a list: an application's own metrics stay.
+            let value = match response.header(name) {
+                Some(existing) if name == "server-timing" => format!("{existing}, {value}"),
+                _ => value,
+            };
+            response = response.with_header(name, &value);
+        }
+        response
+    }
+
     /// The id of the batch the calling code is running in, if any — its
     /// trace id once one is known.
     pub fn current_batch_id(&self) -> Option<String> {
@@ -439,6 +502,10 @@ pub(crate) struct Pending {
     /// Stacks captured for entries' code traces, by entry id: walked on the
     /// request's thread, symbolised later by the writer.
     pub(crate) traces: Vec<(String, Arc<Backtrace>)>,
+    /// Who made it, as the application described them.
+    pub(crate) user: Option<crate::user::LookoutUser>,
+    /// What made it: header values copied at the start, read on the writer.
+    pub(crate) client: Option<crate::client::ClientRaw>,
 }
 
 impl Pending {
@@ -468,6 +535,8 @@ impl Pending {
             request_body: None,
             response_body: None,
             traces: Vec::new(),
+            user: None,
+            client: None,
         }
     }
 
@@ -695,12 +764,14 @@ impl Inner {
                 body.slice(..body.len().min(capture.max_body_bytes))
             })
             .filter(|body| !body.is_empty());
+        let client = capture.client.then(|| crate::client::ClientRaw::of(request));
         let mut state = cell.lock();
         if let Some(pending) = state.as_mut() {
             pending.method.get_or_insert_with(|| request.method().as_str().to_string());
             pending.path.get_or_insert(path);
             pending.request_headers = headers;
             pending.request_body = body;
+            pending.client = client;
         }
     }
 
@@ -730,7 +801,9 @@ impl Inner {
             }
             if let Some((guard, user)) = identity {
                 pending.guard = Some(guard);
-                pending.user_id = user;
+                if user.is_some() {
+                    pending.user_id = user;
+                }
             }
         }
         let matched = response.extensions().get::<rainier_routing::MatchedRoute>();
@@ -1346,6 +1419,26 @@ pub(crate) fn finalize(
             }
         }
     }
+    // Who and what made it — read here, on the writer, for kept batches only.
+    let user = pending.user.take().filter(|_| config.capture.user);
+    let client = pending
+        .client
+        .take()
+        .filter(|_| config.capture.client)
+        .map(|raw| raw.describe(config.capture.client_ip));
+    if user.is_some() || client.is_some() {
+        if let Some(root) = pending.entries.iter_mut().find(|e| e.entry_type == EntryType::Request)
+        {
+            if let Some(map) = root.content.as_object_mut() {
+                if let Some(user) = user.and_then(|u| serde_json::to_value(u).ok()) {
+                    map.insert("user".into(), user);
+                }
+                if let Some(client) = client {
+                    map.insert("client".into(), client);
+                }
+            }
+        }
+    }
 
     let summary = batch_summary(&pending);
     let batch = Batch {
@@ -1560,7 +1653,7 @@ thread_local! {
 }
 
 /// A fast, non-cryptographic random number (xorshift64*), per thread.
-pub(crate) fn random_u64() -> u64 {
+fn random_u64() -> u64 {
     RNG.with(|cell| {
         let mut x = cell.get();
         x ^= x >> 12;

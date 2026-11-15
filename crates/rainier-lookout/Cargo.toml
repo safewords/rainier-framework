@@ -44,6 +44,12 @@ tokio = { workspace = true }
 rainier-events = { workspace = true }
 rainier-middleware = { workspace = true }
 async-trait = { workspace = true }
+# Real user monitoring: a report names the request it describes by a token
+# this application signed, so the public endpoint cannot be fed inventions.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

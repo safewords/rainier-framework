@@ -149,6 +149,7 @@ pub(crate) fn parse_kind(value: &str) -> Option<BatchKind> {
         "command" => Some(BatchKind::Command),
         "scheduled_task" => Some(BatchKind::ScheduledTask),
         "other" => Some(BatchKind::Other),
+        "browser" => Some(BatchKind::Browser),
         _ => None,
     }
 }

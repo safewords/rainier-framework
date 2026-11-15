@@ -51,6 +51,22 @@ the release as a whole and names the crate it landed in.
   every page that shows data (cases, issues, timing, status) refreshes on the
   news it shows, plus once a minute. The writer stores its counts every 2
   seconds instead of 10, and only when something was counted.
+- **Who and what made a request, and how its browser saw it** (`rainier-lookout`,
+  `rainier-framework`), each off by default:
+  - `LOOKOUT_CAPTURE_USER`: the application describes the user with
+    `lookout::describe_user(LookoutUser::new(id).name(..).email(..).with(..))`
+    where it authenticates; the request's page shows a **User** card.
+  - `LOOKOUT_CAPTURE_CLIENT`: the client's address (its network, unless
+    `LOOKOUT_CAPTURE_CLIENT_IP=full`), browser, system and device from the
+    user agent and client hints, origin, page and language — from headers,
+    parsed on the writer, with no frontend changes.
+  - `LOOKOUT_RUM`: real user monitoring for a frontend on another origin.
+    Responses carry a signed `Server-Timing` token and `Timing-Allow-Origin`
+    for `LOOKOUT_RUM_ORIGINS`; the page loads `{path}/rum.js` from the API and
+    beacons each request's phases, device, connection and page vitals to
+    `{path}/rum`, which stores them as a new `browser` batch kind on the
+    request's trace. Reports are accepted only from listed origins, bounded,
+    rate-limited, and only for requests this application signed.
 - **Lookout's duration chart is a distribution curve** (`rainier-lookout`): an
   issue page's bar histogram is now a smooth density over a log time axis
   with the percentiles marked, drawn from every occurrence in the range —

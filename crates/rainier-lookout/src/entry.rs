@@ -197,6 +197,10 @@ pub enum BatchKind {
     ScheduledTask,
     /// Work outside any of those — a background task, boot.
     Other,
+    /// A request as the browser that made it saw it: a real user monitoring
+    /// report, on the same trace as the request's own batch. See
+    /// [`rum`](crate::rum).
+    Browser,
 }
 
 /// Everything recorded for one unit of work, kept or discarded as a whole.

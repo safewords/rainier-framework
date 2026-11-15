@@ -79,6 +79,14 @@ Read at boot through the application's `Env` (so `.env` counts), with
 | `LOOKOUT_CAPTURE_CACHE_KEYS` | | a boolean | `false` |
 | `LOOKOUT_CAPTURE_MAIL` | | a boolean | `false` |
 | `LOOKOUT_CAPTURE_USER_ID` | | a boolean | `false` |
+| `LOOKOUT_CAPTURE_USER` | who made a request, as the application [describes them](#who-made-a-request) | a boolean | `false` |
+| `LOOKOUT_CAPTURE_CLIENT` | [what made it](#what-made-a-request): address, browser, system, device, page | a boolean | `false` |
+| `LOOKOUT_CAPTURE_CLIENT_IP` | how much of the client's address is kept | `partial`, `full`, `none` | `partial` |
+| `LOOKOUT_RUM` | [real user monitoring](#real-user-monitoring): the browser's view of each request | a boolean | `false` |
+| `LOOKOUT_RUM_ORIGINS` | the frontends allowed to report, and to read detailed timing | comma-separated origins | none |
+| `LOOKOUT_RUM_SAMPLE_RATE` | the fraction of page views that report | `0.0..=1.0` | `0.1` |
+| `LOOKOUT_RUM_SLOW_MS` | a request this slow in the browser is reported whatever the sample | milliseconds | `1000` |
+| `LOOKOUT_RUM_SECRET` | the key reports are signed with | a string | derived from `APP_KEY` |
 | `LOOKOUT_CAPTURE_CLIENT_ERRORS` | record a request's 4xx as an exception ([below](#client-errors-are-not-failures)) | a boolean | `false` |
 | `LOOKOUT_CAPTURE_CODE_TRACES` | where a slow query or call came from ([below](#code-traces)) | a boolean | `true` |
 | `LOOKOUT_INSIGHTS_ENABLED` | the dashboard's [insights and forecasts](#insights-and-forecasts) | a boolean | `true` |
@@ -306,6 +314,8 @@ Nothing that identifies a person is stored unless asked for:
 | `cache_keys` | cache keys |
 | `mail` | subjects and recipients |
 | `user_id` | the authenticated user's id — needed for user scoping and "top users" |
+| `user` | the user's description from [`describe_user`](#who-made-a-request): name, address, whatever the application gives |
+| `client` | the client's address (cut to its network by default), browser, system, device, origin, the page without its query, and language |
 
 Some routes carry nothing that may leave them — private messages, identity
 documents — and hiding fields by name is not enough there.
@@ -372,6 +382,123 @@ truncated.
 id only with `capture.user_id`.
 
 ---
+
+## Who and what made a request
+
+### Who made a request
+
+The batch carries the authenticated user's id (`LOOKOUT_CAPTURE_USER_ID`).
+To see *who* that is — a name, an address, anything else worth recognising
+someone by — the application describes the user where it authenticates the
+request, with what it already has loaded there. Here `user` is the
+application's own user, whatever its type; Lookout takes strings and JSON
+values, not the model:
+
+```rust
+use rainier_framework::lookout::{describe_user, LookoutUser};
+
+// In a guard, a middleware, or a handler — anywhere inside the request.
+describe_user(
+    LookoutUser::new(user.id.to_string())
+        .name(&user.display_name)
+        .email(&user.email)
+        .with("plan", user.plan.as_str()),
+);
+```
+
+`describe_user` is a free function in the framework's `lookout` module; with a
+`Lookout` in hand, `lookout.describe_user(None, user)` does the same. It is
+safe to call unconditionally: with `LOOKOUT_CAPTURE_USER` off, or Lookout off,
+it does nothing — so the application describes its users once, and
+configuration decides whether they are kept. Lookout never looks a user up
+itself. A batch with no user id yet takes the described one.
+
+The request's page shows a **User** card — initials rather than the avatar,
+because the dashboard loads nothing from other hosts — with a link to every
+request by the same user.
+
+### What made a request
+
+`LOOKOUT_CAPTURE_CLIENT=true` keeps, on every kept request, what its headers
+say about the client:
+
+| Field | From |
+|---|---|
+| `ip` | the client's address as the server believes it — behind a proxy, configure [`TrustProxies`](middleware.md) — cut to its network (`203.0.113.0/24`, `2001:db8:1::/48`) unless `LOOKOUT_CAPTURE_CLIENT_IP=full`; `none` keeps none of it |
+| `browser`, `os`, `device`, `model` | `User-Agent`, with the client hints a Chromium browser sends (`Sec-CH-UA-Platform`, `-Platform-Version`, `-Mobile`, `-Model`) winning over the user agent's frozen values |
+| `origin`, `referer` | the page that made the request — its query and fragment dropped, since links carry tokens there |
+| `language` | the first language of `Accept-Language` |
+
+The request's thread only copies those header values; the user agent is parsed
+on the background writer, for kept batches. The parser knows the browsers and
+systems people use and calls a crawler, a monitor or a command-line client a
+`bot`; an agent it does not recognise is shown as it came rather than guessed
+at.
+
+This needs nothing from the frontend, and works the same when the frontend is
+a separate application: its browser calls the API directly, so the API sees
+the browser's own headers.
+
+### Real user monitoring
+
+The server sees a request from its first byte in to its last byte out. The
+person waits longer: the DNS lookup, the connection and TLS handshake, the
+time the browser held the request in a queue, the network both ways. Only the
+browser measures that, so with `LOOKOUT_RUM=true` a small script on the page
+reads it and reports it, and the request's page shows the two side by side —
+**In the browser**: a bar of the phases, the browser's total against the
+server's own time, and the device, connection and page it happened on.
+
+It is built for a frontend that is not this application — `app.example.com`
+calling `api.example.com`:
+
+1. **Every response names its batch.** Each carries
+   `Server-Timing: lookout;desc="<trace id>.<signature>"`, and
+   `Timing-Allow-Origin` listing `LOOKOUT_RUM_ORIGINS`. A browser shows a
+   cross-origin response's detailed timing, and its `Server-Timing`, only to
+   the origins `Timing-Allow-Origin` names — so the frontends must be listed.
+   An application's own `Server-Timing` metrics stay; Lookout's is appended.
+2. **The frontend loads the script** from the API, once, on every page:
+
+   ```html
+   <script src="https://api.example.com/_lookout/rum.js" async></script>
+   ```
+
+   It finds where to report from its own URL, so the tag is all a page needs.
+   `data-sample="0.5"` or `data-slow-ms="500"` on the tag overrides the
+   server's settings for that page. A frontend with a Content Security Policy
+   allows the API's origin in `script-src`.
+3. **The script reports with `navigator.sendBeacon`** to `{path}/rum`: a
+   `text/plain` POST, which needs no CORS preflight and is sent even as the
+   page closes. It reports a sampled page view's requests to the API
+   (`LOOKOUT_RUM_SAMPLE_RATE`, decided once per page view), and any request
+   slower than `LOOKOUT_RUM_SLOW_MS` from any page view.
+4. **Each reported request becomes a `browser` batch** on the request's
+   trace. It is listed under **Browser**, and the request's page shows it —
+   whether or not the request's own batch was kept.
+
+What a report carries: the request's URL without its query; its phases —
+queued, DNS, connect, TLS, waiting (the server's time plus the network's),
+download — protocol and sizes; the device (browser, system, screen, memory,
+cores, touch, connection type and round trip, language, time zone); and the
+page (its address without the query, where it came from, its age, and its
+largest and first paint, layout shift and slowest input). The address the
+report came from is kept like `client.ip`.
+
+**What a report cannot do.** `{path}/rum.js` and `{path}/rum` are public —
+every visitor's browser loads one and posts to the other — so a report is
+shown and never trusted. It is accepted only from an origin in
+`LOOKOUT_RUM_ORIGINS`, up to 64 KiB and 50 requests a report, and 240 requests
+a minute from one address on each replica; refused reports are answered the
+same `204` as accepted ones. And it can describe only a request this
+application answered: the token is an HMAC of the trace id under a key derived
+from `APP_KEY` (or `LOOKOUT_RUM_SECRET`), shared by every replica, so a report
+cannot invent a request — only describe one its sender made. A report never
+changes the request's own batch.
+
+The phases are zero when the browser withholds them: the response's
+`Timing-Allow-Origin` did not name the page's origin, or a reused connection
+had no DNS or handshake to measure. The page says which.
 
 ## The dashboard
 

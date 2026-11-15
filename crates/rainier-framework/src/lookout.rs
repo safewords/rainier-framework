@@ -159,8 +159,42 @@ pub(crate) fn configure(
     for adjust in adjustments {
         lookout = adjust(lookout);
     }
+    // Real user monitoring signs the token each response carries. Every
+    // replica must sign alike, so the key comes from what they share: the
+    // application key, through a derivation of its own so the RUM token
+    // reveals nothing about it. Without either, a key of this process's own:
+    // reports then verify only on the replica that answered the request.
+    if lookout.rum.enabled && lookout.rum.secret.is_empty() {
+        lookout.rum.secret = match env.get("APP_KEY").filter(|key| !key.trim().is_empty()) {
+            Some(key) => rainier_lookout::rum::derive_secret(key.as_bytes()),
+            None => {
+                tracing::warn!(
+                    "lookout: LOOKOUT_RUM is on with neither LOOKOUT_RUM_SECRET nor APP_KEY set; \
+                     browser reports will verify only on the replica that served the request"
+                );
+                rainier_lookout::rum::random_secret()
+            }
+        };
+    }
     lookout.validate().map_err(|e| Error::internal(format!("lookout: {e}")))?;
     Ok(lookout)
+}
+
+/// Say who the current request was made by, for Lookout — a no-op when
+/// Lookout is off, unbound, or [`Capture::user`](config::Capture::user) is
+/// off, so it is safe to call from any application's authentication path.
+///
+/// ```no_run
+/// use rainier_framework::lookout::{describe_user, LookoutUser};
+///
+/// describe_user(LookoutUser::new("42").name("Ada").email("ada@example.com"));
+/// ```
+pub fn describe_user(user: LookoutUser) {
+    if let Some(app) = rainier_container::try_facade_application() {
+        if let Ok(lookout) = app.resolve::<Lookout>() {
+            lookout.describe_user(None, user);
+        }
+    }
 }
 
 /// The environment name the dashboard's gate is given. [`LookoutConfig::local`]

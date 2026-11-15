@@ -25,6 +25,7 @@
 
 pub mod aggregate;
 pub mod cases;
+pub mod client;
 pub mod commands;
 pub mod config;
 pub mod entry;
@@ -33,8 +34,10 @@ pub mod layer;
 pub mod middleware;
 pub mod recorder;
 pub mod redact;
+pub mod rum;
 pub mod store;
 pub mod trends;
+pub mod user;
 pub mod watchers;
 
 pub use config::LookoutConfig;
@@ -47,3 +50,4 @@ pub use store::cache::CacheStore;
 pub use store::database::DatabaseStore;
 pub use store::memory::MemoryStore;
 pub use store::{AggregateOrder, AggregateQuery, BatchQuery, Store};
+pub use user::LookoutUser;

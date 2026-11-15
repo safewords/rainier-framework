@@ -72,6 +72,7 @@ use crate::store::Store;
 
 mod api;
 mod params;
+mod rum;
 mod shell;
 pub(crate) mod stream;
 
@@ -184,6 +185,8 @@ pub(crate) struct Shared {
     pub(crate) base: String,
     /// The one tail of the store "Live" viewers share.
     pub(crate) tail: Arc<stream::Tail>,
+    /// How much each address has reported this minute.
+    pub(crate) rum_limiter: crate::rum::Limiter,
 }
 
 /// Declare the dashboard and its API on a new [`Router`], under
@@ -225,6 +228,7 @@ pub fn routes(
         environment: environment.to_string(),
         base: base.clone(),
         tail: stream::Tail::new(),
+        rum_limiter: crate::rum::Limiter::default(),
     });
 
     let group = GroupAttributes::new().prefix(base).name("lookout.");
@@ -248,6 +252,13 @@ pub fn routes(
         router.post("/api/cases/{id}", guarded(&state, api::act_on_case)).name("api.case.act");
         router.get("/api/status", guarded(&state, api::status)).name("api.status");
         router.get("/api/stream", guarded(&state, stream::stream)).name("api.stream");
+
+        // Real user monitoring: public, because every visitor's browser
+        // loads the script and reports. Only while it is on.
+        if state.config.rum.enabled {
+            router.get("/rum.js", open(&state, rum::script)).name("rum.script");
+            router.post("/rum", open(&state, rum::ingest)).name("rum.ingest");
+        }
 
         // Declared last, so every route above wins: the app's own client
         // routes (`/batches/abc`) get the shell on a reload or a shared link.
@@ -298,6 +309,23 @@ where
             }
             secure(handler(state, request).await.into_response())
         })
+    }
+}
+
+/// A handler every visitor may reach: no gate, and its own headers.
+fn open<F, Fut>(
+    state: &Arc<Shared>,
+    handler: F,
+) -> impl Fn(Req) -> BoxFuture<'static, Response> + Clone + Send + Sync + 'static
+where
+    F: Fn(Arc<Shared>, Req) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Response> + Send + 'static,
+{
+    let state = Arc::clone(state);
+    move |request: Req| {
+        let state = Arc::clone(&state);
+        let handler = handler.clone();
+        Box::pin(async move { handler(state, request).await })
     }
 }
 

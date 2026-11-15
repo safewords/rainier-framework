@@ -2,6 +2,8 @@
 import { computed, onMounted, ref } from 'vue'
 
 import BatchStatus from '../components/BatchStatus.vue'
+import BrowserView from '../components/BrowserView.vue'
+import ClientCard from '../components/ClientCard.vue'
 import Empty from '../components/Empty.vue'
 import ErrorBox from '../components/ErrorBox.vue'
 import Flags from '../components/Flags.vue'
@@ -9,6 +11,7 @@ import Json from '../components/Json.vue'
 import Pill from '../components/Pill.vue'
 import StackTrace from '../components/StackTrace.vue'
 import TimeAgo from '../components/TimeAgo.vue'
+import UserCard from '../components/UserCard.vue'
 import Waterfall from '../components/Waterfall.vue'
 import { api } from '../api.js'
 import { absolute, caseId, duration, hasTag, issueRoute } from '../format.js'
@@ -21,7 +24,21 @@ const error = ref(null)
 const loading = ref(true)
 const selected = ref(null)
 
-const KIND = { request: 'Request', job: 'Job', command: 'Command', scheduled_task: 'Scheduled task', other: 'Other' }
+const KIND = { request: 'Request', job: 'Job', command: 'Command', scheduled_task: 'Scheduled task', other: 'Other', browser: 'Browser' }
+
+// The request's own record: who made it and what with, when Lookout was
+// asked to keep them (LOOKOUT_CAPTURE_USER, LOOKOUT_CAPTURE_CLIENT).
+const rootContent = computed(() => {
+  const root = batch.value ? batch.value.entries.find((e) => e.type === 'request') : null
+  return root && root.content && typeof root.content === 'object' ? root.content : {}
+})
+const user = computed(() => (rootContent.value.user && typeof rootContent.value.user === 'object' ? rootContent.value.user : null))
+const client = computed(() => (rootContent.value.client && typeof rootContent.value.client === 'object' ? rootContent.value.client : null))
+
+// How the browser saw it (LOOKOUT_RUM): reports on the same trace. On a
+// browser batch, the request it describes, for the server's side of it.
+const browserReports = computed(() => related.value.filter((b) => b.kind === 'browser'))
+const serverSide = computed(() => related.value.find((b) => b.kind === 'request') || null)
 
 const facts = computed(() => {
   const b = batch.value
@@ -164,6 +181,20 @@ onMounted(async () => {
           </div>
         </dl>
       </section>
+
+      <UserCard
+        v-if="batch.kind === 'request' && (user || batch.user_id)"
+        :user="user"
+        :user-id="batch.user_id"
+        :guard="batch.guard"
+      />
+      <ClientCard v-if="client" :client="client" />
+      <template v-if="batch.kind === 'browser'">
+        <BrowserView :batch="batch" :server-us="serverSide ? serverSide.duration_us : null" />
+      </template>
+      <template v-else>
+        <BrowserView v-for="report in browserReports" :key="report.id" :id="report.id" :server-us="batch.duration_us" />
+      </template>
 
       <section v-if="payload.length" class="lk-card">
         <header class="lk-card-header">
