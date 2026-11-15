@@ -39,6 +39,20 @@
   var queue = []
   var vitals = {}
 
+  // This page view, and what the page itself has done since its last report:
+  // its load (once), its route changes, its script errors, its long tasks.
+  // Reported as a `page` batch, apart from the API calls, and joined to them
+  // by the view's id. `proof` is the latest API token this page received:
+  // a frontend on another origin is not served by the API, so the only thing
+  // that can vouch for its activity is a response the API sent it.
+  var view = (function () {
+    var bytes = new Uint8Array(16)
+    ;(window.crypto || {}).getRandomValues ? crypto.getRandomValues(bytes) : bytes.forEach(function (_, i) { bytes[i] = Math.random() * 256 })
+    return Array.prototype.map.call(bytes, function (b) { return ('0' + b.toString(16)).slice(-2) }).join('')
+  })()
+  var proof = null
+  var activity = { loadSent: false, navigations: [], errors: [], longTasks: { count: 0, total: 0, longest: 0 } }
+
   function round(n) {
     return typeof n === 'number' && isFinite(n) ? Math.round(n * 10) / 10 : undefined
   }
@@ -132,10 +146,45 @@
     return p
   }
 
+  // What the page did since its last report, or null when there is nothing
+  // to say. A sampled page view reports its activity; any page view reports
+  // a script error.
+  function pageActivity() {
+    var a = activity
+    var news = !a.loadSent || a.navigations.length || a.errors.length || a.longTasks.count
+    if (!news || !(sampled || a.errors.length)) return null
+    var out = {
+      navigations: a.navigations.splice(0),
+      errors: a.errors.splice(0),
+      long_tasks: a.longTasks.count ? { count: a.longTasks.count, total: round(a.longTasks.total), longest: round(a.longTasks.longest) } : undefined,
+      vitals: vitals,
+    }
+    a.longTasks = { count: 0, total: 0, longest: 0 }
+    if (!a.loadSent) {
+      var nav = (performance.getEntriesByType('navigation') || [])[0]
+      if (nav) {
+        out.load = {
+          type: nav.type,
+          dns: round(nav.domainLookupEnd - nav.domainLookupStart),
+          connect: round(nav.connectEnd - nav.connectStart),
+          ttfb: round(nav.responseStart),
+          dom_ready: round(nav.domContentLoadedEventEnd),
+          load: round(nav.loadEventEnd),
+          transfer: nav.transferSize,
+          protocol: nav.nextHopProtocol || undefined,
+        }
+      }
+      a.loadSent = true
+    }
+    return out
+  }
+
   function flush() {
-    if (!queue.length) return
+    // Activity waits for a token to vouch for it; calls carry their own.
+    var act = proof ? pageActivity() : null
+    if (!queue.length && !act) return
     var calls = queue.splice(0, 50)
-    var body = JSON.stringify({ page: page(), device: device(), calls: calls })
+    var body = JSON.stringify({ view: view, proof: proof || undefined, page: page(), device: device(), calls: calls, activity: act || undefined })
     try {
       navigator.sendBeacon(settings.endpoint, new Blob([body], { type: 'text/plain' }))
     } catch (e) {
@@ -267,6 +316,7 @@
     var token = tokenOf(entry)
     if (!token) return
     replay.lastToken = token
+    proof = token
     var failed = entry.responseStatus >= 400
     var slow = entry.duration >= settings.slowMs
     if (failed || slow) upload(failed ? 'failed' : 'slow')
@@ -288,6 +338,58 @@
   observe('event', function (entry) {
     if (!vitals.inp || entry.duration > vitals.inp) vitals.inp = round(entry.duration)
   }, { durationThreshold: 40 })
+
+  // --- the page's own activity ----------------------------------------------
+
+  // Route changes inside the app: what a single-page frontend calls a page.
+  function routed() {
+    var to = location.pathname
+    var last = activity.navigations[activity.navigations.length - 1]
+    if (last && last.to === to) return
+    if (activity.navigations.length < 50) activity.navigations.push({ to: to, at: round(performance.now()) })
+  }
+  ;['pushState', 'replaceState'].forEach(function (name) {
+    var original = history[name]
+    if (typeof original !== 'function') return
+    history[name] = function () {
+      var result = original.apply(this, arguments)
+      try {
+        routed()
+      } catch (e) {
+        // Never in the app's way.
+      }
+      return result
+    }
+  })
+  addEventListener('popstate', routed)
+
+  // Script errors: the message and where, never the page's data.
+  function failed(message, source, line, col) {
+    if (activity.errors.length >= 20) return
+    activity.errors.push({
+      message: String(message || 'error').slice(0, 300),
+      source: source ? bare(source) : undefined,
+      line: line || undefined,
+      col: col || undefined,
+      at: round(performance.now()),
+      page: location.pathname,
+    })
+  }
+  addEventListener('error', function (event) {
+    // A resource that failed to load is an error event without a message.
+    if (event && event.message !== undefined) failed(event.message, event.filename, event.lineno, event.colno)
+  })
+  addEventListener('unhandledrejection', function (event) {
+    var reason = event && event.reason
+    failed('Unhandled rejection: ' + (reason && reason.message ? reason.message : String(reason)))
+  })
+
+  // Long tasks: the main thread busy for 50 ms or more — a frozen page.
+  observe('longtask', function (entry) {
+    activity.longTasks.count++
+    activity.longTasks.total += entry.duration
+    if (entry.duration > activity.longTasks.longest) activity.longTasks.longest = entry.duration
+  })
 
   setInterval(flush, 10000)
   addEventListener('visibilitychange', function () {

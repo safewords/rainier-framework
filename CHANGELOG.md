@@ -51,6 +51,15 @@ the release as a whole and names the crate it landed in.
   every page that shows data (cases, issues, timing, status) refreshes on the
   news it shows, plus once a minute. The writer stores its counts every 2
   seconds instead of 10, and only when something was counted.
+- **Page views, apart from API calls** (`rainier-lookout`): with RUM on,
+  the browser script also reports what the page itself did — its load,
+  vitals, route changes inside a single-page app, script errors and long
+  tasks — as a new `page` batch kind (tag `rum:page`), listed under
+  **Browser → Page views**, separate from the API calls it made (`browser`,
+  tag `rum:api`, summaries now `api …`) under **Browser → API calls**. Both
+  carry `pageview:<id>`, so a page view lists its calls and a call links to
+  its page view. A frontend on another origin proves its page talked to the
+  API with a token from one of its responses.
 - **Session replay** (`rainier-lookout`), off by default:
   `LOOKOUT_RUM_REPLAY=true` lets a page record itself with rrweb, masked in
   the browser — text as asterisks, no inputs, media as blank boxes,

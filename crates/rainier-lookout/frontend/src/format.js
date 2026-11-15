@@ -37,7 +37,8 @@ export const KINDS = [
   { key: 'command', label: 'Commands' },
   { key: 'scheduled_task', label: 'Scheduled' },
   { key: 'other', label: 'Other' },
-  { key: 'browser', label: 'Browser' },
+  { key: 'page', label: 'Page views' },
+  { key: 'browser', label: 'API calls (browser)' },
 ]
 
 export const TYPES = {

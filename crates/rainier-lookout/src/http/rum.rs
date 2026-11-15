@@ -70,12 +70,16 @@ pub(crate) async fn ingest(state: Arc<Shared>, request: Req) -> Response {
     let Ok(report) = serde_json::from_slice::<Report>(body) else {
         return done();
     };
-    let calls = report.calls.len().min(MAX_CALLS) as u32;
+    // A page's own activity counts as one more, against the same budget.
+    let calls = report.calls.len().min(MAX_CALLS) as u32 + u32::from(report.activity.is_some());
     if calls == 0 || !state.rum_limiter.allow(request.ip(), calls) {
         return done();
     }
 
-    let batches = rum::batches(&state.config, report, request.ip(), request.header("user-agent"));
+    let page = rum::page_batch(&state.config, &report, request.ip(), request.header("user-agent"));
+    let mut batches =
+        rum::batches(&state.config, report, request.ip(), request.header("user-agent"));
+    batches.extend(page);
     if !batches.is_empty() {
         // Stored as they are: a browser batch adds nothing to the request
         // counts, and is never sampled away — the browser already sampled.

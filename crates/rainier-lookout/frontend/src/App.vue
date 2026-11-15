@@ -41,11 +41,23 @@ const sections = [
       ['command', 'Commands'],
       ['scheduled_task', 'Scheduled tasks'],
       ['other', 'Other'],
-      ['browser', 'Browser'],
     ].map(([kind, label]) => ({
       label,
       to: { name: 'batches', query: { kind } },
       match: (r) => r.name === 'batches' && (r.query.kind || 'request') === kind,
+    })),
+  },
+  {
+    // Real user monitoring, kept apart: what pages did in visitors' browsers,
+    // and the API calls as those browsers saw them.
+    title: 'Browser',
+    items: [
+      ['page', 'Page views'],
+      ['browser', 'API calls'],
+    ].map(([kind, label]) => ({
+      label,
+      to: { name: 'batches', query: { kind } },
+      match: (r) => r.name === 'batches' && r.query.kind === kind,
     })),
   },
   {

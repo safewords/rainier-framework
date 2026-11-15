@@ -483,7 +483,24 @@ calling `api.example.com`:
    page closes. It reports a sampled page view's requests to the API
    (`LOOKOUT_RUM_SAMPLE_RATE`, decided once per page view), and any request
    slower than `LOOKOUT_RUM_SLOW_MS` from any page view.
-4. **Each reported request becomes a `browser` batch** on the request's
+4. **The page reports what it did, too.** Apart from its requests, a
+   sampled page view — or any page view that throws — reports its own
+   activity: the page load (DNS, connect, first byte, ready, loaded,
+   protocol), its vitals, every route change inside the app (pushState,
+   replaceState, popstate — what a single-page frontend calls a page),
+   script errors (message, file, line, column, the route it was on), and
+   long tasks (the main thread busy for 50 ms or more). Each report becomes
+   a **`page`** batch, listed under **Browser → Page views**; the API calls
+   are **`browser`** batches under **Browser → API calls**. They are told
+   apart by kind and by tag — `rum:page` and `rum:api` — and joined by the
+   page view's id, `pageview:<id>`, which both carry: a page view lists the
+   calls it made, and a call links back to its page view.
+
+   A frontend on another origin is not served by this application, so no
+   response of its own vouches for its page. Its activity is accepted only
+   with a token from an API response that page received (`proof`), checked
+   like any other; a page that never called the API reports no activity.
+5. **Each reported request becomes a `browser` batch** on the request's
    trace. It is listed under **Browser**, and the request's page shows it.
    In production most requests' own batches are not kept — only slow and
    failed ones — so the report carries what the response said about the

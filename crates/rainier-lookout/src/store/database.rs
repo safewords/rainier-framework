@@ -967,6 +967,7 @@ fn kind_name(kind: BatchKind) -> &'static str {
         BatchKind::ScheduledTask => "scheduled_task",
         BatchKind::Other => "other",
         BatchKind::Browser => "browser",
+        BatchKind::Page => "page",
     }
 }
 
@@ -1043,6 +1044,7 @@ mod tests {
             BatchKind::ScheduledTask,
             BatchKind::Other,
             BatchKind::Browser,
+            BatchKind::Page,
         ] {
             assert_eq!(parse_kind(kind_name(kind)).unwrap(), kind);
         }

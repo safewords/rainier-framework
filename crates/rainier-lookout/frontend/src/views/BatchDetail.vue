@@ -4,6 +4,7 @@ import { computed, onMounted, ref } from 'vue'
 import BatchStatus from '../components/BatchStatus.vue'
 import BrowserView from '../components/BrowserView.vue'
 import ClientCard from '../components/ClientCard.vue'
+import PageView from '../components/PageView.vue'
 import ReplayPlayer from '../components/ReplayPlayer.vue'
 import Empty from '../components/Empty.vue'
 import ErrorBox from '../components/ErrorBox.vue'
@@ -25,7 +26,18 @@ const error = ref(null)
 const loading = ref(true)
 const selected = ref(null)
 
-const KIND = { request: 'Request', job: 'Job', command: 'Command', scheduled_task: 'Scheduled task', other: 'Other', browser: 'Browser' }
+const KIND = {
+  request: 'Request',
+  job: 'Job',
+  command: 'Command',
+  scheduled_task: 'Scheduled task',
+  other: 'Other',
+  browser: 'API call (browser)',
+  page: 'Page view',
+}
+
+// The page view an API call report came from, by its `pageview:` tag.
+const pageViewTag = computed(() => (batch.value ? (batch.value.tags || []).find((t) => t.startsWith('pageview:')) : null))
 
 // The request's own record: who made it and what with, when Lookout was
 // asked to keep them (LOOKOUT_CAPTURE_USER, LOOKOUT_CAPTURE_CLIENT).
@@ -194,6 +206,14 @@ onMounted(async () => {
         :guard="batch.guard"
       />
       <ClientCard v-if="client" :client="client" />
+      <PageView v-if="batch.kind === 'page'" :batch="batch" />
+      <p v-if="batch.kind === 'browser' && pageViewTag" class="text-sm text-zinc-500 dark:text-zinc-400">
+        Made by a page view:
+        <RouterLink
+          :to="{ name: 'batches', query: { kind: 'page', tag: pageViewTag } }"
+          class="text-indigo-600 hover:underline dark:text-indigo-400"
+        >what that page did</RouterLink>.
+      </p>
       <template v-if="batch.kind === 'browser' && isReplay(batch)">
         <ReplayPlayer :batch="batch" />
       </template>

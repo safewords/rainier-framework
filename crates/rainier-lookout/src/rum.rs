@@ -194,6 +194,46 @@ pub struct Report {
     pub(crate) device: Map<String, Value>,
     #[serde(default)]
     pub(crate) calls: Vec<Map<String, Value>>,
+    /// The page view this came from: an id the script makes when the page
+    /// loads, shared by every report the page sends.
+    #[serde(default)]
+    pub(crate) view: String,
+    /// What the page itself did since its last report — its load, route
+    /// changes, script errors, long tasks. Becomes a `page` batch.
+    #[serde(default)]
+    pub(crate) activity: Option<Map<String, Value>>,
+    /// A token from an API response this page received, so its activity is
+    /// accepted only from a page that really talked to this application: a
+    /// frontend on another origin is not served by this one, so nothing else
+    /// can vouch for it.
+    #[serde(default)]
+    pub(crate) proof: Option<String>,
+}
+
+/// The tag every report about an API call carries.
+pub const TAG_API: &str = "rum:api";
+
+/// The tag every page-view batch carries.
+pub const TAG_PAGE: &str = "rum:page";
+
+/// The tag tying a page view's batches — its activity and its API calls —
+/// together: `pageview:<id>`.
+pub fn view_tag(view: &str) -> String {
+    format!("pageview:{view}")
+}
+
+/// A page view's id, if it is one the script could have made: 32 hex digits.
+fn view_id(view: &str) -> Option<&str> {
+    (view.len() == 32 && view.bytes().all(|b| b.is_ascii_hexdigit())).then_some(view)
+}
+
+/// `840 ms`, `1.2 s`.
+fn short_ms(ms: f64) -> String {
+    if ms < 1000.0 {
+        format!("{} ms", ms.round())
+    } else {
+        format!("{:.1} s", ms / 1000.0)
+    }
 }
 
 /// Cut a value from a browser down to something safe to store and show:
@@ -241,6 +281,11 @@ pub(crate) fn batches(
         .map(|u| u.split(['?', '#']).next().unwrap_or(u).to_string());
 
     let now = chrono::Utc::now();
+    let view = view_id(&report.view).map(str::to_string);
+    let mut tags = vec!["browser".to_string(), TAG_API.to_string()];
+    if let Some(view) = &view {
+        tags.push(view_tag(view));
+    }
     report
         .calls
         .iter()
@@ -283,7 +328,7 @@ pub(crate) fn batches(
             let id = crate::recorder::new_id();
             let started_at = now - chrono::Duration::microseconds(duration_us as i64);
             let summary =
-                format!("browser {path}{}", status.map(|s| format!(" {s}")).unwrap_or_default());
+                format!("api {path}{}", status.map(|s| format!(" {s}")).unwrap_or_default());
             let entry = Entry {
                 id: crate::recorder::new_entry_id(),
                 batch_id: id.clone(),
@@ -324,11 +369,116 @@ pub(crate) fn batches(
                 has_slow: total_ms >= rum.slow_ms as f64,
                 host: page_path.clone(),
                 started_at,
-                tags: vec!["browser".into()],
+                tags: tags.clone(),
                 entries: vec![entry],
             })
         })
         .collect()
+}
+
+/// A report's page activity as a `page` batch — or `None` when it carries
+/// none, has no page-view id, or cannot show it came from a page that talked
+/// to this application (its proof token, or one of its calls', must verify).
+pub(crate) fn page_batch(
+    config: &LookoutConfig,
+    report: &Report,
+    ip: Option<IpAddr>,
+    user_agent: Option<&str>,
+) -> Option<Batch> {
+    let rum = &config.rum;
+    let activity = report.activity.as_ref()?;
+    let view = view_id(&report.view)?.to_string();
+    let proven = report
+        .proof
+        .iter()
+        .map(String::as_str)
+        .chain(report.calls.iter().filter_map(|c| c.get("token").and_then(Value::as_str)))
+        .take(MAX_CALLS + 1)
+        .any(|token| verify(&rum.secret, token).is_some());
+    if !proven {
+        return None;
+    }
+
+    let page = bounded_map(&report.page, 2);
+    let mut device = bounded_map(&report.device, 2);
+    describe_sender(config, &mut device, ip, user_agent);
+    let activity = bounded_map(activity, 3);
+    let url = page.get("url").and_then(Value::as_str).unwrap_or("");
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .and_then(|u| u.splitn(4, '/').nth(3).map(|p| format!("/{p}")))
+        .unwrap_or_else(|| "/".to_string());
+
+    let count = |key: &str| activity.get(key).and_then(Value::as_array).map_or(0, Vec::len);
+    let errors = count("errors");
+    let navigations = count("navigations");
+    let load_ms = activity
+        .get("load")
+        .and_then(Value::as_object)
+        .and_then(|l| number(l, "load").or_else(|| number(l, "dom_ready")));
+    let mut parts = Vec::new();
+    if let Some(ms) = load_ms {
+        parts.push(format!("loaded in {}", short_ms(ms)));
+    }
+    if navigations > 0 {
+        parts
+            .push(format!("{navigations} route change{}", if navigations == 1 { "" } else { "s" }));
+    }
+    if errors > 0 {
+        parts.push(format!("{errors} error{}", if errors == 1 { "" } else { "s" }));
+    }
+    let summary = if parts.is_empty() {
+        format!("page {path}")
+    } else {
+        format!("page {path} — {}", parts.join(", "))
+    };
+    // A page's time is how long it has been open, as far as this report goes.
+    let age_ms = number(&page, "age").unwrap_or(0.0).min(24.0 * 3600.0 * 1000.0);
+    let duration_us = (age_ms * 1000.0).round() as u64;
+    let now = chrono::Utc::now();
+    let started_at = now - chrono::Duration::microseconds(duration_us as i64);
+
+    let id = crate::recorder::new_id();
+    let content = json!({
+        "url": url.split(['?', '#']).next().unwrap_or(url),
+        "page": Value::Object(page.clone()),
+        "device": Value::Object(device),
+        "activity": Value::Object(activity),
+    });
+    let tags = vec!["browser".to_string(), TAG_PAGE.to_string(), view_tag(&view)];
+    Some(Batch {
+        id: id.clone(),
+        // The page view is the trace: every report a page sends lands on it.
+        trace_id: view.clone(),
+        kind: BatchKind::Page,
+        summary: summary.clone(),
+        route_name: None,
+        route_pattern: None,
+        method: None,
+        status: None,
+        guard: None,
+        user_id: None,
+        duration_us,
+        has_exception: errors > 0,
+        has_slow: load_ms.is_some_and(|ms| ms >= rum.slow_ms as f64),
+        host: Some(url.split(['?', '#']).next().unwrap_or(url).chars().take(512).collect()),
+        started_at,
+        tags: tags.clone(),
+        entries: vec![Entry {
+            id: crate::recorder::new_entry_id(),
+            batch_id: id,
+            entry_type: EntryType::Custom,
+            span_id: None,
+            parent_span_id: None,
+            family_hash: Some(format!("page:{path}")),
+            summary,
+            occurred_at: started_at,
+            duration_us: Some(duration_us),
+            tags,
+            content,
+        }],
+    })
 }
 
 /// The script a page loads. Its settings are written into it and it finds its
@@ -592,7 +742,8 @@ mod tests {
         let batch = &out[0];
         assert_eq!(batch.kind, BatchKind::Browser);
         assert_eq!(batch.trace_id, "trace1", "on the request's own trace");
-        assert_eq!(batch.summary, "browser /api/posts 200");
+        assert_eq!(batch.summary, "api /api/posts 200");
+        assert!(batch.tags.contains(&TAG_API.to_string()), "an API call, not page activity");
         assert_eq!(batch.duration_us, 812_400);
         assert_eq!(
             batch.route_name.as_deref(),
@@ -697,5 +848,70 @@ mod tests {
         assert!(script.contains("\"consent\":\"implied\""), "the page is told");
         assert!(script.contains("\"except\":[\"/chats*\"]"));
         assert!(!script.contains("__LOOKOUT_RUM_SETTINGS__"));
+    }
+
+    const VIEW: &str = "0123456789abcdef0123456789abcdef";
+
+    fn activity_report(view: &str, proof: Option<String>, calls: serde_json::Value) -> Report {
+        serde_json::from_value(json!({
+            "view": view,
+            "proof": proof,
+            "page": { "url": "https://app.example.com/feed?tab=new", "age": 42000.0 },
+            "device": { "screen": "390x844" },
+            "calls": calls,
+            "activity": {
+                "load": { "ttfb": 120.0, "dom_ready": 640.0, "load": 1240.0 },
+                "navigations": [{ "to": "/feed", "at": 900.0 }, { "to": "/chats", "at": 30000.0 }],
+                "errors": [{ "message": "TypeError: x is undefined", "source": "https://app.example.com/assets/app.js", "line": 3, "col": 14 }],
+                "long_tasks": { "count": 2, "total": 380.0, "longest": 260.0 },
+            },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_page_view_is_its_own_kind_tied_to_its_api_calls() {
+        let mut config = LookoutConfig::default();
+        config.rum = Rum { enabled: true, secret: b"key".to_vec(), ..config.rum };
+        let call_token = token(b"key", "trace1");
+        let report = activity_report(
+            VIEW,
+            None,
+            json!([{ "token": call_token, "url": "https://api.example.com/api/feed", "duration": 80 }]),
+        );
+
+        let page = page_batch(&config, &report, None, None)
+            .expect("activity from a page that called the API");
+        assert_eq!(page.kind, BatchKind::Page);
+        assert_eq!(page.trace_id, VIEW, "the page view is its trace");
+        assert_eq!(page.summary, "page /feed — loaded in 1.2 s, 2 route changes, 1 error");
+        assert!(page.has_exception, "a script error");
+        assert!(page.tags.contains(&TAG_PAGE.to_string()));
+        assert!(page.tags.contains(&view_tag(VIEW)));
+        assert_eq!(page.entries[0].content["activity"]["long_tasks"]["count"], 2);
+        assert_eq!(page.entries[0].content["url"], "https://app.example.com/feed");
+
+        let calls = batches(&config, report, None, None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].kind, BatchKind::Browser);
+        assert!(calls[0].tags.contains(&view_tag(VIEW)), "an API call knows its page view");
+        assert!(!calls[0].tags.contains(&TAG_PAGE.to_string()));
+    }
+
+    #[test]
+    fn page_activity_needs_a_page_that_talked_to_this_application() {
+        let mut config = LookoutConfig::default();
+        config.rum = Rum { enabled: true, secret: b"key".to_vec(), ..config.rum };
+        // Proof alone — no calls this time — is enough.
+        let proved = activity_report(VIEW, Some(token(b"key", "trace7")), json!([]));
+        assert!(page_batch(&config, &proved, None, None).is_some());
+        // No token at all, or one this application did not sign: refused.
+        let none = activity_report(VIEW, None, json!([]));
+        assert!(page_batch(&config, &none, None, None).is_none());
+        let forged = activity_report(VIEW, Some("trace7.0000000000000000".into()), json!([]));
+        assert!(page_batch(&config, &forged, None, None).is_none());
+        // A view id the script could not have made: refused.
+        let odd = activity_report("not-a-view", Some(token(b"key", "trace7")), json!([]));
+        assert!(page_batch(&config, &odd, None, None).is_none());
     }
 }

@@ -201,6 +201,10 @@ pub enum BatchKind {
     /// report, on the same trace as the request's own batch. See
     /// [`rum`](crate::rum).
     Browser,
+    /// A page view in a visitor's browser: its load, its route changes, its
+    /// script errors and long tasks — what the browser did, rather than what
+    /// it asked the API. Real user monitoring; see [`rum`](crate::rum).
+    Page,
 }
 
 /// Everything recorded for one unit of work, kept or discarded as a whole.
