@@ -1143,6 +1143,12 @@ impl Rainier {
         if let Some((lookout, _)) = &lookout {
             let at = global.iter().position(|stage| stage.name() == "Trace").map_or(0, |i| i + 1);
             global.insert(at, Arc::new(lookout.middleware()));
+            // And innermost, after the application's `TrustProxies`: the
+            // client's address as the application believes it, rather than
+            // the proxy in front of it.
+            if lookout.config().capture.client {
+                global.push(Arc::new(lookout.client_middleware()));
+            }
         }
 
         let settings_for_kernel = app.resolve::<Config>()?;

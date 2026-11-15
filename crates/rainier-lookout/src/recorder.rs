@@ -357,6 +357,14 @@ impl Lookout {
         true
     }
 
+    /// The middleware that tells Lookout the client's address once the
+    /// application has decided which to believe: put it **after** the
+    /// application's `TrustProxies`, innermost of the global middleware. The
+    /// framework does. See [`LookoutClientMiddleware`](crate::middleware::LookoutClientMiddleware).
+    pub fn client_middleware(&self) -> crate::middleware::LookoutClientMiddleware {
+        crate::middleware::LookoutClientMiddleware::new(self.clone())
+    }
+
     /// With real user monitoring on, add the headers that let the browser
     /// report on `response`: its batch's signed trace id in `Server-Timing`,
     /// and `Timing-Allow-Origin` for the frontends. See [`crate::rum`].
@@ -776,6 +784,20 @@ impl Inner {
             pending.request_headers = headers;
             pending.request_body = body;
             pending.client = client;
+        }
+    }
+
+    /// The client's address as the application settled on it (after its
+    /// `TrustProxies`), in place of the peer [`before_request`] saw.
+    pub(crate) fn refine_client(&self, request: &rainier_http::Request) {
+        if !self.config.capture.client {
+            return;
+        }
+        let Some(ip) = request.ip() else { return };
+        let Some(cell) = self.current_batch() else { return };
+        let mut state = cell.lock();
+        if let Some(client) = state.as_mut().and_then(|p| p.client.as_mut()) {
+            client.ip = Some(ip);
         }
     }
 

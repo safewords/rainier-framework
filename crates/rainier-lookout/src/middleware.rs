@@ -87,6 +87,38 @@ impl Middleware for LookoutMiddleware {
     }
 }
 
+/// The client's address, once the application has decided which one to
+/// believe. Get one from [`Lookout::client_middleware`].
+///
+/// [`LookoutMiddleware`] runs outermost, so it sees every request — including
+/// those a throttle turns away — but it also sees the socket's peer, which
+/// behind a proxy is the proxy. The application's own `TrustProxies` replaces
+/// that with the visitor further in. This runs innermost of the global
+/// middleware, after it, and hands Lookout the address the application
+/// settled on. A request turned away before reaching it keeps the peer.
+#[derive(Debug, Clone)]
+pub struct LookoutClientMiddleware {
+    lookout: Lookout,
+}
+
+impl LookoutClientMiddleware {
+    pub(crate) fn new(lookout: Lookout) -> Self {
+        Self { lookout }
+    }
+}
+
+#[async_trait::async_trait]
+impl Middleware for LookoutClientMiddleware {
+    async fn handle(&self, request: Request, next: Next) -> Response {
+        self.lookout.inner.refine_client(&request);
+        next.run(request).await
+    }
+
+    fn name(&self) -> &'static str {
+        "LookoutClient"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -315,6 +347,46 @@ mod tests {
         assert_eq!(browser.trace_id, me.trace_id, "on the request's trace");
         assert_eq!(browser.duration_us, 412_500);
         assert_eq!(browser.entries[0].content["timing"]["waiting"], 180.0);
+    }
+
+    #[tokio::test]
+    async fn the_client_is_the_visitor_the_application_trusts_not_its_proxy() {
+        let mut config = LookoutConfig::default().enabled(true).local(true);
+        config.capture.client = true;
+        let store = Arc::new(MemoryStore::new(10));
+        let lookout = Lookout::new(config, store.clone());
+        let mut router = Router::new();
+        router.get("/hello", || async { "hi" }).name("hello");
+        let compiled = router.compile(&rainier_container::Container::new()).unwrap();
+        // The order the framework builds: Lookout outermost, the
+        // application's proxy trust, then Lookout's client hook innermost.
+        let kernel = Kernel::with_middleware(
+            compiled,
+            vec![
+                Arc::new(lookout.middleware()),
+                Arc::new(
+                    rainier_middleware::TrustProxies::these(["10.0.0.0/8"])
+                        .header("cf-connecting-ip"),
+                ),
+                Arc::new(lookout.client_middleware()),
+            ],
+        );
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri("/hello")
+            .header("cf-connecting-ip", "198.51.100.23")
+            .build();
+        // The socket's peer: the ingress, inside the cluster.
+        request.extensions_mut().insert(rainier_http::ClientIp("10.42.2.7".parse().unwrap()));
+        assert_eq!(kernel.handle_request(request).await.status().as_u16(), 200);
+        lookout.flush().await;
+
+        let batches = store.all();
+        let client = &batches[0].entries[0].content["client"];
+        assert_eq!(client["ip"], "198.51.100.0/24", "the visitor, not the ingress: {client}");
     }
 
     #[tokio::test]

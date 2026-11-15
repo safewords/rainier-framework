@@ -44,7 +44,7 @@ pub use config::LookoutConfig;
 pub use entry::{Aggregate, Batch, BatchKind, BatchSummary, Entry, EntryType};
 pub use http::{routes, LookoutGate};
 pub use layer::LookoutLayer;
-pub use middleware::LookoutMiddleware;
+pub use middleware::{LookoutClientMiddleware, LookoutMiddleware};
 pub use recorder::{Lookout, WriterHandle};
 pub use store::cache::CacheStore;
 pub use store::database::DatabaseStore;

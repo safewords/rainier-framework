@@ -424,7 +424,7 @@ say about the client:
 
 | Field | From |
 |---|---|
-| `ip` | the client's address as the server believes it — behind a proxy, configure [`TrustProxies`](middleware.md) — cut to its network (`203.0.113.0/24`, `2001:db8:1::/48`) unless `LOOKOUT_CAPTURE_CLIENT_IP=full`; `none` keeps none of it |
+| `ip` | the client's address as the application believes it — behind a proxy, after its [`TrustProxies`](middleware.md): Lookout's middleware runs outermost and sees the proxy, so the framework adds a second, `LookoutClient`, innermost of the global middleware, which records the address `TrustProxies` settled on (a request turned away before reaching it keeps the proxy's) — cut to its network (`203.0.113.0/24`, `2001:db8:1::/48`) unless `LOOKOUT_CAPTURE_CLIENT_IP=full`; `none` keeps none of it |
 | `browser`, `os`, `device`, `model` | `User-Agent`, with the client hints a Chromium browser sends (`Sec-CH-UA-Platform`, `-Platform-Version`, `-Mobile`, `-Model`) winning over the user agent's frozen values |
 | `origin`, `referer` | the page that made the request — its query and fragment dropped, since links carry tokens there |
 | `language` | the first language of `Accept-Language` |
