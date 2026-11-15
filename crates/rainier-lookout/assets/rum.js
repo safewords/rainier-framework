@@ -145,8 +145,12 @@
     }
   }
 
+  // Lookout's own path on the API: the script and its reports are not
+  // requests to report on.
+  var own = self.href.replace(/rum\.js(\?.*)?$/, '')
   observe('resource', function (entry) {
     if (entry.name.indexOf(settings.origin) !== 0) return
+    if (entry.initiatorType === 'beacon' || entry.name.indexOf(own) === 0) return
     var token = tokenOf(entry)
     if (!token) return
     if (!sampled && !(entry.duration >= settings.slowMs)) return

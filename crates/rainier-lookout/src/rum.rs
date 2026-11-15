@@ -224,6 +224,11 @@ pub(crate) fn batches(
         .iter()
         .take(MAX_CALLS)
         .filter_map(|call| {
+            // A report about a report — from a script cached before Lookout
+            // stopped marking its own responses — is not a request.
+            if call.get("initiator").and_then(Value::as_str) == Some("beacon") {
+                return None;
+            }
             let token = call.get("token").and_then(Value::as_str)?;
             let trace_id = verify(&rum.secret, token)?;
             let total_ms = number(call, "duration").unwrap_or(0.0);
@@ -236,6 +241,10 @@ pub(crate) fn batches(
                 .unwrap_or_default();
             let path =
                 url.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_else(|| url.clone());
+            let own = config.dashboard.path.trim_end_matches('/');
+            if !own.is_empty() && (path == own || path.starts_with(&format!("{own}/"))) {
+                return None;
+            }
             let status = number(call, "status")
                 .and_then(|s| u16::try_from(s as u64).ok())
                 .filter(|s| *s > 0);
@@ -359,13 +368,15 @@ mod tests {
                 { "token": good, "url": "https://api.example.com/api/posts?page=2", "duration": 812.4,
                   "dns": 0, "connect": 31.2, "waiting": 240.0, "download": 3.1, "protocol": "h2", "status": 200 },
                 { "token": "trace2.0000000000000000", "url": "https://api.example.com/x", "duration": 5 },
+                { "token": token(b"key", "trace3"), "url": "https://api.example.com/_lookout/rum", "duration": 80 },
+                { "token": token(b"key", "trace4"), "url": "https://api.example.com/api/x", "initiator": "beacon", "duration": 80 },
             ],
         }))
         .unwrap();
         let ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1";
         let out = batches(&config, report, Some("203.0.113.77".parse().unwrap()), Some(ua));
 
-        assert_eq!(out.len(), 1, "the forged token is dropped");
+        assert_eq!(out.len(), 1, "the forged token, and reports about Lookout itself, are dropped");
         let batch = &out[0];
         assert_eq!(batch.kind, BatchKind::Browser);
         assert_eq!(batch.trace_id, "trace1", "on the request's own trace");

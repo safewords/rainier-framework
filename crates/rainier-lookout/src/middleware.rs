@@ -51,9 +51,10 @@ impl Middleware for LookoutMiddleware {
 
         if inner.current_batch().is_some() {
             inner.before_request(&request);
+            let path = request.path().to_string();
             let response = next.run(request).await;
             inner.after_response(&response);
-            return self.lookout.mark_for_rum(response);
+            return self.lookout.mark_for_rum(response, &path);
         }
 
         // No server span around us: open one, so the request has a batch.
@@ -71,9 +72,10 @@ impl Middleware for LookoutMiddleware {
         let lookout = self.lookout.clone();
         let work = async move {
             lookout.inner.before_request(&request);
+            let path = request.path().to_string();
             let response = next.run(request).await;
             lookout.inner.after_response(&response);
-            lookout.mark_for_rum(response)
+            lookout.mark_for_rum(response, &path)
         };
         let response = tracing::Instrument::instrument(work, span.clone()).await;
         span.record("http.response.status_code", response.status().as_u16());
@@ -302,6 +304,10 @@ mod tests {
                 .build()
         };
         assert_eq!(router.dispatch(post("https://evil.example")).await.status().as_u16(), 204);
+        // Lookout's own responses carry no token: the script would report
+        // its reports otherwise, one after another.
+        let own = kernel.handle_request(get("/_lookout/rum.js")).await;
+        assert!(own.header("server-timing").is_none(), "no token on Lookout's own path");
         assert_eq!(store.all().len(), 1, "an origin not listed stores nothing");
         assert_eq!(router.dispatch(post("https://app.example.com")).await.status().as_u16(), 204);
         let all = store.all();

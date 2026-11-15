@@ -360,9 +360,13 @@ impl Lookout {
     /// With real user monitoring on, add the headers that let the browser
     /// report on `response`: its batch's signed trace id in `Server-Timing`,
     /// and `Timing-Allow-Origin` for the frontends. See [`crate::rum`].
-    pub(crate) fn mark_for_rum(&self, mut response: Response) -> Response {
+    ///
+    /// Not Lookout's own responses: the script's reports, and the script,
+    /// would otherwise each be reported in turn — a report about the last
+    /// report, every few seconds, for as long as the page is open.
+    pub(crate) fn mark_for_rum(&self, mut response: Response, path: &str) -> Response {
         let rum = &self.inner.config.rum;
-        if !rum.enabled {
+        if !rum.enabled || self.inner.is_dashboard_path(path) {
             return response;
         }
         let Some(trace_id) = self.current_batch_id() else { return response };
@@ -665,7 +669,7 @@ impl Inner {
         cell
     }
 
-    fn is_dashboard_path(&self, path: &str) -> bool {
+    pub(crate) fn is_dashboard_path(&self, path: &str) -> bool {
         let dashboard = self.config.dashboard.path.trim_end_matches('/');
         !dashboard.is_empty()
             && (path == dashboard
