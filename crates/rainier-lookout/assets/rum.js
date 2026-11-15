@@ -27,6 +27,10 @@
     if (tag.dataset.slowMs !== undefined) settings.slowMs = Number(tag.dataset.slowMs)
   }
   if (!window.PerformanceObserver || !navigator.sendBeacon || window.__lookoutRum) return
+  // A visitor who asked not to be tracked (Global Privacy Control) is not
+  // measured either. This is performance monitoring, not tracking, but the
+  // report does describe their device; the request is honoured broadly.
+  if (navigator.globalPrivacyControl === true) return
   window.__lookoutRum = true
 
   // One decision per page view, so a sampled page reports all its requests

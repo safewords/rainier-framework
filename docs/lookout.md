@@ -477,6 +477,9 @@ calling `api.example.com`:
    trace. It is listed under **Browser**, and the request's page shows it —
    whether or not the request's own batch was kept.
 
+A browser sending Global Privacy Control (`navigator.globalPrivacyControl`)
+reports nothing.
+
 What a report carries: the request's URL without its query; its phases —
 queued, DNS, connect, TLS, waiting (the server's time plus the network's),
 download — protocol and sizes; the device (browser, system, screen, memory,
