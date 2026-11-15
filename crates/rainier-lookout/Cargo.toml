@@ -30,6 +30,8 @@ tracing = { workspace = true }
 # dashboard's Vue app is prebuilt into `assets/dist/` (see `frontend/`), so
 # building the crate never needs Node.
 rainier-http = { workspace = true }
+# The captured request and response bodies, held as slices of the originals.
+bytes = { workspace = true }
 rainier-routing = { workspace = true }
 # `lookout:prune`, `lookout:clear`, `lookout:status` (`commands`). The
 # container only because `Command::handle` is given the `Application`.

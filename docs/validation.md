@@ -109,6 +109,7 @@ impl FormRequest for UpdatePostRequest {
 | `rules()` | required |
 | `authorize(&request)` | `true` |
 | `messages()` | none |
+| `sensitive()` | none — fields [Lookout](lookout.md#redaction) must never show, beyond the names it hides already |
 | `validation_data(&request)` | `request.all()` |
 | `from_input(value)` | deserialise with string coercion |
 

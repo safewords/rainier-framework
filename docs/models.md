@@ -156,6 +156,31 @@ struct Document {
 `table.soft_deletes()` in a [migration](migrations.md#the-schema-builder) is the
 matching DDL.
 
+### Fields that must never be displayed
+
+`#[orm(sensitive)]` on a field changes nothing about how it is stored or
+queried. It tells whatever displays payloads — [Lookout](lookout.md#redaction)
+— never to show a value under that name, in a request, a response or a job,
+at any depth:
+
+```rust
+#[derive(Entity)]
+#[orm(table = "accounts")]
+struct Account {
+    #[orm(pk)]
+    id: u64,
+    #[orm(sensitive)]
+    recovery_hash: String,
+}
+
+assert_eq!(Account::sensitive_columns(), &["recovery_hash"]);
+```
+
+`Entity::sensitive_columns()` lists the column and, when they differ, the
+field name. Building an `EntityRepository` for the model registers them with
+`rainier_support::sensitive`. Names with `password`, `secret` or `token` in
+them are hidden already and need no marking.
+
 ### The marker is declared, never inferred
 
 Nothing looks for a column *called* `deleted_at`. Inferring the scope from a

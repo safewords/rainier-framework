@@ -150,6 +150,7 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
         index: bool,
         shard: bool,
         soft_delete: bool,
+        sensitive: bool,
         references: Option<(String, String)>, // (foreign_table, foreign_column)
         on_delete: Option<String>,
         on_update: Option<String>,
@@ -179,6 +180,7 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
         let mut index = false;
         let mut shard = false;
         let mut soft_delete = false;
+        let mut sensitive = false;
         let mut references = None;
         let mut on_delete = None;
         let mut on_update = None;
@@ -197,6 +199,8 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
                         shard = true;
                     } else if meta.path.is_ident("soft_delete") {
                         soft_delete = true;
+                    } else if meta.path.is_ident("sensitive") {
+                        sensitive = true;
                     } else if meta.path.is_ident("column") {
                         column = meta.value()?.parse::<LitStr>()?.value();
                     } else if meta.path.is_ident("references") {
@@ -224,6 +228,7 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
             index,
             shard,
             soft_delete,
+            sensitive,
             references,
             on_delete,
             on_update,
@@ -364,6 +369,19 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
         let c = &m.column;
         quote! { #c }
     });
+    // The column and the field name, deduplicated: a payload may carry either.
+    let mut sensitive_names: Vec<String> = Vec::new();
+    for m in metas.iter().filter(|m| m.sensitive) {
+        let mut field = m.ident.to_string();
+        if let Some(stripped) = field.strip_prefix("r#") {
+            field = stripped.to_string();
+        }
+        for name in [m.column.clone(), field] {
+            if !sensitive_names.contains(&name) {
+                sensitive_names.push(name);
+            }
+        }
+    }
 
     let from_row_fields = metas.iter().map(|m| {
         let fident = &m.ident;
@@ -410,6 +428,9 @@ pub fn derive_entity(input: TokenStream) -> TokenStream {
             }
             fn shard_columns() -> &'static [&'static str] {
                 &[ #(#shard_cols),* ]
+            }
+            fn sensitive_columns() -> &'static [&'static str] {
+                &[ #(#sensitive_names),* ]
             }
             #soft_delete_impl
             fn from_row(row: &dyn ::rainier_orm::Row)

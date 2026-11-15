@@ -62,7 +62,11 @@ Read at boot through the application's `Env` (so `.env` counts), with
 | `LOOKOUT_RETENTION_HOURS` | how long raw batches are kept | a positive integer | `24` |
 | `LOOKOUT_AGGREGATE_RETENTION_DAYS` | how long aggregates are kept | a positive integer | `30` |
 | `LOOKOUT_CAPTURE_REQUEST_HEADERS` | [opt-in capture](#privacy) | a boolean | `false` |
+| `LOOKOUT_CAPTURE_REQUEST_BODY` | every kept request's body, redacted ([privacy](#privacy)) | a boolean | `false` |
+| `LOOKOUT_CAPTURE_RESPONSE_BODY` | every kept request's response body, redacted | a boolean | `false` |
+| `LOOKOUT_CAPTURE_MAX_BODY_BYTES` | the most of a body kept | a positive integer | `65536` |
 | `LOOKOUT_CAPTURE_REQUEST_BODY_ON_EXCEPTION` | | a boolean | `false` |
+| `LOOKOUT_MASK_SECRETS` | star out values that look like keys and tokens ([privacy](#privacy)) | a boolean | `true` |
 | `LOOKOUT_CAPTURE_CACHE_KEYS` | | a boolean | `false` |
 | `LOOKOUT_CAPTURE_MAIL` | | a boolean | `false` |
 | `LOOKOUT_CAPTURE_USER_ID` | | a boolean | `false` |
@@ -284,14 +288,67 @@ Nothing that identifies a person is stored unless asked for:
 
 | `Capture` | What it adds |
 |---|---|
-| `request_headers` | request headers, with `authorization`, `cookie`, `set-cookie`, `proxy-authorization`, `x-xsrf-token`, `x-csrf-token` and `x-api-key` redacted |
-| `request_body_on_exception` | the request body, only on a batch that has an exception, with `password`, `token`, `secret`, `api_key`, `card_number`, `cvc` and their kin redacted |
+| `request_headers` | request headers, with `authorization`, `cookie`, `set-cookie`, `proxy-authorization`, `x-xsrf-token`, `x-csrf-token` and `x-api-key` redacted, and any header named like a sensitive field (below) |
+| `request_body` | every kept request's body, JSON or form parsed and redacted |
+| `response_body` | every kept request's response body: JSON and text redacted, a streamed or binary body noted by its type and size |
+| `request_body_on_exception` | the request body, only on a batch that has an exception |
 | `cache_keys` | cache keys |
 | `mail` | subjects and recipients |
 | `user_id` | the authenticated user's id — needed for user scoping and "top users" |
 
-Add names to `redaction.headers` and `redaction.fields`; values longer than
-`redaction.max_value_len` (2048 bytes) are truncated.
+The batch page shows what was kept under **Payload**: request headers, request
+body and response body. A body is cut to `capture.max_body_bytes` (64 KiB) on
+the request's thread — a slice of the request's own buffer, not a copy — and
+parsed and redacted only on the background writer, and only for a batch that
+is kept, so a request that is let go costs nothing for it.
+
+### Redaction
+
+A value is replaced by `[redacted]` when its field or header name is
+
+- listed in `redaction.fields` (`password`, `token`, `secret`, `api_key`,
+  `card_number`, `cvc`, `cvv`, `ssn`, `pin`, `otp`, `code`, `handoff`) or
+  `redaction.headers`, case-insensitive;
+- **contains** one of `redaction.field_patterns` — `password`, `passwd`,
+  `secret`, `token`, `api_key`, `apikey`, `private_key`, `credential`,
+  `verifier`, `signature`, `authorization`, `session_ticket`,
+  `recovery_code` — so `new_password`, `client_secret` and `x-signature` are
+  covered without listing each; or
+- **marked sensitive by the application**, at any depth of any payload:
+
+  ```rust
+  #[derive(Entity)]
+  #[orm(table = "accounts")]
+  struct Account {
+      #[orm(pk)]
+      id: u64,
+      #[orm(sensitive)]          // hidden wherever a field of this name appears
+      recovery_hash: String,
+  }
+
+  impl FormRequest for EnrolRequest {
+      fn sensitive() -> &'static [&'static str] { &["pin", "backup_phrase"] }
+      // …
+  }
+  ```
+
+  An entity's marks are registered when a repository for it is first built,
+  a form request's when it validates — both during the request, before the
+  writer shows anything. The registry is `rainier_support::sensitive`, and
+  anything that displays payloads can ask it.
+
+**Values that look like secrets are starred out** whatever their name
+(`redaction.mask_secrets`, on by default; `LOOKOUT_MASK_SECRETS=false`): a
+string of twenty or more characters, one word, from a key's alphabet
+(letters, digits, `+/=_-.`), with letters and digits in it and over 3.5 bits
+of entropy a character — an API key, a session id, a JWT, a hash. It keeps
+its first four characters and its length, the same way every time, so two
+requests carrying the same token visibly carry the same one:
+`tok_************************* (29 chars)`. UUIDs, numbers, URLs, paths,
+email addresses and prose are left alone.
+
+Everything else longer than `redaction.max_value_len` (2048 bytes) is
+truncated.
 
 **Who a request was for** comes from the `Authenticated` marker the
 `Authenticate` middleware leaves on the response: the guard always, the user

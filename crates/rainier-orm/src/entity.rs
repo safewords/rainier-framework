@@ -120,6 +120,16 @@ pub trait Entity: Sized {
         &[]
     }
 
+    /// Fields whose values must never be displayed — `#[orm(sensitive)]`.
+    ///
+    /// Both spellings of each: the column and the Rust field name, since a
+    /// payload may carry either. Whatever shows payloads (Lookout) hides a
+    /// field of this name at any depth. The ORM itself reads and writes these
+    /// like any other column; this is about display, not storage.
+    fn sensitive_columns() -> &'static [&'static str] {
+        &[]
+    }
+
     /// The **tombstone column** of a soft-deleting table, or `None`.
     ///
     /// `Some` for exactly the structs carrying an `#[orm(soft_delete)]` field,

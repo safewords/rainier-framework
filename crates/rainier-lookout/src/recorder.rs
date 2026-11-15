@@ -428,7 +428,12 @@ pub(crate) struct Pending {
     pub(crate) sampled_out: bool,
     pub(crate) failed_job: bool,
     pub(crate) request_headers: Option<serde_json::Value>,
-    pub(crate) request_body: Option<Vec<u8>>,
+    /// Raw, cut to `max_body_bytes`: a reference to the request's own
+    /// buffer, not a copy. Parsed and redacted on the writer.
+    pub(crate) request_body: Option<bytes::Bytes>,
+    /// The response's body, the same way — or a note of what it was when it
+    /// was not a buffered one.
+    pub(crate) response_body: Option<CapturedBody>,
     /// Stacks captured for entries' code traces, by entry id: walked on the
     /// request's thread, symbolised later by the writer.
     pub(crate) traces: Vec<(String, Arc<Backtrace>)>,
@@ -459,6 +464,7 @@ impl Pending {
             failed_job: false,
             request_headers: None,
             request_body: None,
+            response_body: None,
             traces: Vec::new(),
         }
     }
@@ -678,10 +684,15 @@ impl Inner {
                 &self.config.redaction,
             )
         });
-        let body = capture.request_body_on_exception.then(|| {
-            let body = request.body();
-            body[..body.len().min(64 * 1024)].to_vec()
-        });
+        // A slice of the request's own buffer — a reference count, not a
+        // copy. Nothing is parsed here: that is the writer's job, and only
+        // for batches it keeps.
+        let body = (capture.request_body || capture.request_body_on_exception)
+            .then(|| {
+                let body = request.body();
+                body.slice(..body.len().min(capture.max_body_bytes))
+            })
+            .filter(|body| !body.is_empty());
         let mut state = cell.lock();
         if let Some(pending) = state.as_mut() {
             pending.method.get_or_insert_with(|| request.method().as_str().to_string());
@@ -703,10 +714,18 @@ impl Inner {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .and_then(|hook| hook(response));
+        let body = self
+            .config
+            .capture
+            .response_body
+            .then(|| CapturedBody::of(response, self.config.capture.max_body_bytes));
         {
             let mut state = cell.lock();
             let Some(pending) = state.as_mut() else { return };
             pending.status = Some(response.status().as_u16());
+            if let Some(body) = body.flatten() {
+                pending.response_body = Some(body);
+            }
             if let Some((guard, user)) = identity {
                 pending.guard = Some(guard);
                 pending.user_id = user;
@@ -1111,6 +1130,62 @@ fn fill_from_root(pending: &mut Pending, root: &Entry) {
 
 /// Everything that happens when a batch closes, in one pure function: scope,
 /// watchers, slow, N+1, the keep rule. `None` means "not kept".
+/// A response body as captured on the request's thread: the bytes, cheaply,
+/// when it was buffered, and only a note otherwise.
+#[derive(Debug, Clone)]
+pub(crate) enum CapturedBody {
+    /// A buffered body, cut to `max_body_bytes`, with its content type.
+    Bytes { bytes: bytes::Bytes, content_type: Option<String>, total: usize },
+    /// A streamed body: never read, so never kept.
+    Streamed { content_type: Option<String> },
+}
+
+impl CapturedBody {
+    fn of(response: &rainier_http::Response, max: usize) -> Option<Self> {
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        match response.body() {
+            rainier_http::Body::Empty => None,
+            rainier_http::Body::Bytes(bytes) if bytes.is_empty() => None,
+            rainier_http::Body::Bytes(bytes) => Some(Self::Bytes {
+                bytes: bytes.slice(..bytes.len().min(max)),
+                content_type,
+                total: bytes.len(),
+            }),
+            rainier_http::Body::Stream(_) => Some(Self::Streamed { content_type }),
+        }
+    }
+
+    /// As something safe to keep: JSON and forms parsed and redacted, text
+    /// truncated, anything else described by its type and size.
+    fn redacted(self, redaction: &crate::config::Redaction) -> serde_json::Value {
+        match self {
+            Self::Streamed { content_type } => serde_json::json!({
+                "streamed": true,
+                "content_type": content_type,
+            }),
+            Self::Bytes { bytes, content_type, total } => {
+                let textual = content_type.as_deref().is_none_or(|t| {
+                    let t = t.to_ascii_lowercase();
+                    t.contains("json")
+                        || t.starts_with("text/")
+                        || t.contains("x-www-form-urlencoded")
+                        || t.contains("xml")
+                        || t.contains("javascript")
+                });
+                if textual && std::str::from_utf8(&bytes).is_ok() {
+                    crate::redact::redact_body(&bytes, redaction)
+                } else {
+                    serde_json::json!({ "bytes": total, "content_type": content_type })
+                }
+            }
+        }
+    }
+}
+
 /// What became of a finished request or job.
 pub(crate) enum Finalized {
     /// Kept: stored whole, and rolled into the aggregates. Boxed: one is
@@ -1229,17 +1304,24 @@ pub(crate) fn finalize(
     }
     let has_slow = pending.entries.iter().any(|e| e.tags.iter().any(|t| t == "slow"));
 
-    // The request body, only now that we know there was a failure.
-    if has_exception {
-        if let Some(body) = pending.request_body.take() {
-            if let Some(root) =
-                pending.entries.iter_mut().find(|e| e.entry_type == EntryType::Request)
-            {
-                if let Some(map) = root.content.as_object_mut() {
-                    map.insert(
-                        "request.body".into(),
-                        crate::redact::redact_body(&body, &config.redaction),
-                    );
+    // The bodies: the request's when every one is captured, or when this one
+    // failed; the response's when those are captured. Parsed and redacted
+    // here, on the writer, and only for a batch that is kept.
+    let request_body = pending
+        .request_body
+        .take()
+        .filter(|_| config.capture.request_body || has_exception)
+        .map(|body| crate::redact::redact_body(&body, &config.redaction));
+    let response_body = pending.response_body.take().map(|body| body.redacted(&config.redaction));
+    if request_body.is_some() || response_body.is_some() {
+        if let Some(root) = pending.entries.iter_mut().find(|e| e.entry_type == EntryType::Request)
+        {
+            if let Some(map) = root.content.as_object_mut() {
+                if let Some(body) = request_body {
+                    map.insert("request.body".into(), body);
+                }
+                if let Some(body) = response_body {
+                    map.insert("response.body".into(), body);
                 }
             }
         }

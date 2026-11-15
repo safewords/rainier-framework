@@ -24,6 +24,21 @@ the release as a whole and names the crate it landed in.
   same figures per route or job class in the table, and the latest batches
   below. They replace the separate "Jobs (timing)" page and the Requests and
   Jobs batch tabs in the navigation; the filtered batch list is a link away.
+- **Lookout keeps request and response bodies, redacted** (`rainier-lookout`):
+  `LOOKOUT_CAPTURE_REQUEST_BODY` and `LOOKOUT_CAPTURE_RESPONSE_BODY` keep
+  every kept request's bodies (up to `LOOKOUT_CAPTURE_MAX_BODY_BYTES`, 64
+  KiB), shown under **Payload** on the batch page with the request headers.
+  The request holds a slice of its own buffer; parsing and redaction happen on
+  the writer, for kept batches only.
+- **Redaction hides more, and can be told what to hide** (`rainier-lookout`,
+  `rainier-orm`, `rainier-validation`, `rainier-support`): a field is hidden
+  when its name contains `password`, `secret`, `token`, `signature` and the
+  like (`redaction.field_patterns`), and when the application marks it —
+  `#[orm(sensitive)]` on a model field, `FormRequest::sensitive()`, or
+  `rainier_support::sensitive::mark`. Any other value that looks like a key or
+  token (long, one word, a key's alphabet, high entropy) is starred out the
+  same way every time, keeping its first four characters and length
+  (`LOOKOUT_MASK_SECRETS`, on by default).
 - **Independent queries at once** (`rainier-database`, in the prelude):
   `concurrently!(a, b, …)` runs a handful of queries at the same time, each on
   its own pooled connection, and returns their values in order or the first

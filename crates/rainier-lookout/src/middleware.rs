@@ -119,6 +119,16 @@ mod tests {
             })
             .name("posts.show");
         router.get("/health", || async { "ok" }).name("health");
+        router
+            .post("/sessions", || async {
+                Response::json(&serde_json::json!({
+                    "user": {"name": "ada"},
+                    "access_token": "abc",
+                    "session_ticket": "Zq8mN2pL7vR4tY9wK3xB6cD1eF0gH5jT",
+                    "opaque": "Zq8mN2pL7vR4tY9wK3xB6cD1eF0gH5jT",
+                }))
+            })
+            .name("sessions.store");
         router.get("/boom", || async {
             Err::<Response, _>(rainier_support::Error::internal("db password is hunter2"))
         });
@@ -188,6 +198,68 @@ mod tests {
         let exception =
             boom.entries.iter().find(|e| e.entry_type == EntryType::Exception).expect("exception");
         assert_eq!(exception.content["type"], "HttpRequest");
+    }
+
+    #[tokio::test]
+    async fn request_and_response_bodies_are_kept_redacted_when_captured() {
+        let mut config = LookoutConfig::default().enabled(true).local(true);
+        config.capture.request_body = true;
+        config.capture.response_body = true;
+        let store = Arc::new(MemoryStore::new(10));
+        let lookout = Lookout::new(config, store.clone());
+        let kernel = kernel(&lookout, Arc::new(Dispatcher::new()));
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+
+        let answered = kernel
+            .handle_request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/sessions")
+                    .json(
+                        &serde_json::json!({"email": "ada@example.com", "new_password": "hunter2"}),
+                    )
+                    .build(),
+            )
+            .await;
+        assert_eq!(answered.status().as_u16(), 200);
+        lookout.flush().await;
+
+        let batches = store.all();
+        let root = &batches[0].entries[0].content;
+        let sent = &root["request.body"];
+        assert_eq!(sent["email"], "ada@example.com", "{root}");
+        assert_eq!(sent["new_password"], crate::redact::REDACTED, "a pattern hides it");
+        let got = &root["response.body"];
+        assert_eq!(got["user"]["name"], "ada", "{root}");
+        assert_eq!(got["access_token"], crate::redact::REDACTED);
+        assert_eq!(got["session_ticket"], crate::redact::REDACTED);
+        assert!(got["opaque"].as_str().unwrap().starts_with("Zq8m***"), "masked: {got}");
+    }
+
+    #[tokio::test]
+    async fn bodies_are_not_kept_unless_asked_for() {
+        let config = LookoutConfig::default().enabled(true).local(true);
+        let store = Arc::new(MemoryStore::new(10));
+        let lookout = Lookout::new(config, store.clone());
+        let kernel = kernel(&lookout, Arc::new(Dispatcher::new()));
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+        kernel
+            .handle_request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/sessions")
+                    .json(&serde_json::json!({"email": "ada@example.com"}))
+                    .build(),
+            )
+            .await;
+        lookout.flush().await;
+        let root = &store.all()[0].entries[0].content;
+        assert!(
+            root.get("request.body").is_none() && root.get("response.body").is_none(),
+            "{root}"
+        );
     }
 
     #[tokio::test]

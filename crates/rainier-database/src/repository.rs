@@ -348,6 +348,13 @@ impl<M> Clone for EntityRepository<M> {
 impl<E: Entity> EntityRepository<E> {
     /// A repository over `db`, with no lifecycle hooks.
     pub fn new(db: Database) -> Self {
+        // A model with `#[orm(sensitive)]` fields makes them known to whatever
+        // shows payloads, before any of its rows can be in one. Most have
+        // none, and then this is a length check.
+        let sensitive = E::sensitive_columns();
+        if !sensitive.is_empty() {
+            rainier_support::sensitive::mark(sensitive.iter().copied());
+        }
         Self { db, events: None, _model: PhantomData }
     }
 

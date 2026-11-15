@@ -73,6 +73,22 @@ pub trait FormRequest: DeserializeOwned + Send + Sync + 'static {
         true
     }
 
+    /// Fields of this request whose values must never be displayed — a
+    /// password, a recovery code. Whatever shows payloads (Lookout) hides
+    /// them at any depth, in this request and every other.
+    ///
+    /// Names Lookout already hides by default — anything with `password`,
+    /// `secret` or `token` in it, among others — need not be listed.
+    ///
+    /// ```ignore
+    /// fn sensitive() -> &'static [&'static str] {
+    ///     &["recovery_code", "pin"]
+    /// }
+    /// ```
+    fn sensitive() -> &'static [&'static str] {
+        &[]
+    }
+
     /// Messages overriding the defaults, keyed `"field.rule"`.
     fn messages() -> Vec<(&'static str, &'static str)> {
         Vec::new()
@@ -109,6 +125,13 @@ pub trait FormRequest: DeserializeOwned + Send + Sync + 'static {
     async fn validate_request(request: &Request) -> Result<Self> {
         if !Self::authorize(request).await {
             return Err(Error::unauthorized("This action is unauthorized."));
+        }
+
+        // Before anything could record the payload: the writer that shows it
+        // runs after the request has ended.
+        let sensitive = Self::sensitive();
+        if !sensitive.is_empty() {
+            rainier_support::sensitive::mark(sensitive.iter().copied());
         }
 
         let input = Self::validation_data(request);

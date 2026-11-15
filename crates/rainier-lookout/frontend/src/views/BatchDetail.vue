@@ -48,6 +48,20 @@ const counts = computed(() => {
   return Object.entries(out)
 })
 
+// What the request carried and what it answered, when Lookout was asked to
+// keep them (LOOKOUT_CAPTURE_REQUEST_HEADERS / _REQUEST_BODY / _RESPONSE_BODY),
+// already redacted on the server.
+const payload = computed(() => {
+  const root = batch.value ? batch.value.entries.find((e) => e.type === 'request') : null
+  const c = root && root.content && typeof root.content === 'object' ? root.content : {}
+  const parts = [
+    ['Request headers', c['request.headers']],
+    ['Request body', c['request.body']],
+    ['Response body', c['response.body']],
+  ].filter(([, value]) => value !== undefined && value !== null)
+  return parts
+})
+
 const entry = computed(() =>
   batch.value && selected.value ? batch.value.entries.find((e) => e.id === selected.value) : null,
 )
@@ -149,6 +163,19 @@ onMounted(async () => {
             </dd>
           </div>
         </dl>
+      </section>
+
+      <section v-if="payload.length" class="lk-card">
+        <header class="lk-card-header">
+          <h2 class="text-sm font-semibold">Payload</h2>
+          <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">redacted: sensitive fields hidden, secret-looking values starred</span>
+        </header>
+        <div class="space-y-4 p-4">
+          <div v-for="[label, value] in payload" :key="label">
+            <h3 class="lk-th mb-1.5">{{ label }}</h3>
+            <Json :value="value" />
+          </div>
+        </div>
       </section>
 
       <section v-if="related.length" class="lk-card">

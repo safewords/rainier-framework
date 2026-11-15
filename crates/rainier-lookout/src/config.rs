@@ -172,6 +172,20 @@ pub struct Capture {
     pub request_headers: bool,
     /// The request body — only for batches with an exception.
     pub request_body_on_exception: bool,
+    /// The request body, for every kept batch. Parsed (JSON or a form) and
+    /// redacted on the writer, after the request has ended; up to
+    /// [`max_body_bytes`](Self::max_body_bytes).
+    #[serde(default)]
+    pub request_body: bool,
+    /// The response body, for every kept batch: JSON and text, redacted like
+    /// the request's; a streamed or binary body is noted by its size and type,
+    /// not kept.
+    #[serde(default)]
+    pub response_body: bool,
+    /// The most of a body kept, in bytes. What is beyond it is cut before it
+    /// is ever parsed.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
     /// Cache keys.
     pub cache_keys: bool,
     /// Mail subjects and recipients.
@@ -200,11 +214,18 @@ fn yes() -> bool {
     true
 }
 
+fn default_max_body_bytes() -> usize {
+    64 * 1024
+}
+
 impl Default for Capture {
     fn default() -> Self {
         Self {
             request_headers: false,
             request_body_on_exception: false,
+            request_body: false,
+            response_body: false,
+            max_body_bytes: default_max_body_bytes(),
             cache_keys: false,
             mail: false,
             user_id: false,
@@ -221,8 +242,40 @@ pub struct Redaction {
     pub headers: BTreeSet<String>,
     /// Body and payload field names, case-insensitive.
     pub fields: BTreeSet<String>,
+    /// Field names are also redacted when they **contain** one of these,
+    /// case-insensitive: `password` covers `new_password` and
+    /// `password_confirmation` without listing each.
+    #[serde(default = "default_field_patterns")]
+    pub field_patterns: BTreeSet<String>,
+    /// Star out any other string that looks like a secret — long, one word,
+    /// from a token's alphabet, and random enough. See
+    /// [`redact::mask_secret`](crate::redact::mask_secret).
+    #[serde(default = "yes")]
+    pub mask_secrets: bool,
     /// Longest value kept, in bytes; longer ones are truncated.
     pub max_value_len: usize,
+}
+
+/// Substrings that make a field name sensitive wherever they appear in it.
+fn default_field_patterns() -> BTreeSet<String> {
+    [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "private_key",
+        "credential",
+        "verifier",
+        "signature",
+        "authorization",
+        "session_ticket",
+        "recovery_code",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 impl Default for Redaction {
@@ -245,10 +298,18 @@ impl Default for Redaction {
             "api_key",
             "card_number",
             "cvc",
+            "cvv",
+            "ssn",
+            "pin",
+            "otp",
+            "code",
+            "handoff",
         ];
         Self {
             headers: headers.iter().map(|s| s.to_string()).collect(),
             fields: fields.iter().map(|s| s.to_string()).collect(),
+            field_patterns: default_field_patterns(),
+            mask_secrets: true,
             max_value_len: 2048,
         }
     }
@@ -536,7 +597,9 @@ impl LookoutConfig {
     /// | `LOOKOUT_LOG_LEVEL` | [`log_level`](Self::log_level) | one of [`LOG_LEVELS`] |
     /// | `LOOKOUT_RETENTION_HOURS` | [`Retention::batches_hours`] | a positive integer |
     /// | `LOOKOUT_AGGREGATE_RETENTION_DAYS` | [`Retention::aggregates_days`] | a positive integer |
-    /// | `LOOKOUT_CAPTURE_REQUEST_HEADERS`, `…_REQUEST_BODY_ON_EXCEPTION`, `…_CACHE_KEYS`, `…_MAIL`, `…_USER_ID`, `…_CLIENT_ERRORS`, `…_CODE_TRACES` | [`Capture`] | booleans |
+    /// | `LOOKOUT_CAPTURE_REQUEST_HEADERS`, `…_REQUEST_BODY`, `…_RESPONSE_BODY`, `…_REQUEST_BODY_ON_EXCEPTION`, `…_CACHE_KEYS`, `…_MAIL`, `…_USER_ID`, `…_CLIENT_ERRORS`, `…_CODE_TRACES` | [`Capture`] | booleans |
+    /// | `LOOKOUT_CAPTURE_MAX_BODY_BYTES` | [`Capture::max_body_bytes`] | a positive integer |
+    /// | `LOOKOUT_MASK_SECRETS` | [`Redaction::mask_secrets`] | a boolean |
     /// | `LOOKOUT_INSIGHTS_ENABLED` | [`InsightsConfig::enabled`](crate::trends::InsightsConfig) | a boolean |
     /// | `LOOKOUT_INSIGHTS_WINDOW_MINUTES` | the window compared with the one before | a positive integer |
     /// | `LOOKOUT_INSIGHTS_MIN_COUNT` | how many a key needs before it is reported | a positive integer |
@@ -631,8 +694,11 @@ impl LookoutConfig {
                 parse_positive("LOOKOUT_AGGREGATE_RETENTION_DAYS", &v)?;
         }
 
-        let flags: [(&str, &mut bool); 7] = [
+        let flags: [(&str, &mut bool); 10] = [
             ("LOOKOUT_CAPTURE_REQUEST_HEADERS", &mut config.capture.request_headers),
+            ("LOOKOUT_CAPTURE_REQUEST_BODY", &mut config.capture.request_body),
+            ("LOOKOUT_CAPTURE_RESPONSE_BODY", &mut config.capture.response_body),
+            ("LOOKOUT_MASK_SECRETS", &mut config.redaction.mask_secrets),
             (
                 "LOOKOUT_CAPTURE_REQUEST_BODY_ON_EXCEPTION",
                 &mut config.capture.request_body_on_exception,
@@ -647,6 +713,10 @@ impl LookoutConfig {
             if let Some(v) = get(name) {
                 *slot = parse_bool(name, &v)?;
             }
+        }
+        if let Some(v) = get("LOOKOUT_CAPTURE_MAX_BODY_BYTES") {
+            config.capture.max_body_bytes =
+                parse_positive("LOOKOUT_CAPTURE_MAX_BODY_BYTES", &v)? as usize;
         }
 
         if let Some(v) = get("LOOKOUT_INSIGHTS_ENABLED") {
