@@ -127,6 +127,18 @@ impl SharedRedis {
         self.settle(outcome)
     }
 
+    /// Run a pipeline and decode its replies. A connection failure drops the
+    /// connection for the next call to replace.
+    ///
+    /// The commands have to share a hash slot when this talks to a cluster:
+    /// the whole pipeline goes to the node that owns the first key, and a
+    /// second slot is an error rather than a split.
+    pub async fn query_pipeline<T: FromRedisValue>(&self, pipeline: &redis::Pipeline) -> Result<T> {
+        let mut connection = self.connection().await?;
+        let outcome = connection.query_pipeline_raw(pipeline).await;
+        self.settle(outcome)
+    }
+
     /// Run a command, ignoring its reply.
     pub async fn run(&self, command: &Cmd) -> Result<()> {
         self.query::<redis::Value>(command).await.map(|_| ())

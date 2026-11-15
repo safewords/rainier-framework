@@ -420,6 +420,24 @@ impl RedisConnection {
         }
     }
 
+    /// Run a pipeline and decode its replies.
+    ///
+    /// On a cluster every key in the pipeline has to share a slot: the client
+    /// sends the whole pipeline to the node that owns the first key, and a
+    /// second slot is a cross-slot error rather than a split. Commands for one
+    /// hash tag are one slot.
+    pub(crate) async fn query_pipeline_raw<T: FromRedisValue>(
+        &mut self,
+        pipeline: &redis::Pipeline,
+    ) -> redis::RedisResult<T> {
+        match self {
+            RedisConnection::Single(connection) => pipeline.query_async(connection).await,
+            RedisConnection::Reconnecting(connection) => pipeline.query_async(connection).await,
+            #[cfg(feature = "redis-cluster")]
+            RedisConnection::Cluster(connection) => pipeline.query_async(connection).await,
+        }
+    }
+
     /// Run `script` with `keys` and `args`: by its hash, falling back to its
     /// source when the server has not seen it.
     ///

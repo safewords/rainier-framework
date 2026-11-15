@@ -17,6 +17,9 @@ the release as a whole and names the crate it landed in.
   as a write. An empty slice writes nothing. An auto-increment key stays the
   database's, and a shard key is not minted — a row that needs one still goes
   through `repo::insert`.
+- **`SharedRedis::query_pipeline`** (`rainier-drivers`): run several commands
+  on one connection and decode the replies together. On a cluster they have
+  to share a hash slot; a second slot is an error rather than a split.
 
 - **Lookout percentiles over the whole range** (`rainier-lookout`): every
   aggregate bucket keeps a duration histogram, four slots per doubling, so
