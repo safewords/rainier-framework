@@ -24,8 +24,14 @@ use rainier_lookout::store::conformance;
 use rainier_lookout::DatabaseStore;
 use rainier_orm::PoolConfig;
 
-const TABLES: &[&str] =
-    &["lookout_entries", "lookout_batch_tags", "lookout_aggregates", "lookout_batches"];
+const TABLES: &[&str] = &[
+    "lookout_entries",
+    "lookout_batch_tags",
+    "lookout_aggregates",
+    "lookout_aggregate_histograms",
+    "lookout_cases",
+    "lookout_batches",
+];
 
 fn servers() -> Vec<String> {
     let urls = std::env::var("LOOKOUT_TEST_DATABASE_URLS")
@@ -56,11 +62,8 @@ async fn the_database_store_conforms_on_a_real_server() {
         let scheme = url.split("://").next().unwrap_or("?").to_string();
         let db = fresh(&url).await;
 
-        assert_eq!(
-            DatabaseStore::migrations().run(&db).await.expect("migrate").len(),
-            6,
-            "[{scheme}]"
-        );
+        let applied = DatabaseStore::migrations().run(&db).await.expect("migrate");
+        assert_eq!(applied.len(), DatabaseStore::migrations().names().len(), "[{scheme}]");
         assert!(
             DatabaseStore::migrations().run(&db).await.expect("migrate again").is_empty(),
             "[{scheme}]"
