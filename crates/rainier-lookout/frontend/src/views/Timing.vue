@@ -138,6 +138,10 @@ const columns = computed(() => [
   { key: 'share', label: 'Share', title: 'Its part of all the time spent in what is shown', sortable: true, value: share, text: (r) => percent(share(r)) },
   { key: 'trend', label: 'Trend', title: `Count per bucket over the last ${range.value.key} (the 50 busiest)`, text: () => '' },
 ])
+// Beside the latest list there is room for what tells routes apart; every
+// column is on the route's own page.
+const COMPACT = ['key', 'count', 'average', 'p95', 'p99', 'share', 'trend']
+const compactColumns = computed(() => columns.value.filter((c) => COMPACT.includes(c.key)))
 
 // --- Chart: count, and time (average and percentiles), with the forecast.
 
@@ -245,17 +249,20 @@ const bucketLabel = computed(() => {
       </div>
     </section>
 
-    <section class="lk-card">
+    <!-- The routes and the latest requests side by side: what is slow in
+         general, and what just happened, without leaving the page. -->
+    <div class="grid items-start gap-5 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
+    <section class="lk-card min-w-0">
       <header class="lk-card-header">
         <h2 class="text-sm font-semibold">Every {{ kind.thing.toLowerCase() }}</h2>
-        <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">the 100 busiest {{ kind.things }} in the last {{ range.key }} · opens its issue page</span>
+        <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">busiest {{ range.key }} · opens its page</span>
       </header>
       <DataTable
-        :columns="columns"
+        :columns="compactColumns"
         :rows="rows"
         :row-key="(r) => r.key"
         :to="(r) => issueRoute(type, r.key)"
-        :initial-sort="{ key: 'total', dir: 'desc' }"
+        :initial-sort="{ key: 'share', dir: 'desc' }"
         filterable
         :filter-placeholder="`Filter ${kind.things}…`"
         :loading="loading"
@@ -277,17 +284,16 @@ const bucketLabel = computed(() => {
       </DataTable>
     </section>
 
-    <section class="space-y-3">
-      <div class="flex flex-wrap items-baseline gap-2">
-        <h2 class="text-base font-semibold">Latest {{ kind.units }}</h2>
+    <section class="lk-card min-w-0">
+      <header class="lk-card-header">
+        <h2 class="text-sm font-semibold">Latest {{ kind.units }}</h2>
         <router-link
           :to="{ name: 'batches', query: { kind: kind.batchKind } }"
-          class="ml-auto text-sm text-indigo-600 hover:underline dark:text-indigo-400"
-        >All {{ kind.units }}, with filters →</router-link>
-      </div>
-      <div class="lk-card">
-        <BatchList :batches="batches" :loading="loading" :label="`Latest ${kind.units}`" :empty="`No ${kind.units} recorded.`" />
-      </div>
+          class="ml-auto text-xs text-indigo-600 hover:underline dark:text-indigo-400"
+        >all, with filters →</router-link>
+      </header>
+      <BatchList :batches="batches" :loading="loading" :label="`Latest ${kind.units}`" :empty="`No ${kind.units} recorded.`" />
     </section>
+    </div>
   </div>
 </template>
