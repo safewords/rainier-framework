@@ -200,7 +200,9 @@ The framework's reporter puts every error on the event bus, a `404` or a
 `422` included, because some listener may want them. Lookout does not: a
 request answered with a client error is recorded with its status, but it adds
 no exception entry, does not flag the batch as failed, and does not open a
-[case](#cases). `LOOKOUT_CAPTURE_CLIENT_ERRORS=true` records them. A client
+[case](#cases). A WebSocket whose handler refused its client with a client
+error — a revoked token, a channel it may not join — is treated the same way.
+`LOOKOUT_CAPTURE_CLIENT_ERRORS=true` records them. A client
 error inside a job or a command — a `NotFound` for a row that should exist —
 is always recorded: there it is the application's fault.
 

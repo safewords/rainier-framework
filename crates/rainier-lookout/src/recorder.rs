@@ -2257,6 +2257,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_websocket_refusing_its_client_is_not_a_failure_unless_asked_for() {
+        use rainier_events::report::WebSocketFailed;
+
+        let refused = || -> rainier_events::report::Failure {
+            WebSocketFailed::new(Error::unauthorized("revoked"), "1", "/socket", "connect").into()
+        };
+
+        let quiet = rig(local());
+        quiet.lookout.record_failure(&refused());
+        quiet.lookout.flush().await;
+        assert!(quiet.store.all().is_empty(), "a refused client is not a failure");
+
+        let mut config = local();
+        config.capture.client_errors = true;
+        let loud = rig(config);
+        loud.lookout.record_failure(&refused());
+        loud.lookout.flush().await;
+        let batches = loud.store.all();
+        assert_eq!(batches.len(), 1, "{batches:#?}");
+        assert!(batches[0].has_exception, "recorded when asked for");
+
+        // A socket that failed on the server's side is still a failure.
+        let rig = rig(local());
+        let broken: rainier_events::report::Failure =
+            WebSocketFailed::new(Error::internal("boom"), "2", "/socket", "message").into();
+        rig.lookout.record_failure(&broken);
+        rig.lookout.flush().await;
+        assert_eq!(rig.store.all().len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_parked_batch_nobody_claims_is_released_on_flush() {
         let rig = rig(local());
         request("/posts/1", 500, || {});

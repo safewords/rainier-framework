@@ -81,8 +81,11 @@ impl Lookout {
             return;
         }
         // A 404 or a 422 is the client's mistake, not a failure of the
-        // application — unless it was asked for.
-        if matches!(failure, Failure::HttpRequest(_))
+        // application — unless it was asked for. A socket whose handler
+        // refused the client (a revoked token, a channel it may not join) is
+        // the same refusal over a WebSocket, and became a case per refusal
+        // before it was treated as one.
+        if matches!(failure, Failure::HttpRequest(_) | Failure::WebSocket(_))
             && failure.exception().is_client_error()
             && !inner.config.capture.client_errors
         {
