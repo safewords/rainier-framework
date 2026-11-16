@@ -28,6 +28,8 @@ the release as a whole and names the crate it landed in.
   keeps the slots in a new `lookout_aggregate_histograms` table (migration
   `rainier_lookout_0007_aggregate_histograms`), incremented atomically like
   the counts; the memory and cache stores keep them in the aggregate.
+- **Lookout's Slow page filters by type.** The list mixes queries, outgoing
+  calls and the rest of what ran slow; a Type menu shows one kind on its own.
 - **Lookout Requests and Jobs pages**: one page each, grouped by route and by
   job class, with totals and p50/p90/p95/p99 over everything at the top, the
   same figures per route or job class in the table, and the latest batches

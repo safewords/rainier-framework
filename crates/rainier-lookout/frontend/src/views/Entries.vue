@@ -16,12 +16,36 @@ const props = defineProps({ type: { type: String, required: true } })
 const PAGE = 100
 
 const entries = ref([])
+const slowType = ref('')
 const next = ref(null)
 const loading = ref(true)
 const more = ref(false)
 const error = ref(null)
 
 const title = computed(() => TYPES[props.type] || props.type)
+
+// Slow entries are one list of several kinds of work. The type filter
+// narrows that list by the kind that was slow, and nothing else.
+const slowTypes = computed(() => {
+  if (props.type !== 'slow') return []
+  const seen = new Set()
+  for (const entry of entries.value) {
+    const kind = slowParts(entry).of
+    if (kind) seen.add(kind)
+  }
+  return [...seen].sort((a, b) => (TYPES[a] || a).localeCompare(TYPES[b] || b))
+})
+const visible = computed(() => {
+  if (props.type !== 'slow' || !slowType.value) return entries.value
+  return entries.value.filter((entry) => slowParts(entry).of === slowType.value)
+})
+const emptyText = computed(() => {
+  if (props.type === 'slow' && slowType.value) {
+    const name = TYPES[slowType.value] || slowType.value
+    return `No slow ${name.toLowerCase()} in the entries loaded.`
+  }
+  return `No ${title.value.toLowerCase()} recorded.`
+})
 
 function text(content, keys) {
   if (!content || typeof content !== 'object') return null
@@ -331,9 +355,18 @@ usePolling(refresh)
 
 <template>
   <div class="space-y-5">
-    <div>
-      <h1 class="text-xl font-semibold tracking-tight">{{ title }}</h1>
-      <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Newest first, across every request and job kept.</p>
+    <div class="flex flex-wrap items-end justify-between gap-3">
+      <div>
+        <h1 class="text-xl font-semibold tracking-tight">{{ title }}</h1>
+        <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Newest first, across every request and job kept.</p>
+      </div>
+      <label v-if="type === 'slow'" class="block text-sm">
+        <span class="lk-th">Type</span>
+        <select v-model="slowType" class="lk-input mt-1 w-48" aria-label="Filter by type">
+          <option value="">All types</option>
+          <option v-for="kind in slowTypes" :key="kind" :value="kind">{{ TYPES[kind] || kind }}</option>
+        </select>
+      </label>
     </div>
 
     <ErrorBox :error="error" />
@@ -383,13 +416,13 @@ usePolling(refresh)
       </header>
       <DataTable
         :columns="columns"
-        :rows="entries"
+        :rows="visible"
         :row-key="rowKey"
         :to="toBatch"
         :loading="loading"
         filterable
         :filter-placeholder="`Filter these ${title.toLowerCase()}…`"
-        :empty="`No ${title.toLowerCase()} recorded.`"
+        :empty="emptyText"
         :label="title"
       >
         <template #cell-sql="{ row }">{{ type === 'n_plus_one' ? nPlusOne(row).sql : row.summary }}</template>
