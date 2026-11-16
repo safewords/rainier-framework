@@ -172,7 +172,7 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// fails is a dependency that is briefly unavailable, and retrying at full
     /// speed makes that worse.
     fn backoff(attempt: u32) -> Duration {
-        Duration::from_secs(1u64 << attempt.min(6))
+        default_backoff(attempt)
     }
 
     /// Called after the final attempt fails. For recording the failure
@@ -447,6 +447,12 @@ pub struct JobRegistry {
     /// the type: without this the trait's constant would be unreachable from
     /// the only place that could act on it.
     timeouts: HashMap<String, Duration>,
+    /// Each job's own [`Job::backoff`], by name — for the same reason as
+    /// `timeouts`: the worker has the name and never the type. Without it
+    /// every job retried on the default curve whatever it declared, and a job
+    /// that meant "retry hourly for three days" exhausted its tries in under
+    /// two hours.
+    backoffs: HashMap<String, fn(u32) -> Duration>,
     /// Each job's Kubernetes spec extractor. Only present for job types
     /// whose [`Job::kubernetes`](Job::kubernetes) ever returned `Some` on
     /// a sample payload during registration (see
@@ -466,6 +472,11 @@ pub struct JobRegistry {
     /// its jobs, which is the only ordering that carries intent. Sorting would
     /// silently reprioritise.
     queues: Vec<String>,
+}
+
+/// [`Job::backoff`]'s default: 1s, 2s, 4s, …, capped at 64s.
+pub(crate) fn default_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << attempt.min(6))
 }
 
 impl JobRegistry {
@@ -539,6 +550,8 @@ impl JobRegistry {
             self.timeouts.insert(J::NAME.to_string(), timeout);
         }
 
+        self.backoffs.insert(J::NAME.to_string(), J::backoff as fn(u32) -> Duration);
+
         // Record a spec extractor so the worker can ask, by name, whether
         // this job wants a Kubernetes pod. Each extractor deserialises the
         // payload and asks the typed job; the worker never has to touch J.
@@ -569,6 +582,19 @@ impl JobRegistry {
     /// `None` means the job did not state one and the worker's limit applies.
     pub fn timeout_for(&self, name: &str) -> Option<Duration> {
         self.timeouts.get(name).copied()
+    }
+
+    /// How long to wait before retrying `name` after `attempts` failures —
+    /// its own [`Job::backoff`].
+    ///
+    /// A name nothing registered gets the trait's default curve; the worker
+    /// cannot run such a job anyway, so this only decides how soon it says so
+    /// again.
+    pub fn backoff_for(&self, name: &str, attempts: u32) -> Duration {
+        match self.backoffs.get(name) {
+            Some(backoff) => backoff(attempts),
+            None => default_backoff(attempts),
+        }
     }
 
     /// The Kubernetes spec `name` returns for `payload`, if it opts in.

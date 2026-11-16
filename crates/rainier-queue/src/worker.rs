@@ -1413,7 +1413,7 @@ impl Worker {
 
         // `attempts` counts what has been tried, so the backoff for the *next*
         // attempt is indexed by it directly.
-        let delay = backoff_for(job.attempts);
+        let delay = self.registry.backoff_for(&job.name, job.attempts.max(1));
         ran.backoff = Some(delay);
         if let Err(error) = settle!("queue.release", "release", self.queue.release(&job, delay)) {
             self.report_operation("release", Some(&job), &error).await;
@@ -1494,15 +1494,6 @@ impl Worker {
 #[cfg_attr(not(feature = "kubernetes"), allow(dead_code))]
 fn kubernetes_attempt(job: &QueuedJob) -> u32 {
     job.attempts.max(1)
-}
-
-/// The retry delay after `attempts` failures: 1s, 2s, 4s, …, capped at 64s.
-///
-/// The per-job [`Job::backoff`](crate::Job::backoff) cannot be consulted here —
-/// the worker has only the job's *name*, not its type — so this mirrors the
-/// same default curve.
-fn backoff_for(attempts: u32) -> Duration {
-    Duration::from_secs(1u64 << attempts.clamp(1, 6))
 }
 
 /// A future that turns a panic in the inner future into an `Err` instead of
@@ -2994,11 +2985,13 @@ mod tests {
     }
 
     #[test]
-    fn the_backoff_curve_grows_and_levels_off() {
-        assert_eq!(backoff_for(1), Duration::from_secs(2));
-        assert_eq!(backoff_for(2), Duration::from_secs(4));
-        assert_eq!(backoff_for(6), Duration::from_secs(64));
-        assert_eq!(backoff_for(50), Duration::from_secs(64), "capped");
+    fn a_job_without_its_own_backoff_retries_on_the_default_curve() {
+        let registry = registry();
+        assert_eq!(registry.backoff_for(Flaky::NAME, 1), Duration::from_secs(2));
+        assert_eq!(registry.backoff_for(Flaky::NAME, 2), Duration::from_secs(4));
+        assert_eq!(registry.backoff_for(Flaky::NAME, 6), Duration::from_secs(64));
+        assert_eq!(registry.backoff_for(Flaky::NAME, 50), Duration::from_secs(64), "capped");
+        assert_eq!(registry.backoff_for("never.registered", 1), Duration::from_secs(2));
     }
 
     // --- a broker that fails ------------------------------------------------
@@ -3238,6 +3231,12 @@ mod telemetry_tests {
         const NAME: &'static str = "billing.charge";
         const TRIES: u32 = 2;
 
+        // Not the default curve, so the release below shows the worker asked
+        // this job rather than assuming.
+        fn backoff(attempt: u32) -> Duration {
+            Duration::from_secs(3600 * u64::from(attempt))
+        }
+
         async fn handle(&self, _: &JobContext) -> Result<()> {
             if self.card_number == "traced" {
                 *SEEN_TRACE.lock().unwrap() = rainier_telemetry::propagation::current();
@@ -3336,7 +3335,7 @@ mod telemetry_tests {
 
         let finished = observer.finished.lock().unwrap().clone();
         assert_eq!(finished[0].outcome, JobOutcome::Released);
-        assert_eq!(finished[0].backoff, Some(backoff_for(1)));
+        assert_eq!(finished[0].backoff, Some(Duration::from_secs(3600)), "the job's own backoff");
         assert_eq!(finished[1].outcome, JobOutcome::Failed);
         assert_eq!(finished[1].attempt, 2);
     }
