@@ -764,12 +764,14 @@ the release as a whole and names the crate it landed in.
 
 ### Fixed
 
+- Lookout's dashboard tiles show the whole headline number. A long count
+  shrinks to fit the tile instead of being cut off with an ellipsis, and the
+  sparkline sits under the number so it does not take the number's width.
 - **A WebSocket refusing its client is not a Lookout case** (`rainier-lookout`):
   a handler that refuses a client with a client error — a `401` for a revoked
   token — no longer opens a case per refusal. It follows the same rule as an
   HTTP client error: recorded only with `LOOKOUT_CAPTURE_CLIENT_ERRORS=true`.
   A socket that fails on the server's side is still recorded.
-
 - **A session that was only read is no longer written back** (`rainier-session`):
   `StartSession` wrote every non-empty session back at the end of every
   request, so a background request that read the session before a logout and
