@@ -569,6 +569,9 @@ the release as a whole and names the crate it landed in.
 
 ### Changed
 
+- Lookout's dashboard draws request throughput and average request time on
+  one chart: requests per minute on the left axis, mean duration on the
+  right, each with its forecast.
 - **Lookout's cache store no longer rewrites every bucket and case on every
   write** (`rainier-lookout`). Each aggregate bucket used to be listed in one
   `lookout:buckets` key and every case kept in one `lookout:cases` key, both

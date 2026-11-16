@@ -176,19 +176,16 @@ function projected(s, pick, last) {
   return tail && last ? [{ t: tail.bucket_start, v: last(tail) }, ...points] : points
 }
 
-const throughputChart = computed(() => {
+// Throughput and average time share one chart: requests per minute on the
+// left axis, mean duration on the right, each with its own forecast.
+const requestChart = computed(() => {
   const s = series.request
   const f = perMinute(s)
   return [
     { label: 'Requests / min', color: 'indigo', points: actual(s, (p) => p.count * f) },
-    { label: 'Forecast', color: 'indigo', dashed: true, points: projected(s, (p) => p.count * f, (p) => p.count * f) },
-  ]
-})
-const requestTimeChart = computed(() => {
-  const s = series.request
-  return [
-    { label: 'Avg request time', color: 'emerald', points: actual(s, (p) => p.average_us, true) },
-    { label: 'Forecast', color: 'emerald', dashed: true, points: projected(s, (p) => p.average_us, (p) => p.average_us) },
+    { label: 'Throughput forecast', color: 'indigo', dashed: true, points: projected(s, (p) => p.count * f, (p) => p.count * f) },
+    { label: 'Avg request time', color: 'emerald', axis: 'right', points: actual(s, (p) => p.average_us, true) },
+    { label: 'Time forecast', color: 'emerald', axis: 'right', dashed: true, points: projected(s, (p) => p.average_us, (p) => p.average_us) },
   ]
 })
 const exceptionChart = computed(() => {
@@ -330,19 +327,14 @@ function insightLink(i) {
     </div>
 
     <div class="grid gap-4 md:grid-cols-2">
-      <section class="lk-card min-w-0">
+      <section class="lk-card min-w-0 md:col-span-2">
         <header class="lk-card-header">
-          <h2 class="text-sm font-semibold">Request throughput</h2>
-          <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">requests per minute, {{ bucketLabel }} buckets · dashed: forecast</span>
+          <h2 class="text-sm font-semibold">Requests</h2>
+          <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">per minute on the left, average time on the right · {{ bucketLabel }} buckets · dashed: forecast</span>
         </header>
-        <div class="p-4"><LineChart :series="throughputChart" :format="perMin" :height="160" /></div>
-      </section>
-      <section class="lk-card min-w-0">
-        <header class="lk-card-header">
-          <h2 class="text-sm font-semibold">Average request time</h2>
-          <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">mean per bucket · dashed: forecast</span>
-        </header>
-        <div class="p-4"><LineChart :series="requestTimeChart" :format="time" :height="160" /></div>
+        <div class="p-4">
+          <LineChart :series="requestChart" :format="perMin" :format-right="time" :height="200" />
+        </div>
       </section>
       <section class="lk-card min-w-0">
         <header class="lk-card-header">

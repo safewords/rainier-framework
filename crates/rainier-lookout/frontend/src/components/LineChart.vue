@@ -247,7 +247,7 @@ const summary = computed(() => {
         <svg viewBox="0 0 16 4" class="h-1 w-4" aria-hidden="true">
           <line x1="0" y1="2" x2="16" y2="2" stroke-width="2.5" :stroke-dasharray="s.dashed ? '3 2' : null" :class="COLORS[s.color][0]" />
         </svg>
-        {{ s.label }}<span v-if="hasRight" class="text-zinc-400 dark:text-zinc-500">({{ s.axis }})</span>
+        {{ s.label }}
       </li>
     </ul>
     <div ref="root" class="relative w-full" :style="{ height: `${height}px` }">
