@@ -256,6 +256,10 @@
     if (!replaySettings.enabled || replay.started || excluded(location.pathname)) return
     if (typeof CompressionStream !== 'function') return
     replay.started = true
+    // A visitor recorded whole has agreed to it: their page view and its API
+    // calls are reported whole too, so the session's timeline matches what
+    // the replay shows, rather than only when this page view was sampled.
+    if (always) sampled = true
     var s = document.createElement('script')
     s.src = new URL('rum-replay.js?v=' + (replaySettings.recorder || ''), self.href).href
     s.async = true

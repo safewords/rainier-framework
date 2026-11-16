@@ -106,7 +106,10 @@ const failed = (b) => (b.status && b.status >= 400) || b.has_exception
     </div>
 
     <ErrorBox :error="error" />
-    <Empty v-if="!loading && !timeline.length && !error">Nothing recorded for this session.</Empty>
+    <Empty v-if="!loading && !timeline.length && !replays.length && !error">Nothing recorded for this session.</Empty>
+    <p v-else-if="!loading && !timeline.length && replays.length" class="text-sm text-zinc-500 dark:text-zinc-400">
+      Only the replay: this session's page views were not sampled for timing.
+    </p>
 
     <ReplayPlayer v-if="replays.length" :ids="replays.map((r) => r.id)" title="Replay of the session" />
 
