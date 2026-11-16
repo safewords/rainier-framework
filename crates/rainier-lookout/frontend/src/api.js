@@ -55,11 +55,11 @@ export const api = {
   // params: kind, type, route, user, tag, trace, exception, slow, q (search), before, limit
   batches: (params) => request('GET', '/batches', params),
   batch: (id) => request('GET', `/batches/${path(id)}`),
-  // params: before, limit, key (one family), q (search summary/key)
+  // params: before, limit, family (16 hex; preferred), key (one family), q
   entries: (type, params) => request('GET', `/entries/${path(type)}`, params),
   // params: period (60|600|3600), since (RFC 3339), order (count|average|max), limit
   aggregates: (type, params) => request('GET', `/aggregates/${path(type)}`, params),
-  // params: since, period?, key?, keys (N busiest keys' own series), forecast (buckets)
+  // params: since, until?, period?, family? (16 hex; preferred over key), key?, keys, forecast
   // -> { data: [{bucket_start,count,sum_us,max_us,average_us}], forecast: [{bucket_start,count,average_us}], period, keys: {key: points} }
   series: (type, params) => request('GET', `/series/${path(type)}`, params),
   // params: window (minutes), min, change (percent), forecast, limit

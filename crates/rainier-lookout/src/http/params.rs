@@ -87,6 +87,17 @@ impl<'a> Params<'a> {
         }
     }
 
+    /// A family's 16 hex digits (`family`).
+    pub(crate) fn family_id(&mut self) -> Option<String> {
+        let value = self.raw("family")?;
+        if value.len() == 16 && value.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(value.to_ascii_lowercase())
+        } else {
+            self.fail("family", "The family must be 16 hexadecimal digits.");
+            None
+        }
+    }
+
     pub(crate) fn integer(&mut self, field: &str, min: u64, max: u64) -> Option<u64> {
         let value = self.raw(field)?;
         match value.parse::<u64>() {
@@ -176,6 +187,8 @@ pub(crate) fn batch_query(params: &mut Params<'_>) -> BatchQuery {
 pub(crate) struct EntriesQuery {
     pub(crate) before: Option<DateTime<Utc>>,
     pub(crate) limit: usize,
+    /// One family by its 16-digit id. Wins over `key`.
+    pub(crate) family: Option<String>,
     /// One family: `key`.
     pub(crate) key: Option<String>,
     /// Text in the summary or the family key: `q`.
@@ -187,6 +200,7 @@ pub(crate) fn entries_query(params: &mut Params<'_>) -> EntriesQuery {
     EntriesQuery {
         before: params.time("before"),
         limit: params.limit(MAX_LIMIT, DEFAULT_LIMIT),
+        family: params.family_id(),
         key: params.raw("key"),
         search: params.text("q"),
     }
@@ -199,7 +213,10 @@ pub(crate) struct SeriesQuery {
     pub(crate) since: DateTime<Utc>,
     /// Through when. `None` runs the series up to now.
     pub(crate) until: Option<DateTime<Utc>>,
-    /// Only this family.
+    /// Only this family, named by its 16-digit id rather than its key.
+    pub(crate) family: Option<String>,
+    /// Only this family, by its key. Ignored when `family` is set, so a query
+    /// string does not have to carry the SQL.
     pub(crate) key: Option<String>,
     /// Also a series for each of the busiest keys, at most this many.
     pub(crate) keys: usize,
@@ -248,10 +265,20 @@ pub(crate) fn series_query(
     if end >= since && span.num_seconds() / i64::from(period_s) > 2000 {
         params.fail("since", "That is more than 2000 buckets; use a longer period.");
     }
+    let family = params.family_id();
     let key = params.raw("key");
     let keys = params.integer("keys", 0, 50).unwrap_or(0) as usize;
     let forecast = params.integer("forecast", 0, 100).map_or(default_forecast, |n| n as usize);
-    Some(SeriesQuery { entry_type: entry_type?, period_s, since, until, key, keys, forecast })
+    Some(SeriesQuery {
+        entry_type: entry_type?,
+        period_s,
+        since,
+        until,
+        family,
+        key,
+        keys,
+        forecast,
+    })
 }
 
 /// `GET /api/insights`: the configured thresholds, each overridable.

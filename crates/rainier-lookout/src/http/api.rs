@@ -53,16 +53,19 @@ pub(crate) async fn batch(state: Arc<Shared>, request: Req) -> Result<Response> 
     }
 }
 
-/// `GET /api/entries/{type}`: newest first; `key` narrows to one family,
-/// `q` to entries whose summary or family key contains the text.
+/// `GET /api/entries/{type}`: newest first; `family` (or `key`) narrows to
+/// one family, `q` to entries whose summary or family key contains the text.
 pub(crate) async fn entries(state: Arc<Shared>, request: Req) -> Result<Response> {
     let mut params = Params::new(request.query());
     let entry_type = params.parse_type("type", request.route_param("type").unwrap_or_default());
-    let query = params::entries_query(&mut params);
+    let mut query = params::entries_query(&mut params);
     params.finish()?;
     let Some(entry_type) = entry_type else {
         return Err(Error::internal("validated entry type missing"));
     };
+    if let Some(id) = query.family.clone() {
+        query.key = Some(require_family(&state, entry_type, &id).await?);
+    }
     let limit = query.limit;
     let Some(search) = query.search.map(|q| q.to_lowercase()) else {
         let found = match &query.key {
@@ -121,10 +124,6 @@ fn aggregate_json(row: &Aggregate) -> Value {
 }
 
 /// `GET /api/families/{type}/{id}`: the key a [`family_id`] names.
-///
-/// From the aggregates of the retention window first — every family with a
-/// duration is in them — then from the newest entries of the type, for the
-/// derived ones (`slow`, `n_plus_one`) that are not aggregated.
 pub(crate) async fn family(state: Arc<Shared>, request: Req) -> Result<Response> {
     let mut params = Params::new(request.query());
     let entry_type = params.parse_type("type", request.route_param("type").unwrap_or_default());
@@ -133,19 +132,28 @@ pub(crate) async fn family(state: Arc<Shared>, request: Req) -> Result<Response>
         return Err(Error::internal("validated entry type missing"));
     };
     let id = request.route_param("id").unwrap_or_default().to_ascii_lowercase();
-    let found = |key: &str| Response::json(&json!({ "data": { "id": id, "key": key } }));
+    let key = require_family(&state, entry_type, &id).await?;
+    Ok(Response::json(&json!({ "data": { "id": id, "key": key } })))
+}
 
+/// The key a [`family_id`] names, or 404.
+///
+/// From the aggregates of the retention window first — every family with a
+/// duration is in them — then from the newest entries of the type, for the
+/// derived ones (`slow`, `n_plus_one`) that are not aggregated.
+async fn require_family(state: &Shared, entry_type: EntryType, id: &str) -> Result<String> {
+    let id = id.to_ascii_lowercase();
     if AGGREGATED.contains(&entry_type) {
         let days = i64::try_from(state.config.retention.aggregates_days).unwrap_or(i64::MAX);
         let since = Utc::now() - chrono::Duration::days(days.min(3650));
         let rows = state.store.aggregate_rows(entry_type, 3600, since).await?;
         if let Some(row) = rows.iter().find(|r| family_id(entry_type, &r.key) == id) {
-            return Ok(found(&row.key));
+            return Ok(row.key.clone());
         }
     }
     let recent = state.store.entries(entry_type, None, 1000).await?;
     if let Some(entry) = recent.iter().find(|e| family_id(entry_type, e.family_key()) == id) {
-        return Ok(found(entry.family_key()));
+        return Ok(entry.family_key().to_string());
     }
     Err(Error::not_found("No such family."))
 }
@@ -180,7 +188,12 @@ pub(crate) async fn series(state: Arc<Shared>, request: Req) -> Result<Response>
     };
     let mut rows =
         state.store.aggregate_rows(query.entry_type, query.period_s, query.since).await?;
-    if let Some(key) = &query.key {
+    let key = if let Some(id) = &query.family {
+        Some(require_family(&state, query.entry_type, id).await?)
+    } else {
+        query.key.clone()
+    };
+    if let Some(key) = &key {
         rows.retain(|r| &r.key == key);
     }
     // A custom window ends at `until`. Anything later than now is not a

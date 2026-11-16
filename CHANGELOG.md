@@ -774,6 +774,10 @@ the release as a whole and names the crate it landed in.
 
 ### Fixed
 
+- Lookout's "every query like this" page no longer asks for the family by
+  putting its SQL in the query string. Entries and series take `family`, the
+  same 16 hex id the page URL already uses, and resolve it on the server.
+  A filter in front of the app was answering 403 to the SQL.
 - Lookout's dashboard tiles show the whole headline number. A long count
   shrinks to fit the tile instead of being cut off with an ellipsis, and the
   sparkline sits under the number so it does not take the number's width.

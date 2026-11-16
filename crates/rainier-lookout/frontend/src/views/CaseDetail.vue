@@ -12,7 +12,7 @@ import StackTrace from '../components/StackTrace.vue'
 import StatTile from '../components/StatTile.vue'
 import TimeAgo from '../components/TimeAgo.vue'
 import { api } from '../api.js'
-import { absolute, ago, count, duration, issueRoute } from '../format.js'
+import { absolute, ago, count, duration, familyId, issueRoute } from '../format.js'
 import { usePolling } from '../live.js'
 
 const props = defineProps({ id: { type: String, required: true } })
@@ -42,7 +42,7 @@ const STATUS_TONE = { open: 'bad', resolved: 'ok', ignored: 'neutral' }
 async function loadSeries(key) {
   try {
     const since = new Date(Date.now() - 7 * 86_400_000).toISOString()
-    series.value = await api.series('exception', { since, key })
+    series.value = await api.series('exception', { since, family: familyId('exception', key) })
     seriesError.value = null
   } catch (e) {
     seriesError.value = e
@@ -51,7 +51,7 @@ async function loadSeries(key) {
 
 async function loadEntries(key) {
   try {
-    const page = await api.entries('exception', { key, limit: 200 })
+    const page = await api.entries('exception', { family: familyId('exception', key), limit: 200 })
     entries.value = page.data
     next.value = page.next
     entriesError.value = null
@@ -71,7 +71,11 @@ async function loadMore() {
   paged.value = true
   more.value = true
   try {
-    const page = await api.entries('exception', { key: kase.value.key, limit: 200, before: next.value.before })
+    const page = await api.entries('exception', {
+      family: familyId('exception', kase.value.key),
+      limit: 200,
+      before: next.value.before,
+    })
     const seen = new Set(entries.value.map((e) => `${e.batch_id}/${e.id}`))
     entries.value = entries.value.concat(page.data.filter((e) => !seen.has(`${e.batch_id}/${e.id}`)))
     next.value = page.next

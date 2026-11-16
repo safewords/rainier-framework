@@ -13,7 +13,7 @@ import StackTrace from '../components/StackTrace.vue'
 import StatTile from '../components/StatTile.vue'
 import TimeAgo from '../components/TimeAgo.vue'
 import { api } from '../api.js'
-import { caseId, count, duration, percentile, TYPES } from '../format.js'
+import { caseId, count, duration, familyId, percentile, TYPES } from '../format.js'
 import { usePolling } from '../live.js'
 import { followsNow, parseRange } from '../range.js'
 
@@ -41,14 +41,23 @@ const error = ref(null)
 const kase = ref(null)
 const caseKey = computed(() => (props.type === 'exception' && key.value ? caseId(key.value) : null))
 
+// The id in the path, or the same id hashed from a legacy `?key=` link.
+// Either way the requests carry the id, never the SQL.
+function familyRef() {
+  if (props.id) return props.id
+  if (key.value) return familyId(props.type, key.value)
+  return ''
+}
+
 async function loadSeries() {
-  if (!key.value) return
+  const family = familyRef()
+  if (!family) return
   seriesLoading.value = true
   try {
     series.value = await api.series(props.type, {
       since: range.value.since,
       until: range.value.until || undefined,
-      key: key.value,
+      family,
       forecast: followsNow(range.value) ? 6 : 0,
     })
     seriesError.value = null
@@ -61,12 +70,13 @@ async function loadSeries() {
 }
 
 async function loadEntries() {
-  if (!key.value) {
+  const family = familyRef()
+  if (!family) {
     loading.value = false
     return
   }
   try {
-    const page = await api.entries(props.type, { key: key.value, limit: 200 })
+    const page = await api.entries(props.type, { family, limit: 200 })
     entries.value = page.data
     next.value = page.next
     error.value = null
@@ -87,7 +97,7 @@ async function loadMore() {
   paged.value = true
   more.value = true
   try {
-    const page = await api.entries(props.type, { key: key.value, limit: 200, before: next.value.before })
+    const page = await api.entries(props.type, { family: familyRef(), limit: 200, before: next.value.before })
     const seen = new Set(entries.value.map((e) => `${e.batch_id}/${e.id}`))
     entries.value = entries.value.concat(page.data.filter((e) => !seen.has(`${e.batch_id}/${e.id}`)))
     next.value = page.next
