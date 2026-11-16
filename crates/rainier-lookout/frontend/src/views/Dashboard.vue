@@ -166,6 +166,21 @@ const exceptionTotals = computed(() => sum(series.exception))
 const jobTotals = computed(() => sum(series.job))
 const counts = (s) => (s ? s.data.map((p) => p.count) : [])
 
+// p50 to p99 of request time over the whole range: the series adds every
+// bucket's histogram on the server, so these count every request, not the
+// ones kept (which in production are mostly the slow).
+const requestPercentile = (field) => {
+  const s = series.request
+  const v = s && s.percentiles ? s.percentiles[field] : null
+  return requestTotals.value.count && typeof v === 'number' ? v : null
+}
+const REQUEST_PERCENTILES = [
+  { field: 'p50_us', label: 'p50', hint: 'half took less' },
+  { field: 'p90_us', label: 'p90', hint: '1 in 10 took longer' },
+  { field: 'p95_us', label: 'p95', hint: '1 in 20 took longer' },
+  { field: 'p99_us', label: 'p99', hint: '1 in 100 took longer' },
+]
+
 // --- Charts. A forecast starts at the last real point so the line joins.
 
 const perMinute = (s) => (s && s.period ? 60 / s.period : 1)
@@ -180,16 +195,30 @@ function projected(s, pick, last) {
   return tail && last ? [{ t: tail.bucket_start, v: last(tail) }, ...points] : points
 }
 
-// Throughput and average time share one chart: requests per minute on the
-// left axis, mean duration on the right, each with its own forecast.
+// Throughput, then time: the average and each bucket's p90, p95 and p99,
+// read off that bucket's histogram. A bucket recorded before histograms were
+// kept has no percentiles, so those lines start where the data does.
 const requestChart = computed(() => {
   const s = series.request
   const f = perMinute(s)
   return [
     { label: 'Requests / min', color: 'indigo', points: actual(s, (p) => p.count * f) },
-    { label: 'Throughput forecast', color: 'indigo', dashed: true, points: projected(s, (p) => p.count * f, (p) => p.count * f) },
-    { label: 'Avg request time', color: 'emerald', axis: 'right', points: actual(s, (p) => p.average_us, true) },
-    { label: 'Time forecast', color: 'emerald', axis: 'right', dashed: true, points: projected(s, (p) => p.average_us, (p) => p.average_us) },
+    { label: 'Forecast', color: 'indigo', dashed: true, points: projected(s, (p) => p.count * f, (p) => p.count * f) },
+  ]
+})
+const percentileLine = (s, label, color, field) => ({
+  label,
+  color,
+  points: s ? s.data.filter((p) => p.count > 0 && p[field] != null).map((p) => ({ t: p.bucket_start, v: p[field] })) : [],
+})
+const requestTimeChart = computed(() => {
+  const s = series.request
+  return [
+    { label: 'Average', color: 'indigo', points: actual(s, (p) => p.average_us, true) },
+    percentileLine(s, 'p90', 'emerald', 'p90_us'),
+    percentileLine(s, 'p95', 'amber', 'p95_us'),
+    percentileLine(s, 'p99', 'rose', 'p99_us'),
+    { label: 'Forecast', color: 'indigo', dashed: true, points: projected(s, (p) => p.average_us, (p) => p.average_us) },
   ]
 })
 const exceptionChart = computed(() => {
@@ -293,13 +322,11 @@ function insightLink(i) {
 
     <ErrorBox :error="error" />
 
-    <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-7">
+    <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
       <StatTile label="Requests" :value="count(requestTotals.count)" :hint="windowHint" :loading="loading">
         <Sparkline :points="counts(series.request)" color="indigo" />
       </StatTile>
       <StatTile label="Throughput" :value="`${rate(requestTotals.count / minutes)}/min`" hint="requests per minute, averaged" :loading="loading" />
-      <StatTile label="Avg request" :value="time(requestTotals.count ? requestTotals.average_us : null)" hint="mean time per request" :loading="loading" />
-      <StatTile label="Worst request" :value="time(requestTotals.count ? requestTotals.max_us : null)" hint="the single slowest" :loading="loading" />
       <StatTile
         label="Exceptions"
         :value="count(exceptionTotals.count)"
@@ -315,14 +342,37 @@ function insightLink(i) {
       <StatTile label="Avg job time" :value="time(jobTotals.count ? jobTotals.average_us : null)" :hint="jobTotals.count ? `worst ${time(jobTotals.max_us)}` : 'no jobs ran'" :loading="loading" />
     </div>
 
+    <section aria-labelledby="request-time-heading">
+      <h2 id="request-time-heading" class="lk-th mb-2">Request time {{ windowHint }}</h2>
+      <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+        <StatTile label="Average" :value="time(requestTotals.count ? requestTotals.average_us : null)" hint="mean time per request" :loading="loading" />
+        <StatTile
+          v-for="pc in REQUEST_PERCENTILES"
+          :key="pc.field"
+          :label="pc.label"
+          :value="time(requestPercentile(pc.field))"
+          :hint="requestPercentile(pc.field) === null && requestTotals.count ? 'no histogram for this range' : pc.hint"
+          :loading="loading"
+        />
+        <StatTile label="Worst" :value="time(requestTotals.count ? requestTotals.max_us : null)" hint="the single slowest" :loading="loading" />
+      </div>
+    </section>
+
     <div class="grid gap-4 md:grid-cols-2">
       <section class="lk-card min-w-0 md:col-span-2">
         <header class="lk-card-header">
           <h2 class="text-sm font-semibold">Requests</h2>
-          <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">per minute on the left, average time on the right · {{ bucketLabel }} buckets · dashed: forecast</span>
+          <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">per minute, then time · {{ bucketLabel }} buckets · dashed: forecast</span>
         </header>
-        <div class="p-4">
-          <LineChart :series="requestChart" :format="perMin" :format-right="time" :height="200" />
+        <div class="grid gap-4 p-4 lg:grid-cols-2">
+          <div class="min-w-0">
+            <h3 class="lk-th mb-1">Requests per minute</h3>
+            <LineChart :series="requestChart" :format="perMin" :height="180" />
+          </div>
+          <div class="min-w-0">
+            <h3 class="lk-th mb-1">Time: average, p90, p95 and p99</h3>
+            <LineChart :series="requestTimeChart" :format="time" :height="180" />
+          </div>
         </div>
       </section>
       <section class="lk-card min-w-0">

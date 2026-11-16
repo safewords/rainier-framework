@@ -12,6 +12,9 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Request percentiles on Lookout's dashboard** (`rainier-lookout`): p50,
+  p90, p95 and p99 of request time over the chosen range, beside the average
+  and the worst, and a chart of the average, p90, p95 and p99 per bucket.
 - **`repo::insert_many`** (`rainier-orm`): many rows of one entity in one
   `INSERT … VALUES (…), (…)`, chunked under the placeholder cap and reported
   as a write. An empty slice writes nothing. An auto-increment key stays the
