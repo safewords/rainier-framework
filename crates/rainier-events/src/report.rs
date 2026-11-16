@@ -1202,8 +1202,10 @@ mod tests {
         assert!(install(Reporter::new(Arc::new(Dispatcher::new()))).is_none());
         assert!(report_error(Error::internal("z")).await);
 
-        assert_eq!(capture.reports().len(), 3);
+        // A parallel test's failing listener is reported here too, so count
+        // the kinds this test sent.
         assert_eq!(capture.of_kind(FailureKind::BackgroundTask).len(), 1);
+        assert_eq!(capture.of_kind(FailureKind::Application).len(), 2);
     }
 
     #[tokio::test]
@@ -1211,12 +1213,13 @@ mod tests {
         let capture = capture();
         report_detached(BackgroundTaskFailed::new(Error::internal("x"), "sweeper"));
         for _ in 0..100 {
-            if !capture.reports().is_empty() {
+            if !capture.of_kind(FailureKind::BackgroundTask).is_empty() {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert_eq!(capture.reports().len(), 1);
+        // A parallel test's failing listener can land in this capture first.
+        assert_eq!(capture.of_kind(FailureKind::BackgroundTask).len(), 1);
     }
 
     #[tokio::test]

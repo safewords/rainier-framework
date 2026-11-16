@@ -724,11 +724,20 @@ mod tests {
         events.dispatch_quietly(Shipped(1)).await;
         events.dispatch(Cancelled).await.unwrap();
 
+        // A failing listener is reported on the process-wide bus. A parallel
+        // test capturing reports is listening for that, and the report opens
+        // its own `event.dispatch` span on this thread — so count this
+        // dispatcher's events, not every span the thread recorded.
         let spans = recorder.named("event.dispatch");
-        assert_eq!(spans.len(), 1, "nobody listens for Cancelled");
-        assert_eq!(spans[0].field("rainier.event.listeners"), Some("2"));
-        assert_eq!(spans[0].field("otel.name"), Some("event Shipped"));
-        assert_eq!(spans[0].field("error.type"), Some("listener_failed"));
+        assert!(
+            spans.iter().all(|span| span.field("otel.name") != Some("event Cancelled")),
+            "nobody listens for Cancelled"
+        );
+        let shipped: Vec<_> =
+            spans.iter().filter(|span| span.field("otel.name") == Some("event Shipped")).collect();
+        assert_eq!(shipped.len(), 1);
+        assert_eq!(shipped[0].field("rainier.event.listeners"), Some("2"));
+        assert_eq!(shipped[0].field("error.type"), Some("listener_failed"));
     }
 
     #[tokio::test]
