@@ -10,7 +10,7 @@
 //! [reference ones](super::conformance), and the conformance suite runs
 //! against it.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
@@ -38,9 +38,51 @@ struct State {
     batches: VecDeque<Batch>,
     aggregates: BTreeMap<AggregateKey, Aggregate>,
     cases: BTreeMap<String, Case>,
+    /// Batches held for pairing, by trace id, with when they lapse.
+    held: HashMap<String, (std::time::Instant, Batch)>,
 }
 
 impl MemoryStore {
+    /// Store `batches` and `counted`; with `count_batches` off the batches
+    /// are kept without being rolled into the aggregates.
+    fn insert(
+        &self,
+        batches: Vec<Batch>,
+        counted: Vec<Aggregate>,
+        count_batches: bool,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let mut rolled = if count_batches { rollup(&batches) } else { Vec::new() };
+            rolled.extend(counted);
+            let seen = occurrences(&batches);
+            let mut state = self.lock();
+            for occurrence in &seen {
+                let existing = state.cases.remove(&occurrence.id);
+                state.cases.insert(occurrence.id.clone(), observe(existing, occurrence));
+            }
+            for row in rolled {
+                let key = (row.bucket_start, row.period_s, row.entry_type, row.key.clone());
+                match state.aggregates.get_mut(&key) {
+                    Some(existing) => merge(existing, &row),
+                    None => {
+                        state.aggregates.insert(key, row);
+                    }
+                }
+            }
+            for batch in batches {
+                if let Some(slot) = state.batches.iter_mut().find(|b| b.id == batch.id) {
+                    *slot = batch;
+                    continue;
+                }
+                state.batches.push_back(batch);
+                while state.batches.len() > self.capacity {
+                    state.batches.pop_front();
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// A store keeping at most `capacity` batches (at least one).
     pub fn new(capacity: usize) -> Self {
         Self { capacity: capacity.max(1), state: Mutex::new(State::default()) }
@@ -76,8 +118,36 @@ impl Store for MemoryStore {
         "memory"
     }
 
+    fn hold(&self, batches: Vec<Batch>, ttl: std::time::Duration) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let now = std::time::Instant::now();
+            let mut state = self.lock();
+            state.held.retain(|_, (until, _)| *until > now);
+            // Bounded like the ring: a burst must not grow it without end.
+            if state.held.len() + batches.len() > self.capacity.max(1) * 4 {
+                return Ok(());
+            }
+            for batch in batches {
+                state.held.insert(batch.trace_id.clone(), (now + ttl, batch));
+            }
+            Ok(())
+        })
+    }
+
+    fn release(&self, trace_id: &str) -> BoxFuture<'_, Result<Option<Batch>>> {
+        let trace_id = trace_id.to_string();
+        Box::pin(async move {
+            let now = std::time::Instant::now();
+            Ok(self.lock().held.remove(&trace_id).filter(|(until, _)| *until > now).map(|(_, b)| b))
+        })
+    }
+
     fn store(&self, batches: Vec<Batch>) -> BoxFuture<'_, Result<()>> {
         self.store_counting(batches, Vec::new())
+    }
+
+    fn store_uncounted(&self, batches: Vec<Batch>) -> BoxFuture<'_, Result<()>> {
+        self.insert(batches, Vec::new(), false)
     }
 
     fn store_counting(
@@ -85,38 +155,8 @@ impl Store for MemoryStore {
         batches: Vec<Batch>,
         counted: Vec<Aggregate>,
     ) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move {
-            let mut rolled = rollup(&batches);
-            rolled.extend(counted);
-            let seen = occurrences(&batches);
-            let mut state = self.lock();
-            for occurrence in &seen {
-                let existing = state.cases.remove(&occurrence.id);
-                state.cases.insert(occurrence.id.clone(), observe(existing, occurrence));
-            }
-            for row in rolled {
-                let key = (row.bucket_start, row.period_s, row.entry_type, row.key.clone());
-                match state.aggregates.get_mut(&key) {
-                    Some(existing) => merge(existing, &row),
-                    None => {
-                        state.aggregates.insert(key, row);
-                    }
-                }
-            }
-            for batch in batches {
-                if let Some(slot) = state.batches.iter_mut().find(|b| b.id == batch.id) {
-                    *slot = batch;
-                    continue;
-                }
-                state.batches.push_back(batch);
-                while state.batches.len() > self.capacity {
-                    state.batches.pop_front();
-                }
-            }
-            Ok(())
-        })
+        self.insert(batches, counted, true)
     }
-
     fn batches(&self, query: BatchQuery) -> BoxFuture<'_, Result<Vec<BatchSummary>>> {
         Box::pin(async move {
             let state = self.lock();

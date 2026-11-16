@@ -79,6 +79,29 @@ pub(crate) async fn ingest(state: Arc<Shared>, request: Req) -> Response {
     let page = rum::page_batch(&state.config, &report, request.ip(), request.header("user-agent"));
     let mut batches =
         rum::batches(&state.config, report, request.ip(), request.header("user-agent"));
+
+    // Pairing: the server's side of each reported call, held since it was
+    // answered, is kept now — so the call's page shows the request it was,
+    // queries and all, and the request's page shows how the browser saw it.
+    // Stored uncounted: it was counted when it was held.
+    let mut paired = Vec::new();
+    for call in &batches {
+        if let Ok(Some(mut server)) = state.store.release(&call.trace_id).await {
+            server.tags.push(rum::TAG_PAIRED.to_string());
+            for tag in &call.tags {
+                if (tag.starts_with("session:") || tag.starts_with("pageview:"))
+                    && !server.tags.contains(tag)
+                {
+                    server.tags.push(tag.clone());
+                }
+            }
+            paired.push(server);
+        }
+    }
+    if !paired.is_empty() {
+        let _ = state.store.store_uncounted(paired).await;
+    }
+
     batches.extend(page);
     if !batches.is_empty() {
         // Stored as they are: a browser batch adds nothing to the request

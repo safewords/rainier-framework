@@ -51,6 +51,22 @@ the release as a whole and names the crate it landed in.
   every page that shows data (cases, issues, timing, status) refreshes on the
   news it shows, plus once a minute. The writer stores its counts every 2
   seconds instead of 10, and only when something was counted.
+- **Pairing, sessions and whole-page replay** (`rainier-lookout`,
+  `rainier-framework`):
+  - A request from a listed frontend that would be dropped is held for
+    `LOOKOUT_RUM_HOLD_SECONDS` (120) in the store; a browser report about it
+    keeps it, tagged `rum:paired` and uncounted the second time, so an API
+    call's page links to its server request and the two times compare. New
+    `Store::hold`, `release` and `store_uncounted`, implemented by the memory
+    and cache stores.
+  - Sessions: `Rainier::with_lookout_sessions(|request| …)` binds the
+    application's own session key (an HMAC of it is kept); every page view,
+    API call, kept request and replay carries `session:<id>`, and
+    **Browser → Sessions** lays a session out as one timeline with a stitched
+    replay. Without a binding, the script keeps a session per tab. The user is
+    attributed by a signed `lookout-user` id.
+  - `LOOKOUT_RUM_REPLAY_MODE=always` records whole page views, uploading each
+    stretch as it closes; page views and sessions show their replay.
 - **Page views, apart from API calls** (`rainier-lookout`): with RUM on,
   the browser script also reports what the page itself did — its load,
   vitals, route changes inside a single-page app, script errors and long

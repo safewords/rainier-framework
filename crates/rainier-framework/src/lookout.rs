@@ -416,6 +416,27 @@ impl Store for DeferredStore {
         }
     }
 
+    fn hold(&self, batches: Vec<Batch>, ttl: std::time::Duration) -> BoxFuture<'_, Result<()>> {
+        match self.get() {
+            Ok(store) => store.hold(batches, ttl),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
+    }
+
+    fn release(&self, trace_id: &str) -> BoxFuture<'_, Result<Option<Batch>>> {
+        match self.get() {
+            Ok(store) => store.release(trace_id),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
+    }
+
+    fn store_uncounted(&self, batches: Vec<Batch>) -> BoxFuture<'_, Result<()>> {
+        match self.get() {
+            Ok(store) => store.store_uncounted(batches),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
+    }
+
     fn batch(&self, id: &str) -> BoxFuture<'_, Result<Option<Batch>>> {
         match self.get() {
             Ok(store) => store.batch(id),

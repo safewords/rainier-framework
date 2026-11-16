@@ -207,6 +207,25 @@ onMounted(async () => {
       />
       <ClientCard v-if="client" :client="client" />
       <PageView v-if="batch.kind === 'page'" :batch="batch" />
+      <!-- An API call from the browser, and the request it was on the
+           server: kept because it was slow or failed, or paired when the
+           browser reported it. Side by side, so the two times compare. -->
+      <section v-if="batch.kind === 'browser' && !isReplay(batch) && serverSide" class="lk-card">
+        <header class="lk-card-header">
+          <h2 class="text-sm font-semibold">The request on the server</h2>
+          <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">the same trace</span>
+        </header>
+        <RouterLink
+          :to="{ name: 'batch', params: { id: serverSide.id } }"
+          class="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3 hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
+        >
+          <span class="min-w-0 flex-1 truncate font-mono text-[13px]">{{ serverSide.summary }}</span>
+          <BatchStatus :batch="serverSide" />
+          <span class="text-sm tabular-nums">{{ duration(serverSide.duration_us) }} on the server</span>
+          <span class="text-sm text-zinc-500 tabular-nums dark:text-zinc-400">of {{ duration(batch.duration_us) }} in the browser</span>
+          <span class="text-xs text-indigo-600 dark:text-indigo-400">queries and timeline →</span>
+        </RouterLink>
+      </section>
       <p v-if="batch.kind === 'browser' && pageViewTag" class="text-sm text-zinc-500 dark:text-zinc-400">
         Made by a page view:
         <RouterLink

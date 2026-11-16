@@ -288,7 +288,15 @@ mod tests {
         // `lookout;dur=…;desc="<token>", lookout-route;desc="me"`: the
         // server's own time and the route ride along with the token.
         assert!(timing.starts_with("lookout;dur="), "{timing}");
-        assert!(timing.ends_with(", lookout-route;desc=\"me\""), "{timing}");
+        assert!(timing.contains(", lookout-route;desc=\"me\""), "{timing}");
+        // And who it was for, signed, so the browser's reports name them.
+        assert!(
+            timing.contains(&format!(
+                ", lookout-user;desc=\"{}\"",
+                crate::rum::user_token(b"test-key", "42")
+            )),
+            "{timing}"
+        );
         let token = timing
             .split("desc=\"")
             .nth(1)
@@ -366,6 +374,105 @@ mod tests {
         assert_eq!(browser.trace_id, me.trace_id, "on the request's trace");
         assert_eq!(browser.duration_us, 412_500);
         assert_eq!(browser.entries[0].content["timing"]["waiting"], 180.0);
+    }
+
+    #[tokio::test]
+    async fn a_browser_report_pairs_with_the_request_it_describes_in_its_session() {
+        use crate::store::Store as _;
+        // Production's rule: only slow or failed requests are kept.
+        let mut config = LookoutConfig::default().enabled(true).local(false);
+        config.capture.user_id = true;
+        config.rum.enabled = true;
+        config.rum.origins = vec!["https://app.example.com".into()];
+        config.rum.secret = b"test-key".to_vec();
+        let store = Arc::new(MemoryStore::new(10));
+        let lookout = Lookout::new(config.clone(), store.clone());
+        lookout.sessions_with(|request| request.cookie("app_session").map(str::to_string));
+        let kernel = kernel(&lookout, Arc::new(Dispatcher::new()));
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+
+        let answered = kernel
+            .handle_request(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/posts/42")
+                    .header("origin", "https://app.example.com")
+                    .header("cookie", "app_session=s3cr3t-cookie-value")
+                    .build(),
+            )
+            .await;
+        lookout.flush().await;
+        assert!(store.all().is_empty(), "fast and fine: not kept");
+
+        let timing = answered.header("server-timing").unwrap().to_string();
+        let token =
+            timing.split("desc=\"").nth(1).and_then(|t| t.split('"').next()).unwrap().to_string();
+        let session = timing
+            .split("lookout-session;desc=\"")
+            .nth(1)
+            .and_then(|t| t.split('"').next())
+            .expect("the session rides along")
+            .to_string();
+        assert_eq!(session, crate::rum::session_id(b"test-key", "s3cr3t-cookie-value"));
+        assert!(!timing.contains("s3cr3t"), "never the cookie itself");
+        let counted_before: u64 = store
+            .aggregate_rows(EntryType::Request, 60, chrono::Utc::now() - chrono::Duration::hours(1))
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.count)
+            .sum();
+        assert_eq!(counted_before, 1, "counted though not kept");
+
+        // The page reports the call: the held request is kept and paired.
+        let mut router = Router::new();
+        router.merge(crate::routes(
+            store.clone(),
+            Arc::new(config),
+            crate::LookoutGate::deny_all(),
+            "production",
+        ));
+        let router = router.compile(&rainier_container::Container::new()).unwrap();
+        let report = serde_json::json!({
+            "view": "0123456789abcdef0123456789abcdef",
+            "session": session,
+            "page": { "url": "https://app.example.com/posts/42" },
+            "calls": [{ "token": token, "url": "https://api.example.com/posts/42", "duration": 90.0, "status": 200 }],
+        })
+        .to_string();
+        let posted = router
+            .dispatch(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/_lookout/rum")
+                    .header("origin", "https://app.example.com")
+                    .body(report)
+                    .build(),
+            )
+            .await;
+        assert_eq!(posted.status().as_u16(), 204);
+
+        let all = store.all();
+        let server =
+            all.iter().find(|b| b.kind == BatchKind::Request).expect("the request, kept now");
+        let browser =
+            all.iter().find(|b| b.kind == BatchKind::Browser).expect("the browser's report");
+        assert_eq!(server.trace_id, browser.trace_id, "one trace: each links to the other");
+        assert!(server.tags.contains(&crate::rum::TAG_PAIRED.to_string()));
+        let session_tag = format!("session:{session}");
+        assert!(
+            server.tags.contains(&session_tag) && browser.tags.contains(&session_tag),
+            "one session"
+        );
+        let counted_after: u64 = store
+            .aggregate_rows(EntryType::Request, 60, chrono::Utc::now() - chrono::Duration::hours(1))
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.count)
+            .sum();
+        assert_eq!(counted_after, 1, "paired, not counted twice");
     }
 
     #[tokio::test]

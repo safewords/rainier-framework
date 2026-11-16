@@ -112,6 +112,72 @@ pub fn verify(secret: &[u8], token: &str) -> Option<String> {
 /// The `Server-Timing` metric that names the route.
 pub const ROUTE_METRIC: &str = "lookout-route";
 
+/// The `Server-Timing` metric that carries the session's id.
+pub const SESSION_METRIC: &str = "lookout-session";
+
+/// The `Server-Timing` metric that carries the signed user id.
+pub const USER_METRIC: &str = "lookout-user";
+
+/// A session's id: an HMAC of the application's own key for it, so a session
+/// cookie — a credential — is never stored or sent back, and the same key
+/// always gives the same id.
+pub fn session_id(secret: &[u8], key: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC takes a key of any length");
+    mac.update(b"lookout-session\n");
+    mac.update(key.as_bytes());
+    mac.finalize().into_bytes().iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether `text` can go in a `Server-Timing` quoted string as it is.
+pub fn safe_header_text(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 128
+        && text.bytes().all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+}
+
+/// A user id, signed: `<id>.<signature>`. A report naming a user is believed
+/// only with this, so a browser cannot attribute its reports to someone else.
+pub fn user_token(secret: &[u8], user_id: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC takes a key of any length");
+    mac.update(b"lookout-user\n");
+    mac.update(user_id.as_bytes());
+    let sig: String =
+        mac.finalize().into_bytes().iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("{user_id}.{sig}")
+}
+
+/// The user id a [`user_token`] names, if this application signed it.
+pub fn verify_user(secret: &[u8], token: &str) -> Option<String> {
+    let (user_id, presented) = token.rsplit_once('.')?;
+    if !safe_header_text(user_id) {
+        return None;
+    }
+    let expected = user_token(secret, user_id);
+    let expected_sig = expected.rsplit_once('.')?.1;
+    bool::from(presented.as_bytes().ct_eq(expected_sig.as_bytes())).then(|| user_id.to_string())
+}
+
+/// A session id as a report may carry it: the server's (16 hex digits) or
+/// the browser's own (32).
+fn session_tag(session: &str) -> Option<String> {
+    ((session.len() == 16 || session.len() == 32) && session.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| format!("session:{session}"))
+}
+
+/// The session and user tags a report earns, and the user it is believed
+/// to be from.
+fn identity_tags(rum: &Rum, session: &str, user: Option<&str>) -> (Vec<String>, Option<String>) {
+    let mut tags = Vec::new();
+    if let Some(tag) = session_tag(session) {
+        tags.push(tag);
+    }
+    let user = user.and_then(|u| verify_user(&rum.secret, u));
+    if let Some(user) = &user {
+        tags.push(format!("user:{user}"));
+    }
+    (tags, user)
+}
+
 /// What the server knows about a response as it leaves: its own time so far,
 /// and the route that answered.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -208,10 +274,20 @@ pub struct Report {
     /// can vouch for it.
     #[serde(default)]
     pub(crate) proof: Option<String>,
+    /// The session: the server's id for it from `lookout-session`, or the
+    /// script's own for a visitor the application does not bind.
+    #[serde(default)]
+    pub(crate) session: String,
+    /// The signed user id from `lookout-user`, if the page has one.
+    #[serde(default)]
+    pub(crate) user: Option<String>,
 }
 
 /// The tag every report about an API call carries.
 pub const TAG_API: &str = "rum:api";
+
+/// The tag a server request carries once a browser report paired with it.
+pub const TAG_PAIRED: &str = "rum:paired";
 
 /// The tag every page-view batch carries.
 pub const TAG_PAGE: &str = "rum:page";
@@ -286,6 +362,8 @@ pub(crate) fn batches(
     if let Some(view) = &view {
         tags.push(view_tag(view));
     }
+    let (identity, user) = identity_tags(rum, &report.session, report.user.as_deref());
+    tags.extend(identity);
     report
         .calls
         .iter()
@@ -363,7 +441,7 @@ pub(crate) fn batches(
                 method: None,
                 status,
                 guard: None,
-                user_id: None,
+                user_id: user.clone(),
                 duration_us,
                 has_exception: false,
                 has_slow: total_ms >= rum.slow_ms as f64,
@@ -446,7 +524,9 @@ pub(crate) fn page_batch(
         "device": Value::Object(device),
         "activity": Value::Object(activity),
     });
-    let tags = vec!["browser".to_string(), TAG_PAGE.to_string(), view_tag(&view)];
+    let mut tags = vec!["browser".to_string(), TAG_PAGE.to_string(), view_tag(&view)];
+    let (identity, user) = identity_tags(rum, &report.session, report.user.as_deref());
+    tags.extend(identity);
     Some(Batch {
         id: id.clone(),
         // The page view is the trace: every report a page sends lands on it.
@@ -458,7 +538,7 @@ pub(crate) fn page_batch(
         method: None,
         status: None,
         guard: None,
-        user_id: None,
+        user_id: user,
         duration_us,
         has_exception: errors > 0,
         has_slow: load_ms.is_some_and(|ms| ms >= rum.slow_ms as f64),
@@ -496,6 +576,10 @@ pub(crate) fn script(rum: &Rum) -> String {
             },
             "except": replay.except,
             "maxBytes": replay.max_bytes,
+            "mode": match replay.mode {
+                crate::config::ReplayMode::Errors => "errors",
+                crate::config::ReplayMode::Always => "always",
+            },
             "recorder": recorder_version(),
         },
         "sample": rum.sample_rate,
@@ -545,6 +629,13 @@ pub struct ReplayUpload {
     /// How much time the recording covers, in milliseconds.
     #[serde(default)]
     pub(crate) ms: f64,
+    /// The page view, session and signed user, as a report carries them.
+    #[serde(default)]
+    pub(crate) view: String,
+    #[serde(default)]
+    pub(crate) session: String,
+    #[serde(default)]
+    pub(crate) user: Option<String>,
 }
 
 /// Turn an upload into a `browser` batch tagged `replay`, on the trace of the
@@ -586,9 +677,15 @@ pub(crate) fn replay_batch(
         return None;
     }
     let trigger = match upload.trigger.as_str() {
-        t @ ("slow" | "failed" | "error") => t.to_string(),
+        t @ ("slow" | "failed" | "error" | "recording") => t.to_string(),
         _ => "error".to_string(),
     };
+    let mut tags = vec!["browser".to_string(), "replay".to_string()];
+    if let Some(view) = view_id(&upload.view) {
+        tags.push(view_tag(view));
+    }
+    let (identity, user) = identity_tags(rum, &upload.session, upload.user.as_deref());
+    tags.extend(identity);
     let mut device = bounded_map(&upload.device, 2);
     describe_sender(config, &mut device, ip, user_agent);
     let duration_us = (upload.ms.clamp(0.0, 10.0 * 60.0 * 1000.0) * 1000.0).round() as u64;
@@ -615,13 +712,13 @@ pub(crate) fn replay_batch(
         method: None,
         status: None,
         guard: None,
-        user_id: None,
+        user_id: user,
         duration_us,
         has_exception: trigger == "error",
         has_slow: trigger == "slow",
         host: None,
         started_at: now - chrono::Duration::microseconds(duration_us as i64),
-        tags: vec!["browser".into(), "replay".into()],
+        tags,
         entries: vec![Entry {
             id: crate::recorder::new_entry_id(),
             batch_id: id,

@@ -591,4 +591,12 @@ fn describing_who_made_a_request(lookout: &rainier_framework::lookout::Lookout) 
             .with("plan", "pro"),
     );
     lookout.describe_user(None, LookoutUser::new("42"));
+    lookout.sessions_with(|request| request.cookie("app_session").map(str::to_string));
+}
+
+/// `docs/lookout.md` — sessions, bound to the application's own.
+#[cfg(feature = "lookout")]
+#[allow(dead_code, reason = "compiling is the point")]
+fn binding_sessions(app: rainier_framework::Rainier) -> rainier_framework::Rainier {
+    app.with_lookout_sessions(|request| request.cookie("app_session").map(str::to_string))
 }

@@ -52,13 +52,16 @@ const sections = [
     // and the API calls as those browsers saw them.
     title: 'Browser',
     items: [
-      ['page', 'Page views'],
-      ['browser', 'API calls'],
-    ].map(([kind, label]) => ({
-      label,
-      to: { name: 'batches', query: { kind } },
-      match: (r) => r.name === 'batches' && r.query.kind === kind,
-    })),
+      { label: 'Sessions', to: { name: 'sessions' }, match: (r) => r.name === 'sessions' || r.name === 'session' },
+      ...[
+        ['page', 'Page views'],
+        ['browser', 'API calls'],
+      ].map(([kind, label]) => ({
+        label,
+        to: { name: 'batches', query: { kind } },
+        match: (r) => r.name === 'batches' && r.query.kind === kind,
+      })),
+    ],
   },
   {
     title: 'Entries',

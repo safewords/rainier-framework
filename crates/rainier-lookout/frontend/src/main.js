@@ -14,6 +14,8 @@ import Timing from './views/Timing.vue'
 import Cases from './views/Cases.vue'
 import CaseDetail from './views/CaseDetail.vue'
 import Search from './views/Search.vue'
+import Session from './views/Session.vue'
+import Sessions from './views/Sessions.vue'
 import NotFound from './views/NotFound.vue'
 
 const router = createRouter({
@@ -33,6 +35,8 @@ const router = createRouter({
     { path: '/cases/:id', name: 'case', component: CaseDetail, props: true },
     // ?q=<text>
     { path: '/search', name: 'search', component: Search },
+    { path: '/sessions', name: 'sessions', component: Sessions },
+    { path: '/sessions/:id', name: 'session', component: Session, props: true },
     { path: '/:rest(.*)*', name: 'not-found', component: NotFound },
   ],
   scrollBehavior: (to, from, saved) => saved || { top: 0 },

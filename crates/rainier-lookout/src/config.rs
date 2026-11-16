@@ -277,6 +277,15 @@ pub struct Rum {
     /// Session replay: off unless turned on, and only with RUM on.
     #[serde(default)]
     pub replay: Replay,
+    /// How long a request from a listed frontend that would otherwise be
+    /// dropped is held, so that a browser report about it can pair with it
+    /// and keep it. `0` holds nothing. See `docs/lookout.md`, "Pairing".
+    #[serde(default = "default_rum_hold_seconds")]
+    pub hold_seconds: u64,
+}
+
+fn default_rum_hold_seconds() -> u64 {
+    120
 }
 
 /// Session replay: what the page looked like in the seconds before a request
@@ -297,6 +306,23 @@ pub struct Replay {
     /// The most one recording may weigh, compressed, in bytes.
     #[serde(default = "default_replay_max_bytes")]
     pub max_bytes: usize,
+    /// When a consenting page uploads what it recorded.
+    #[serde(default)]
+    pub mode: ReplayMode,
+}
+
+/// When a recording page uploads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayMode {
+    /// Only the last ~30 seconds, and only when an API request fails or is
+    /// slow, or the page throws.
+    #[default]
+    Errors,
+    /// The whole page view, in ~15-second pieces, so a session can be played
+    /// from start to end. For visitors who agreed to it — the consent rule
+    /// still applies — and a store with room for it.
+    Always,
 }
 
 impl Default for Replay {
@@ -306,6 +332,7 @@ impl Default for Replay {
             except: Vec::new(),
             consent: ReplayConsent::Required,
             max_bytes: default_replay_max_bytes(),
+            mode: ReplayMode::Errors,
         }
     }
 }
@@ -639,6 +666,7 @@ impl Default for LookoutConfig {
             local: false,
             insights: crate::trends::InsightsConfig::default(),
             rum: Rum {
+                hold_seconds: default_rum_hold_seconds(),
                 sample_rate: default_rum_sample(),
                 slow_ms: default_rum_slow_ms(),
                 ..Rum::default()
@@ -767,9 +795,11 @@ impl LookoutConfig {
     /// | `LOOKOUT_RUM_SAMPLE_RATE` | [`Rum::sample_rate`] | `0.0` to `1.0` |
     /// | `LOOKOUT_RUM_SLOW_MS` | [`Rum::slow_ms`] | an integer |
     /// | `LOOKOUT_RUM_SECRET` | [`Rum::secret`] (default: from `APP_KEY`) | a string |
+    /// | `LOOKOUT_RUM_HOLD_SECONDS` | [`Rum::hold_seconds`] | an integer |
     /// | `LOOKOUT_RUM_REPLAY` | [`Replay::enabled`] | a boolean |
     /// | `LOOKOUT_RUM_REPLAY_EXCEPT` | [`Replay::except`] | comma-separated globs over page paths |
     /// | `LOOKOUT_RUM_REPLAY_CONSENT` | [`Replay::consent`] | `required` or `implied` |
+    /// | `LOOKOUT_RUM_REPLAY_MODE` | [`Replay::mode`] | `errors` or `always` |
     /// | `LOOKOUT_RUM_REPLAY_MAX_BYTES` | [`Replay::max_bytes`] | a positive integer |
     /// | `LOOKOUT_INSIGHTS_ENABLED` | [`InsightsConfig::enabled`](crate::trends::InsightsConfig) | a boolean |
     /// | `LOOKOUT_INSIGHTS_WINDOW_MINUTES` | the window compared with the one before | a positive integer |
@@ -939,9 +969,21 @@ impl LookoutConfig {
                 }
             };
         }
+        if let Some(v) = get("LOOKOUT_RUM_REPLAY_MODE") {
+            config.rum.replay.mode = match v.to_ascii_lowercase().as_str() {
+                "errors" => ReplayMode::Errors,
+                "always" => ReplayMode::Always,
+                _ => {
+                    return Err(ConfigError::new("LOOKOUT_RUM_REPLAY_MODE", v, "errors or always"))
+                }
+            };
+        }
         if let Some(v) = get("LOOKOUT_RUM_REPLAY_MAX_BYTES") {
             config.rum.replay.max_bytes =
                 parse_positive("LOOKOUT_RUM_REPLAY_MAX_BYTES", &v)? as usize;
+        }
+        if let Some(v) = get("LOOKOUT_RUM_HOLD_SECONDS") {
+            config.rum.hold_seconds = parse_u64("LOOKOUT_RUM_HOLD_SECONDS", &v)?;
         }
         if let Some(v) = get("LOOKOUT_RUM_SECRET") {
             config.rum.secret = v.into_bytes();

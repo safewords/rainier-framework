@@ -51,6 +51,27 @@
     return Array.prototype.map.call(bytes, function (b) { return ('0' + b.toString(16)).slice(-2) }).join('')
   })()
   var proof = null
+
+  // The session: the application's, when the API names one
+  // (lookout-session), else one the script keeps per tab, renewed after 30
+  // idle minutes — so page views, API calls and replays can be laid out as
+  // one timeline. And the user, as the API signed it (lookout-user).
+  var serverSession = null
+  var user = null
+  var browserSession = (function () {
+    try {
+      var now = Date.now()
+      var held = JSON.parse(sessionStorage.getItem('lookout.session') || 'null')
+      var id = held && now - held.last < 30 * 60 * 1000 ? held.id : view
+      sessionStorage.setItem('lookout.session', JSON.stringify({ id: id, last: now }))
+      return id
+    } catch (e) {
+      return view
+    }
+  })()
+  function session() {
+    return serverSession || browserSession
+  }
   var activity = { loadSent: false, navigations: [], errors: [], longTasks: { count: 0, total: 0, longest: 0 } }
 
   function round(n) {
@@ -184,7 +205,7 @@
     var act = proof ? pageActivity() : null
     if (!queue.length && !act) return
     var calls = queue.splice(0, 50)
-    var body = JSON.stringify({ view: view, proof: proof || undefined, page: page(), device: device(), calls: calls, activity: act || undefined })
+    var body = JSON.stringify({ view: view, session: session(), user: user || undefined, proof: proof || undefined, page: page(), device: device(), calls: calls, activity: act || undefined })
     try {
       navigator.sendBeacon(settings.endpoint, new Blob([body], { type: 'text/plain' }))
     } catch (e) {
@@ -244,6 +265,8 @@
         emit: function (event, isCheckout) {
           // A new stretch at each full snapshot; only the last two are kept.
           if (isCheckout) {
+            // Recording everything: the stretch just finished goes up now.
+            if (always) send(replay.segments[replay.segments.length - 1], 'recording', false)
             replay.segments.push([])
             if (replay.segments.length > 2) replay.segments.shift()
           }
@@ -265,15 +288,12 @@
     document.head.appendChild(s)
   }
 
-  function upload(trigger) {
-    if (!replay.on || !replay.lastToken) return
-    // A page that keeps failing sends a few recordings, not one per failure.
-    var now = Date.now()
-    if (replay.sent >= 3 || now - replay.lastSent < 30000) return
-    var events = [].concat.apply([], replay.segments)
-    if (events.length < 2) return
-    replay.sent++
-    replay.lastSent = now
+  // 'always': the whole page view, piece by piece. 'errors' (the default):
+  // only the last ~30 s, and only when something goes wrong.
+  var always = replaySettings.mode === 'always'
+
+  function send(events, trigger, leaving) {
+    if (!events || events.length < 2 || !replay.lastToken) return
     var token = replay.lastToken
     var ms = events[events.length - 1].timestamp - events[0].timestamp
     var gzip = new Blob([JSON.stringify(events)]).stream().pipeThrough(new CompressionStream('gzip'))
@@ -284,14 +304,50 @@
       for (var i = 0; i < bytes.length; i += 0x8000) {
         binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
       }
-      var body = JSON.stringify({ token: token, trigger: trigger, page: page(), device: device(), replay: btoa(binary), ms: ms })
+      var body = JSON.stringify({
+        token: token, trigger: trigger, view: view, session: session(), user: user || undefined,
+        page: page(), device: device(), replay: btoa(binary), ms: ms,
+      })
       // A plain-text POST: no CORS preflight, like the beacon — but not a
-      // beacon, which browsers cap at 64 KB.
-      return fetch(settings.endpoint + '/replay', { method: 'POST', body: body, credentials: 'omit', mode: 'cors' })
+      // beacon, which browsers cap at 64 KB. As the page goes away, keepalive
+      // lets a small last piece out (the browser's limit is also 64 KB).
+      return fetch(settings.endpoint + '/replay', {
+        method: 'POST', body: body, credentials: 'omit', mode: 'cors', keepalive: !!leaving && body.length < 60000,
+      })
     }).catch(function () {
       // A recording that could not be sent is simply lost.
     })
   }
+
+  function upload(trigger) {
+    // Recording everything already sends it all; nothing to add.
+    if (!replay.on || always) return
+    // A page that keeps failing sends a few recordings, not one per failure.
+    var now = Date.now()
+    if (replay.sent >= 3 || now - replay.lastSent < 30000) return
+    var events = [].concat.apply([], replay.segments)
+    if (events.length < 2) return
+    replay.sent++
+    replay.lastSent = now
+    send(events, trigger, false)
+  }
+
+  // The piece in progress when the page is hidden or closed.
+  function leave() {
+    if (!replay.on || !always) return
+    var current = replay.segments[replay.segments.length - 1]
+    replay.segments[replay.segments.length - 1] = []
+    send(current, 'recording', true)
+  }
+  addEventListener('pagehide', leave)
+  addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') leave()
+    // Back again: start the next piece from a full snapshot, so it plays on
+    // its own as well as after the one before.
+    else if (replay.on && always && window.LookoutReplay && window.LookoutReplay.record.takeFullSnapshot) {
+      window.LookoutReplay.record.takeFullSnapshot(true)
+    }
+  })
 
   window.LookoutRum = {
     /** Let this page record for session replay, from the site's own consent prompt. */
@@ -317,6 +373,10 @@
     if (!token) return
     replay.lastToken = token
     proof = token
+    var s = metric(entry, settings.metric + '-session')
+    if (s && s.description) serverSession = s.description
+    var u = metric(entry, settings.metric + '-user')
+    if (u && u.description) user = u.description
     var failed = entry.responseStatus >= 400
     var slow = entry.duration >= settings.slowMs
     if (failed || slow) upload(failed ? 'failed' : 'slow')

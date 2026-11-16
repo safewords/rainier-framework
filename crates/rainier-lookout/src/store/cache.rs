@@ -334,6 +334,17 @@ impl CacheStore {
     }
 
     async fn write(&self, batches: Vec<Batch>, counted: Vec<Aggregate>) -> Result<()> {
+        self.write_with(batches, counted, true).await
+    }
+
+    /// [`write`](Self::write), and with `count_batches` off the batches are
+    /// stored without being rolled into the aggregates.
+    async fn write_with(
+        &self,
+        batches: Vec<Batch>,
+        counted: Vec<Aggregate>,
+        count_batches: bool,
+    ) -> Result<()> {
         let mut unique: BTreeMap<String, Batch> = BTreeMap::new();
         for batch in batches {
             unique.insert(batch.id.clone(), batch);
@@ -359,7 +370,8 @@ impl CacheStore {
             try_join3(
                 self.add_to_index(&batches),
                 self.roll_up({
-                    let mut rolled = aggregate::rollup(&batches);
+                    let mut rolled =
+                        if count_batches { aggregate::rollup(&batches) } else { Vec::new() };
                     rolled.extend(counted);
                     rolled
                 }),
@@ -970,6 +982,40 @@ impl Store for CacheStore {
 
     fn batches(&self, query: BatchQuery) -> BoxFuture<'_, Result<Vec<BatchSummary>>> {
         Box::pin(self.list(query).instrument(internal("batches")))
+    }
+
+    fn store_uncounted(&self, batches: Vec<Batch>) -> BoxFuture<'_, Result<()>> {
+        Box::pin(self.write_with(batches, Vec::new(), false).instrument(internal("store")))
+    }
+
+    /// One key a batch, `held:<trace id>`, expiring on its own: never in the
+    /// ring, never listed, gone after `ttl` unless a report claims it first.
+    fn hold(&self, batches: Vec<Batch>, ttl: Duration) -> BoxFuture<'_, Result<()>> {
+        Box::pin(
+            async move {
+                let writes = batches.iter().map(|batch| {
+                    let key = self.key(&format!("held:{}", batch.trace_id));
+                    async move { self.put_json(&key, batch, ttl).await }
+                });
+                futures_util::future::try_join_all(writes).await?;
+                Ok(())
+            }
+            .instrument(internal("hold")),
+        )
+    }
+
+    fn release(&self, trace_id: &str) -> BoxFuture<'_, Result<Option<Batch>>> {
+        let key = self.key(&format!("held:{trace_id}"));
+        Box::pin(
+            async move {
+                let found: Option<Batch> = self.get_json(&key).await?;
+                if found.is_some() {
+                    self.cache.forget(&key).await?;
+                }
+                Ok(found)
+            }
+            .instrument(internal("release")),
+        )
     }
 
     fn batch(&self, id: &str) -> BoxFuture<'_, Result<Option<Batch>>> {

@@ -105,6 +105,10 @@ const MAX_PARKED: usize = 256;
 /// [`Lookout::identify_with`].
 pub type IdentifyHook = Arc<dyn Fn(&Response) -> Option<(String, Option<String>)> + Send + Sync>;
 
+/// Says which of the application's sessions a request belongs to. See
+/// [`Lookout::sessions_with`].
+pub type SessionHook = Arc<dyn Fn(&rainier_http::Request) -> Option<String> + Send + Sync>;
+
 /// Lookout: the handle an application holds.
 ///
 /// Cheap to clone; every clone shares the same buffers, channel and counters.
@@ -164,6 +168,7 @@ impl Lookout {
                 open: Mutex::new(HashMap::new()),
                 parked: Mutex::new(Vec::new()),
                 identify: RwLock::new(None),
+                sessions: RwLock::new(None),
                 last_store_error: Mutex::new(None),
                 counts: Mutex::new(Vec::new()),
                 counts_written: Mutex::new(Instant::now()),
@@ -216,6 +221,28 @@ impl Lookout {
         hook: impl Fn(&Response) -> Option<(String, Option<String>)> + Send + Sync + 'static,
     ) {
         *self.inner.identify.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
+    }
+
+    /// Say which of the application's sessions a request belongs to, for
+    /// real user monitoring's session timeline.
+    ///
+    /// `hook` returns the application's own key for the visitor's session —
+    /// its session cookie, its session id, or the user's id if a user is the
+    /// unit worth following — or `None` for a request with none. Lookout
+    /// keeps an HMAC of it, never the key: a session cookie is a credential.
+    /// Every kept request, API call, page view and replay from that session
+    /// then carries `session:<id>`, and the dashboard lays them out as one
+    /// timeline. Without a hook, the browser script keeps a session of its
+    /// own, one per tab.
+    ///
+    /// Called at the start of every request while RUM is on, so it should
+    /// read what the request already carries — a cookie, a header — and
+    /// fetch nothing.
+    pub fn sessions_with(
+        &self,
+        hook: impl Fn(&rainier_http::Request) -> Option<String> + Send + Sync + 'static,
+    ) {
+        *self.inner.sessions.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
     }
 
     /// Spawn the background writer on the current tokio runtime.
@@ -377,8 +404,23 @@ impl Lookout {
         if !rum.enabled || self.inner.is_dashboard_path(path) {
             return response;
         }
-        let Some((trace_id, server)) = self.rum_context() else { return response };
-        for (name, value) in crate::rum::response_headers(rum, &trace_id, Some(&server)) {
+        let Some((trace_id, server, session, user)) = self.rum_context() else { return response };
+        let mut headers = crate::rum::response_headers(rum, &trace_id, Some(&server));
+        if let Some(first) = headers.first_mut() {
+            // The session and the signed user ride along, so the browser's
+            // reports join the right timeline and name the right person.
+            if let Some(session) = session {
+                first.1.push_str(&format!(", {};desc=\"{session}\"", crate::rum::SESSION_METRIC));
+            }
+            if let Some(user) = user.filter(|u| crate::rum::safe_header_text(u)) {
+                first.1.push_str(&format!(
+                    ", {};desc=\"{}\"",
+                    crate::rum::USER_METRIC,
+                    crate::rum::user_token(&rum.secret, &user)
+                ));
+            }
+        }
+        for (name, value) in headers {
             // `Server-Timing` is a list: an application's own metrics stay.
             let value = match response.header(name) {
                 Some(existing) if name == "server-timing" => format!("{existing}, {value}"),
@@ -390,7 +432,9 @@ impl Lookout {
     }
 
     /// The current batch's trace id, with its time so far and its route.
-    fn rum_context(&self) -> Option<(String, crate::rum::ServerSide)> {
+    fn rum_context(
+        &self,
+    ) -> Option<(String, crate::rum::ServerSide, Option<String>, Option<String>)> {
         let cell = self.inner.current_batch()?;
         let state = cell.lock();
         let pending = state.as_ref()?;
@@ -400,6 +444,8 @@ impl Lookout {
                 duration_ms: pending.started.elapsed().as_secs_f64() * 1000.0,
                 route: pending.route_name.clone(),
             },
+            pending.session.clone(),
+            pending.user_id.clone(),
         ))
     }
 
@@ -532,6 +578,12 @@ pub(crate) struct Pending {
     pub(crate) user: Option<crate::user::LookoutUser>,
     /// What made it: header values copied at the start, read on the writer.
     pub(crate) client: Option<crate::client::ClientRaw>,
+    /// The session this request belongs to, keyed: the application's own key
+    /// from [`Lookout::sessions_with`], through an HMAC, never the key itself.
+    pub(crate) session: Option<String>,
+    /// From a listed frontend, so held for a browser report to pair with if
+    /// it would otherwise be dropped.
+    pub(crate) rum_hold: bool,
 }
 
 impl Pending {
@@ -563,6 +615,8 @@ impl Pending {
             traces: Vec::new(),
             user: None,
             client: None,
+            session: None,
+            rum_hold: false,
         }
     }
 
@@ -593,6 +647,7 @@ pub(crate) struct Inner {
     /// Closed request batches waiting for their failure report.
     parked: Mutex<Vec<(Instant, Pending)>>,
     identify: RwLock<Option<IdentifyHook>>,
+    sessions: RwLock<Option<SessionHook>>,
     last_store_error: Mutex<Option<Instant>>,
     /// Aggregates of batches counted but not kept, waiting to be written.
     counts: Mutex<Vec<crate::entry::Aggregate>>,
@@ -791,8 +846,28 @@ impl Inner {
             })
             .filter(|body| !body.is_empty());
         let client = capture.client.then(|| crate::client::ClientRaw::of(request));
+        let rum = &self.config.rum;
+        let (session, rum_hold) = if rum.enabled && !rum.secret.is_empty() {
+            let session = self
+                .sessions
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|hook| hook(request))
+                .filter(|key| !key.is_empty())
+                .map(|key| crate::rum::session_id(&rum.secret, &key));
+            let from_frontend = request.header("origin").is_some_and(|origin| {
+                let origin = origin.trim_end_matches('/');
+                rum.origins.iter().any(|allowed| allowed == origin)
+            });
+            (session, from_frontend && rum.hold_seconds > 0)
+        } else {
+            (None, false)
+        };
         let mut state = cell.lock();
         if let Some(pending) = state.as_mut() {
+            pending.session = session;
+            pending.rum_hold = rum_hold;
             pending.method.get_or_insert_with(|| request.method().as_str().to_string());
             pending.path.get_or_insert(path);
             pending.request_headers = headers;
@@ -1045,7 +1120,15 @@ impl Inner {
             let rest = waiting.split_off(waiting.len().min(size));
             let chunk = std::mem::replace(&mut waiting, rest);
             // On the writer's task, after the requests and jobs have ended.
-            let (kept, counted) = sort_closed(&self.config, &self.host, chunk);
+            let (kept, counted, held) = sort_closed(&self.config, &self.host, chunk);
+            if !held.is_empty() {
+                let ttl = Duration::from_secs(self.config.rum.hold_seconds);
+                let result =
+                    tracing::Instrument::instrument(self.store.hold(held, ttl), span.clone()).await;
+                if let Err(error) = result {
+                    self.log_store_error(&span, &error);
+                }
+            }
             {
                 let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
                 counts.extend(counted);
@@ -1128,8 +1211,9 @@ fn sort_closed(
     config: &LookoutConfig,
     host: &Option<String>,
     closed: Vec<Closed>,
-) -> (Vec<Kept>, Vec<crate::entry::Aggregate>) {
+) -> (Vec<Kept>, Vec<crate::entry::Aggregate>, Vec<Batch>) {
     let mut kept = Vec::new();
+    let mut held = Vec::new();
     let mut counted: Vec<Entry> = Vec::new();
     for Closed { mut pending } in closed {
         let mut traces = std::mem::take(&mut pending.traces);
@@ -1142,10 +1226,16 @@ fn sort_closed(
                 }
                 kept.push(Kept { batch, traces });
             }
+            Finalized::Held(batch) => {
+                // Counted now, as any dropped request is: if a report claims
+                // it later it is stored without being counted again.
+                counted.extend(batch.entries.iter().cloned());
+                held.push(*batch);
+            }
             Finalized::Counted(entries) => counted.extend(entries),
         }
     }
-    (kept, crate::aggregate::rollup_entries(&counted))
+    (kept, crate::aggregate::rollup_entries(&counted), held)
 }
 
 /// Turn each batch's captured stacks into `code.trace` frames.
@@ -1306,6 +1396,10 @@ pub(crate) enum Finalized {
     /// Kept: stored whole, and rolled into the aggregates. Boxed: one is
     /// moved per finished batch, and most are the small variant.
     Kept(Box<Batch>),
+    /// Not kept, but counted — and held a while for a browser report to pair
+    /// with: a request from a listed frontend. Stored for good only if a
+    /// report claims it. See [`crate::rum`].
+    Held(Box<Batch>),
     /// Not kept, but counted: these entries are rolled into the aggregates,
     /// so a route's numbers cover every request and not only the slow ones.
     /// Empty for a batch out of scope, which is counted nowhere.
@@ -1318,6 +1412,7 @@ pub(crate) fn finalize(
     host: Option<String>,
 ) -> Finalized {
     let scope = &config.scope;
+    let hold = pending.rum_hold;
     let has_exception = pending.entries.iter().any(|e| e.entry_type == EntryType::Exception);
 
     // Guard and user scope, now that authentication has run.
@@ -1345,6 +1440,9 @@ pub(crate) fn finalize(
     }
     if pending.failed_job {
         tags.insert("failed".to_string());
+    }
+    if let Some(session) = &pending.session {
+        tags.insert(format!("session:{session}"));
     }
     if pending.truncated > 0 {
         tags.insert(format!("truncated:{}", pending.truncated));
@@ -1391,7 +1489,10 @@ pub(crate) fn finalize(
         // Most production requests end here: the default keep rule drops a
         // batch with nothing slow, failed or monitored in it, so nothing
         // below — the N+1 search, the sort, the summary — would be kept.
+        // Except one held for a browser report: it is built whole, in case
+        // the report comes and keeps it.
         if config.keep.is_none()
+            && !hold
             && !config.local
             && !monitored
             && pending.kind != BatchKind::Other
@@ -1512,6 +1613,8 @@ pub(crate) fn finalize(
         };
     if keep {
         Finalized::Kept(Box::new(batch))
+    } else if hold {
+        Finalized::Held(Box::new(batch))
     } else {
         Finalized::Counted(batch.entries)
     }

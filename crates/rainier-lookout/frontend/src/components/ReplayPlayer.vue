@@ -14,6 +14,9 @@ const props = defineProps({
   // The replay's batch: its id, or the batch itself when already loaded.
   id: { type: String, default: null },
   batch: { type: Object, default: null },
+  // Several pieces of one page view or session, played as one, in order.
+  ids: { type: Array, default: null },
+  title: { type: String, default: 'Replay' },
 })
 
 const stage = ref(null)
@@ -28,7 +31,12 @@ const content = ref({})
 let replayer = null
 let ticker = null
 
-const TRIGGER = { failed: 'a request failed', slow: 'a request was slow', error: 'the page threw an error' }
+const TRIGGER = {
+  failed: 'a request failed',
+  slow: 'a request was slow',
+  error: 'the page threw an error',
+  recording: 'the visitor is recorded throughout',
+}
 const trigger = computed(() => TRIGGER[content.value.trigger] || 'something went wrong')
 const page = computed(() => (content.value.page && content.value.page.url) || null)
 
@@ -47,14 +55,25 @@ function fit() {
 
 async function load() {
   try {
-    const batch = props.batch || (await api.batch(props.id)).data
-    const entry = batch.entries.find((e) => e.content && e.content.kind === 'replay')
-    if (!entry) {
+    const batches = props.batch
+      ? [props.batch]
+      : props.ids
+        ? await Promise.all(props.ids.map(async (id) => (await api.batch(id)).data))
+        : [(await api.batch(props.id)).data]
+    const pieces = batches
+      .map((b) => b.entries.find((e) => e.content && e.content.kind === 'replay'))
+      .filter(Boolean)
+    if (!pieces.length) {
       state.value = 'empty'
       return
     }
-    content.value = entry.content
-    const events = await unpack(entry.content.replay)
+    content.value = pieces[pieces.length - 1].content
+    // Each piece starts from a full snapshot, so they play end to end; the
+    // gaps between them (a page hidden, a reload) are skipped.
+    const events = (await Promise.all(pieces.map((p) => unpack(p.content.replay))))
+      .flat()
+      .filter((e) => e && typeof e.timestamp === 'number')
+      .sort((a, b) => a.timestamp - b.timestamp)
     if (!Array.isArray(events) || events.length < 2) {
       state.value = 'empty'
       return
@@ -114,7 +133,7 @@ onBeforeUnmount(() => {
   clearInterval(ticker)
   if (replayer) replayer.destroy()
 })
-watch(() => [props.id, props.batch], () => {
+watch(() => [props.id, props.batch, props.ids && props.ids.join()], () => {
   if (replayer) replayer.destroy()
   replayer = null
   playing.value = false
@@ -127,7 +146,7 @@ watch(() => [props.id, props.batch], () => {
 <template>
   <section class="lk-card">
     <header class="lk-card-header">
-      <h2 class="text-sm font-semibold">Replay</h2>
+      <h2 class="text-sm font-semibold">{{ title }}</h2>
       <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">
         recorded because {{ trigger }} — masked: text, inputs and media are not shown
       </span>

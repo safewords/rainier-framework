@@ -6,6 +6,7 @@
 import { computed, onMounted, ref } from 'vue'
 
 import BatchStatus from './BatchStatus.vue'
+import ReplayPlayer from './ReplayPlayer.vue'
 import Pill from './Pill.vue'
 import TimeAgo from './TimeAgo.vue'
 import { api } from '../api.js'
@@ -71,14 +72,23 @@ const deviceFacts = computed(() => {
   ].filter(([, v]) => v !== null && v !== undefined && v !== '')
 })
 
-// The API calls this page view made, each with its own page.
+const session = computed(() => {
+  const tag = (props.batch.tags || []).find((t) => t.startsWith('session:'))
+  return tag ? tag.slice('session:'.length) : null
+})
+
+// The API calls this page view made, each with its own page — and its
+// recording, when the visitor was recorded.
 const calls = ref([])
+const replays = ref([])
 const callsLoaded = ref(false)
 onMounted(async () => {
   if (!view.value) return
   try {
-    const answer = await api.batches({ kind: 'browser', tag: `pageview:${view.value}`, limit: 100 })
-    calls.value = answer.data
+    const answer = await api.batches({ kind: 'browser', tag: `pageview:${view.value}`, limit: 200 })
+    const isReplay = (b) => (b.tags || []).includes('replay')
+    calls.value = answer.data.filter((b) => !isReplay(b))
+    replays.value = answer.data.filter(isReplay).sort((a, b) => (a.started_at < b.started_at ? -1 : 1))
   } catch {
     calls.value = []
   } finally {
@@ -88,9 +98,15 @@ onMounted(async () => {
 </script>
 
 <template>
+  <ReplayPlayer v-if="replays.length" :ids="replays.map((r) => r.id)" title="Replay of this page view" class="mb-5" />
   <section class="lk-card">
     <header class="lk-card-header">
       <h2 class="text-sm font-semibold">Page view</h2>
+      <RouterLink
+        v-if="session"
+        :to="{ name: 'session', params: { id: session } }"
+        class="text-xs text-indigo-600 hover:underline dark:text-indigo-400"
+      >its session</RouterLink>
       <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">what the page did in the visitor's browser — reported by it, not verified</span>
     </header>
     <div class="space-y-5 p-4">

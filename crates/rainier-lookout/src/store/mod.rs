@@ -106,6 +106,34 @@ pub trait Store: Send + Sync + 'static {
         self.store(batches)
     }
 
+    /// Keep `batches` for `ttl` only, out of every listing, for a browser
+    /// report to claim with [`release`](Self::release): requests that would
+    /// otherwise be dropped, held so that the ones a browser reports on can
+    /// be paired with it. See `docs/lookout.md`, "Pairing".
+    ///
+    /// The default holds nothing, and a report then finds no request to pair
+    /// with: a store that cannot expire what it writes should not hold.
+    fn hold(&self, batches: Vec<Batch>, ttl: std::time::Duration) -> BoxFuture<'_, Result<()>> {
+        let _ = (batches, ttl);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Store `batches` without adding them to the aggregates — for a held
+    /// batch a report claimed, which was counted when it was held.
+    ///
+    /// The default stores them the ordinary way, which counts them again: a
+    /// store that holds should override this too.
+    fn store_uncounted(&self, batches: Vec<Batch>) -> BoxFuture<'_, Result<()>> {
+        self.store(batches)
+    }
+
+    /// Take back the batch [`hold`](Self::hold) is keeping for `trace_id`,
+    /// if it is still there. Taking it removes it: a pairing happens once.
+    fn release(&self, trace_id: &str) -> BoxFuture<'_, Result<Option<Batch>>> {
+        let _ = trace_id;
+        Box::pin(async { Ok(None) })
+    }
+
     /// Newest first.
     fn batches(&self, query: BatchQuery) -> BoxFuture<'_, Result<Vec<BatchSummary>>>;
 

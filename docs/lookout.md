@@ -87,7 +87,9 @@ Read at boot through the application's `Env` (so `.env` counts), with
 | `LOOKOUT_RUM_SAMPLE_RATE` | the fraction of page views that report | `0.0..=1.0` | `0.1` |
 | `LOOKOUT_RUM_SLOW_MS` | a request this slow in the browser is reported whatever the sample | milliseconds | `1000` |
 | `LOOKOUT_RUM_SECRET` | the key reports are signed with | a string | derived from `APP_KEY` |
+| `LOOKOUT_RUM_HOLD_SECONDS` | how long a request from a frontend is held for a browser report to [pair](#pairing) with | an integer; `0` holds none | `120` |
 | `LOOKOUT_RUM_REPLAY` | [session replay](#session-replay), masked, around failures | a boolean | `false` |
+| `LOOKOUT_RUM_REPLAY_MODE` | upload around failures only, or the whole page view | `errors`, `always` | `errors` |
 | `LOOKOUT_RUM_REPLAY_EXCEPT` | pages never recorded | comma-separated globs over the page's path | none |
 | `LOOKOUT_RUM_REPLAY_CONSENT` | whether a page records before it says the visitor agreed | `required`, `implied` | `required` |
 | `LOOKOUT_RUM_REPLAY_MAX_BYTES` | the most one recording may weigh, compressed | a positive integer | `262144` |
@@ -534,6 +536,63 @@ The phases are zero when the browser withholds them: the response's
 `Timing-Allow-Origin` did not name the page's origin, or a reused connection
 had no DNS or handshake to measure. The page says which.
 
+### Pairing
+
+A browser report about an API call is most use beside the request it was on
+the server — the queries, the timeline, the server's own time against the
+browser's. Production keeps only slow and failed requests, so most of those
+are gone by the time a report arrives. Pairing keeps them for it:
+
+1. A request whose `Origin` is in `LOOKOUT_RUM_ORIGINS`, and that the keep
+   rule would drop, is **held** instead: written by the background writer,
+   after the response, to the store with a short lifetime
+   (`LOOKOUT_RUM_HOLD_SECONDS`, two minutes) and out of every listing. It is
+   counted in the aggregates as any dropped request is.
+2. When a browser report names it, the held request is **released** and
+   kept — tagged `rum:paired`, and with the report's session and page view —
+   without being counted again.
+3. The report's page then shows **The request on the server**, linked, with
+   both times; the request's page shows **In the browser**. They share one
+   trace, so each is in the other's **Related** list too.
+
+A request nobody reports on expires with its hold. Only the `memory` and
+`cache` stores hold; the `database` store keeps no short-lived rows, so it
+pairs only what it already kept. A request made without a page — a script, a
+test runner's API client — has no browser report to pair with.
+
+### Sessions
+
+Page views, API calls, kept and paired requests and replays carry
+`session:<id>`, and **Browser → Sessions** lists sessions, newest first; a
+session's page lays everything in it out as one timeline — each page view,
+its route changes and script errors at the moment they happened, each API
+call with its browser time beside its server time when the request was kept
+or paired, and a **Replay of the session** stitched from its recordings.
+It is what to open when someone reports a problem: find them (filter by user
+id), find the session, read it from the top.
+
+What a session *is* is the application's to say — the binding to its own
+application layer:
+
+```rust
+// At boot: the application's own key for the visitor's session. Here, the
+// session cookie; it could be a header, or the user's id.
+app.with_lookout_sessions(|request| request.cookie("app_session").map(str::to_string))
+```
+
+The closure runs at the start of every request while RUM is on, so it reads
+what the request carries and fetches nothing. Lookout keeps an HMAC of the
+key (`lookout-session` in `Server-Timing`), never the key: a session cookie
+is a credential. With a `Lookout` in hand, `lookout.sessions_with(..)` does
+the same. Without a binding, the browser script keeps a session of its own,
+one per tab, renewed after 30 idle minutes.
+
+The user is attributed the same way: a response to an authenticated request
+carries the user's id signed (`lookout-user`), the script returns it with its
+reports, and Lookout believes it only if the signature holds — so a browser
+cannot file its reports under someone else's name. Its reports then carry the
+user's id, and the user's own page links to their sessions.
+
 ### Session replay
 
 With `LOOKOUT_RUM_REPLAY=true` (and RUM on), a page can record itself, so
@@ -541,7 +600,11 @@ the dashboard can play back what the visitor saw in the seconds before a
 request failed or was slow, or the page threw. It is off unless turned on,
 and built to keep as little as it can:
 
-- **Only around a problem.** The script keeps the last two stretches of the
+- **Only around a problem**, by default (`LOOKOUT_RUM_REPLAY_MODE=errors`).
+  With `always`, a page that may record uploads the whole page view instead,
+  piece by piece as each fifteen-second stretch closes and as the page is
+  hidden or left, so a session plays from start to end — for visitors who
+  agreed to it, under the same consent rule. The script keeps the last two stretches of the
   page in the browser's memory — each from a full snapshot, a new one every
   15 seconds — and uploads them only when a request to the API answers 4xx
   or 5xx, takes longer than `LOOKOUT_RUM_SLOW_MS`, or the page throws. At
