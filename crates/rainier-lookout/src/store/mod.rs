@@ -58,6 +58,9 @@ pub struct AggregateQuery {
     pub period_s: u32,
     /// From when.
     pub since: DateTime<Utc>,
+    /// Through when. `None` keeps every bucket from `since` on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
     /// How to order the keys.
     pub order: AggregateOrder,
     /// At most this many keys.

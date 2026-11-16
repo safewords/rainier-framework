@@ -663,9 +663,17 @@ on a refused request, which is the next point.
 
 ### What it shows
 
-- **Dashboard** — requests, throughput, error and job counts for the chosen
-  range, graphs over time with a forecast, the insights, and the slowest and
-  most frequent of each type.
+- **The time range** sits in the bar under the header: 1h, 6h, 24h, 7d, or a
+  calendar for a custom pair of dates (60 days at most). It is kept in the
+  URL (`range`, and `from` / `to` as `YYYY-MM-DD` for a custom range) and
+  follows the viewer from page to page. The dashboard, Requests, Jobs and an
+  issue's charts read it. Pages that list newest-first — batches, entries,
+  cases, search, sessions — leave those keys in the URL and do not filter by
+  them. A custom range sends `until` as well as `since`; without `until` a
+  series still runs up to now.
+- **Dashboard** — requests, throughput and average request time on one chart,
+  error and job counts for the chosen range, the insights, and the slowest
+  and most frequent of each type.
 - **Every row drills in.** A route, query, job, exception or outgoing call
   opens its own page — `/issues/{type}/{id}`, where the id is the family's
   [`family_id`](#the-json-api), sixteen hex digits rather than its SQL — with
@@ -862,8 +870,8 @@ shape.
 | `GET` | `/api/batches/{id}` | one batch, with its entries |
 | `GET` | `/api/entries/{type}` | entries of one type across batches — `key` (one family), `q` (text in the summary or key; reads at most five pages), `before`, `limit` |
 | `GET` | `/api/families/{type}/{id}` | the key a family id names — `{"id", "key"}`, or `404`. The id is `family_id(type, key)`: FNV-1a over the type, a newline and the key, sixteen hex digits, so the dashboard can make one without asking |
-| `GET` | `/api/aggregates/{type}` | rolled-up counts and durations, with `average_us`, `p50_us`, `p90_us`, `p95_us`, `p99_us`, the `histogram` (`{slot: count}`) and the row's `family_id` — `period` (60, 600, 3600), `since`, `order` (`count`, `average`, `max`) |
-| `GET` | `/api/series/{type}` | one zero-filled point per bucket from `since` to now, each with `count`, `average_us`, `max_us` and, where the bucket kept a histogram, `p50_us`, `p90_us`, `p95_us` and `p99_us`; `percentiles` holds the same four over the whole range — `period` (default: a dozen points or more), `key`, `keys` (that many busiest keys' own series), `forecast` (buckets) |
+| `GET` | `/api/aggregates/{type}` | rolled-up counts and durations, with `average_us`, `p50_us`, `p90_us`, `p95_us`, `p99_us`, the `histogram` (`{slot: count}`) and the row's `family_id` — `period` (60, 600, 3600), `since`, `until` (omit it to run to now), `order` (`count`, `average`, `max`) |
+| `GET` | `/api/series/{type}` | one zero-filled point per bucket from `since` to `until` (or now), each with `count`, `average_us`, `max_us` and, where the bucket kept a histogram, `p50_us`, `p90_us`, `p95_us` and `p99_us`; `percentiles` holds the same four over the whole range — `period` (default: a dozen points or more), `key`, `keys` (that many busiest keys' own series), `forecast` (buckets) |
 | `GET` | `/api/insights` | what changed since the previous window — `window`, `min`, `change`, `forecast`, `limit` |
 | `GET` | `/api/cases` | cases — `status` (`open`, `resolved`, `ignored`, `all`), `severity` (minimum), `q`, `limit` |
 | `GET` | `/api/cases/{id}` | one case |

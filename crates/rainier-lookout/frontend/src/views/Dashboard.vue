@@ -1,6 +1,6 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 
 import AggregateCard from '../components/AggregateCard.vue'
 import BatchList from '../components/BatchList.vue'
@@ -12,8 +12,9 @@ import Sparkline from '../components/Sparkline.vue'
 import StatTile from '../components/StatTile.vue'
 import { api } from '../api.js'
 import { config } from '../config.js'
-import { count, issueRoute, percent, RANGES, rate, since as sinceHours, time, totals, TYPES } from '../format.js'
+import { count, issueRoute, percent, rate, time, totals, TYPES } from '../format.js'
 import { mergePulse, usePolling } from '../live.js'
+import { followsNow, parseRange } from '../range.js'
 
 const CARDS = [
   { id: 'routes', title: 'Slowest routes', type: 'request', order: 'max', hint: 'by worst time', keyLabel: 'Route' },
@@ -24,9 +25,9 @@ const CARDS = [
 ]
 
 const route = useRoute()
-const router = useRouter()
-const range = RANGES.find((r) => r.key === route.query.range) || RANGES[2]
-const minutes = range.hours * 60
+const range = computed(() => parseRange(route.query))
+const minutes = computed(() => range.value.ms / 60_000)
+const windowHint = computed(() => (range.value.preset ? `in the last ${range.value.label}` : range.value.label))
 
 // --- Insight thresholds: the server's, unless this browser has its own.
 
@@ -117,13 +118,14 @@ async function loadInsights() {
 }
 
 async function load() {
-  const since = sinceHours(range.hours)
-  const forecast = config.insights.enabled ? settings.forecast : undefined
-  const seriesParams = { since, period: range.period, forecast }
+  const since = range.value.since
+  const until = range.value.until || undefined
+  const forecast = config.insights.enabled && followsNow(range.value) ? settings.forecast : 0
+  const seriesParams = { since, until, period: range.value.period, forecast }
   loadInsights()
   try {
     const [aggregates, failed, requests, exceptions, jobs] = await Promise.all([
-      Promise.all(CARDS.map((card) => api.aggregates(card.type, { period: range.period, since, order: card.order, limit: 8 }))),
+      Promise.all(CARDS.map((card) => api.aggregates(card.type, { period: range.value.period, since, until, order: card.order, limit: 8 }))),
       api.batches({ exception: true, limit: 8 }),
       api.series('request', seriesParams),
       api.series('exception', seriesParams),
@@ -143,14 +145,16 @@ async function load() {
 }
 
 onMounted(load)
+watch(() => [range.value.key, range.value.since, range.value.until], () => load())
 // The totals and charts move with every pulse, in place; the cards, the
 // failures and the insights reload at most every five seconds.
 usePolling(load, 10_000, {
   on: 'both',
   onPulse: (pulse) => {
-    mergePulse(series.request, pulse, 'request', range.period)
-    mergePulse(series.exception, pulse, 'exception', range.period)
-    mergePulse(series.job, pulse, 'job', range.period)
+    if (!followsNow(range.value)) return
+    mergePulse(series.request, pulse, 'request', range.value.period)
+    mergePulse(series.exception, pulse, 'exception', range.value.period)
+    mergePulse(series.job, pulse, 'job', range.value.period)
   },
 })
 
@@ -210,7 +214,7 @@ const jobTimeChart = computed(() => {
   ]
 })
 const bucketLabel = computed(() => {
-  const p = (series.request && series.request.period) || range.period
+  const p = (series.request && series.request.period) || range.value.period
   return p >= 3600 ? `${p / 3600} h` : `${p / 60} min`
 })
 const whole = (v) => count(v)
@@ -280,32 +284,17 @@ function insightLink(i) {
 
 <template>
   <div class="space-y-6">
-    <div class="flex flex-wrap items-end justify-between gap-3">
-      <div>
-        <h1 class="text-xl font-semibold tracking-tight">Dashboard</h1>
-        <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-          What was slowest and what failed most — from rolled-up measurements that outlive the individual requests and jobs kept.
-        </p>
-      </div>
-      <div class="inline-flex overflow-hidden rounded-md border border-zinc-300 dark:border-zinc-700" role="group" aria-label="Period">
-        <button
-          v-for="r in RANGES"
-          :key="r.key"
-          type="button"
-          class="px-3 py-1.5 text-sm font-medium transition not-first:border-l not-first:border-zinc-300 dark:not-first:border-zinc-700"
-          :class="r.key === range.key
-            ? 'bg-indigo-50 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300'
-            : 'bg-white text-zinc-600 hover:bg-zinc-50 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800'"
-          :aria-pressed="r.key === range.key"
-          @click="router.replace({ query: { range: r.key } })"
-        >{{ r.key }}</button>
-      </div>
+    <div>
+      <h1 class="text-xl font-semibold tracking-tight">Dashboard</h1>
+      <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+        What was slowest and what failed most — from rolled-up measurements that outlive the individual requests and jobs kept.
+      </p>
     </div>
 
     <ErrorBox :error="error" />
 
     <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-7">
-      <StatTile label="Requests" :value="count(requestTotals.count)" :hint="`in the last ${range.key}`" :loading="loading">
+      <StatTile label="Requests" :value="count(requestTotals.count)" :hint="windowHint" :loading="loading">
         <Sparkline :points="counts(series.request)" color="indigo" />
       </StatTile>
       <StatTile label="Throughput" :value="`${rate(requestTotals.count / minutes)}/min`" hint="requests per minute, averaged" :loading="loading" />

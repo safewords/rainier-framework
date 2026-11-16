@@ -15,6 +15,7 @@ import TimeAgo from '../components/TimeAgo.vue'
 import { api } from '../api.js'
 import { caseId, count, duration, percentile, TYPES } from '../format.js'
 import { usePolling } from '../live.js'
+import { followsNow, parseRange } from '../range.js'
 
 const props = defineProps({ type: { type: String, required: true }, id: { type: String, default: '' } })
 const route = useRoute()
@@ -24,14 +25,8 @@ const resolved = ref('')
 const resolving = ref(false)
 const key = computed(() => (typeof route.query.key === 'string' && route.query.key) || resolved.value)
 
-const RANGES = [
-  { key: '1h', label: '1h', minutes: 60 },
-  { key: '6h', label: '6h', minutes: 360 },
-  { key: '24h', label: '24h', minutes: 1440 },
-  { key: '7d', label: '7d', minutes: 7 * 1440 },
-]
-const range = ref('24h')
-const minutes = computed(() => (RANGES.find((r) => r.key === range.value) || RANGES[2]).minutes)
+const range = computed(() => parseRange(route.query))
+const minutes = computed(() => range.value.ms / 60_000)
 
 const series = ref(null)
 const seriesError = ref(null)
@@ -50,8 +45,12 @@ async function loadSeries() {
   if (!key.value) return
   seriesLoading.value = true
   try {
-    const since = new Date(Date.now() - minutes.value * 60_000).toISOString()
-    series.value = await api.series(props.type, { since, key: key.value, forecast: 6 })
+    series.value = await api.series(props.type, {
+      since: range.value.since,
+      until: range.value.until || undefined,
+      key: key.value,
+      forecast: followsNow(range.value) ? 6 : 0,
+    })
     seriesError.value = null
   } catch (e) {
     series.value = null
@@ -128,7 +127,7 @@ onMounted(async () => {
   loadEntries()
   loadCase()
 })
-watch(range, loadSeries)
+watch(() => [range.value.key, range.value.since, range.value.until], () => loadSeries())
 usePolling(
   () => {
     loadSeries()
@@ -287,22 +286,11 @@ const columns = [
         <RouterLink v-if="kase" :to="{ name: 'case', params: { id: kase.id } }" class="lk-btn">Case →</RouterLink>
       </div>
 
-      <div class="flex flex-wrap items-center gap-2" role="group" aria-label="Time range">
-        <button
-          v-for="r in RANGES"
-          :key="r.key"
-          type="button"
-          class="lk-btn"
-          :class="range === r.key ? 'border-indigo-500 bg-indigo-50 text-indigo-700 dark:border-indigo-400 dark:bg-indigo-500/10 dark:text-indigo-300' : ''"
-          :aria-pressed="range === r.key"
-          @click="range = r.key"
-        >{{ r.label }}</button>
-        <span v-if="seriesLoading" class="text-xs text-zinc-500 dark:text-zinc-400">Loading…</span>
-      </div>
+      <p v-if="seriesLoading" class="text-xs text-zinc-500 dark:text-zinc-400">Loading…</p>
 
       <div class="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-8">
-        <StatTile label="Occurrences" :value="series ? count(totals.n) : '—'" :hint="`last ${range}`" :tone="type === 'exception' && totals.n ? 'bad' : 'neutral'" />
-        <StatTile label="Per minute" :value="series ? (totals.n / minutes).toFixed(totals.n / minutes >= 10 ? 0 : 2) : '—'" :hint="`over ${range}`" />
+        <StatTile label="Occurrences" :value="series ? count(totals.n) : '—'" :hint="range.preset ? `last ${range.label}` : range.label" :tone="type === 'exception' && totals.n ? 'bad' : 'neutral'" />
+        <StatTile label="Per minute" :value="series ? (totals.n / minutes).toFixed(totals.n / minutes >= 10 ? 0 : 2) : '—'" :hint="range.preset ? `over ${range.label}` : range.label" />
         <StatTile label="Average" :value="series && totals.avg !== null && hasTimes ? duration(totals.avg) : '—'" />
         <StatTile label="Worst" :value="series && hasTimes && totals.n ? duration(totals.worst) : '—'" :tone="totals.worst > 1_000_000 ? 'warn' : 'neutral'" />
         <StatTile label="p50" :value="duration(pcts.p50.value)" :hint="pcts.p50.hint" />

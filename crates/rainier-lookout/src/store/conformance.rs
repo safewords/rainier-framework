@@ -128,11 +128,13 @@ pub fn select_aggregates(
     query: &AggregateQuery,
 ) -> Vec<Aggregate> {
     let from = bucket_start(query.since, query.period_s);
+    let end = query.until.map(|until| bucket_start(until, query.period_s));
     let mut per_key: BTreeMap<String, Aggregate> = BTreeMap::new();
     for row in rows {
         if row.period_s != query.period_s
             || row.entry_type != query.entry_type
             || row.bucket_start < from
+            || end.is_some_and(|end| row.bucket_start > end)
         {
             continue;
         }
@@ -667,7 +669,7 @@ fn agg_query(
     order: AggregateOrder,
     limit: usize,
 ) -> AggregateQuery {
-    AggregateQuery { entry_type, period_s, since, order, limit }
+    AggregateQuery { entry_type, period_s, since, until: None, order, limit }
 }
 
 /// Aggregates match [`aggregate::rollup`] of what was stored, per period, and

@@ -197,6 +197,8 @@ pub(crate) struct SeriesQuery {
     pub(crate) entry_type: EntryType,
     pub(crate) period_s: u32,
     pub(crate) since: DateTime<Utc>,
+    /// Through when. `None` runs the series up to now.
+    pub(crate) until: Option<DateTime<Utc>>,
     /// Only this family.
     pub(crate) key: Option<String>,
     /// Also a series for each of the busiest keys, at most this many.
@@ -231,17 +233,25 @@ pub(crate) fn series_query(
         }
     }
     let since = params.time("since").unwrap_or(now - Duration::hours(24));
+    let until = params.time("until");
     if since > now {
         params.fail("since", "The since must be in the past.");
     }
-    let period_s = period(params).unwrap_or_else(|| crate::trends::period_for(now - since));
-    if (now - since).num_seconds() / i64::from(period_s) > 2000 {
+    if let Some(until) = until {
+        if until < since {
+            params.fail("until", "The until must not be before since.");
+        }
+    }
+    let end = until.unwrap_or(now).min(now);
+    let span = if end >= since { end - since } else { Duration::zero() };
+    let period_s = period(params).unwrap_or_else(|| crate::trends::period_for(span));
+    if end >= since && span.num_seconds() / i64::from(period_s) > 2000 {
         params.fail("since", "That is more than 2000 buckets; use a longer period.");
     }
     let key = params.raw("key");
     let keys = params.integer("keys", 0, 50).unwrap_or(0) as usize;
     let forecast = params.integer("forecast", 0, 100).map_or(default_forecast, |n| n as usize);
-    Some(SeriesQuery { entry_type: entry_type?, period_s, since, key, keys, forecast })
+    Some(SeriesQuery { entry_type: entry_type?, period_s, since, until, key, keys, forecast })
 }
 
 /// `GET /api/insights`: the configured thresholds, each overridable.
@@ -278,6 +288,12 @@ pub(crate) fn aggregate_query(
     }
     let period_s = period(params).unwrap_or(3600);
     let since = params.time("since").unwrap_or(now - Duration::hours(24));
+    let until = params.time("until");
+    if let Some(until) = until {
+        if until < since {
+            params.fail("until", "The until must not be before since.");
+        }
+    }
     let order = match params.raw("order") {
         None => AggregateOrder::Max,
         Some(o) => match o.as_str() {
@@ -291,7 +307,7 @@ pub(crate) fn aggregate_query(
         },
     };
     let limit = params.limit(MAX_AGGREGATE_LIMIT, 10);
-    Some(AggregateQuery { entry_type: entry_type?, period_s, since, order, limit })
+    Some(AggregateQuery { entry_type: entry_type?, period_s, since, until, order, limit })
 }
 
 /// `GET /api/cases`.

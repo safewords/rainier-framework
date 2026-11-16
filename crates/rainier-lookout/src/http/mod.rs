@@ -12,8 +12,8 @@
 //! | `DELETE` | `/api/batches` | `lookout.api.clear` | Delete everything — needs `X-Lookout: 1` |
 //! | `GET` | `/api/batches/{id}` | `lookout.api.batch` | One [`Batch`](crate::entry::Batch), with entries |
 //! | `GET` | `/api/entries/{type}` | `lookout.api.entries` | [`Entry`](crate::entry::Entry) list |
-//! | `GET` | `/api/aggregates/{type}` | `lookout.api.aggregates` | [`Aggregate`](crate::entry::Aggregate) list |
-//! | `GET` | `/api/series/{type}` | `lookout.api.series` | Zero-filled points per bucket, a forecast, and per-key series with `keys=N` |
+//! | `GET` | `/api/aggregates/{type}` | `lookout.api.aggregates` | [`Aggregate`](crate::entry::Aggregate) list; `until` ends the window |
+//! | `GET` | `/api/series/{type}` | `lookout.api.series` | Zero-filled points per bucket from `since` to `until` (or now), a forecast, and per-key series with `keys=N` |
 //! | `GET` | `/api/insights` | `lookout.api.insights` | What changed since the previous window ([`trends`](crate::trends)) |
 //! | `GET` | `/api/cases` | `lookout.api.cases` | [`Case`](crate::cases::Case) list: `status`, `severity` (minimum), `q`, `limit` |
 //! | `GET` | `/api/cases/{id}` | `lookout.api.case` | One case |

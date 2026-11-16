@@ -4,6 +4,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import './style.css'
 import App from './App.vue'
 import { config } from './config.js'
+import { rangeQuery } from './range.js'
 import Dashboard from './views/Dashboard.vue'
 import Batches from './views/Batches.vue'
 import BatchDetail from './views/BatchDetail.vue'
@@ -49,6 +50,18 @@ const router = createRouter({
     { path: '/:rest(.*)*', name: 'not-found', component: NotFound },
   ],
   scrollBehavior: (to, from, saved) => saved || { top: 0 },
+})
+
+// The header's window travels with the viewer. A link that names its own
+// query keeps it; pages that do not read the window leave the keys alone.
+router.beforeEach((to, from) => {
+  if (to.query.range || !from.query.range) return
+  return {
+    path: to.path,
+    hash: to.hash,
+    query: { ...to.query, ...rangeQuery(from.query) },
+    replace: true,
+  }
 })
 
 createApp(App).use(router).mount('#lookout')

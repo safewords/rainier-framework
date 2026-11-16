@@ -104,7 +104,7 @@ export function count(n) {
   return n === null || n === undefined ? '—' : Number(n).toLocaleString()
 }
 
-/** The time ranges the dashboard and the job view offer, with the bucket length each reads. */
+/** The time ranges the header offers, with the bucket length each reads. */
 export const RANGES = [
   { key: '1h', period: 60, hours: 1 },
   { key: '6h', period: 600, hours: 6 },

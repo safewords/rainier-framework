@@ -10,8 +10,9 @@ import Sparkline from '../components/Sparkline.vue'
 import StatTile from '../components/StatTile.vue'
 import { api } from '../api.js'
 import { config } from '../config.js'
-import { count, histogramPercentile, issueRoute, mergeHistograms, percent, RANGES, rate, since as sinceHours, time } from '../format.js'
+import { count, histogramPercentile, issueRoute, mergeHistograms, percent, rate, time } from '../format.js'
 import { usePolling } from '../live.js'
+import { followsNow, parseRange } from '../range.js'
 
 // One page per measured kind of work: every distinct job class, or every
 // route, with its timing over the whole range — percentiles included, read
@@ -44,8 +45,9 @@ const kind = computed(() => KINDS[props.type] || KINDS.request)
 
 const route = useRoute()
 const router = useRouter()
-const range = computed(() => RANGES.find((r) => r.key === route.query.range) || RANGES[2])
-const minutes = computed(() => range.value.hours * 60)
+const range = computed(() => parseRange(route.query))
+const minutes = computed(() => range.value.ms / 60_000)
+const windowLabel = computed(() => (range.value.preset ? `the last ${range.value.label}` : range.value.label))
 
 // Publishing a job is recorded as a job entry too (`dispatch:<name>`); its
 // time is the enqueue, not the work, so it stays out unless asked for.
@@ -59,12 +61,13 @@ const loading = ref(true)
 const error = ref(null)
 
 async function load() {
-  const since = sinceHours(range.value.hours)
+  const since = range.value.since
+  const until = range.value.until || undefined
   const type = props.type
   try {
     const [rows, points, recent] = await Promise.all([
-      api.aggregates(type, { period: range.value.period, since, order: 'count', limit: 100 }),
-      api.series(type, { since, period: range.value.period, keys: 50, forecast: config.insights.enabled ? undefined : 0 }),
+      api.aggregates(type, { period: range.value.period, since, until, order: 'count', limit: 100 }),
+      api.series(type, { since, until, period: range.value.period, keys: 50, forecast: config.insights.enabled && followsNow(range.value) ? undefined : 0 }),
       api.batches({ kind: kind.value.batchKind, limit: 50 }),
     ])
     if (type !== props.type) return
@@ -78,7 +81,7 @@ async function load() {
     loading.value = false
   }
 }
-watch([() => props.type, () => range.value.key], () => {
+watch([() => props.type, () => range.value.key, () => range.value.since, () => range.value.until], () => {
   loading.value = true
   aggregates.value = []
   series.value = null
@@ -117,7 +120,7 @@ const share = (r) => (totals.value.spent ? (r.sum_us * 100) / totals.value.spent
 const pct = (name, hint) => ({
   key: name,
   label: name,
-  title: `${hint} (over every one in the last ${range.value.key}; to within ~9%)`,
+  title: `${hint} (over every one in ${windowLabel.value}; to within ~9%)`,
   align: 'right',
   sortable: true,
   value: (r) => r[`${name}_us`] ?? -1,
@@ -126,8 +129,8 @@ const pct = (name, hint) => ({
 
 const columns = computed(() => [
   { key: 'key', label: kind.value.thing, sortable: true, value: (r) => r.key, text: (r) => r.key, class: 'font-mono text-[12.5px]' },
-  { key: 'count', label: kind.value.unit, title: `How many in the last ${range.value.key}`, align: 'right', sortable: true, value: (r) => r.count, text: (r) => count(r.count) },
-  { key: 'rate', label: 'Per min', title: `Per minute, averaged over the last ${range.value.key}`, align: 'right', sortable: true, value: (r) => r.count / minutes.value, text: (r) => rate(r.count / minutes.value) },
+  { key: 'count', label: kind.value.unit, title: `How many in ${windowLabel.value}`, align: 'right', sortable: true, value: (r) => r.count, text: (r) => count(r.count) },
+  { key: 'rate', label: 'Per min', title: `Per minute, averaged over ${windowLabel.value}`, align: 'right', sortable: true, value: (r) => r.count / minutes.value, text: (r) => rate(r.count / minutes.value) },
   { key: 'average', label: 'Avg', title: 'Mean time', align: 'right', sortable: true, value: avg, text: (r) => time(avg(r)) },
   pct('p50', 'Half took less'),
   pct('p90', '1 in 10 took longer'),
@@ -136,7 +139,7 @@ const columns = computed(() => [
   { key: 'max', label: 'Max', title: 'The single slowest', align: 'right', sortable: true, value: (r) => r.max_us, text: (r) => time(r.max_us) },
   { key: 'total', label: 'Total time', title: 'Count × average: all the time spent here', align: 'right', sortable: true, value: (r) => r.sum_us, text: (r) => time(r.sum_us) },
   { key: 'share', label: 'Share', title: 'Its part of all the time spent in what is shown', sortable: true, value: share, text: (r) => percent(share(r)) },
-  { key: 'trend', label: 'Trend', title: `Count per bucket over the last ${range.value.key} (the 50 busiest)`, text: () => '' },
+  { key: 'trend', label: 'Trend', title: `Count per bucket over ${windowLabel.value} (the 50 busiest)`, text: () => '' },
 ])
 // Beside the latest list there is room for what tells routes apart; every
 // column is on the route's own page.
@@ -192,31 +195,16 @@ const bucketLabel = computed(() => {
         <h1 class="text-xl font-semibold tracking-tight">{{ kind.title }}</h1>
         <p class="mt-1 max-w-3xl text-sm text-zinc-500 dark:text-zinc-400">{{ kind.blurb }}</p>
       </div>
-      <div class="flex flex-wrap items-center gap-2">
-        <label v-if="type === 'job'" class="flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-300">
-          <input type="checkbox" class="size-4 accent-indigo-600" :checked="dispatches" @change="setQuery({ dispatches: dispatches ? undefined : '1' })" /> Include dispatches
-        </label>
-        <div class="inline-flex overflow-hidden rounded-md border border-zinc-300 dark:border-zinc-700" role="group" aria-label="Period">
-          <button
-            v-for="r in RANGES"
-            :key="r.key"
-            type="button"
-            class="px-3 py-1.5 text-sm font-medium transition not-first:border-l not-first:border-zinc-300 dark:not-first:border-zinc-700"
-            :class="r.key === range.key
-              ? 'bg-indigo-50 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300'
-              : 'bg-white text-zinc-600 hover:bg-zinc-50 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800'"
-            :aria-pressed="r.key === range.key"
-            @click="setQuery({ range: r.key })"
-          >{{ r.key }}</button>
-        </div>
-      </div>
+      <label v-if="type === 'job'" class="flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-300">
+        <input type="checkbox" class="size-4 accent-indigo-600" :checked="dispatches" @change="setQuery({ dispatches: dispatches ? undefined : '1' })" /> Include dispatches
+      </label>
     </div>
 
     <ErrorBox :error="error" />
 
     <section class="space-y-3" aria-label="Over everything">
       <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-5">
-        <StatTile :label="kind.unit" :value="count(totals.n)" :hint="`in the last ${range.key}`" :loading="loading" />
+        <StatTile :label="kind.unit" :value="count(totals.n)" :hint="range.preset ? `in the last ${range.label}` : range.label" :loading="loading" />
         <StatTile label="Throughput" :value="`${rate(totals.n / minutes)}/min`" :hint="`${kind.units} per minute, averaged`" :loading="loading" />
         <StatTile label="Avg" :value="time(totals.average)" hint="mean time" :loading="loading" />
         <StatTile label="Max" :value="time(totals.n ? totals.worst : null)" hint="the single slowest" :loading="loading" />
@@ -255,7 +243,7 @@ const bucketLabel = computed(() => {
     <section class="lk-card min-w-0">
       <header class="lk-card-header">
         <h2 class="text-sm font-semibold">Every {{ kind.thing.toLowerCase() }}</h2>
-        <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">busiest {{ range.key }} · opens its page</span>
+        <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">busiest in {{ windowLabel }} · opens its page</span>
       </header>
       <DataTable
         :columns="compactColumns"
@@ -266,7 +254,7 @@ const bucketLabel = computed(() => {
         filterable
         :filter-placeholder="`Filter ${kind.things}…`"
         :loading="loading"
-        :empty="`Nothing in the last ${range.key}.`"
+        :empty="`Nothing in ${windowLabel}.`"
         :label="kind.title"
       >
         <template #cell-share="{ row }">

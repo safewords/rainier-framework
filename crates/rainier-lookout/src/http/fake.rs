@@ -165,6 +165,9 @@ impl Store for FakeStore {
                     || row.period_s != query.period_s
                     || row.bucket_start
                         < crate::aggregate::bucket_start(query.since, query.period_s)
+                    || query.until.is_some_and(|until| {
+                        row.bucket_start > crate::aggregate::bucket_start(until, query.period_s)
+                    })
                 {
                     continue;
                 }

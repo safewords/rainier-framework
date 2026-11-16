@@ -1196,6 +1196,7 @@ mod tests {
                 entry_type: EntryType::Request,
                 period_s: 60,
                 since: at(0, 0),
+                until: None,
                 order: crate::store::AggregateOrder::Count,
                 limit: 10,
             })

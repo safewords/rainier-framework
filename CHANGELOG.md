@@ -571,6 +571,11 @@ the release as a whole and names the crate it landed in.
 
 ### Changed
 
+- Lookout's time range lives in the bar under the header — 1h, 6h, 24h, 7d,
+  or a custom pair of dates — and follows the viewer from page to page.
+  Dashboard, Requests, Jobs and an issue's charts read it; newest-first pages
+  leave it in the URL and do not filter by it. A custom range sends `until`
+  on `/api/series` and `/api/aggregates`, which otherwise still run up to now.
 - Lookout's dashboard draws request throughput and average request time on
   one chart: requests per minute on the left axis, mean duration on the
   right, each with its forecast.

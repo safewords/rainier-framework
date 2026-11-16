@@ -2,9 +2,12 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
+import RangePicker from './components/RangePicker.vue'
 import { api } from './api.js'
 import { config } from './config.js'
 import { createLive, createStream } from './live.js'
+import { parseRange } from './range.js'
+import { RANGES } from './format.js'
 
 const live = createLive()
 const stream = createStream(live)
@@ -19,6 +22,17 @@ provide('now', now)
 const generation = ref(0)
 
 const route = useRoute()
+const range = computed(() => parseRange(route.query))
+function setRange(key) {
+  const query = { ...route.query }
+  delete query.from
+  delete query.to
+  query.range = key
+  router.replace({ query })
+}
+function applyCustom({ from, to }) {
+  router.replace({ query: { ...route.query, range: 'custom', from, to } })
+}
 const menu = ref(false)
 watch(() => route.fullPath, () => {
   menu.value = false
@@ -230,13 +244,38 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
         class="lk-btn text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-500/10"
         :disabled="clearing"
         @click="clear"
-      >Clear</button>
+      >Clear      </button>
     </header>
+    <div
+      class="sticky top-14 z-30 flex h-11 items-center gap-2 border-b border-zinc-200 bg-white/90 px-4 backdrop-blur dark:border-zinc-800 dark:bg-zinc-900/90"
+    >
+      <div class="inline-flex overflow-hidden rounded-md border border-zinc-300 dark:border-zinc-700" role="group" aria-label="Time range">
+        <button
+          v-for="item in RANGES"
+          :key="item.key"
+          type="button"
+          class="px-2.5 py-1 text-sm font-medium transition not-first:border-l not-first:border-zinc-300 dark:not-first:border-zinc-700"
+          :class="item.key === range.key
+            ? 'bg-indigo-50 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300'
+            : 'bg-white text-zinc-600 hover:bg-zinc-50 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800'"
+          :aria-pressed="item.key === range.key"
+          @click="setRange(item.key)"
+        >{{ item.key }}</button>
+      </div>
+      <RangePicker
+        :active="range.key === 'custom'"
+        :from="typeof route.query.from === 'string' ? route.query.from : ''"
+        :to="typeof route.query.to === 'string' ? route.query.to : ''"
+        @apply="applyCustom"
+        @clear="setRange('24h')"
+      />
+      <span v-if="range.key === 'custom'" class="truncate text-xs text-zinc-500 dark:text-zinc-400">{{ range.label }}</span>
+    </div>
     <form
       v-if="searchOpen"
       id="lookout-mobile-search"
       role="search"
-      class="sticky top-14 z-30 flex gap-2 border-b border-zinc-200 bg-white px-4 py-2 sm:hidden dark:border-zinc-800 dark:bg-zinc-900"
+      class="sticky top-[6.25rem] z-30 flex gap-2 border-b border-zinc-200 bg-white px-4 py-2 sm:hidden dark:border-zinc-800 dark:bg-zinc-900"
       @submit.prevent="submitSearch"
     >
       <input
@@ -252,11 +291,11 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
     </form>
 
     <div class="lg:grid lg:grid-cols-[14rem_minmax(0,1fr)]">
-      <div v-if="menu" class="fixed inset-0 top-14 z-10 bg-zinc-950/30 lg:hidden" aria-hidden="true" @click="menu = false" />
+      <div v-if="menu" class="fixed inset-0 top-[6.25rem] z-10 bg-zinc-950/30 lg:hidden" aria-hidden="true" @click="menu = false" />
       <nav
         id="lookout-nav"
         aria-label="Lookout"
-        class="fixed inset-y-0 top-14 left-0 z-20 w-64 overflow-y-auto border-r border-zinc-200 bg-white px-3 py-4 transition-transform lg:sticky lg:z-0 lg:h-[calc(100dvh-3.5rem)] lg:w-auto lg:translate-x-0 dark:border-zinc-800 dark:bg-zinc-900"
+        class="fixed inset-y-0 top-[6.25rem] left-0 z-20 w-64 overflow-y-auto border-r border-zinc-200 bg-white px-3 py-4 transition-transform lg:sticky lg:z-0 lg:h-[calc(100dvh-6.25rem)] lg:w-auto lg:translate-x-0 dark:border-zinc-800 dark:bg-zinc-900"
         :class="menu ? 'translate-x-0' : '-translate-x-full'"
       >
         <div v-for="(section, s) in sections" :key="s" class="mb-4">

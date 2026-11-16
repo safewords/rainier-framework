@@ -183,15 +183,24 @@ pub(crate) async fn series(state: Arc<Shared>, request: Req) -> Result<Response>
     if let Some(key) = &query.key {
         rows.retain(|r| &r.key == key);
     }
-    let points = trends::series(&rows, query.period_s, query.since, now);
+    // A custom window ends at `until`. Anything later than now is not a
+    // bucket yet; the forecast, when asked for, is what extends past the end.
+    let end = query.until.unwrap_or(now).min(now);
+    let last = aggregate::bucket_start(end, query.period_s);
+    rows.retain(|r| r.bucket_start <= last);
+    let points = trends::series(&rows, query.period_s, query.since, end);
     let forecast = trends::forecast(&points, query.period_s, query.forecast);
 
     // Over the whole range: every bucket's histogram added, so p50 to p99
     // cover every occurrence in it — not the stored ones, which in
     // production are mostly the slow.
     let first = aggregate::bucket_start(query.since, query.period_s);
-    let in_range: Vec<&Aggregate> =
-        rows.iter().filter(|r| r.period_s == query.period_s && r.bucket_start >= first).collect();
+    let in_range: Vec<&Aggregate> = rows
+        .iter()
+        .filter(|r| {
+            r.period_s == query.period_s && r.bucket_start >= first && r.bucket_start <= last
+        })
+        .collect();
     let mut histogram = aggregate::Histogram::new();
     for row in &in_range {
         aggregate::add_histogram(&mut histogram, &row.histogram);
@@ -214,7 +223,7 @@ pub(crate) async fn series(state: Arc<Shared>, request: Req) -> Result<Response>
             let own: Vec<Aggregate> = rows.iter().filter(|r| r.key == key).cloned().collect();
             keys.insert(
                 key.to_string(),
-                json!(trends::series(&own, query.period_s, query.since, now)),
+                json!(trends::series(&own, query.period_s, query.since, end)),
             );
         }
     }
