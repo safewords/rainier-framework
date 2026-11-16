@@ -6,6 +6,13 @@ work did — a request, a job, a console command, a scheduled task — as a
 made out, the jobs it queued, the mail it sent, the failures it reported, and
 how long each took. You open `/_lookout` and look.
 
+"Batch" is the storage word — the unit Lookout keeps or drops, with
+everything in it — and the API's (`/api/batches`). The dashboard calls each
+by what it is: a **request** at `/_lookout/requests/<id>`, a **job** at
+`/jobs/<id>`, a **page view** at `/page-views/<id>`, an **API call** seen
+from the browser at `/api-calls/<id>`. `/_lookout/batches/<id>` opens any of
+them, for a link that knows only the id.
+
 It is built from what the framework already emits. With the `lookout` feature
 every component opens the same spans the [`telemetry`](observability.md#passive-instrumentation)
 feature gives it; Lookout reads them in-process through a `tracing` layer, and

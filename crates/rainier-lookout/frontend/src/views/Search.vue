@@ -82,7 +82,7 @@ const caseColumns = [
   <div class="space-y-6">
     <div>
       <h1 class="text-xl font-semibold tracking-tight">Search</h1>
-      <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Batches, entries and cases whose summary or fingerprint contains the text.</p>
+      <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Requests, jobs, page views, entries and cases whose summary or fingerprint contains the text.</p>
     </div>
 
     <form class="flex gap-2" role="search" @submit.prevent="submit">
@@ -148,7 +148,7 @@ const caseColumns = [
 
       <section class="lk-card">
         <header class="lk-card-header">
-          <h2 class="text-sm font-semibold">Batches</h2>
+          <h2 class="text-sm font-semibold">Requests, jobs and page views</h2>
           <span class="text-xs text-zinc-500 dark:text-zinc-400">{{ batches.length }}</span>
           <RouterLink :to="{ name: 'batches', query: { kind: 'request', q } }" class="ml-auto text-xs font-medium text-indigo-600 hover:underline dark:text-indigo-400">Search in batches →</RouterLink>
         </header>

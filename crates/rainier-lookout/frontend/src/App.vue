@@ -36,7 +36,7 @@ const sections = [
     ],
   },
   {
-    title: 'Batches',
+    title: 'Other work',
     items: [
       ['command', 'Commands'],
       ['scheduled_task', 'Scheduled tasks'],
@@ -219,7 +219,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
         type="button"
         class="lk-btn"
         :aria-pressed="live"
-        :title="live ? (stream.connected.value ? 'Live: new batches stream in as they are stored' : 'Live: refreshing every few seconds') : 'Show new batches as they arrive'"
+        :title="live ? (stream.connected.value ? 'Live: new requests and jobs stream in as they are stored' : 'Live: refreshing every few seconds') : 'Show new requests and jobs as they arrive'"
         @click="live = !live"
       >
         <span class="size-2 rounded-full" :class="live ? 'animate-pulse bg-emerald-500' : 'bg-zinc-400 dark:bg-zinc-600'" />

@@ -175,7 +175,7 @@ const columns = [
 
     <template v-if="error">
       <h1 class="text-xl font-semibold">{{ error.status === 404 ? 'No such case' : 'Could not load this case' }}</h1>
-      <p v-if="error.status === 404" class="text-sm text-zinc-500 dark:text-zinc-400">It may have been pruned with the batches it came from.</p>
+      <p v-if="error.status === 404" class="text-sm text-zinc-500 dark:text-zinc-400">It may have been pruned with the requests and jobs it came from.</p>
       <ErrorBox v-else :error="error" />
     </template>
 
@@ -280,7 +280,7 @@ const columns = [
           <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">every occurrence kept — open one for its full trace</span>
         </header>
         <div v-if="(kase.recent_batches || []).length" class="flex flex-wrap items-center gap-2 border-b border-zinc-200 px-4 py-2.5 text-xs dark:border-zinc-800">
-          <span class="lk-th">Recent batches</span>
+          <span class="lk-th">Recent occurrences</span>
           <RouterLink
             v-for="b in kase.recent_batches"
             :key="b"

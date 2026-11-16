@@ -222,7 +222,7 @@ const columns = computed(() => {
     case 'n_plus_one':
       return [
         { key: 'sql', label: 'Query', sortable: true, value: (e) => nPlusOne(e).sql, text: (e) => nPlusOne(e).sql, class: 'font-mono text-[12.5px]' },
-        { key: 'count', label: 'Count', title: 'How many times this query repeated in one batch', align: 'right', sortable: true, value: (e) => nPlusOne(e).count, text: (e) => nPlusOne(e).count },
+        { key: 'count', label: 'Count', title: 'How many times this query repeated in one request or job', align: 'right', sortable: true, value: (e) => nPlusOne(e).count, text: (e) => nPlusOne(e).count },
         { key: 'total', label: 'Total time', title: 'Total time spent in all the repeats of this query', align: 'right', sortable: true, value: (e) => nPlusOne(e).total_us, text: (e) => time(nPlusOne(e).total_us) },
         { key: 'average', label: 'Avg per query', title: 'Total time divided by the number of repeats', align: 'right', sortable: true, value: (e) => nPlusOne(e).average_us, text: (e) => time(nPlusOne(e).average_us) },
         { ...WHEN, label: 'Last occurrence', title: 'When this run of repeats happened' },
@@ -333,7 +333,7 @@ usePolling(refresh)
   <div class="space-y-5">
     <div>
       <h1 class="text-xl font-semibold tracking-tight">{{ title }}</h1>
-      <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Newest first, across every batch kept.</p>
+      <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">Newest first, across every request and job kept.</p>
     </div>
 
     <ErrorBox :error="error" />
@@ -379,7 +379,7 @@ usePolling(refresh)
     <section class="lk-card">
       <header v-if="groups.length" class="lk-card-header">
         <h2 class="text-sm font-semibold">Every occurrence</h2>
-        <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">opens the batch it happened in</span>
+        <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">opens the request or job it happened in</span>
       </header>
       <DataTable
         :columns="columns"

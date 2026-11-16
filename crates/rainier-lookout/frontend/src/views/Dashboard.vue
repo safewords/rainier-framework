@@ -287,7 +287,7 @@ function insightLink(i) {
       <div>
         <h1 class="text-xl font-semibold tracking-tight">Dashboard</h1>
         <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-          What was slowest and what failed most — from rolled-up measurements that outlive the raw batches.
+          What was slowest and what failed most — from rolled-up measurements that outlive the individual requests and jobs kept.
         </p>
       </div>
       <div class="inline-flex overflow-hidden rounded-md border border-zinc-300 dark:border-zinc-700" role="group" aria-label="Period">

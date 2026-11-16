@@ -10,7 +10,7 @@ import ReplayPlayer from './ReplayPlayer.vue'
 import Pill from './Pill.vue'
 import TimeAgo from './TimeAgo.vue'
 import { api } from '../api.js'
-import { duration } from '../format.js'
+import { duration, itemRoute } from '../format.js'
 
 const props = defineProps({ batch: { type: Object, required: true } })
 
@@ -183,7 +183,7 @@ onMounted(async () => {
       <ul class="divide-y divide-zinc-100 dark:divide-zinc-800">
         <li v-for="c in calls" :key="c.id">
           <RouterLink
-            :to="{ name: 'batch', params: { id: c.id } }"
+            :to="itemRoute(c)"
             class="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
           >
             <Pill tone="accent">API call</Pill>

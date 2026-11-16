@@ -14,7 +14,7 @@ const route = useRoute()
 const router = useRouter()
 
 const kind = computed(() => (typeof route.query.kind === 'string' ? route.query.kind : 'request'))
-const label = computed(() => (KINDS.find((k) => k.key === kind.value) || { label: 'Batches' }).label)
+const label = computed(() => (KINDS.find((k) => k.key === kind.value) || { label: 'Recorded work' }).label)
 
 const text = (key) => (typeof route.query[key] === 'string' ? route.query[key] : '')
 const form = reactive({
@@ -128,7 +128,7 @@ usePolling(refresh)
         class="lk-input col-span-2 sm:col-span-3 lg:w-64"
         type="search"
         placeholder="Search summaries…"
-        aria-label="Search batches"
+        aria-label="Search"
       />
       <input v-model="form.route" class="lk-input lg:w-44" type="search" placeholder="Route name" aria-label="Route name" />
       <input v-model="form.user" class="lk-input lg:w-32" type="search" placeholder="User id" aria-label="User id" />

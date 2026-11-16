@@ -3,7 +3,7 @@ import BatchStatus from './BatchStatus.vue'
 import DataTable from './DataTable.vue'
 import Flags from './Flags.vue'
 import TimeAgo from './TimeAgo.vue'
-import { time } from '../format.js'
+import { time, itemRoute } from '../format.js'
 
 defineProps({
   batches: { type: Array, required: true },
@@ -56,7 +56,7 @@ const columns = [
     :columns="columns"
     :rows="batches"
     :row-key="(b) => b.id"
-    :to="(b) => ({ name: 'batch', params: { id: b.id } })"
+    :to="(b) => (itemRoute(b))"
     :filterable="filterable"
     filter-placeholder="Filter these batches…"
     :loading="loading"

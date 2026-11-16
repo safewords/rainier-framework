@@ -228,3 +228,34 @@ export function histogramPercentile(histogram, p, max) {
   }
   return max ?? null
 }
+
+/**
+ * What a recorded unit of work is, by its kind — what the dashboard calls it.
+ * (Lookout stores each one, with everything it did, as a "batch"; that is
+ * its storage, not what anyone is looking at.)
+ */
+export const KIND_NAME = {
+  request: 'Request',
+  job: 'Job',
+  command: 'Command',
+  scheduled_task: 'Scheduled task',
+  other: 'Other work',
+  page: 'Page view',
+  browser: 'API call',
+}
+
+const KIND_PATH = {
+  request: 'requests',
+  job: 'jobs',
+  command: 'commands',
+  scheduled_task: 'tasks',
+  other: 'other',
+  page: 'page-views',
+  browser: 'api-calls',
+}
+
+/** The page of one request, job, page view or API call: `/requests/<id>`, and so on. */
+export function itemRoute(b) {
+  const segment = b && KIND_PATH[b.kind]
+  return segment ? { name: 'item', params: { kind: segment, id: b.id } } : { name: 'batch', params: { id: b.id } }
+}

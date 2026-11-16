@@ -36,6 +36,15 @@ const router = createRouter({
     // ?q=<text>
     { path: '/search', name: 'search', component: Search },
     { path: '/sessions', name: 'sessions', component: Sessions },
+    // One request, job, page view or API call, at a path that says which.
+    // `/batches/:id` still opens any of them: links already shared, and
+    // places that know only the id.
+    {
+      path: '/:kind(requests|jobs|commands|tasks|other|page-views|api-calls)/:id',
+      name: 'item',
+      component: BatchDetail,
+      props: (route) => ({ id: route.params.id }),
+    },
     { path: '/sessions/:id', name: 'session', component: Session, props: true },
     { path: '/:rest(.*)*', name: 'not-found', component: NotFound },
   ],

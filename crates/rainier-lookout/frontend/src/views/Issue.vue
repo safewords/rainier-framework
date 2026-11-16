@@ -369,7 +369,7 @@ const columns = [
           <RouterLink
             :to="{ name: 'batch', params: { id: exception.entry.batch_id } }"
             class="inline-block text-sm text-indigo-600 hover:underline dark:text-indigo-400"
-          >Open its batch →</RouterLink>
+          >Open where it happened →</RouterLink>
         </div>
       </section>
 

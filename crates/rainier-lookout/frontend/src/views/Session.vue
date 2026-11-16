@@ -11,7 +11,7 @@ import ErrorBox from '../components/ErrorBox.vue'
 import Pill from '../components/Pill.vue'
 import ReplayPlayer from '../components/ReplayPlayer.vue'
 import { api } from '../api.js'
-import { absolute, duration } from '../format.js'
+import { absolute, duration, itemRoute } from '../format.js'
 import { usePolling } from '../live.js'
 
 const props = defineProps({ id: { type: String, required: true } })
@@ -120,7 +120,7 @@ const failed = (b) => (b.status && b.status >= 400) || b.has_exception
           <span class="w-16 shrink-0 text-xs text-zinc-500 tabular-nums dark:text-zinc-400">+{{ offset(row.at) }}</span>
           <template v-if="row.kind === 'page'">
             <Pill tone="accent">page</Pill>
-            <RouterLink :to="{ name: 'batch', params: { id: row.batch.id } }" class="min-w-0 flex-1 truncate text-sm font-medium hover:underline">{{ row.text }}</RouterLink>
+            <RouterLink :to="itemRoute(row.batch)" class="min-w-0 flex-1 truncate text-sm font-medium hover:underline">{{ row.text }}</RouterLink>
           </template>
           <template v-else-if="row.kind === 'route'">
             <span class="w-12 text-xs text-zinc-500">→</span>
@@ -133,17 +133,17 @@ const failed = (b) => (b.status && b.status >= 400) || b.has_exception
           </template>
           <template v-else-if="row.kind === 'call'">
             <Pill :tone="failed(row.batch) ? 'bad' : row.batch.has_slow ? 'warn' : 'neutral'">api</Pill>
-            <RouterLink :to="{ name: 'batch', params: { id: row.batch.id } }" class="min-w-0 flex-1 truncate font-mono text-[12.5px] hover:underline">{{ row.text }}</RouterLink>
+            <RouterLink :to="itemRoute(row.batch)" class="min-w-0 flex-1 truncate font-mono text-[12.5px] hover:underline">{{ row.text }}</RouterLink>
             <span class="text-xs text-zinc-500 tabular-nums dark:text-zinc-400">{{ duration(row.batch.duration_us) }} in the browser</span>
             <RouterLink
               v-if="row.server"
-              :to="{ name: 'batch', params: { id: row.server.id } }"
+              :to="itemRoute(row.server)"
               class="text-xs text-indigo-600 tabular-nums hover:underline dark:text-indigo-400"
             >{{ duration(row.server.duration_us) }} on the server</RouterLink>
           </template>
           <template v-else>
             <Pill>server</Pill>
-            <RouterLink :to="{ name: 'batch', params: { id: row.batch.id } }" class="min-w-0 flex-1 truncate font-mono text-[12.5px] hover:underline">{{ row.text }}</RouterLink>
+            <RouterLink :to="itemRoute(row.batch)" class="min-w-0 flex-1 truncate font-mono text-[12.5px] hover:underline">{{ row.text }}</RouterLink>
             <BatchStatus :batch="row.batch" />
             <span class="text-xs text-zinc-500 tabular-nums dark:text-zinc-400">{{ duration(row.batch.duration_us) }}</span>
           </template>

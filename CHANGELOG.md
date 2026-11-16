@@ -51,6 +51,10 @@ the release as a whole and names the crate it landed in.
   every page that shows data (cases, issues, timing, status) refreshes on the
   news it shows, plus once a minute. The writer stores its counts every 2
   seconds instead of 10, and only when something was counted.
+- **The dashboard names what it shows** (`rainier-lookout`): a request's
+  page says Request and lives at `/requests/<id>` — likewise jobs, commands,
+  tasks, page views and API calls — instead of calling everything a batch,
+  which is the storage word. `/batches/<id>` still opens any of them.
 - **Pairing, sessions and whole-page replay** (`rainier-lookout`,
   `rainier-framework`):
   - A request from a listed frontend that would be dropped is held for

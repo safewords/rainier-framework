@@ -21,7 +21,7 @@ const settings = computed(() => {
     ['Request sample rate', s.sample_rates.request],
     ['Job sample rate', s.sample_rates.job],
     ['Command sample rate', s.sample_rates.command],
-    ['Batches kept', `${s.retention.batches_hours} hours`],
+    ['Requests and jobs kept', `${s.retention.batches_hours} hours`],
     ['Aggregates kept', `${s.retention.aggregates_days} days`],
     ['Lowest log level', s.log_level],
     [

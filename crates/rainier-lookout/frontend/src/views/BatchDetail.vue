@@ -16,7 +16,7 @@ import TimeAgo from '../components/TimeAgo.vue'
 import UserCard from '../components/UserCard.vue'
 import Waterfall from '../components/Waterfall.vue'
 import { api } from '../api.js'
-import { absolute, caseId, duration, hasTag, issueRoute } from '../format.js'
+import { absolute, caseId, duration, hasTag, issueRoute, itemRoute } from '../format.js'
 
 const props = defineProps({ id: { type: String, required: true } })
 
@@ -71,7 +71,7 @@ const facts = computed(() => {
     ['Guard', b.guard],
     ['User', b.user_id],
     ['Host', b.host],
-    ['Batch', b.id, true],
+    ['Id', b.id, true],
     ['Trace', b.trace_id, true],
   ]
 })
@@ -161,7 +161,7 @@ onMounted(async () => {
     >← Back</RouterLink>
 
     <template v-if="error">
-      <h1 class="text-xl font-semibold">{{ error.status === 404 ? 'No such batch' : 'Could not load this batch' }}</h1>
+      <h1 class="text-xl font-semibold">{{ error.status === 404 ? 'Not found' : 'Could not load this' }}</h1>
       <p v-if="error.status === 404" class="text-sm text-zinc-500 dark:text-zinc-400">It may have been pruned, or never kept.</p>
       <ErrorBox v-else :error="error" />
     </template>
@@ -170,7 +170,8 @@ onMounted(async () => {
 
     <template v-else-if="batch">
       <div>
-        <h1 class="font-mono text-lg font-semibold break-all sm:text-xl">{{ batch.summary }}</h1>
+        <p class="lk-th">{{ KIND[batch.kind] || batch.kind }}</p>
+        <h1 class="mt-1 font-mono text-lg font-semibold break-all sm:text-xl">{{ batch.summary }}</h1>
         <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-zinc-500 dark:text-zinc-400">
           <BatchStatus :batch="batch" />
           <span class="tabular-nums">{{ duration(batch.duration_us) }}</span>
@@ -216,7 +217,7 @@ onMounted(async () => {
           <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">the same trace</span>
         </header>
         <RouterLink
-          :to="{ name: 'batch', params: { id: serverSide.id } }"
+          :to="itemRoute(serverSide)"
           class="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3 hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
         >
           <span class="min-w-0 flex-1 truncate font-mono text-[13px]">{{ serverSide.summary }}</span>
@@ -272,7 +273,7 @@ onMounted(async () => {
         <ul class="divide-y divide-zinc-100 dark:divide-zinc-800">
           <li v-for="other in related" :key="other.id">
             <RouterLink
-              :to="{ name: 'batch', params: { id: other.id } }"
+              :to="itemRoute(other)"
               class="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5 hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
             >
               <Pill tone="accent">{{ KIND[other.kind] || other.kind }}</Pill>
