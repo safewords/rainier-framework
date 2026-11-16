@@ -671,11 +671,11 @@ on a refused request, which is the next point.
   cases, search, sessions — leave those keys in the URL and do not filter by
   them. A custom range sends `until` as well as `since`; without `until` a
   series still runs up to now.
-- **Dashboard** — requests and throughput, then request time for the chosen
-  range: the average, p50, p90, p95, p99 and the worst, over every request
-  (from the buckets' histograms, not the requests kept), and a chart of the
-  average, p90, p95 and p99 per bucket. Then error and job counts, the
-  insights, and the slowest and most frequent of each type.
+- **Dashboard** — one chart of requests per minute against request time:
+  the average, p90, p95 and p99 per bucket, each read off that bucket's
+  histogram, so every request counts rather than only the kept ones. Then
+  error and job counts for the chosen range, the insights, and the slowest
+  and most frequent of each type.
 - **Every row drills in.** A route, query, job, exception or outgoing call
   opens its own page — `/issues/{type}/{id}`, where the id is the family's
   [`family_id`](#the-json-api), sixteen hex digits rather than its SQL — with
