@@ -1,5 +1,5 @@
 //! Running independent queries in parallel — at the same time, on separate
-//! connections — with [`concurrently!`] and [`all`].
+//! connections — with [`concurrently!`](macro@crate::concurrently) and [`all`].
 //!
 //! Every query a [`Database`](crate::Database) runs takes a connection from
 //! the pool for as long as it runs, and gives it back. So two queries that do
@@ -30,10 +30,11 @@
 //! join, a batched `WHERE id IN (…)`), not concurrency.
 //!
 //! What it costs is connections: a request running four queries at once holds
-//! four for that moment, where it held one four times over. [`concurrently!`]
-//! is for a handful written out by hand. For a list of any length use [`all`],
-//! which runs at most [`DEFAULT_LIMIT`] at a time, so one request cannot take
-//! the whole pool from every other request.
+//! four for that moment, where it held one four times over.
+//! [`concurrently!`](macro@crate::concurrently) is for a handful written out by
+//! hand. For a list of any length use [`all`], which runs at most
+//! [`DEFAULT_LIMIT`] at a time, so one request cannot take the whole pool from
+//! every other request.
 //!
 //! # Errors
 //!
