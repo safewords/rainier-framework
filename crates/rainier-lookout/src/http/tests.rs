@@ -704,8 +704,11 @@ async fn the_stream_pulses_when_requests_are_only_counted() {
     assert!(frame.starts_with("event: pulse\ndata: "), "{frame}");
     let data: Value =
         serde_json::from_str(frame.trim_start_matches("event: pulse\ndata: ").trim()).unwrap();
+    // Summed, not the last bucket: when the minute turns between counting and
+    // the pulse, the request is in the previous minute, which the pulse carries.
     let minute = data["request"]["60"].as_array().expect("the minute buckets");
-    assert_eq!(minute.last().unwrap()["count"], 1, "the counted request: {data}");
+    let counted: u64 = minute.iter().map(|b| b["count"].as_u64().unwrap_or(0)).sum();
+    assert_eq!(counted, 1, "the counted request: {data}");
     assert!(data["request"]["600"].is_array() && data["job"]["3600"].is_array(), "{data}");
     assert!(
         !store.batches.lock().unwrap().iter().any(|b| b.id == "c1"),
