@@ -52,26 +52,55 @@
   })()
   var proof = null
 
-  // The session: the application's, when the API names one
-  // (lookout-session), else one the script keeps per tab, renewed after 30
-  // idle minutes — so page views, API calls and replays can be laid out as
-  // one timeline. And the user, as the API signed it (lookout-user).
-  var serverSession = null
+  // The session: the browser's own, one per tab — kept in sessionStorage so
+  // it survives a reload — and renewed after 30 minutes without the visitor
+  // doing anything, so page views, API calls and replays can be laid out as
+  // one timeline. What the session *is* to the application (the profile
+  // acting, say) comes from the API, signed (lookout-context), and so does
+  // the user (lookout-user).
   var user = null
-  var browserSession = (function () {
+  var context = null
+  var IDLE = 30 * 60 * 1000
+  var held = (function () {
     try {
-      var now = Date.now()
-      var held = JSON.parse(sessionStorage.getItem('lookout.session') || 'null')
-      var id = held && now - held.last < 30 * 60 * 1000 ? held.id : view
-      sessionStorage.setItem('lookout.session', JSON.stringify({ id: id, last: now }))
-      return id
+      return JSON.parse(sessionStorage.getItem('lookout.session') || 'null')
     } catch (e) {
-      return view
+      return null
     }
   })()
-  function session() {
-    return serverSession || browserSession
+  function newId() {
+    var bytes = new Uint8Array(16)
+    ;(window.crypto || {}).getRandomValues ? crypto.getRandomValues(bytes) : bytes.forEach(function (_, i) { bytes[i] = Math.random() * 256 })
+    return Array.prototype.map.call(bytes, function (b) { return ('0' + b.toString(16)).slice(-2) }).join('')
   }
+  function keep() {
+    try {
+      sessionStorage.setItem('lookout.session', JSON.stringify(held))
+    } catch (e) {
+      // Private mode: the session lasts as long as this page.
+    }
+  }
+  function session() {
+    var now = Date.now()
+    if (!held || !held.id || now - held.last >= IDLE) {
+      held = { id: held && held.id ? newId() : view, last: now }
+      keep()
+    }
+    return held.id
+  }
+  // The visitor did something: the session is not idle. Written at most
+  // every ten seconds.
+  function active() {
+    var now = Date.now()
+    session()
+    if (now - held.last < 10000) return
+    held.last = now
+    keep()
+  }
+  active()
+  ;['pointerdown', 'keydown', 'scroll', 'touchstart'].forEach(function (type) {
+    addEventListener(type, active, { passive: true, capture: true })
+  })
   var activity = { loadSent: false, navigations: [], errors: [], longTasks: { count: 0, total: 0, longest: 0 } }
 
   function round(n) {
@@ -205,7 +234,7 @@
     var act = proof ? pageActivity() : null
     if (!queue.length && !act) return
     var calls = queue.splice(0, 50)
-    var body = JSON.stringify({ view: view, session: session(), user: user || undefined, proof: proof || undefined, page: page(), device: device(), calls: calls, activity: act || undefined })
+    var body = JSON.stringify({ view: view, session: session(), context: context || undefined, user: user || undefined, proof: proof || undefined, page: page(), device: device(), calls: calls, activity: act || undefined })
     try {
       navigator.sendBeacon(settings.endpoint, new Blob([body], { type: 'text/plain' }))
     } catch (e) {
@@ -268,7 +297,10 @@
       window.LookoutReplay.record({
         emit: function (event, isCheckout) {
           // A new stretch at each full snapshot; only the last two are kept.
-          if (isCheckout) {
+          // A snapshot is two events, both flagged: the page's size (Meta, 4),
+          // then the page (FullSnapshot, 2). The stretch starts at the first,
+          // so each one carries its own size and plays on its own.
+          if (isCheckout && event.type === 4) {
             // Recording everything: the stretch just finished goes up now.
             if (always) send(replay.segments[replay.segments.length - 1], 'recording', false)
             replay.segments.push([])
@@ -309,7 +341,7 @@
         binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
       }
       var body = JSON.stringify({
-        token: token, trigger: trigger, view: view, session: session(), user: user || undefined,
+        token: token, trigger: trigger, view: view, session: session(), context: context || undefined, user: user || undefined,
         page: page(), device: device(), replay: btoa(binary), ms: ms,
       })
       // A plain-text POST: no CORS preflight, like the beacon — but not a
@@ -377,8 +409,8 @@
     if (!token) return
     replay.lastToken = token
     proof = token
-    var s = metric(entry, settings.metric + '-session')
-    if (s && s.description) serverSession = s.description
+    var c = metric(entry, settings.metric + '-context')
+    if (c && c.description) context = c.description
     var u = metric(entry, settings.metric + '-user')
     if (u && u.description) user = u.description
     var failed = entry.responseStatus >= 400

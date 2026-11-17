@@ -31,3 +31,30 @@
     @apply text-[11px] font-semibold tracking-wide text-zinc-500 uppercase dark:text-zinc-400;
   }
 }
+
+/* The replay's pointer. rrweb's own is a black arrow, lost on a dark page:
+   this one is white with a dark outline, larger, above the page, with a
+   brighter halo — seen on any page. Its tip is the pointer's position. */
+.lk-replay .replayer-mouse {
+  z-index: 10;
+  width: 28px;
+  height: 28px;
+  background-position: top left;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M2 1.5 L2 19 L6.6 14.8 L9.6 21.6 L12.6 20.3 L9.7 13.6 L16 13.4 Z' fill='white' stroke='black' stroke-width='1.5' stroke-linejoin='round'/%3E%3C/svg%3E");
+  filter: drop-shadow(0 1px 2px rgb(0 0 0 / 0.5));
+}
+.lk-replay .replayer-mouse::after {
+  width: 28px;
+  height: 28px;
+  background: rgb(99 102 241);
+  opacity: 0.45;
+}
+.lk-replay .replayer-mouse.touch-device {
+  width: 70px;
+  height: 70px;
+  background-image: none;
+  filter: none;
+}
+.lk-replay .replayer-mouse.touch-device::after {
+  opacity: 0;
+}

@@ -48,6 +48,38 @@ async function unpack(base64) {
   return JSON.parse(await new Response(stream).text())
 }
 
+// The longest pause kept between two pieces. A session's pieces are minutes
+// or hours apart — the tab hidden, the visitor away — and nothing happened
+// in between, so the timeline closes the gap rather than play it.
+const GAP_MS = 1000
+
+// Several pieces as one recording, in order, the time between them taken
+// out. Each piece starts from a full snapshot, so it plays after any other;
+// one recorded before the recorder kept the page's size with every piece
+// borrows the last size seen.
+function stitch(pieces) {
+  const ordered = pieces
+    .map((piece) => (Array.isArray(piece) ? piece.filter((e) => e && typeof e.timestamp === 'number') : []))
+    .filter((piece) => piece.length)
+    .map((piece) => piece.sort((a, b) => a.timestamp - b.timestamp))
+    .sort((a, b) => a[0].timestamp - b[0].timestamp)
+  const out = []
+  let meta = null
+  let shift = 0
+  let end = null // the latest moment played so far; pieces can overlap
+  for (const piece of ordered) {
+    const start = piece[0].timestamp - shift
+    if (end !== null && start - end > GAP_MS) shift += start - end - GAP_MS
+    if (piece[0].type !== 4 && meta) out.push({ ...meta, timestamp: piece[0].timestamp - shift })
+    for (const event of piece) {
+      if (event.type === 4) meta = event
+      out.push({ ...event, timestamp: event.timestamp - shift })
+    }
+    end = Math.max(end ?? -Infinity, piece[piece.length - 1].timestamp - shift)
+  }
+  return out.sort((a, b) => a.timestamp - b.timestamp)
+}
+
 function fit() {
   if (!frame.value || !size.value.width) return
   scale.value = Math.min(1, frame.value.clientWidth / size.value.width)
@@ -68,12 +100,7 @@ async function load() {
       return
     }
     content.value = pieces[pieces.length - 1].content
-    // Each piece starts from a full snapshot, so they play end to end; the
-    // gaps between them (a page hidden, a reload) are skipped.
-    const events = (await Promise.all(pieces.map((p) => unpack(p.content.replay))))
-      .flat()
-      .filter((e) => e && typeof e.timestamp === 'number')
-      .sort((a, b) => a.timestamp - b.timestamp)
+    const events = stitch(await Promise.all(pieces.map((p) => unpack(p.content.replay))))
     if (!Array.isArray(events) || events.length < 2) {
       state.value = 'empty'
       return
@@ -148,7 +175,7 @@ watch(() => [props.id, props.batch, props.ids && props.ids.join()], () => {
     <header class="lk-card-header">
       <h2 class="text-sm font-semibold">{{ title }}</h2>
       <span class="ml-auto text-xs text-zinc-500 dark:text-zinc-400">
-        recorded because {{ trigger }} — masked: text, inputs and media are not shown
+        recorded because {{ trigger }} — masked: text, inputs and media are not shown; time between recordings is skipped
       </span>
     </header>
     <div class="space-y-3 p-4">

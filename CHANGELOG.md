@@ -10,6 +10,30 @@ the release as a whole and names the crate it landed in.
 
 ## [Unreleased]
 
+### Changed
+
+- **A Lookout session is the browser's** (`rainier-lookout`,
+  `rainier-framework`), breaking: one tab, renewed after 30 minutes without
+  the visitor doing anything — measured from their activity, not only from a
+  reload, so a tab left open is not one session for days. An application no
+  longer defines what a session is: `Rainier::with_lookout_sessions` and
+  `Lookout::sessions_with` are gone, and so is the `lookout-session` metric.
+  It labels the session instead, with **`Lookout::describe_session(batch,
+  name, value)`** or **`rainier_framework::lookout::describe_session(name,
+  value)`** — `("profile", "ada")` — from where the request already knows:
+  the request is tagged `profile:ada`, and the label rides back to the
+  browser signed (`lookout-context`), so the page views, API calls and
+  replays the session reports are tagged too. A browser cannot label itself.
+
+### Fixed
+
+- **Session replay** (`rainier-lookout`): each recorded piece starts at the
+  page's size, not one event later — the recorder split a snapshot's two
+  events into two pieces and dropped the first, so most pieces had no size.
+  The player plays a session's pieces back to back, a second apart, instead
+  of across the hours between them, and draws a white, outlined pointer that
+  shows on a dark page; rrweb's own is black.
+
 ### Added
 
 - **Request percentiles on Lookout's dashboard** (`rainier-lookout`): the
@@ -68,12 +92,11 @@ the release as a whole and names the crate it landed in.
     call's page links to its server request and the two times compare. New
     `Store::hold`, `release` and `store_uncounted`, implemented by the memory
     and cache stores.
-  - Sessions: `Rainier::with_lookout_sessions(|request| …)` binds the
-    application's own session key (an HMAC of it is kept); every page view,
-    API call, kept request and replay carries `session:<id>`, and
-    **Browser → Sessions** lays a session out as one timeline with a stitched
-    replay. Without a binding, the script keeps a session per tab. The user is
-    attributed by a signed `lookout-user` id.
+  - Sessions: every page view, API call, paired request and replay carries
+    `session:<id>`, and **Browser → Sessions** lays a session out as one
+    timeline with a stitched replay. (Since changed: a session is always the
+    browser's; see above.) The user is attributed by a signed `lookout-user`
+    id.
   - `LOOKOUT_RUM_REPLAY_MODE=always` records whole page views, uploading each
     stretch as it closes; page views and sessions show their replay.
 - **Page views, apart from API calls** (`rainier-lookout`): with RUM on,

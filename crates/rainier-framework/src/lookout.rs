@@ -197,6 +197,27 @@ pub fn describe_user(user: LookoutUser) {
     }
 }
 
+/// Say what the current request's session is, in the application's own
+/// terms — `describe_session("profile", "ada")` — for Lookout. A Lookout
+/// session is always the browser's; this labels it, tagging the request
+/// `name:value` and, with real user monitoring on, the browser's reports from
+/// the session too. A no-op when Lookout is off or unbound, or the label is
+/// not one it accepts (see [`Lookout::describe_session`]), so it is safe to
+/// call from any application's authentication path.
+///
+/// ```no_run
+/// use rainier_framework::lookout::describe_session;
+///
+/// describe_session("profile", "ada");
+/// ```
+pub fn describe_session(name: &str, value: impl Into<String>) {
+    if let Some(app) = rainier_container::try_facade_application() {
+        if let Ok(lookout) = app.resolve::<Lookout>() {
+            lookout.describe_session(None, name, value);
+        }
+    }
+}
+
 /// The environment name the dashboard's gate is given. [`LookoutConfig::local`]
 /// is the authority — an application can turn it off in a local environment,
 /// or on in a test — so the gate sees `local` exactly when it is set.

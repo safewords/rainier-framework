@@ -105,9 +105,9 @@ const MAX_PARKED: usize = 256;
 /// [`Lookout::identify_with`].
 pub type IdentifyHook = Arc<dyn Fn(&Response) -> Option<(String, Option<String>)> + Send + Sync>;
 
-/// Says which of the application's sessions a request belongs to. See
-/// [`Lookout::sessions_with`].
-pub type SessionHook = Arc<dyn Fn(&rainier_http::Request) -> Option<String> + Send + Sync>;
+/// What the application said a session is: `(name, value)` pairs, from
+/// [`Lookout::describe_session`].
+type SessionContext = Vec<(String, String)>;
 
 /// Lookout: the handle an application holds.
 ///
@@ -168,7 +168,6 @@ impl Lookout {
                 open: Mutex::new(HashMap::new()),
                 parked: Mutex::new(Vec::new()),
                 identify: RwLock::new(None),
-                sessions: RwLock::new(None),
                 last_store_error: Mutex::new(None),
                 counts: Mutex::new(Vec::new()),
                 counts_written: Mutex::new(Instant::now()),
@@ -221,28 +220,6 @@ impl Lookout {
         hook: impl Fn(&Response) -> Option<(String, Option<String>)> + Send + Sync + 'static,
     ) {
         *self.inner.identify.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
-    }
-
-    /// Say which of the application's sessions a request belongs to, for
-    /// real user monitoring's session timeline.
-    ///
-    /// `hook` returns the application's own key for the visitor's session —
-    /// its session cookie, its session id, or the user's id if a user is the
-    /// unit worth following — or `None` for a request with none. Lookout
-    /// keeps an HMAC of it, never the key: a session cookie is a credential.
-    /// Every kept request, API call, page view and replay from that session
-    /// then carries `session:<id>`, and the dashboard lays them out as one
-    /// timeline. Without a hook, the browser script keeps a session of its
-    /// own, one per tab.
-    ///
-    /// Called at the start of every request while RUM is on, so it should
-    /// read what the request already carries — a cookie, a header — and
-    /// fetch nothing.
-    pub fn sessions_with(
-        &self,
-        hook: impl Fn(&rainier_http::Request) -> Option<String> + Send + Sync + 'static,
-    ) {
-        *self.inner.sessions.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
     }
 
     /// Spawn the background writer on the current tokio runtime.
@@ -384,6 +361,63 @@ impl Lookout {
         true
     }
 
+    /// Say what the visitor's session is, in the application's own terms —
+    /// the profile they are acting as, the workspace they are in — for the
+    /// request the calling code is running in, or with `batch`, the open
+    /// batch with that id.
+    ///
+    /// A Lookout session is always the browser's: one tab, renewed after 30
+    /// idle minutes. This does not change which session a request is in; it
+    /// labels it. The request is tagged `name:value`, and with real user
+    /// monitoring on the label rides back to the browser signed, so the page
+    /// views, API calls and replays it reports are tagged too — a browser
+    /// cannot label its own reports.
+    ///
+    /// `name` is lower-case letters, digits, `_` and `-`, at most 32, and not
+    /// one of Lookout's own tag prefixes (`session`, `user`, `pageview`, …);
+    /// `value` is printable ASCII without quotes, backslashes, `,` or `=`, at
+    /// most 64. Saying the same `name` again replaces its value. Call it where
+    /// the request already knows the answer: Lookout looks nothing up.
+    /// Returns whether a batch was found and the label accepted.
+    ///
+    /// ```no_run
+    /// # fn after_authenticating(lookout: &rainier_lookout::Lookout) {
+    /// lookout.describe_session(None, "profile", "ada");
+    /// # }
+    /// ```
+    pub fn describe_session(
+        &self,
+        batch: Option<&str>,
+        name: &str,
+        value: impl Into<String>,
+    ) -> bool {
+        let value = value.into();
+        if !crate::rum::valid_context_name(name) || !crate::rum::valid_context_value(&value) {
+            return false;
+        }
+        let cell = match batch {
+            None => self.inner.current_batch(),
+            Some(id) => self
+                .inner
+                .open
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(id)
+                .and_then(Weak::upgrade),
+        };
+        let Some(cell) = cell else { return false };
+        let mut state = cell.lock();
+        let Some(pending) = state.as_mut() else { return false };
+        let prefix = format!("{name}:");
+        pending.tags.retain(|t| !t.starts_with(&prefix));
+        pending.tags.insert(format!("{name}:{value}"));
+        match pending.context.iter_mut().find(|(n, _)| n == name) {
+            Some(held) => held.1 = value,
+            None => pending.context.push((name.to_string(), value)),
+        }
+        true
+    }
+
     /// The middleware that tells Lookout the client's address once the
     /// application has decided which to believe: put it **after** the
     /// application's `TrustProxies`, innermost of the global middleware. The
@@ -404,13 +438,14 @@ impl Lookout {
         if !rum.enabled || self.inner.is_dashboard_path(path) {
             return response;
         }
-        let Some((trace_id, server, session, user)) = self.rum_context() else { return response };
+        let Some((trace_id, server, context, user)) = self.rum_context() else { return response };
         let mut headers = crate::rum::response_headers(rum, &trace_id, Some(&server));
         if let Some(first) = headers.first_mut() {
-            // The session and the signed user ride along, so the browser's
-            // reports join the right timeline and name the right person.
-            if let Some(session) = session {
-                first.1.push_str(&format!(", {};desc=\"{session}\"", crate::rum::SESSION_METRIC));
+            // The session's context and the signed user ride along, so the
+            // browser's reports say what the session is and name the right
+            // person. The session itself is the browser's.
+            if let Some(context) = crate::rum::context_token(&rum.secret, &context) {
+                first.1.push_str(&format!(", {};desc=\"{context}\"", crate::rum::CONTEXT_METRIC));
             }
             if let Some(user) = user.filter(|u| crate::rum::safe_header_text(u)) {
                 first.1.push_str(&format!(
@@ -434,7 +469,7 @@ impl Lookout {
     /// The current batch's trace id, with its time so far and its route.
     fn rum_context(
         &self,
-    ) -> Option<(String, crate::rum::ServerSide, Option<String>, Option<String>)> {
+    ) -> Option<(String, crate::rum::ServerSide, SessionContext, Option<String>)> {
         let cell = self.inner.current_batch()?;
         let state = cell.lock();
         let pending = state.as_ref()?;
@@ -444,7 +479,7 @@ impl Lookout {
                 duration_ms: pending.started.elapsed().as_secs_f64() * 1000.0,
                 route: pending.route_name.clone(),
             },
-            pending.session.clone(),
+            pending.context.clone(),
             pending.user_id.clone(),
         ))
     }
@@ -578,9 +613,9 @@ pub(crate) struct Pending {
     pub(crate) user: Option<crate::user::LookoutUser>,
     /// What made it: header values copied at the start, read on the writer.
     pub(crate) client: Option<crate::client::ClientRaw>,
-    /// The session this request belongs to, keyed: the application's own key
-    /// from [`Lookout::sessions_with`], through an HMAC, never the key itself.
-    pub(crate) session: Option<String>,
+    /// What the application said about the visitor's session — `profile`
+    /// and the like — through [`Lookout::describe_session`].
+    pub(crate) context: Vec<(String, String)>,
     /// From a listed frontend, so held for a browser report to pair with if
     /// it would otherwise be dropped.
     pub(crate) rum_hold: bool,
@@ -615,7 +650,7 @@ impl Pending {
             traces: Vec::new(),
             user: None,
             client: None,
-            session: None,
+            context: Vec::new(),
             rum_hold: false,
         }
     }
@@ -647,7 +682,6 @@ pub(crate) struct Inner {
     /// Closed request batches waiting for their failure report.
     parked: Mutex<Vec<(Instant, Pending)>>,
     identify: RwLock<Option<IdentifyHook>>,
-    sessions: RwLock<Option<SessionHook>>,
     last_store_error: Mutex<Option<Instant>>,
     /// Aggregates of batches counted but not kept, waiting to be written.
     counts: Mutex<Vec<crate::entry::Aggregate>>,
@@ -847,26 +881,17 @@ impl Inner {
             .filter(|body| !body.is_empty());
         let client = capture.client.then(|| crate::client::ClientRaw::of(request));
         let rum = &self.config.rum;
-        let (session, rum_hold) = if rum.enabled && !rum.secret.is_empty() {
-            let session = self
-                .sessions
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .and_then(|hook| hook(request))
-                .filter(|key| !key.is_empty())
-                .map(|key| crate::rum::session_id(&rum.secret, &key));
+        let rum_hold = if rum.enabled && !rum.secret.is_empty() {
             let from_frontend = request.header("origin").is_some_and(|origin| {
                 let origin = origin.trim_end_matches('/');
                 rum.origins.iter().any(|allowed| allowed == origin)
             });
-            (session, from_frontend && rum.hold_seconds > 0)
+            from_frontend && rum.hold_seconds > 0
         } else {
-            (None, false)
+            false
         };
         let mut state = cell.lock();
         if let Some(pending) = state.as_mut() {
-            pending.session = session;
             pending.rum_hold = rum_hold;
             pending.method.get_or_insert_with(|| request.method().as_str().to_string());
             pending.path.get_or_insert(path);
@@ -1440,9 +1465,6 @@ pub(crate) fn finalize(
     }
     if pending.failed_job {
         tags.insert("failed".to_string());
-    }
-    if let Some(session) = &pending.session {
-        tags.insert(format!("session:{session}"));
     }
     if pending.truncated > 0 {
         tags.insert(format!("truncated:{}", pending.truncated));

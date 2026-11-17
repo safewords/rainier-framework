@@ -172,6 +172,20 @@ mod tests {
                 })
                 .name("me");
         }
+        {
+            // What an application does once it knows what the session is:
+            // here, the profile the visitor is acting as.
+            let lookout = lookout.clone();
+            router
+                .get("/acting", move || {
+                    let lookout = lookout.clone();
+                    async move {
+                        lookout.describe_session(None, "profile", "ada");
+                        "acting"
+                    }
+                })
+                .name("acting");
+        }
         router
             .post("/sessions", || async {
                 Response::json(&serde_json::json!({
@@ -377,7 +391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_browser_report_pairs_with_the_request_it_describes_in_its_session() {
+    async fn a_browser_report_pairs_with_the_request_it_describes_in_its_session_and_context() {
         use crate::store::Store as _;
         // Production's rule: only slow or failed requests are kept.
         let mut config = LookoutConfig::default().enabled(true).local(false);
@@ -387,7 +401,6 @@ mod tests {
         config.rum.secret = b"test-key".to_vec();
         let store = Arc::new(MemoryStore::new(10));
         let lookout = Lookout::new(config.clone(), store.clone());
-        lookout.sessions_with(|request| request.cookie("app_session").map(str::to_string));
         let kernel = kernel(&lookout, Arc::new(Dispatcher::new()));
         let _guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
@@ -396,7 +409,7 @@ mod tests {
             .handle_request(
                 Request::builder()
                     .method(Method::GET)
-                    .uri("/posts/42")
+                    .uri("/acting")
                     .header("origin", "https://app.example.com")
                     .header("cookie", "app_session=s3cr3t-cookie-value")
                     .build(),
@@ -408,14 +421,20 @@ mod tests {
         let timing = answered.header("server-timing").unwrap().to_string();
         let token =
             timing.split("desc=\"").nth(1).and_then(|t| t.split('"').next()).unwrap().to_string();
-        let session = timing
-            .split("lookout-session;desc=\"")
+        let context = timing
+            .split("lookout-context;desc=\"")
             .nth(1)
             .and_then(|t| t.split('"').next())
-            .expect("the session rides along")
+            .expect("the session's context rides along, signed")
             .to_string();
-        assert_eq!(session, crate::rum::session_id(b"test-key", "s3cr3t-cookie-value"));
-        assert!(!timing.contains("s3cr3t"), "never the cookie itself");
+        assert!(context.starts_with("profile=ada."), "{context}");
+        assert!(
+            !timing.contains("lookout-session"),
+            "the session is the browser's, not the server's"
+        );
+        assert!(!timing.contains("s3cr3t"), "never the cookie");
+        // The browser's own session, as the script keeps it.
+        let session = "fedcba9876543210fedcba9876543210";
         let counted_before: u64 = store
             .aggregate_rows(EntryType::Request, 60, chrono::Utc::now() - chrono::Duration::hours(1))
             .await
@@ -437,8 +456,9 @@ mod tests {
         let report = serde_json::json!({
             "view": "0123456789abcdef0123456789abcdef",
             "session": session,
-            "page": { "url": "https://app.example.com/posts/42" },
-            "calls": [{ "token": token, "url": "https://api.example.com/posts/42", "duration": 90.0, "status": 200 }],
+            "context": context,
+            "page": { "url": "https://app.example.com/acting" },
+            "calls": [{ "token": token, "url": "https://api.example.com/acting", "duration": 90.0, "status": 200 }],
         })
         .to_string();
         let posted = router
@@ -464,6 +484,11 @@ mod tests {
         assert!(
             server.tags.contains(&session_tag) && browser.tags.contains(&session_tag),
             "one session"
+        );
+        assert!(
+            server.tags.contains(&"profile:ada".to_string())
+                && browser.tags.contains(&"profile:ada".to_string()),
+            "labelled with the profile, on both sides"
         );
         let counted_after: u64 = store
             .aggregate_rows(EntryType::Request, 60, chrono::Utc::now() - chrono::Duration::hours(1))

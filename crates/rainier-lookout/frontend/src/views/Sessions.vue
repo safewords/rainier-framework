@@ -1,8 +1,8 @@
 <script setup>
-// Browser sessions (LOOKOUT_RUM): page views grouped by the session they
-// belong to — the application's own, through `sessions_with`, or the
-// browser tab's — newest first. A session's page lays out everything in it
-// as one timeline.
+// Browser sessions (LOOKOUT_RUM): page views grouped by the browser session
+// they belong to — one tab, renewed after 30 idle minutes — newest first,
+// with what the application said the session is (`describe_session`:
+// `profile:ada`). A session's page lays out everything in it as one timeline.
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
@@ -48,13 +48,19 @@ const sessionOf = (b) => {
   return tag ? tag.slice('session:'.length) : null
 }
 
+// Lookout's own tag prefixes; any other `name:value` tag is the
+// application's label for the session (rum.rs, RESERVED_CONTEXT).
+const OWN = new Set(['session', 'user', 'pageview', 'route', 'outcome', 'rum', 'browser', 'page', 'replay', 'held', 'truncated', 'dispatch', 'trace', 'kind'])
+const labelsOf = (b) => (b.tags || []).filter((t) => /^[a-z][a-z0-9_-]*:./.test(t) && !OWN.has(t.split(':')[0]))
+
 const sessions = computed(() => {
   const by = new Map()
   for (const b of batches.value) {
     const id = sessionOf(b)
     if (!id) continue
-    const s = by.get(id) || { id, users: new Set(), pages: 0, errors: 0, replays: 0, first: b.started_at, last: b.started_at, paths: [] }
+    const s = by.get(id) || { id, users: new Set(), labels: new Set(), pages: 0, errors: 0, replays: 0, first: b.started_at, last: b.started_at, paths: [] }
     if (b.user_id) s.users.add(b.user_id)
+    for (const label of labelsOf(b)) s.labels.add(label)
     if (b.kind === 'page') {
       s.pages++
       if (b.has_exception) s.errors++
@@ -97,6 +103,7 @@ const span = (s) => duration(Math.max(0, Date.parse(s.last) - Date.parse(s.first
             <span class="font-mono text-[12.5px] text-zinc-500 dark:text-zinc-400">{{ s.id.slice(0, 10) }}</span>
             <span v-if="s.users.size" class="text-sm font-medium">user {{ [...s.users].join(', ') }}</span>
             <span v-else class="text-sm text-zinc-500 dark:text-zinc-400">anonymous</span>
+            <Pill v-for="label in [...s.labels].slice(0, 3)" :key="label">{{ label }}</Pill>
             <span class="min-w-0 flex-1 truncate font-mono text-[12.5px]">{{ s.paths.slice(0, 4).join(' → ') }}</span>
             <Pill>{{ s.pages }} page view{{ s.pages === 1 ? '' : 's' }}</Pill>
             <Pill v-if="s.errors" tone="bad">{{ s.errors }} with errors</Pill>

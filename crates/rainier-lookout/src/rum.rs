@@ -112,20 +112,90 @@ pub fn verify(secret: &[u8], token: &str) -> Option<String> {
 /// The `Server-Timing` metric that names the route.
 pub const ROUTE_METRIC: &str = "lookout-route";
 
-/// The `Server-Timing` metric that carries the session's id.
-pub const SESSION_METRIC: &str = "lookout-session";
-
 /// The `Server-Timing` metric that carries the signed user id.
 pub const USER_METRIC: &str = "lookout-user";
 
-/// A session's id: an HMAC of the application's own key for it, so a session
-/// cookie — a credential — is never stored or sent back, and the same key
-/// always gives the same id.
-pub fn session_id(secret: &[u8], key: &str) -> String {
+/// The `Server-Timing` metric that carries the session's context, signed.
+pub const CONTEXT_METRIC: &str = "lookout-context";
+
+/// Tag prefixes Lookout uses itself, so an application's session context
+/// cannot be confused with them.
+const RESERVED_CONTEXT: &[&str] = &[
+    "session",
+    "user",
+    "pageview",
+    "route",
+    "outcome",
+    "rum",
+    "browser",
+    "page",
+    "replay",
+    "held",
+    "truncated",
+    "dispatch",
+    "trace",
+    "kind",
+];
+
+/// Whether `name` may name a piece of session context: lower-case letters,
+/// digits, `_` and `-`, a letter first, at most 32, and not one of Lookout's
+/// own tag prefixes.
+pub fn valid_context_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name.as_bytes()[0].is_ascii_lowercase()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        && !RESERVED_CONTEXT.contains(&name)
+}
+
+/// Whether `value` may be a piece of session context's value: printable
+/// ASCII without quotes, backslashes, `,` or `=`, at most 64.
+pub fn valid_context_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b'\\' | b',' | b'='))
+}
+
+fn context_signature(secret: &[u8], body: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC takes a key of any length");
-    mac.update(b"lookout-session\n");
-    mac.update(key.as_bytes());
+    mac.update(b"lookout-context\n");
+    mac.update(body.as_bytes());
     mac.finalize().into_bytes().iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// A session's context, signed: `name=value,name=value.<signature>`. A
+/// report carrying it is believed only with the signature, as with the user.
+/// `None` when there is nothing to say or it would not fit in the header.
+pub fn context_token(secret: &[u8], context: &[(String, String)]) -> Option<String> {
+    let body: Vec<String> = context
+        .iter()
+        .filter(|(n, v)| valid_context_name(n) && valid_context_value(v))
+        .map(|(n, v)| format!("{n}={v}"))
+        .collect();
+    if body.is_empty() {
+        return None;
+    }
+    let body = body.join(",");
+    let token = format!("{body}.{}", context_signature(secret, &body));
+    safe_header_text(&token).then_some(token)
+}
+
+/// The context a [`context_token`] names, if this application signed it.
+pub fn verify_context(secret: &[u8], token: &str) -> Option<Vec<(String, String)>> {
+    let (body, presented) = token.rsplit_once('.')?;
+    let expected = context_signature(secret, body);
+    if !bool::from(presented.as_bytes().ct_eq(expected.as_bytes())) {
+        return None;
+    }
+    body.split(',')
+        .map(|pair| {
+            let (n, v) = pair.split_once('=')?;
+            (valid_context_name(n) && valid_context_value(v))
+                .then(|| (n.to_string(), v.to_string()))
+        })
+        .collect()
 }
 
 /// Whether `text` can go in a `Server-Timing` quoted string as it is.
@@ -157,19 +227,26 @@ pub fn verify_user(secret: &[u8], token: &str) -> Option<String> {
     bool::from(presented.as_bytes().ct_eq(expected_sig.as_bytes())).then(|| user_id.to_string())
 }
 
-/// A session id as a report may carry it: the server's (16 hex digits) or
-/// the browser's own (32).
+/// A session id as a report may carry it: the browser's own, 32 hex digits.
 fn session_tag(session: &str) -> Option<String> {
-    ((session.len() == 16 || session.len() == 32) && session.bytes().all(|b| b.is_ascii_hexdigit()))
+    (session.len() == 32 && session.bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| format!("session:{session}"))
 }
 
-/// The session and user tags a report earns, and the user it is believed
-/// to be from.
-fn identity_tags(rum: &Rum, session: &str, user: Option<&str>) -> (Vec<String>, Option<String>) {
+/// The session, context and user tags a report earns, and the user it is
+/// believed to be from.
+fn identity_tags(
+    rum: &Rum,
+    session: &str,
+    context: Option<&str>,
+    user: Option<&str>,
+) -> (Vec<String>, Option<String>) {
     let mut tags = Vec::new();
     if let Some(tag) = session_tag(session) {
         tags.push(tag);
+    }
+    for (name, value) in context.and_then(|c| verify_context(&rum.secret, c)).unwrap_or_default() {
+        tags.push(format!("{name}:{value}"));
     }
     let user = user.and_then(|u| verify_user(&rum.secret, u));
     if let Some(user) = &user {
@@ -274,10 +351,14 @@ pub struct Report {
     /// can vouch for it.
     #[serde(default)]
     pub(crate) proof: Option<String>,
-    /// The session: the server's id for it from `lookout-session`, or the
-    /// script's own for a visitor the application does not bind.
+    /// The session: the browser's own id for it, one per tab, renewed after
+    /// 30 idle minutes.
     #[serde(default)]
     pub(crate) session: String,
+    /// The session's context from `lookout-context`, signed, if the
+    /// application described the session.
+    #[serde(default)]
+    pub(crate) context: Option<String>,
     /// The signed user id from `lookout-user`, if the page has one.
     #[serde(default)]
     pub(crate) user: Option<String>,
@@ -362,7 +443,8 @@ pub(crate) fn batches(
     if let Some(view) = &view {
         tags.push(view_tag(view));
     }
-    let (identity, user) = identity_tags(rum, &report.session, report.user.as_deref());
+    let (identity, user) =
+        identity_tags(rum, &report.session, report.context.as_deref(), report.user.as_deref());
     tags.extend(identity);
     report
         .calls
@@ -525,7 +607,8 @@ pub(crate) fn page_batch(
         "activity": Value::Object(activity),
     });
     let mut tags = vec!["browser".to_string(), TAG_PAGE.to_string(), view_tag(&view)];
-    let (identity, user) = identity_tags(rum, &report.session, report.user.as_deref());
+    let (identity, user) =
+        identity_tags(rum, &report.session, report.context.as_deref(), report.user.as_deref());
     tags.extend(identity);
     Some(Batch {
         id: id.clone(),
@@ -629,11 +712,14 @@ pub struct ReplayUpload {
     /// How much time the recording covers, in milliseconds.
     #[serde(default)]
     pub(crate) ms: f64,
-    /// The page view, session and signed user, as a report carries them.
+    /// The page view, session, signed context and signed user, as a report
+    /// carries them.
     #[serde(default)]
     pub(crate) view: String,
     #[serde(default)]
     pub(crate) session: String,
+    #[serde(default)]
+    pub(crate) context: Option<String>,
     #[serde(default)]
     pub(crate) user: Option<String>,
 }
@@ -684,7 +770,8 @@ pub(crate) fn replay_batch(
     if let Some(view) = view_id(&upload.view) {
         tags.push(view_tag(view));
     }
-    let (identity, user) = identity_tags(rum, &upload.session, upload.user.as_deref());
+    let (identity, user) =
+        identity_tags(rum, &upload.session, upload.context.as_deref(), upload.user.as_deref());
     tags.extend(identity);
     let mut device = bounded_map(&upload.device, 2);
     describe_sender(config, &mut device, ip, user_agent);
@@ -761,6 +848,43 @@ fn describe_sender(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sessions_context_is_signed_and_a_forged_one_is_refused() {
+        let secret = b"k";
+        let context = vec![
+            ("profile".to_string(), "ada".to_string()),
+            ("team".to_string(), "x-1".to_string()),
+        ];
+        let token = context_token(secret, &context).expect("a token");
+        assert!(token.starts_with("profile=ada,team=x-1."), "{token}");
+        assert_eq!(verify_context(secret, &token), Some(context));
+        let forged = token.replace("profile=ada", "profile=bob");
+        assert_eq!(verify_context(secret, &forged), None, "a browser cannot relabel itself");
+        assert_eq!(verify_context(b"other", &token), None);
+    }
+
+    #[test]
+    fn context_cannot_pose_as_lookouts_own_tags_or_break_the_header() {
+        for name in ["session", "user", "pageview", "Profile", "1st", "", "a b"] {
+            assert!(!valid_context_name(name), "{name:?}");
+        }
+        for value in ["", "a,b", "a=b", "say \"hi\"", "back\\slash", "tab\t", &"x".repeat(65)] {
+            assert!(!valid_context_value(value), "{value:?}");
+        }
+        assert!(valid_context_name("profile") && valid_context_value("ada.lovelace"));
+        assert_eq!(context_token(b"k", &[("session".into(), "1".into())]), None);
+    }
+
+    #[test]
+    fn only_the_browsers_own_session_id_is_a_session() {
+        assert_eq!(
+            session_tag("0123456789abcdef0123456789abcdef").as_deref(),
+            Some("session:0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(session_tag("0123456789abcdef"), None, "the server's old 16-digit form");
+        assert_eq!(session_tag("not-hex-not-hex-not-hex-not-hex!"), None);
+    }
 
     #[test]
     fn a_token_verifies_only_with_its_own_key_and_trace() {

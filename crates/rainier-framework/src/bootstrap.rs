@@ -99,8 +99,6 @@ pub struct Rainier {
     /// its user type.
     #[cfg(feature = "lookout")]
     lookout_viewers: Option<crate::lookout::Viewers>,
-    #[cfg(feature = "lookout")]
-    lookout_sessions: Option<rainier_lookout::recorder::SessionHook>,
 }
 
 impl Rainier {
@@ -151,8 +149,6 @@ impl Rainier {
             lookout: Vec::new(),
             #[cfg(feature = "lookout")]
             lookout_viewers: None,
-            #[cfg(feature = "lookout")]
-            lookout_sessions: None,
         }
     }
 
@@ -684,29 +680,6 @@ impl Rainier {
         self
     }
 
-    /// Say which of the application's sessions a request belongs to, so
-    /// Lookout's real user monitoring can lay a visitor's page views, API
-    /// calls, requests and replay out as one session timeline.
-    ///
-    /// `sessions` reads the application's own key for the session from the
-    /// request — its session cookie, typically — and fetches nothing. Lookout
-    /// keeps an HMAC of the key, never the key. Without it, the browser
-    /// script keeps one session per tab. See `docs/lookout.md`, "Sessions".
-    ///
-    /// ```no_run
-    /// # fn boot(app: rainier_framework::Rainier) -> rainier_framework::Rainier {
-    /// app.with_lookout_sessions(|request| request.cookie("app_session").map(str::to_string))
-    /// # }
-    /// ```
-    #[cfg(feature = "lookout")]
-    pub fn with_lookout_sessions(
-        mut self,
-        sessions: impl Fn(&rainier_http::Request) -> Option<String> + Send + Sync + 'static,
-    ) -> Self {
-        self.lookout_sessions = Some(Arc::new(sessions));
-        self
-    }
-
     /// Let users of type `U` see Lookout's dashboard when they may.
     ///
     /// Outside the local environment a viewer is authenticated with the
@@ -1052,9 +1025,6 @@ impl Rainier {
                     .get::<rainier_auth::Authenticated>()
                     .map(|who| (who.guard.clone(), Some(who.user_id.clone())))
             });
-            if let Some(sessions) = self.lookout_sessions.take() {
-                lookout.sessions_with(move |request| sessions(request));
-            }
             lookout.listen(app.resolve::<Dispatcher>()?.as_ref());
             app.instance(store);
             app.instance(lookout.clone());

@@ -571,30 +571,36 @@ test runner's API client — has no browser report to pair with.
 
 ### Sessions
 
-Page views, API calls, kept and paired requests and replays carry
-`session:<id>`, and **Browser → Sessions** lists sessions, newest first; a
-session's page lays everything in it out as one timeline — each page view,
-its route changes and script errors at the moment they happened, each API
-call with its browser time beside its server time when the request was kept
-or paired, and a **Replay of the session** stitched from its recordings.
-It is what to open when someone reports a problem: find them (filter by user
-id), find the session, read it from the top.
+Page views, API calls, paired requests and replays carry `session:<id>`, and
+**Browser → Sessions** lists sessions, newest first; a session's page lays
+everything in it out as one timeline — each page view, its route changes and
+script errors at the moment they happened, each API call with its browser
+time beside its server time when the request was kept or paired, and a
+**Replay of the session** stitched from its recordings, the time between them
+skipped. It is what to open when someone reports a problem: find them (filter
+by user id), find the session, read it from the top.
 
-What a session *is* is the application's to say — the binding to its own
-application layer:
+A session is the browser's: one tab, kept across reloads, and renewed after
+30 minutes without the visitor doing anything — a click, a key, a scroll.
+It is not the application's login session, which can last for months; it is
+one sitting.
+
+What the session *is* to the application — the profile the visitor is acting
+as, the workspace they are in — the application says, from where the request
+already knows it:
 
 ```rust
-// At boot: the application's own key for the visitor's session. Here, the
-// session cookie; it could be a header, or the user's id.
-app.with_lookout_sessions(|request| request.cookie("app_session").map(str::to_string))
+// Where the request is authenticated, with what is already loaded there.
+rainier_framework::lookout::describe_session("profile", "ada");
 ```
 
-The closure runs at the start of every request while RUM is on, so it reads
-what the request carries and fetches nothing. Lookout keeps an HMAC of the
-key (`lookout-session` in `Server-Timing`), never the key: a session cookie
-is a credential. With a `Lookout` in hand, `lookout.sessions_with(..)` does
-the same. Without a binding, the browser script keeps a session of its own,
-one per tab, renewed after 30 idle minutes.
+The request is tagged `profile:ada`, and the label rides back to the browser
+signed (`lookout-context` in `Server-Timing`), so the page views, API calls
+and replays the session reports are tagged too; a browser cannot label its
+own. The name is lower-case letters, digits, `_` and `-`, and not one of
+Lookout's own tag prefixes (`session`, `user`, `pageview`, …); the value is at
+most 64 printable characters without `,` `=` or quotes. With a `Lookout` in
+hand, `lookout.describe_session(None, name, value)` does the same.
 
 The user is attributed the same way: a response to an authenticated request
 carries the user's id signed (`lookout-user`), the script returns it with its
