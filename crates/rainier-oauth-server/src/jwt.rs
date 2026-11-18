@@ -34,10 +34,10 @@ use rainier_support::{Error, Result};
 use rsa::pkcs1::{DecodeRsaPrivateKey, DecodeRsaPublicKey};
 use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
-use rsa::sha2::Sha256;
 use rsa::signature::{SignatureEncoding, Signer, Verifier};
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{PrivateKey, PublicKey};
 use serde_json::{json, Map, Value};
+use sha2::Sha256;
 
 /// What goes into a new access token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,8 +70,8 @@ impl AccessTokenSigner {
     /// it into the secret store instead of shipping the passphrase beside it.
     pub fn from_pem(pem: &str) -> Result<Self> {
         let pem = normalise_pem(pem);
-        let key = RsaPrivateKey::from_pkcs8_pem(&pem)
-            .or_else(|_| RsaPrivateKey::from_pkcs1_pem(&pem))
+        let key = PrivateKey::from_pkcs8_pem(&pem)
+            .or_else(|_| PrivateKey::from_pkcs1_pem(&pem))
             .map_err(|_| {
                 Error::internal("the access token private key is not a readable RSA PEM")
             })?;
@@ -82,13 +82,13 @@ impl AccessTokenSigner {
     /// examples and local development. A deployment loads its key with
     /// [`from_pem`](Self::from_pem), or every restart invalidates every token.
     pub fn generate(bits: usize) -> Result<Self> {
-        let key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, bits)
+        let key = PrivateKey::new(&mut rand::rng(), bits)
             .map_err(|e| Error::internal(format!("could not generate an RSA key: {e}")))?;
         Ok(Self::from_key(key))
     }
 
     /// A signer over an already-parsed key.
-    pub fn from_key(key: RsaPrivateKey) -> Self {
+    pub fn from_key(key: PrivateKey) -> Self {
         Self { key: SigningKey::new(key), kid: None, issuer: None, extra: Map::new() }
     }
 
@@ -148,7 +148,7 @@ impl AccessTokenSigner {
 
     /// The matching verifier.
     pub fn verifier(&self) -> AccessTokenVerifier {
-        let public = RsaPublicKey::from(self.key.as_ref());
+        let public = PublicKey::from(self.key.as_ref());
         let mut verifier = AccessTokenVerifier::from_key(public, self.kid.clone());
         verifier.issuer = self.issuer.clone();
         verifier
@@ -196,7 +196,7 @@ impl AccessTokenVerifier {
     }
 
     /// A verifier over an already-parsed key, optionally under a `kid`.
-    pub fn from_key(key: RsaPublicKey, kid: Option<String>) -> Self {
+    pub fn from_key(key: PublicKey, kid: Option<String>) -> Self {
         Self { keys: vec![(kid, VerifyingKey::new(key))], issuer: None, leeway: 0 }
     }
 
@@ -325,10 +325,10 @@ impl std::fmt::Debug for AccessTokenVerifier {
     }
 }
 
-fn parse_public(pem: &str) -> Result<RsaPublicKey> {
+fn parse_public(pem: &str) -> Result<PublicKey> {
     let pem = normalise_pem(pem);
-    RsaPublicKey::from_public_key_pem(&pem)
-        .or_else(|_| RsaPublicKey::from_pkcs1_pem(&pem))
+    PublicKey::from_public_key_pem(&pem)
+        .or_else(|_| PublicKey::from_pkcs1_pem(&pem))
         .map_err(|_| Error::internal("the access token public key is not a readable RSA PEM"))
 }
 
@@ -362,12 +362,10 @@ pub(crate) mod tests {
 
     /// One 2048-bit key for the whole test run — generating one is the slow
     /// part of every test that signs.
-    pub(crate) fn key() -> RsaPrivateKey {
-        static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
-        KEY.get_or_init(|| {
-            RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("generate a test key")
-        })
-        .clone()
+    pub(crate) fn key() -> PrivateKey {
+        static KEY: OnceLock<PrivateKey> = OnceLock::new();
+        KEY.get_or_init(|| PrivateKey::new(&mut rand::rng(), 2048).expect("generate a test key"))
+            .clone()
     }
 
     fn claims(now: DateTime<Utc>) -> AccessTokenClaims {
@@ -435,13 +433,13 @@ pub(crate) mod tests {
             }),
         );
         let verified =
-            AccessTokenVerifier::from_key(RsaPublicKey::from(&key()), None).verify(&token).unwrap();
+            AccessTokenVerifier::from_key(PublicKey::from(&key()), None).verify(&token).unwrap();
         assert_eq!(verified.client_id, "client-id");
     }
 
     #[test]
     fn expired_future_and_forged_tokens_are_refused() {
-        let verifier = AccessTokenVerifier::from_key(RsaPublicKey::from(&key()), None);
+        let verifier = AccessTokenVerifier::from_key(PublicKey::from(&key()), None);
         let now = Utc::now().timestamp();
         let body = |exp: i64, nbf: i64| json!({ "aud": "c", "jti": "j", "sub": "1", "scopes": [], "nbf": nbf, "exp": exp });
         let rs = json!({ "alg": "RS256" });
@@ -461,15 +459,15 @@ pub(crate) mod tests {
 
     #[test]
     fn a_rotation_accepts_the_previous_key() {
-        let new_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+        let new_key = PrivateKey::new(&mut rand::rng(), 2048).unwrap();
         let old = AccessTokenSigner::from_key(key());
         let old_token = old.sign(&claims(Utc::now())).unwrap();
 
-        let verifier = AccessTokenVerifier::from_key(RsaPublicKey::from(&new_key), None);
+        let verifier = AccessTokenVerifier::from_key(PublicKey::from(&new_key), None);
         assert!(verifier.verify(&old_token).is_err());
 
         use rsa::pkcs8::{EncodePublicKey, LineEnding};
-        let old_pem = RsaPublicKey::from(&key()).to_public_key_pem(LineEnding::LF).unwrap();
+        let old_pem = PublicKey::from(&key()).to_public_key_pem(LineEnding::LF).unwrap();
         let verifier = verifier.also_accepting(&old_pem, None).unwrap();
         assert!(verifier.verify(&old_token).is_ok());
     }

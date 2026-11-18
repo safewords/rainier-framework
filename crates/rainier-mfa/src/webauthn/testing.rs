@@ -44,7 +44,7 @@ pub struct SoftwareKey(Inner);
 enum Inner {
     Es256(p256::ecdsa::SigningKey),
     Ed25519(ed25519_dalek::SigningKey),
-    Rs256(Box<rsa::RsaPrivateKey>),
+    Rs256(Box<rsa::PrivateKey>),
 }
 
 impl SoftwareKey {
@@ -68,8 +68,7 @@ impl SoftwareKey {
 
     /// A fresh 2048-bit RSA key. Slow in a debug build — a second or two.
     pub fn rs256() -> Self {
-        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048)
-            .expect("an RSA key generates");
+        let key = rsa::PrivateKey::new(&mut rand::rng(), 2048).expect("an RSA key generates");
         Self(Inner::Rs256(Box::new(key)))
     }
 
@@ -96,7 +95,7 @@ impl SoftwareKey {
             Inner::Ed25519(key) => CoseKey::Ed25519 { x: key.verifying_key().to_bytes() },
             Inner::Rs256(key) => {
                 use rsa::traits::PublicKeyParts as _;
-                CoseKey::Rs256 { n: key.n().to_bytes_be(), e: key.e().to_bytes_be() }
+                CoseKey::Rs256 { n: key.n_bytes().into_vec(), e: key.e_bytes().into_vec() }
             }
         };
         key.to_bytes()
@@ -116,7 +115,7 @@ impl SoftwareKey {
             }
             Inner::Rs256(key) => {
                 let hashed = Sha256::digest(message);
-                key.sign(rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(), &hashed).expect("RSA signs")
+                key.sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &hashed).expect("RSA signs")
             }
         }
     }

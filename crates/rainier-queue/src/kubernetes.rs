@@ -640,6 +640,13 @@ mod dispatcher {
         }
     }
 
+    /// k8s-openapi carries times as `jiff` timestamps; the queue measures in `chrono`.
+    fn chrono_time(
+        at: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::from_timestamp(at.0.as_second(), at.0.subsec_nanosecond().unsigned_abs())
+    }
+
     /// The timings one pod's first container records.
     pub(crate) fn pod_timing(pod: &Pod, dispatched: chrono::DateTime<chrono::Utc>) -> PodTiming {
         let Some(state) = pod
@@ -654,10 +661,10 @@ mod dispatcher {
 
         let (started, finished) = match (&state.terminated, &state.running) {
             (Some(terminated), _) => (
-                terminated.started_at.as_ref().map(|at| at.0),
-                terminated.finished_at.as_ref().map(|at| at.0),
+                terminated.started_at.as_ref().and_then(chrono_time),
+                terminated.finished_at.as_ref().and_then(chrono_time),
             ),
-            (None, Some(running)) => (running.started_at.as_ref().map(|at| at.0), None),
+            (None, Some(running)) => (running.started_at.as_ref().and_then(chrono_time), None),
             (None, None) => (None, None),
         };
 
@@ -1004,6 +1011,7 @@ mod dispatcher {
                     empty_dir: Some(EmptyDirVolumeSource {
                         medium: Some("Memory".into()),
                         size_limit: None,
+                        ..EmptyDirVolumeSource::default()
                     }),
                     ..Volume::default()
                 }]),

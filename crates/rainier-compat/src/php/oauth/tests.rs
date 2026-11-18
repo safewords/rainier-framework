@@ -211,7 +211,7 @@ async fn a_token_row_reads_back_with_its_scopes_and_expiry() {
 #[tokio::test]
 async fn a_server_with_the_defuse_sealer_issues_league_shaped_refresh_tokens() {
     use rainier_crypt::{Argon2Hasher, Hasher};
-    use rsa::RsaPrivateKey;
+    use rsa::PrivateKey;
 
     let hasher = Arc::new(Argon2Hasher::insecure_for_tests());
     let store = Arc::new(MemoryStore::new().with_client(rainier_oauth_server::Client {
@@ -225,7 +225,7 @@ async fn a_server_with_the_defuse_sealer_issues_league_shaped_refresh_tokens() {
         owner_id: None,
         revoked: false,
     }));
-    let key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let key = PrivateKey::new(&mut rand::rng(), 2048).unwrap();
     let sealer = Arc::new(DefuseSealer::new(vec![7u8; 32]));
 
     struct Owners;

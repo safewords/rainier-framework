@@ -12,6 +12,12 @@ the release as a whole and names the crate it landed in.
 
 ### Changed
 
+- **Dependencies are current** (2026-11-18): `jsonwebtoken` 12, `rsa` 0.10 on
+  the same `digest` 0.11 generation as `sha2` and `hmac` (so `rainier-crypt`,
+  `rainier-mfa` and `rainier-oauth-server` hash with the workspace `sha2`
+  rather than rsa's own), and `kube` 5.1 with `k8s-openapi` 0.29 under
+  `rainier-queue`'s `kubernetes` feature. Every other dependency is at its
+  newest compatible release.
 - **A Lookout session is the browser's** (`rainier-lookout`,
   `rainier-framework`), breaking: one tab, renewed after 30 minutes without
   the visitor doing anything — measured from their activity, not only from a

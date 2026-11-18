@@ -127,20 +127,20 @@ impl JwtKey {
         use rsa::pkcs1::DecodeRsaPrivateKey;
         use rsa::pkcs8::DecodePrivateKey;
         use rsa::traits::PublicKeyParts;
-        use rsa::RsaPrivateKey;
+        use rsa::PrivateKey;
 
         // Both spellings are in the wild: `BEGIN PRIVATE KEY` (PKCS#8) and
         // `BEGIN RSA PRIVATE KEY` (PKCS#1). Refusing one of them would be a
         // support question rather than a security property.
-        let private = RsaPrivateKey::from_pkcs8_pem(pem)
-            .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem))
+        let private = PrivateKey::from_pkcs8_pem(pem)
+            .or_else(|_| PrivateKey::from_pkcs1_pem(pem))
             .map_err(|e| Error::internal(format!("could not read the RSA private key: {e}")))?;
 
         let public = private.to_public_key();
         let jwk = json!({
             "kty": "RSA",
-            "n": B64URL.encode(public.n().to_bytes_be()),
-            "e": B64URL.encode(public.e().to_bytes_be()),
+            "n": B64URL.encode(public.n_bytes()),
+            "e": B64URL.encode(public.e_bytes()),
         });
 
         Ok(Self {
@@ -201,9 +201,9 @@ impl JwtKey {
     /// of intermittent logouts anywhere else.
     pub fn generate_rs256(kid: impl Into<String>, bits: usize) -> Result<Self> {
         use rsa::pkcs8::{EncodePrivateKey, LineEnding};
-        use rsa::RsaPrivateKey;
+        use rsa::PrivateKey;
 
-        let private = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, bits)
+        let private = PrivateKey::new(&mut rand::rng(), bits)
             .map_err(|e| Error::internal(format!("could not generate an RSA key: {e}")))?;
         let pem = private
             .to_pkcs8_pem(LineEnding::LF)
@@ -273,15 +273,15 @@ impl JwtKey {
 
         let decoding = match field("kty")?.as_str() {
             "RSA" => {
-                use rsa::{BigUint, RsaPublicKey};
+                use rsa::{BoxedUint, PublicKey};
 
                 // Big-endian, unsigned, as RFC 7518 §6.3.1 specifies. Reading
                 // these little-endian produces a key that is structurally
                 // valid and verifies nothing, which is the failure this is
                 // most likely to be broken into.
-                let public = RsaPublicKey::new(
-                    BigUint::from_bytes_be(&decode("n")?),
-                    BigUint::from_bytes_be(&decode("e")?),
+                let public = PublicKey::new(
+                    BoxedUint::from_be_slice_vartime(&decode("n")?),
+                    BoxedUint::from_be_slice_vartime(&decode("e")?),
                 )
                 .map_err(|e| Error::internal(format!("this JWKS entry is not an RSA key: {e}")))?;
 
@@ -612,7 +612,7 @@ impl std::fmt::Debug for Jwt {
 }
 
 /// An RSA public key as PEM, which is what `DecodingKey` wants.
-fn public_pem(public: &rsa::RsaPublicKey) -> Result<String> {
+fn public_pem(public: &rsa::PublicKey) -> Result<String> {
     use rsa::pkcs8::{EncodePublicKey, LineEnding};
 
     public
@@ -666,8 +666,7 @@ mod tests {
         static PEM: OnceLock<String> = OnceLock::new();
 
         PEM.get_or_init(|| {
-            let private =
-                rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("generate");
+            let private = rsa::PrivateKey::new(&mut rand::rng(), 2048).expect("generate");
             private.to_pkcs8_pem(LineEnding::LF).expect("encode").to_string()
         })
         .clone()
@@ -739,8 +738,7 @@ mod tests {
         static PEM: OnceLock<String> = OnceLock::new();
 
         PEM.get_or_init(|| {
-            let private =
-                rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("generate");
+            let private = rsa::PrivateKey::new(&mut rand::rng(), 2048).expect("generate");
             private.to_pkcs8_pem(LineEnding::LF).expect("encode").to_string()
         })
         .clone()

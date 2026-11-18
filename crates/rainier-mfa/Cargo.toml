@@ -33,9 +33,7 @@ sha1 = { version = "0.11", default-features = false, optional = true }
 # Pure Rust, so the crate builds wherever the rest of the framework does.
 p256 = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
-# `sha2` for the PKCS#1 v1.5 DigestInfo prefix: rsa 0.9 is on digest 0.10, so
-# it names its own SHA-256 rather than the workspace's.
-rsa = { workspace = true, optional = true, features = ["sha2"] }
+rsa = { workspace = true, optional = true }
 
 [features]
 default = ["totp"]

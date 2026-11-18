@@ -26,9 +26,8 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 # RS256 access tokens, signed and verified here rather than through
 # `rainier_crypt::Jwt`: a token issued by another server may carry no `kid`
-# and fractional timestamps, and both have to verify. `sha2` is rsa's own
-# (digest 0.10) re-export, not the workspace's 0.11.
-rsa = { workspace = true, features = ["sha2"] }
+# and fractional timestamps, and both have to verify.
+rsa = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

@@ -200,8 +200,7 @@ impl CoseKey {
                     use sha2::Digest as _;
 
                     let hashed = sha2::Sha256::digest(message);
-                    key.verify(rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(), &hashed, signature)
-                        .is_ok()
+                    key.verify(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &hashed, signature).is_ok()
                 }
                 Err(_) => false,
             },
@@ -243,12 +242,14 @@ fn sec1(x: &[u8; 32], y: &[u8; 32]) -> Vec<u8> {
     point
 }
 
-fn rsa_key(n: &[u8], e: &[u8]) -> Result<rsa::RsaPublicKey> {
+fn rsa_key(n: &[u8], e: &[u8]) -> Result<rsa::PublicKey> {
     use rsa::traits::PublicKeyParts as _;
 
-    let key =
-        rsa::RsaPublicKey::new(rsa::BigUint::from_bytes_be(n), rsa::BigUint::from_bytes_be(e))
-            .map_err(|_| invalid("an RSA key that is not valid"))?;
+    let key = rsa::PublicKey::new(
+        rsa::BoxedUint::from_be_slice_vartime(n),
+        rsa::BoxedUint::from_be_slice_vartime(e),
+    )
+    .map_err(|_| invalid("an RSA key that is not valid"))?;
     if key.size() * 8 < 2048 {
         return Err(invalid("an RSA modulus shorter than 2048 bits"));
     }

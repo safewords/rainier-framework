@@ -1,4 +1,4 @@
-﻿[workspace]
+[workspace]
 resolver = "2"
 members = [
     "crates/rainier-framework",
@@ -171,8 +171,8 @@ sea-query = { version = "1", default-features = false, features = ["derive", "ba
 sea-orm = { version = "2", default-features = false }
 rust_decimal = { version = "1", default-features = false }
 aes = "0.9"
-jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
-rsa = { version = "0.9", features = ["getrandom"] }
+jsonwebtoken = { version = "12", default-features = false, features = ["rust_crypto", "use_pem"] }
+rsa = { version = "0.10", features = ["getrandom"] }
 # `rustls-no-provider`, not `rustls`: 0.13's `rustls` feature turns on aws-lc-rs
 # for the whole rustls 0.23 in the graph, and with ring also enabled rustls
 # refuses to pick a default provider. The transport installs ring explicitly —

@@ -21,12 +21,12 @@ use base64::Engine as _;
 use rainier_crypt::jwt::{Jwt, JwtKey, JwtKeyRing};
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::signature::Verifier;
-use rsa::{BigUint, RsaPublicKey};
+use rsa::{BoxedUint, PublicKey};
 use serde::Serialize;
 use serde_json::Value;
 // rsa 0.9 is on the digest 0.10 generation; its own sha2 re-export is the one
 // its verifier accepts, while the framework itself is on sha2 0.11.
-use rsa::sha2::Sha256;
+use sha2::Sha256;
 
 #[derive(Serialize)]
 struct Claims {
@@ -35,15 +35,18 @@ struct Claims {
 }
 
 /// Rebuild an RSA public key from a JWKS entry, the way a relying party does.
-fn public_key_from_jwk(jwk: &Value) -> RsaPublicKey {
+fn public_key_from_jwk(jwk: &Value) -> PublicKey {
     let decode = |field: &str| {
         B64URL
             .decode(jwk[field].as_str().unwrap_or_else(|| panic!("`{field}` should be a string")))
             .unwrap_or_else(|_| panic!("`{field}` should be base64url"))
     };
 
-    RsaPublicKey::new(BigUint::from_bytes_be(&decode("n")), BigUint::from_bytes_be(&decode("e")))
-        .expect("the modulus and exponent should form a key")
+    PublicKey::new(
+        BoxedUint::from_be_slice_vartime(&decode("n")),
+        BoxedUint::from_be_slice_vartime(&decode("e")),
+    )
+    .expect("the modulus and exponent should form a key")
 }
 
 #[test]
