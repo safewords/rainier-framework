@@ -85,7 +85,7 @@ pub mod telemetry;
 pub mod testing;
 
 pub use concurrent::{all, all_limited};
-pub use connection::{ChangeSubscriber, Connection, Database};
+pub use connection::{ChangeSubscriber, Connection, Database, Transaction};
 pub use criteria::{
     AggregateFn, Assignment, Comparison, Constraint, Criteria, DatePart, Derived, JoinKind,
     Operand, Operator, OrGroup, Projection, Subquery, SubqueryDraft, SubqueryPredicate,

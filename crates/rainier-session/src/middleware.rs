@@ -10,6 +10,7 @@ use rainier_support::Result;
 use crate::manager::{SessionConfig, SessionManager};
 use crate::session::{Session, SessionData};
 use crate::store::SessionStore;
+use crate::touch::TouchLedger;
 
 /// A loaded session, and whether it is safe to write back.
 struct Loaded {
@@ -41,17 +42,32 @@ impl Loaded {
 pub struct StartSession {
     store: Arc<dyn SessionStore>,
     config: SessionConfig,
+    /// When this process last extended each session's expiry — so a session
+    /// read on every request is touched once an interval, not every time. See
+    /// [`TouchLedger`].
+    touches: TouchLedger,
 }
 
 impl StartSession {
     /// Start sessions in `store`, with the default cookie settings.
     pub fn new(store: Arc<dyn SessionStore>) -> Self {
-        Self { store, config: SessionConfig::default() }
+        Self::with_config(store, SessionConfig::default())
     }
 
     /// Start sessions with explicit cookie settings.
     pub fn with_config(store: Arc<dyn SessionStore>, config: SessionConfig) -> Self {
-        Self { store, config }
+        let lifetime = config.lifetime.to_std().unwrap_or_default();
+        Self { store, config, touches: TouchLedger::for_lifetime(lifetime) }
+    }
+
+    /// Extend an unchanged session's expiry on every request rather than once
+    /// per touch interval — a hundredth of the lifetime, at most a minute.
+    ///
+    /// For a store whose sessions must expire to the second after the last
+    /// request; the default suits everything else.
+    pub fn touch_every_request(mut self) -> Self {
+        self.touches = TouchLedger::with_interval(std::time::Duration::ZERO);
+        self
     }
 
     /// Take the settings and the store from a manager — the usual way, since
@@ -244,6 +260,14 @@ impl Middleware for StartSession {
         // stored to extend; its cookie is the session and is re-sent below.
         if !session.needs_write() && !self.store.is_client_side() {
             let id = session.id();
+            // Touched under an interval ago by this process: the expiry is
+            // already about as far out as this touch would put it.
+            if !self.touches.due(&id) {
+                return match self.store.encode(&id, &SessionData::default()) {
+                    Ok(value) => response.with_cookie(&self.cookie(&value)),
+                    Err(_) => response,
+                };
+            }
             if let Err(e) = self.store.touch(&id).await {
                 tracing::error!(error = %e, "could not refresh the session's expiry");
                 report(SessionFailed::new(e, "touch")).await;
@@ -256,7 +280,11 @@ impl Middleware for StartSession {
         }
 
         match self.save(&session).await {
-            Ok(value) => response.with_cookie(&self.cookie(&value)),
+            Ok(value) => {
+                // A write sets a fresh expiry; no touch is due for an interval.
+                self.touches.record(&session.id());
+                response.with_cookie(&self.cookie(&value))
+            }
             Err(e) => {
                 // The response is already built and is very likely correct; the
                 // cost of a failed save is a lost session, not a wrong page.
@@ -525,6 +553,86 @@ mod tests {
 
         assert_eq!(session_cookie(&second).as_deref(), Some(id.as_str()), "the cookie is renewed");
         assert_eq!(store.read(&id).await.unwrap().unwrap().values["user_id"], 7, "the data stays");
+    }
+
+    /// A memory store that counts the touches it is asked for.
+    #[derive(Default)]
+    struct CountingStore {
+        inner: MemorySessionStore,
+        touches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SessionStore for CountingStore {
+        fn name(&self) -> &str {
+            "counting"
+        }
+        fn read<'a>(
+            &'a self,
+            id: &'a str,
+        ) -> rainier_support::BoxFuture<'a, Result<Option<SessionData>>> {
+            self.inner.read(id)
+        }
+        fn write<'a>(
+            &'a self,
+            id: &'a str,
+            data: &'a SessionData,
+        ) -> rainier_support::BoxFuture<'a, Result<()>> {
+            self.inner.write(id, data)
+        }
+        fn destroy<'a>(&'a self, id: &'a str) -> rainier_support::BoxFuture<'a, Result<()>> {
+            self.inner.destroy(id)
+        }
+        fn touch<'a>(&'a self, id: &'a str) -> rainier_support::BoxFuture<'a, Result<()>> {
+            self.touches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.touch(id)
+        }
+    }
+
+    /// Log in, then make `reads` requests that only read the session. Returns
+    /// how many touches the store was asked for.
+    async fn touches_for(start: StartSession, store: &Arc<CountingStore>, reads: usize) -> usize {
+        let start = Arc::new(start);
+        let first = run(&start, Request::builder().build(), |request| {
+            Box::pin(async move {
+                request.session().unwrap().put("user_id", 7u64).unwrap();
+                Response::text("ok")
+            })
+        })
+        .await;
+        let id = session_cookie(&first).unwrap();
+
+        for _ in 0..reads {
+            let response = run(
+                &start,
+                Request::builder().header("cookie", &format!("rainier_session={id}")).build(),
+                |request| {
+                    let _ = request.session().unwrap().get::<u64>("user_id");
+                    Box::pin(async { Response::text("ok") })
+                },
+            )
+            .await;
+            assert_eq!(session_cookie(&response).as_deref(), Some(id.as_str()), "still renewed");
+        }
+        store.touches.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_session_read_on_every_request_is_touched_once_an_interval() {
+        let store = Arc::new(CountingStore::default());
+        let start = StartSession::new(Arc::clone(&store) as Arc<dyn SessionStore>);
+
+        // The login wrote the session, which set its expiry: none of the reads
+        // inside the next interval needs to move it.
+        assert_eq!(touches_for(start, &store, 5).await, 0);
+    }
+
+    #[tokio::test]
+    async fn touching_every_request_can_be_asked_for() {
+        let store = Arc::new(CountingStore::default());
+        let start =
+            StartSession::new(Arc::clone(&store) as Arc<dyn SessionStore>).touch_every_request();
+
+        assert_eq!(touches_for(start, &store, 5).await, 5);
     }
 
     #[tokio::test]

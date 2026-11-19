@@ -121,6 +121,16 @@ impl Cache for TracedCache {
         traced!(self, "cache.increment", "increment", self.inner.increment(key, by))
     }
 
+    fn touch<'a>(&'a self, key: &'a str, ttl: Option<Duration>) -> BoxFuture<'a, Result<bool>> {
+        traced!(self, "cache.touch", "touch", self.inner.touch(key, ttl), |found: &bool| {
+            Some(*found)
+        })
+    }
+
+    fn touches_in_place(&self) -> bool {
+        self.inner.touches_in_place()
+    }
+
     fn add<'a>(
         &'a self,
         key: &'a str,

@@ -136,6 +136,7 @@ pub mod model_cache;
 pub mod notifications;
 pub mod observability;
 pub mod public;
+pub mod query_cache;
 pub mod queued_listeners;
 #[cfg(feature = "kafka")]
 pub mod relay;

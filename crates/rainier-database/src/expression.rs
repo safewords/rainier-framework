@@ -288,6 +288,15 @@ pub enum Predicate {
     Any(Vec<Predicate>),
     /// `NOT (…)`.
     Not(Box<Predicate>),
+    /// Every term occurs as a word, or the start of one, in at least one of
+    /// the columns. See [`words`].
+    Words {
+        /// The columns searched — on MySQL, exactly the columns of one
+        /// `FULLTEXT` index, in its order.
+        columns: Vec<Expression>,
+        /// What is searched for, as typed: one word each.
+        terms: Vec<String>,
+    },
 }
 
 /// A `SELECT` built from expressions.
@@ -756,6 +765,66 @@ pub fn any(predicates: impl IntoIterator<Item = Predicate>) -> Predicate {
 /// The predicate does not hold.
 pub fn not(predicate: Predicate) -> Predicate {
     Predicate::Not(Box::new(predicate))
+}
+
+/// Every one of `terms` occurs in at least one of `columns` — a word search
+/// that a `FULLTEXT` index can answer.
+///
+/// On **MySQL and MariaDB** this is
+/// `MATCH (columns) AGAINST ('+term* +term* …' IN BOOLEAN MODE)`: each term
+/// required, matched as a word or the start of one, through the index — not a
+/// scan of every row, which is what `LIKE '%term%'` is. The columns must be
+/// exactly those of one `FULLTEXT` index, in its order, or the server refuses
+/// the query. The terms go in as one bound value; the characters boolean mode
+/// treats as operators (`+ - < > ( ) ~ * " @`) are taken out of them first, so
+/// what a visitor types is only ever searched for.
+///
+/// On **SQLite and Postgres** it is the portable reading: every term
+/// [`contains`](Expression::contains)-matched against any of the columns, which
+/// finds a superset of what the index would.
+///
+/// **What a full-text index does not find.** InnoDB indexes no word shorter
+/// than `innodb_ft_min_token_size` (3 by default) and none on its stopword
+/// list, and a required term it does not index matches nothing. Pass only the
+/// terms the index can answer, and match the rest another way — a
+/// [`contains`](Expression::contains) on the same columns — so a search for a
+/// short word does not silently come back empty. A predicate with no terms
+/// holds for every row.
+///
+/// ```
+/// use rainier_database::expression::*;
+///
+/// let search = words([col("title"), col("body")], ["rust", "async"]);
+/// ```
+pub fn words<C, T>(
+    columns: impl IntoIterator<Item = C>,
+    terms: impl IntoIterator<Item = T>,
+) -> Predicate
+where
+    C: Into<Expression>,
+    T: Into<String>,
+{
+    Predicate::Words {
+        columns: columns.into_iter().map(Into::into).collect(),
+        terms: terms.into_iter().map(Into::into).collect(),
+    }
+}
+
+/// The boolean-mode query for `terms`: each term's operator characters taken
+/// out, what is left split into words, every word required and matched as a
+/// prefix. `None` when nothing searchable is left.
+fn boolean_mode_query(terms: &[String]) -> Option<String> {
+    const OPERATORS: &[char] = &['+', '-', '<', '>', '(', ')', '~', '*', '"', '@', '\\', '\''];
+    let words: Vec<String> = terms
+        .iter()
+        .flat_map(|term| {
+            term.split(|c: char| c.is_whitespace() || OPERATORS.contains(&c))
+                .filter(|word| !word.is_empty())
+                .map(|word| format!("+{word}*"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    (!words.is_empty()).then(|| words.join(" "))
 }
 
 /// `EXISTS (SELECT …)`.
@@ -1308,6 +1377,35 @@ pub(crate) fn render_predicate(dialect: Dialect, p: &Predicate, resolve: Resolve
         Predicate::All(list) => render_condition(dialect, false, list, resolve).into(),
         Predicate::Any(list) => render_condition(dialect, true, list, resolve).into(),
         Predicate::Not(inner) => render_predicate(dialect, inner, resolve).not(),
+        Predicate::Words { columns, terms } => {
+            if columns.is_empty() {
+                return Expr::cust("1 = 0");
+            }
+            match dialect {
+                Dialect::MySql => {
+                    let Some(query) = boolean_mode_query(terms) else {
+                        return Expr::cust("1 = 1");
+                    };
+                    let mut args: Vec<Expr> = columns.iter().map(e).collect();
+                    let list: Vec<String> =
+                        (1..=args.len()).map(|n| placeholder(dialect, n)).collect();
+                    let against = placeholder(dialect, args.len() + 1);
+                    args.push(Expr::val(query));
+                    Expr::cust_with_exprs(
+                        format!("MATCH ({}) AGAINST ({against} IN BOOLEAN MODE)", list.join(", ")),
+                        args,
+                    )
+                }
+                _ => {
+                    let each_term = terms.iter().filter(|t| !t.trim().is_empty()).map(|term| {
+                        Predicate::Any(
+                            columns.iter().map(|c| c.clone().contains(term.trim())).collect(),
+                        )
+                    });
+                    render_predicate(dialect, &Predicate::All(each_term.collect()), resolve)
+                }
+            }
+        }
     }
 }
 
@@ -1440,6 +1538,39 @@ mod tests {
         stmt.cond_where(predicate_condition(dialect, p, &outer));
         let (sql, values) = dialect.build_query(&stmt);
         (sql, values.0)
+    }
+
+    #[test]
+    fn words_is_a_fulltext_match_on_mysql_with_every_term_required() {
+        let (sql, params) =
+            sql(Dialect::MySql, &words([col("title"), col("body")], ["rust", "async"]));
+        assert!(
+            sql.contains("MATCH (`posts`.`title`, `posts`.`body`) AGAINST (? IN BOOLEAN MODE)"),
+            "{sql}"
+        );
+        assert_eq!(params, vec![Value::from("+rust* +async*")]);
+    }
+
+    #[test]
+    fn words_takes_the_boolean_operators_out_of_what_was_typed() {
+        let (_, params) =
+            sql(Dialect::MySql, &words([col("title")], [r#"-evil "quoted" (x) re-run @3 o'neil"#]));
+        assert_eq!(
+            params,
+            vec![Value::from("+evil* +quoted* +x* +re* +run* +3* +o* +neil*")],
+            "operators become word breaks, never syntax"
+        );
+        // Nothing searchable left: no restriction, rather than a query that
+        // matches nothing or a syntax error.
+        assert!(sql(Dialect::MySql, &words([col("title")], ["+-*"])).0.contains("1 = 1"));
+    }
+
+    #[test]
+    fn words_is_a_contains_per_term_elsewhere() {
+        let (sql, params) = sql(Dialect::Sqlite, &words([col("title"), col("body")], ["ru%st"]));
+        assert!(sql.contains(r#""posts"."title" LIKE ? ESCAPE '!'"#), "{sql}");
+        assert!(sql.contains(" OR "), "any column: {sql}");
+        assert_eq!(params, vec![Value::from("%ru!%st%"), Value::from("%ru!%st%")]);
     }
 
     #[test]

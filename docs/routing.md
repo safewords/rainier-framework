@@ -223,6 +223,13 @@ router.get("/posts/{post}", show);        // or this swallows "create"
 This is also why the sample project declares web routes before API routes: `/`
 should be matched before any catch-all.
 
+Order is the rule; it is not how the router finds a match. Routes are indexed by
+the literal segments their pattern starts with (`/api/v1/posts/{post}` under
+`api` → `v1` → `posts`), and a path is only tried against the routes whose
+literals it starts with, plus those whose pattern starts with a parameter or a
+wildcard — in declaration order. A table of hundreds of routes costs a request
+about as much as a table of a dozen.
+
 ## Method mismatch
 
 A path that matches but a verb that does not produces a `405` carrying an

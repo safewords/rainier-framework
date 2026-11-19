@@ -125,6 +125,17 @@ impl Cache for PrefixedCache {
         })
     }
 
+    fn touch<'a>(&'a self, key: &'a str, ttl: Option<Duration>) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            let key = self.key(key);
+            self.inner.touch(&key, ttl).await
+        })
+    }
+
+    fn touches_in_place(&self) -> bool {
+        self.inner.touches_in_place()
+    }
+
     // Both forward, so the atomicity is whatever the wrapped cache offers —
     // prefixing a key cannot make an operation less atomic, and a wrapper that
     // reimplemented either of these would be a wrapper that quietly downgraded

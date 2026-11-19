@@ -213,6 +213,17 @@ background; a poll that read the session just before the logout and finishes
 just after it used to write the whole session back, and the visitor was signed
 in again. Now the poll's touch finds nothing to extend.
 
+A session that is read on every request is not touched on every request.
+`StartSession` remembers, per process, when it last extended each session and
+skips the touch until a hundredth of the session's lifetime has passed, and
+never more than a minute: a session that lives two hours is touched at most
+every 72 seconds, one that lives for weeks once a minute. Its expiry ends up at
+most that long earlier than a touch on every request would have put it; the
+cookie is still renewed on every response. A write counts as a touch. When
+sessions must expire to the second after the last request, ask for the old
+behaviour with `StartSession::new(store).touch_every_request()`. The process
+keeps a hash of each session id, never the id, and at most 100,000 of them.
+
 Keep the race in mind for a request that *does* write: one that changed the
 session and finishes after a logout still writes it back, as it always did.
 Logging out deletes the session; anything that writes to it should not run
@@ -350,7 +361,8 @@ pub trait SessionStore: Send + Sync + 'static {
 The four required methods are the server-side shape. `touch` defaults to
 reading the session and writing it back if it is there; override it when your
 store can extend an expiry in place (`UPDATE … WHERE id = ?`, an `EXPIRE`),
-which closes the window between the two calls. `encode`/`decode` exist so a
+which closes the window between the two calls. The cache store does: it calls
+`Cache::touch`, which is one `PEXPIRE` on Redis and in place in memory. `encode`/`decode` exist so a
 store can instead put the **whole session in the cookie** without the middleware
 needing to know which kind it has — which is how the cookie driver works, and how
 yours could.

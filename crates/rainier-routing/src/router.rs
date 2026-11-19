@@ -368,13 +368,14 @@ impl Router {
             let pipeline = build_pipeline(&route, container)?;
             compiled.push(CompiledRoute { route, pipeline });
         }
+        let index = RouteIndex::of(&compiled);
 
         let fallback = self.fallback.map(|handler| {
             let destination: Arc<dyn Destination> = Arc::new(HandlerDestination(handler));
             Pipeline::new().then_arc(destination)
         });
 
-        Ok(CompiledRouter { routes: compiled, fallback })
+        Ok(CompiledRouter { routes: compiled, index, fallback })
     }
 }
 
@@ -417,9 +418,56 @@ struct CompiledRoute {
     pipeline: ReadyPipeline,
 }
 
+/// Which routes a path could possibly match, by the literal segments it
+/// starts with.
+///
+/// A route whose pattern starts with literals — `/api/v1/posts/{post}` — can
+/// only match a path that starts with those same literals, so routes are kept
+/// in a trie keyed by their leading literal segments, each route at the node
+/// where its literals end. A path walks the trie along its own segments and
+/// tries only the routes it passes, plus those at the root (patterns that
+/// start with a parameter or a wildcard, and `/`), instead of every route in
+/// the table. Every node holds positions in declaration order, and the router
+/// tries the collected positions in that order, so the first match is the
+/// same route it always was.
+#[derive(Debug, Default)]
+struct RouteIndex {
+    routes: Vec<usize>,
+    children: HashMap<String, RouteIndex>,
+}
+
+impl RouteIndex {
+    fn of(routes: &[CompiledRoute]) -> Self {
+        let mut root = Self::default();
+        for (position, compiled) in routes.iter().enumerate() {
+            let mut node = &mut root;
+            for literal in compiled.route.leading_literals() {
+                node = node.children.entry(literal.to_string()).or_default();
+            }
+            node.routes.push(position);
+        }
+        root
+    }
+
+    /// The routes that could match a path split into `segments`, in
+    /// declaration order.
+    fn candidates(&self, segments: &[&str]) -> Vec<usize> {
+        let mut found: Vec<usize> = self.routes.clone();
+        let mut node = self;
+        for segment in segments {
+            let Some(child) = node.children.get(*segment) else { break };
+            found.extend_from_slice(&child.routes);
+            node = child;
+        }
+        found.sort_unstable();
+        found
+    }
+}
+
 /// A router with every route's middleware resolved and pipeline built.
 pub struct CompiledRouter {
     routes: Vec<CompiledRoute>,
+    index: RouteIndex,
     fallback: Option<ReadyPipeline>,
 }
 
@@ -433,9 +481,11 @@ impl CompiledRouter {
     pub async fn dispatch(&self, mut request: Request) -> Response {
         let path = request.path().to_string();
         let mut allowed: Vec<Method> = Vec::new();
+        let segments = crate::route::split_path(&path);
 
-        for compiled in &self.routes {
-            let Some(params) = compiled.route.match_path(&path) else {
+        for position in self.index.candidates(&segments) {
+            let compiled = &self.routes[position];
+            let Some(params) = compiled.route.match_segments(&segments) else {
                 continue;
             };
 
@@ -633,6 +683,48 @@ mod tests {
 
         let response = compile(router).dispatch(get("/posts")).await;
         assert_eq!(body_of(response).await, "index");
+    }
+
+    #[tokio::test]
+    async fn the_first_declared_match_wins_across_a_literal_and_a_parameter() {
+        // The index keeps literal-led and parameter-led routes in separate
+        // lists; walking them merged must still honour declaration order.
+        let mut first = Router::new();
+        first.get("/{section}/latest", || async { "parameter" });
+        first.get("/posts/latest", || async { "literal" });
+        assert_eq!(body_of(compile(first).dispatch(get("/posts/latest")).await).await, "parameter");
+
+        let mut second = Router::new();
+        second.get("/posts/latest", || async { "literal" });
+        second.get("/{section}/latest", || async { "parameter" });
+        let second = compile(second);
+        assert_eq!(body_of(second.dispatch(get("/posts/latest")).await).await, "literal");
+        assert_eq!(body_of(second.dispatch(get("/users/latest")).await).await, "parameter");
+    }
+
+    #[tokio::test]
+    async fn the_root_and_a_wildcard_are_candidates_for_any_path() {
+        let mut router = Router::new();
+        router.get("/", || async { "root" });
+        router.get("/posts/{post}", show);
+        router.get("/{rest*}", || async { "everything else" });
+        let router = compile(router);
+
+        assert_eq!(body_of(router.dispatch(get("/")).await).await, "root");
+        assert_eq!(body_of(router.dispatch(get("/posts/3")).await).await, "show:3");
+        assert_eq!(body_of(router.dispatch(get("/a/b/c")).await).await, "everything else");
+    }
+
+    #[tokio::test]
+    async fn a_method_mismatch_names_every_method_the_path_answers_across_both_lists() {
+        let mut router = Router::new();
+        router.post("/posts/{post}", show);
+        router.put("/{kind}/{id}", show);
+        let response = compile(router).dispatch(get("/posts/3")).await;
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let allow = response.header("allow").unwrap();
+        assert!(allow.contains("POST") && allow.contains("PUT"), "{allow}");
     }
 
     #[tokio::test]

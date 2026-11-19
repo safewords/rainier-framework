@@ -238,6 +238,15 @@ impl Route {
         &self.uri
     }
 
+    /// The literals every matching path starts with — the pattern's segments
+    /// up to its first parameter or wildcard. What the router indexes by.
+    pub(crate) fn leading_literals(&self) -> impl Iterator<Item = &str> {
+        self.segments.iter().map_while(|segment| match segment {
+            Segment::Static(literal) => Some(literal.as_str()),
+            _ => None,
+        })
+    }
+
     /// The compiled segments.
     pub fn segments(&self) -> &[Segment] {
         &self.segments
@@ -311,7 +320,28 @@ impl Route {
     /// Match `path` against this route's pattern, returning the captured
     /// parameters. `None` if the shape differs or a constraint rejects a value.
     pub fn match_path(&self, path: &str) -> Option<HashMap<String, String>> {
-        let actual: Vec<&str> = split_path(path);
+        self.match_segments(&split_path(path))
+    }
+
+    /// [`match_path`](Self::match_path) over a path already split into
+    /// segments — so a router trying many routes splits the path once.
+    pub(crate) fn match_segments(&self, actual: &[&str]) -> Option<HashMap<String, String>> {
+        // The cheap refusal first, before any parameter is decoded: a path
+        // longer than the pattern can only match a trailing wildcard, and one
+        // shorter than its required segments cannot match at all.
+        let open_ended = matches!(self.segments.last(), Some(Segment::Wildcard(_)));
+        if actual.len() > self.segments.len() && !open_ended {
+            return None;
+        }
+        let required = self
+            .segments
+            .iter()
+            .filter(|s| matches!(s, Segment::Static(_) | Segment::Param(_)))
+            .count();
+        if actual.len() < required {
+            return None;
+        }
+
         let mut params = HashMap::new();
         let mut index = 0;
 
@@ -405,7 +435,7 @@ pub fn normalise_uri(uri: &str) -> String {
 }
 
 /// Split a path into non-empty segments, so `/a//b/` and `a/b` agree.
-fn split_path(path: &str) -> Vec<&str> {
+pub(crate) fn split_path(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
 }
 

@@ -291,6 +291,23 @@ impl Cache for RedisCache {
         Box::pin(async move { self.client.exists(key).await })
     }
 
+    fn touch<'a>(&'a self, key: &'a str, ttl: Option<Duration>) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            match ttl {
+                // `PEXPIRE`: one round trip, and a key that is gone stays gone.
+                Some(ttl) => self.client.pexpire(key, ttl).await,
+                // No expiry to move to. `PERSIST` would be the literal reading,
+                // but a key that was given a TTL had one for a reason; keep it,
+                // and answer whether the key is there.
+                None => self.client.exists(key).await,
+            }
+        })
+    }
+
+    fn touches_in_place(&self) -> bool {
+        true
+    }
+
     fn increment<'a>(&'a self, key: &'a str, by: i64) -> BoxFuture<'a, Result<i64>> {
         Box::pin(async move { self.client.incr_by(key, by).await })
     }
@@ -305,6 +322,31 @@ impl std::fmt::Debug for RedisCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `PEXPIRE` against a real server. Ignored unless asked for:
+    ///
+    /// ```text
+    /// docker run -d --rm -p 6390:6379 valkey/valkey:alpine
+    /// RAINIER_REDIS_TEST_URL=redis://127.0.0.1:6390/ cargo test -p rainier-cache touch -- --ignored
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a Redis at RAINIER_REDIS_TEST_URL"]
+    async fn touch_extends_in_place_and_never_creates_a_key() {
+        let url = std::env::var("RAINIER_REDIS_TEST_URL").expect("RAINIER_REDIS_TEST_URL is set");
+        let cache = RedisCache::connect(&RedisConnector::open(&url).expect("url")).await.unwrap();
+        cache.forget("touch:live").await.unwrap();
+        cache.forget("touch:gone").await.unwrap();
+
+        cache.put("touch:live", b"v", Some(Duration::from_millis(200))).await.unwrap();
+        assert!(cache.touch("touch:live", Some(Duration::from_secs(60))).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(cache.get("touch:live").await.unwrap(), Some(b"v".to_vec()));
+
+        assert!(!cache.touch("touch:gone", Some(Duration::from_secs(60))).await.unwrap());
+        assert_eq!(cache.get("touch:gone").await.unwrap(), None, "a logged-out key stays gone");
+        assert!(cache.touches_in_place());
+        cache.forget("touch:live").await.unwrap();
+    }
 
     /// `CLUSTER INFO` as a healthy three-master cluster prints it, trimmed to
     /// the fields this reads.

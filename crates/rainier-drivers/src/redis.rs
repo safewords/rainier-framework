@@ -700,7 +700,7 @@ impl RedisConnector {
     /// the events it exists to deliver.
     ///
     /// Glob syntax is Redis's own, so a prefix pattern ends in `*`:
-    /// `"lewd-production:*"`.
+    /// `"app-production:*"`.
     ///
     /// # Cluster
     ///
@@ -1545,6 +1545,17 @@ impl RedisClient {
         command.arg(SCRIPT).arg(1).arg(key).arg(expected).arg((ttl.as_millis() as u64).max(1));
 
         let extended: i64 = self.connection.clone().query(&command).await?;
+        Ok(extended == 1)
+    }
+
+    /// `PEXPIRE` — move `key`'s expiry to `ttl` from now. `true` if the key
+    /// exists; an absent key is left absent.
+    pub async fn pexpire(&self, key: &str, ttl: Duration) -> Result<bool> {
+        let extended: i64 = self
+            .connection
+            .clone()
+            .query(redis::cmd("PEXPIRE").arg(key).arg((ttl.as_millis() as u64).max(1)))
+            .await?;
         Ok(extended == 1)
     }
 

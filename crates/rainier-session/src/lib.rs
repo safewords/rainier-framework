@@ -96,6 +96,7 @@ pub mod manager;
 pub mod middleware;
 pub mod session;
 pub mod store;
+mod touch;
 
 pub use cache::CacheSessionStore;
 pub use cookie::CookieSessionStore;

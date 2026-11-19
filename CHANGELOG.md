@@ -10,7 +10,62 @@ the release as a whole and names the crate it landed in.
 
 ## [Unreleased]
 
+### Added
+
+- **`QueryCache`** (`rainier-framework`): a process-local cache of computed
+  results — a lookup table, an aggregate, a small set of ids — invalidated by
+  writes to the tables they were read from, on every replica. Entries are
+  stamped with each table's generation before the load reads; a builder or
+  `repo` write advances the generation before it returns, here and through a
+  shared counter the other processes read back within a second. `watching`
+  names the tables at boot, so a process that never serves the read still
+  announces its writes. Bounded, single-flight per key, never fails a read. See
+  [cache](docs/cache.md#computed-results-querycache).
+- **Transactions** (`rainier-database`, `rainier-drivers`):
+  `Database::transaction(|tx| …)` commits on `Ok` and rolls back on `Err` or a
+  panic; `tx` is an ordinary handle, so repositories and `repo::` run inside.
+  Change notifications are held until the commit and dropped on rollback, so
+  `ModelCache` and `QueryCache` never act on a write that was undone. Nested
+  calls join the outer transaction. `transaction_retrying(n, …)` re-runs on a
+  deadlock, serialization failure or Galera certification conflict. Backends
+  opt in through `Connection::begin` (`bind_executor!(T, begin = f)`); the
+  sea-orm executor does, through `SeaOrmExecutor::begin` and
+  `SeaOrmTransaction`. See [database](docs/database.md#transactions).
+- **`words(columns, terms)`** (`rainier-database`): a word search a `FULLTEXT`
+  index answers — `MATCH … AGAINST (… IN BOOLEAN MODE)` on MySQL and MariaDB,
+  each term required and prefix-matched, operators stripped from what was typed;
+  a `contains` per term elsewhere. See
+  [repositories](docs/repositories.md#expressions).
+- **`Cache::touch`** (`rainier-cache`): move a key's expiry without rewriting it.
+  One `PEXPIRE` on Redis, in place in memory, forwarded by the prefixed and
+  traced wrappers; other stores read and rewrite.
+- **`test_after_idle`** on `PoolConfig` and in a connection's `pool` declaration
+  (`rainier-orm`, `rainier-database`, `rainier-drivers`): the pre-acquire ping
+  runs only for a connection idle at least this long. Default one second;
+  `0` pings every acquire, as `PoolConfig::serverless()` does.
+
 ### Changed
+
+- **A query no longer pays a ping** (`rainier-drivers`): with the new
+  `test_after_idle` default, a connection used within the last second is handed
+  out without one, halving the round trips of a plain read. A plain `SELECT`
+  that draws a connection the server has closed is retried on another, up to the
+  pool's size, so a database restart is ridden through even when every pooled
+  connection died together. Writes are never retried.
+- **An unchanged session is touched once an interval, not every request**
+  (`rainier-session`): `StartSession` skips the touch for a session it extended
+  within a hundredth of the lifetime (at most a minute); the cookie is still
+  renewed every response. `touch_every_request()` restores the old behaviour.
+  The cache session store now touches with `Cache::touch` — one `PEXPIRE` instead
+  of a read and a rewrite, and a logged-out session can no longer be put back by
+  it.
+- **Routing is indexed** (`rainier-routing`): routes are found through a trie of
+  their leading literal segments instead of trying every route in turn, and a
+  path is split once per request rather than once per route. Declaration order
+  still decides the match. Against a 238-route table, dispatch went from 10–20 µs
+  to about 1 µs.
+- **Accepted connections set `TCP_NODELAY`** (`rainier-server`), so a response
+  written in more than one piece is not held back by Nagle's algorithm.
 
 - **Dependencies are current** (2026-11-18): `jsonwebtoken` 12, `rsa` 0.10 on
   the same `digest` 0.11 generation as `sha2` and `hmac` (so `rainier-crypt`,

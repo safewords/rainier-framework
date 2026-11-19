@@ -125,6 +125,31 @@ pub trait Connection: Send + Sync + 'static {
         sql: &'a str,
         params: Vec<Value>,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn Row>>>>;
+
+    /// Begin a transaction on this backend. See [`Database::transaction`].
+    ///
+    /// Refused by default: a backend that cannot hold one connection across
+    /// statements (an HTTP-fronted database, a sharded fleet) has no
+    /// transaction to offer, and pretending to would run the statements one by
+    /// one with nothing to undo them.
+    fn begin(&self) -> BoxFuture<'_, Result<Arc<dyn Transaction>>> {
+        Box::pin(async {
+            Err(Error::internal(
+                "this database backend does not support transactions; its statements cannot be \
+                 held on one connection",
+            ))
+        })
+    }
+}
+
+/// A [`Connection`] that is one open transaction: every statement runs inside
+/// it until [`commit`](Self::commit) or [`rollback`](Self::rollback).
+pub trait Transaction: Connection {
+    /// Make every statement run in it visible.
+    fn commit(&self) -> BoxFuture<'_, Result<()>>;
+
+    /// Undo every statement run in it.
+    fn rollback(&self) -> BoxFuture<'_, Result<()>>;
 }
 
 /// Writes the [`Connection`] impl for a concrete Rainier ORM `Executor`.
@@ -150,6 +175,23 @@ pub trait Connection: Send + Sync + 'static {
 #[macro_export]
 macro_rules! bind_executor {
     ($executor:ty) => {
+        $crate::bind_executor!(@connection $executor;);
+    };
+    // An executor that can open a transaction: `$begin` is a function from
+    // `&$executor` to the `BoxFuture` `Connection::begin` returns.
+    ($executor:ty, begin = $begin:path) => {
+        $crate::bind_executor!(@connection $executor;
+            fn begin(
+                &self,
+            ) -> $crate::reexport::BoxFuture<
+                '_,
+                $crate::reexport::Result<::std::sync::Arc<dyn $crate::Transaction>>,
+            > {
+                $begin(self)
+            }
+        );
+    };
+    (@connection $executor:ty; $($extra:tt)*) => {
         impl $crate::Connection for $executor {
             fn dialect(&self) -> $crate::reexport::Dialect {
                 $crate::reexport::Executor::dialect(self)
@@ -229,6 +271,8 @@ macro_rules! bind_executor {
                         .map_err($crate::reexport::Error::from)
                 })
             }
+
+            $($extra)*
         }
     };
 }
@@ -237,7 +281,35 @@ macro_rules! bind_executor {
 // them out of reach of an application crate. Feature-gated to match
 // Rainier ORM's own gating, so the wasm-safe default stays wasm-safe.
 #[cfg(feature = "sea-orm-executor")]
-crate::bind_executor!(rainier_drivers::sql::SeaOrmExecutor);
+crate::bind_executor!(rainier_drivers::sql::SeaOrmExecutor, begin = begin_sea_orm);
+
+#[cfg(feature = "sea-orm-executor")]
+crate::bind_executor!(rainier_drivers::sql::SeaOrmTransaction);
+
+#[cfg(feature = "sea-orm-executor")]
+fn begin_sea_orm(
+    executor: &rainier_drivers::sql::SeaOrmExecutor,
+) -> BoxFuture<'_, Result<Arc<dyn Transaction>>> {
+    Box::pin(async move {
+        let transaction = executor.begin().await.map_err(Error::from)?;
+        Ok(Arc::new(transaction) as Arc<dyn Transaction>)
+    })
+}
+
+#[cfg(feature = "sea-orm-executor")]
+impl Transaction for rainier_drivers::sql::SeaOrmTransaction {
+    fn commit(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            rainier_drivers::sql::SeaOrmTransaction::commit(self).await.map_err(Error::from)
+        })
+    }
+
+    fn rollback(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            rainier_drivers::sql::SeaOrmTransaction::rollback(self).await.map_err(Error::from)
+        })
+    }
+}
 
 // `d1-http` and `libsql-http` exist to turn the matching executor on in
 // `rainier-drivers` for whoever enables them here — the framework's features of
@@ -271,6 +343,12 @@ pub struct Database {
     /// clone and every handle derived from this one ([`writer`](Self::writer)),
     /// so a write through any of them reaches the same subscribers.
     subscribers: Arc<Subscribers>,
+
+    /// Inside a [transaction](Self::transaction): the writes made so far, held
+    /// back from the subscribers until the transaction commits — a cache must
+    /// not drop its copy for a write that may yet be rolled back, nor keep it
+    /// for one that commits. `None` outside a transaction.
+    pending: Option<Arc<std::sync::Mutex<Vec<RowChange>>>>,
 }
 
 /// A subscriber to row changes. See [`Database::on_change`].
@@ -293,7 +371,13 @@ impl Database {
 
     /// Wrap an already-shared connection.
     pub fn from_arc(connection: Arc<dyn Connection>) -> Self {
-        Self { connection, split: None, to_the_writer: false, subscribers: Arc::default() }
+        Self {
+            connection,
+            split: None,
+            to_the_writer: false,
+            subscribers: Arc::default(),
+            pending: None,
+        }
     }
 
     /// A handle over separate write and read endpoints.
@@ -348,6 +432,7 @@ impl Database {
             })),
             to_the_writer: false,
             subscribers: Arc::default(),
+            pending: None,
         })
     }
 
@@ -524,13 +609,130 @@ impl Database {
     }
 
     /// Hand `change` to every subscriber, in the order they subscribed.
+    ///
+    /// Inside a [transaction](Self::transaction) it is held until the commit.
     pub async fn notify(&self, change: RowChange) {
+        if let Some(pending) = &self.pending {
+            pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(change);
+            return;
+        }
         let subscribers = self.subscribers.snapshot();
         let Some((last, rest)) = subscribers.split_last() else { return };
         for subscriber in rest {
             subscriber(change.clone()).await;
         }
         last(change).await;
+    }
+
+    /// Run `work` in a transaction: committed if it returns `Ok`, rolled back
+    /// if it returns `Err` or panics.
+    ///
+    /// `work` gets a handle bound to the transaction's connection. Everything
+    /// run through it — a repository, `rainier_orm::repo`, a statement, a
+    /// read — runs inside the transaction; anything run through **another**
+    /// handle meanwhile does not, and on MySQL can wait on the transaction's
+    /// locks. Don't hold the transaction open across a call to another service.
+    ///
+    /// ```ignore
+    /// let post = db.transaction(|tx| async move {
+    ///     let post = EntityRepository::<Post>::new(tx.clone()).create(post).await?;
+    ///     EntityRepository::<PostTopic>::new(tx).create(PostTopic::of(&post, topic)).await?;
+    ///     Ok(post)
+    /// }).await?;
+    /// ```
+    ///
+    /// **Writes are announced when they commit.** [`on_change`](Self::on_change)
+    /// subscribers hear about the transaction's writes after the commit
+    /// succeeds — in the order they were made, before this returns — and not at
+    /// all when it rolls back. A cache therefore never drops its copy for a
+    /// write that was undone, and never keeps one for a write that landed. A
+    /// commit whose outcome is unknown (the connection lost mid-`COMMIT`) is
+    /// announced too: a cache retiring something that did not change costs a
+    /// miss, and one keeping something that did is a stale read.
+    ///
+    /// **Nested calls join the transaction they are in.** `work`'s handle
+    /// calling `transaction` again runs its closure in the same transaction, and
+    /// an error there is the caller's to return or handle — nothing is rolled
+    /// back until the outermost call finishes.
+    ///
+    /// On a split connection the transaction runs on the writer. A backend that
+    /// cannot hold a transaction ([`Connection::begin`]) refuses before `work`
+    /// runs.
+    pub async fn transaction<T, F, Fut>(&self, work: F) -> Result<T>
+    where
+        F: FnOnce(Database) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        if self.pending.is_some() {
+            return work(self.clone()).await;
+        }
+
+        let transaction = self.write_connection().begin().await?;
+        let pending = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handle = Database {
+            connection: Arc::clone(&transaction) as Arc<dyn Connection>,
+            split: None,
+            to_the_writer: false,
+            subscribers: Arc::clone(&self.subscribers),
+            pending: Some(Arc::clone(&pending)),
+        };
+
+        match work(handle).await {
+            Ok(value) => {
+                let committed = transaction.commit().await;
+                let changes =
+                    std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner()));
+                for change in changes {
+                    self.notify(change).await;
+                }
+                committed.map(|()| value)
+            }
+            Err(error) => {
+                if let Err(rollback) = transaction.rollback().await {
+                    // The connection goes back to the pool either way, and a
+                    // transaction that was neither committed nor rolled back
+                    // is rolled back by the server when it is closed. The
+                    // error worth returning is `work`'s.
+                    tracing::warn!(error = %rollback.message(), "could not roll a transaction back");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// [`transaction`](Self::transaction), run again from the start when the
+    /// database refuses it for a conflict with another transaction — up to
+    /// `attempts` times in all.
+    ///
+    /// A deadlock, a serialization failure, and the certification conflict a
+    /// multi-primary cluster (Galera) reports as a deadlock at `COMMIT` are not
+    /// errors in the work: the database chose this transaction to undo so
+    /// another could finish, and running it again is the documented answer.
+    /// `work` is `Fn`, not `FnOnce`, because it may run more than once; it must
+    /// do nothing outside the transaction it cannot safely repeat.
+    pub async fn transaction_retrying<T, F, Fut>(&self, attempts: u32, work: F) -> Result<T>
+    where
+        F: Fn(Database) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let attempts = attempts.max(1);
+        let mut attempt = 1;
+        loop {
+            match self.transaction(&work).await {
+                Err(error)
+                    if attempt < attempts && self.pending.is_none() && is_conflict(&error) =>
+                {
+                    tracing::debug!(error = %error.message(), attempt, "transaction conflicted; retrying");
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Whether this handle is inside a [transaction](Self::transaction).
+    pub fn in_transaction(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// Run a raw statement with no bindings — for DDL.
@@ -749,6 +951,28 @@ impl Executor for Database {
     async fn rows_changed(&self, change: RowChange) {
         self.notify(change).await;
     }
+}
+
+/// Whether `error` is the database undoing a transaction for a conflict with
+/// another — the kind [`Database::transaction_retrying`] runs again.
+fn is_conflict(error: &Error) -> bool {
+    let message = error.message().to_ascii_lowercase();
+    [
+        // MySQL / MariaDB: ER_LOCK_DEADLOCK, which Galera also raises for a
+        // certification failure ("WSREP detected deadlock/conflict").
+        "deadlock found",
+        "1213",
+        "wsrep detected deadlock",
+        // Postgres: serialization_failure, deadlock_detected.
+        "40001",
+        "40p01",
+        "could not serialize access",
+        "deadlock detected",
+        // SQLite: another writer holds the database.
+        "database is locked",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 /// Convert back into the ORM's error type at the boundary.

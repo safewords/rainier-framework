@@ -9,9 +9,11 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use rainier_orm::sea_query::Value;
 use rainier_orm::{Dialect, Error, ExecOutcome, Executor, PoolConfig, Result, Row};
+use std::sync::{Arc, Mutex};
+
 use sea_orm::{
-    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, QueryResult,
-    Statement, Value as SeaValue,
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction, DbBackend,
+    QueryResult, Statement, TransactionTrait, Value as SeaValue,
 };
 
 /// Wraps a live sea-orm connection and runs rendered SQL through it.
@@ -24,7 +26,15 @@ use sea_orm::{
 pub struct SeaOrmExecutor {
     db: DatabaseConnection,
     dialect: Dialect,
+    /// How many connections a read may find closed before it gives up: the
+    /// pool's size, so one fresh connection is always reached. See
+    /// [`is_dead_connection`].
+    dead_connection_retries: u32,
 }
+
+/// Retries for an executor adopted with [`SeaOrmExecutor::new`], whose pool
+/// size it was not told: the server default's ceiling.
+const DEFAULT_DEAD_CONNECTION_RETRIES: u32 = 10;
 
 impl SeaOrmExecutor {
     /// Adopt an existing connection, deriving the dialect from the backend it
@@ -38,7 +48,12 @@ impl SeaOrmExecutor {
             // compiles only the three sqlx backends, so nothing else reaches here.
             other => panic!("rainier has no SQL dialect for the {other:?} backend"),
         };
-        Self { db, dialect }
+        Self { db, dialect, dead_connection_retries: DEFAULT_DEAD_CONNECTION_RETRIES }
+    }
+
+    fn sized(mut self, pool: &PoolConfig) -> Self {
+        self.dead_connection_retries = pool.max_connections.max(1);
+        self
     }
 
     /// Open a pooled connection to `url` with the given [`PoolConfig`], then
@@ -84,6 +99,11 @@ impl SeaOrmExecutor {
                 .min_connections(pool.min_connections)
                 .acquire_timeout(pool.acquire_timeout)
                 .test_before_acquire(pool.test_before_acquire);
+            // After `test_before_acquire`, which it turns off: sea-orm runs the
+            // idle check in sqlx's `before_acquire` instead of pinging every time.
+            if let (true, Some(idle)) = (pool.test_before_acquire, pool.test_after_idle) {
+                opts.test_before_acquire_if_idle_for(idle);
+            }
             if let Some(idle) = pool.idle_timeout {
                 opts.idle_timeout(idle);
             }
@@ -91,7 +111,7 @@ impl SeaOrmExecutor {
                 opts.max_lifetime(life);
             }
             let db = Database::connect(opts).await.map_err(Error::from)?;
-            return Ok(Self::new(db));
+            return Ok(Self::new(db).sized(pool));
         }
 
         if !url.starts_with("mysql://") && !url.starts_with("mariadb://") {
@@ -120,6 +140,22 @@ impl SeaOrmExecutor {
             .idle_timeout(pool.idle_timeout)
             .max_lifetime(pool.max_lifetime);
 
+        // The same idle-only ping the sea-orm path gets from
+        // `test_before_acquire_if_idle_for`, written out: sqlx runs both its own
+        // per-acquire ping and this hook, so the flag goes off when the hook
+        // takes over.
+        if let (true, Some(idle)) = (pool.test_before_acquire, pool.test_after_idle) {
+            pool_options =
+                pool_options.test_before_acquire(false).before_acquire(move |conn, meta| {
+                    Box::pin(async move {
+                        if meta.idle_for >= idle {
+                            sea_orm::sqlx::Connection::ping(conn).await?;
+                        }
+                        Ok(true)
+                    })
+                });
+        }
+
         pool_options = pool_options.after_connect(move |conn, _meta| {
             let statements = statements.clone();
             Box::pin(async move {
@@ -135,7 +171,17 @@ impl SeaOrmExecutor {
         });
 
         let sqlx_pool = pool_options.connect_with(options).await.map_err(Error::from)?;
-        Ok(Self::new(sea_orm::SqlxMySqlConnector::from_sqlx_mysql_pool(sqlx_pool)))
+        Ok(Self::new(sea_orm::SqlxMySqlConnector::from_sqlx_mysql_pool(sqlx_pool)).sized(pool))
+    }
+
+    /// Begin a transaction on one of the pool's connections.
+    ///
+    /// The connection is the transaction's until [`SeaOrmTransaction::commit`]
+    /// or [`SeaOrmTransaction::rollback`]; dropped without either, it rolls
+    /// back. Every statement run through the returned executor runs inside it.
+    pub async fn begin(&self) -> Result<SeaOrmTransaction> {
+        let txn = self.db.begin().await.map_err(Error::from)?;
+        Ok(SeaOrmTransaction { txn: Mutex::new(Some(Arc::new(txn))), dialect: self.dialect })
     }
 
     /// Borrow the underlying connection (for migrations, transactions, or
@@ -145,16 +191,104 @@ impl SeaOrmExecutor {
     }
 
     fn backend(&self) -> DbBackend {
-        match self.dialect {
-            Dialect::MySql => DbBackend::MySql,
-            Dialect::Postgres => DbBackend::Postgres,
-            Dialect::Sqlite => DbBackend::Sqlite,
-        }
+        backend_of(self.dialect)
     }
 
     fn statement(&self, sql: &str, params: Vec<Value>) -> Statement {
         let values: Vec<SeaValue> = params.into_iter().collect();
         Statement::from_sql_and_values(self.backend(), sql, values)
+    }
+}
+
+fn backend_of(dialect: Dialect) -> DbBackend {
+    match dialect {
+        Dialect::MySql => DbBackend::MySql,
+        Dialect::Postgres => DbBackend::Postgres,
+        Dialect::Sqlite => DbBackend::Sqlite,
+    }
+}
+
+fn rows_of(rows: Vec<QueryResult>, dialect: Dialect) -> Vec<Box<dyn Row>> {
+    rows.into_iter().map(|r| Box::new(SeaOrmRow { row: r, dialect }) as Box<dyn Row>).collect()
+}
+
+fn outcome_of(res: &sea_orm::ExecResult, dialect: Dialect) -> ExecOutcome {
+    // Postgres has no "last insert id" — an insert that wants its key asks
+    // with `RETURNING` — and sea-orm 2 panics rather than answering 0 when
+    // asked anyway.
+    let last_insert_id = match dialect {
+        Dialect::Postgres => 0,
+        Dialect::MySql | Dialect::Sqlite => res.last_insert_id() as i64,
+    };
+    ExecOutcome { rows_affected: res.rows_affected(), last_insert_id }
+}
+
+/// A transaction on one pooled connection, as an [`Executor`]. From
+/// [`SeaOrmExecutor::begin`].
+///
+/// Every statement runs inside the transaction until [`commit`](Self::commit)
+/// or [`rollback`](Self::rollback); after either, statements fail rather than
+/// running outside it. Dropped without either, the transaction rolls back.
+///
+/// A read is **not** retried on a closed connection the way the pool's reads
+/// are: a transaction whose connection is gone is gone, and running the rest of
+/// it on another connection would be running half of it.
+pub struct SeaOrmTransaction {
+    txn: Mutex<Option<Arc<DatabaseTransaction>>>,
+    dialect: Dialect,
+}
+
+impl SeaOrmTransaction {
+    fn current(&self) -> Result<Arc<DatabaseTransaction>> {
+        self.txn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| Error::msg("this transaction has already been committed or rolled back"))
+    }
+
+    fn take(&self) -> Result<DatabaseTransaction> {
+        let txn =
+            self.txn.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take().ok_or_else(
+                || Error::msg("this transaction has already been committed or rolled back"),
+            )?;
+        Arc::try_unwrap(txn).map_err(|_| {
+            Error::msg(
+                "a statement is still running in this transaction; await it before finishing",
+            )
+        })
+    }
+
+    /// Commit. The transaction's statements become visible to everyone.
+    pub async fn commit(&self) -> Result<()> {
+        self.take()?.commit().await.map_err(Error::from)
+    }
+
+    /// Roll back. Nothing the transaction wrote remains.
+    pub async fn rollback(&self) -> Result<()> {
+        self.take()?.rollback().await.map_err(Error::from)
+    }
+
+    fn statement(&self, sql: &str, params: Vec<Value>) -> Statement {
+        Statement::from_sql_and_values(backend_of(self.dialect), sql, params)
+    }
+}
+
+impl Executor for SeaOrmTransaction {
+    fn dialect(&self) -> Dialect {
+        self.dialect
+    }
+
+    async fn fetch_all(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Box<dyn Row>>> {
+        let txn = self.current()?;
+        let rows = txn.query_all_raw(self.statement(sql, params)).await.map_err(Error::from)?;
+        Ok(rows_of(rows, self.dialect))
+    }
+
+    async fn execute(&self, sql: &str, params: Vec<Value>) -> Result<ExecOutcome> {
+        let txn = self.current()?;
+        let res = txn.execute_raw(self.statement(sql, params)).await.map_err(Error::from)?;
+        Ok(outcome_of(&res, self.dialect))
     }
 }
 
@@ -164,27 +298,79 @@ impl Executor for SeaOrmExecutor {
     }
 
     async fn fetch_all(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Box<dyn Row>>> {
-        let stmt = self.statement(sql, params);
-        let rows = self.db.query_all_raw(stmt).await.map_err(Error::from)?;
-        let dialect = self.dialect;
-        Ok(rows
-            .into_iter()
-            .map(|r| Box::new(SeaOrmRow { row: r, dialect }) as Box<dyn Row>)
-            .collect())
+        // A read that draws a connection the server has already closed — used
+        // under `test_after_idle` ago, so not pinged — runs again. After a
+        // database restart every idle connection in the pool is closed, and
+        // each one fails at once, so the read goes on until it reaches a live
+        // one: at most the pool's size, after which the pool has opened a new
+        // connection. Only a plain `SELECT`: a statement that writes cannot be
+        // known not to have run.
+        let rows = if is_plain_read(sql) {
+            let mut attempts_left = self.dead_connection_retries;
+            loop {
+                match self.db.query_all_raw(self.statement(sql, params.clone())).await {
+                    Err(e) if attempts_left > 0 && is_dead_connection(&e) => attempts_left -= 1,
+                    result => break result.map_err(Error::from)?,
+                }
+            }
+        } else {
+            self.db.query_all_raw(self.statement(sql, params)).await.map_err(Error::from)?
+        };
+        Ok(rows_of(rows, self.dialect))
     }
 
     async fn execute(&self, sql: &str, params: Vec<Value>) -> Result<ExecOutcome> {
         let stmt = self.statement(sql, params);
         let res = self.db.execute_raw(stmt).await.map_err(Error::from)?;
-        // Postgres has no "last insert id" — an insert that wants its key
-        // asks with `RETURNING` — and sea-orm 2 panics rather than answering
-        // 0 when asked anyway, which made every plain statement on Postgres
-        // (a `DROP TABLE`, a migration, an `UPDATE`) take the process down.
-        let last_insert_id = match self.dialect {
-            Dialect::Postgres => 0,
-            Dialect::MySql | Dialect::Sqlite => res.last_insert_id() as i64,
-        };
-        Ok(ExecOutcome { rows_affected: res.rows_affected(), last_insert_id })
+        Ok(outcome_of(&res, self.dialect))
+    }
+}
+
+/// Whether `sql` is a statement that only reads, and so can be run again.
+///
+/// Deliberately narrow: a leading `SELECT` and nothing else. `WITH` can carry a
+/// data-modifying CTE on Postgres, and `INSERT … RETURNING` comes through
+/// `fetch_all` too. A locking read (`FOR UPDATE`) is excluded as well — outside
+/// a transaction it locks nothing worth retrying for, and inside one it never
+/// reaches this pool executor.
+fn is_plain_read(sql: &str) -> bool {
+    let head = sql.trim_start();
+    let is_select = head.get(..6).is_some_and(|word| word.eq_ignore_ascii_case("select"));
+    is_select && !sql.to_ascii_lowercase().contains(" for update")
+}
+
+/// Whether `error` says the connection was gone before the statement ran,
+/// rather than that the statement failed.
+///
+/// An I/O error on the socket (reset, broken pipe, the peer closing it — TLS
+/// reports that as an unexpected EOF), or the driver noticing the stream had
+/// ended. A query error from the server — a syntax error, a deadlock, a
+/// timeout — is not one, and is never retried here.
+fn is_dead_connection(error: &sea_orm::DbErr) -> bool {
+    use sea_orm::{DbErr, RuntimeErr};
+    use std::io::ErrorKind;
+
+    let sqlx = match error {
+        DbErr::Query(RuntimeErr::SqlxError(e))
+        | DbErr::Exec(RuntimeErr::SqlxError(e))
+        | DbErr::Conn(RuntimeErr::SqlxError(e)) => e,
+        _ => return false,
+    };
+    match &**sqlx {
+        sea_orm::sqlx::Error::Io(io) => matches!(
+            io.kind(),
+            ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::NotConnected
+        ),
+        sea_orm::sqlx::Error::Tls(_) => true,
+        sea_orm::sqlx::Error::Protocol(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("closed") || message.contains("eof")
+        }
+        _ => false,
     }
 }
 
@@ -258,6 +444,39 @@ impl Row for SeaOrmRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_plain_select_is_a_read_that_can_run_twice() {
+        assert!(is_plain_read("SELECT * FROM posts"));
+        assert!(is_plain_read("  select id from users where id = ?"));
+        assert!(!is_plain_read("INSERT INTO posts (id) VALUES (1) RETURNING id"));
+        assert!(!is_plain_read("WITH gone AS (DELETE FROM posts RETURNING id) SELECT * FROM gone"));
+        assert!(!is_plain_read("SELECT * FROM posts WHERE id = 1 FOR UPDATE"));
+        assert!(!is_plain_read("UPDATE posts SET title = 'selected'"));
+        assert!(!is_plain_read("sel"));
+    }
+
+    #[test]
+    fn a_closed_socket_is_a_dead_connection_and_a_query_error_is_not() {
+        use sea_orm::{DbErr, RuntimeErr};
+        use std::sync::Arc;
+
+        let io = |kind| {
+            DbErr::Query(RuntimeErr::SqlxError(Arc::new(sea_orm::sqlx::Error::Io(
+                std::io::Error::new(kind, "gone"),
+            ))))
+        };
+        assert!(is_dead_connection(&io(std::io::ErrorKind::UnexpectedEof)));
+        assert!(is_dead_connection(&io(std::io::ErrorKind::ConnectionReset)));
+        assert!(is_dead_connection(&io(std::io::ErrorKind::BrokenPipe)));
+        assert!(!is_dead_connection(&io(std::io::ErrorKind::TimedOut)));
+
+        let protocol = DbErr::Query(RuntimeErr::SqlxError(Arc::new(
+            sea_orm::sqlx::Error::Protocol("syntax error near FROM".into()),
+        )));
+        assert!(!is_dead_connection(&protocol));
+        assert!(!is_dead_connection(&DbErr::RecordNotFound("posts".into())));
+    }
 
     #[tokio::test]
     async fn session_sql_on_a_backend_that_cannot_run_it_is_refused_rather_than_dropped() {

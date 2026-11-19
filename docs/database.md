@@ -334,6 +334,24 @@ Three fail in a way that does not look like a pool problem:
   whichever query happened to draw a dead one. Recycling on an age is what stops
   that presenting as intermittent errors nobody can reproduce.
 
+**`test_before_acquire` and `test_after_idle` are the guard against a restart.**
+A database that restarts or fails over closes every connection it holds, and
+`max_lifetime` does not notice: those connections are young. With
+`test_before_acquire` on (the default), a connection that has sat idle in the
+pool for `test_after_idle` seconds or more (default `1`) is pinged before it is
+handed out, and a dead one is replaced. A connection used within the last
+second is handed out without a ping, because a ping on every acquire is a
+round trip in front of every query. `"test_after_idle": 0` pings on every
+acquire, which is what `PoolConfig::serverless()` does: a thawed instance's
+pool cannot trust any socket.
+
+The gap that leaves — a connection used under a second ago whose server has
+since gone — is closed on the read side: a plain `SELECT` that fails because
+its connection was closed (a reset, a broken pipe, the peer closing a TLS
+stream) is run again on another connection, up to the pool's size, so it
+reaches a live one even when every pooled connection died together. A write is
+never retried: whether it ran cannot be known.
+
 There is deliberately **no preset to name**. `PoolConfig::serverless()` is
 expressible field by field, and a preset *name* in a configuration file is a
 value whose meaning moves when the library changes underneath it — where six
@@ -536,6 +554,46 @@ let outcome = db.execute(prepared).await?;      // rows_affected, last_insert_id
 `statement::` renders SQL **synchronously**, returning a `Prepared { sql,
 params, route }`. That keeps shard routing and dialect rendering explicit at
 the framework seam — see below.
+
+## Transactions
+
+`db.transaction(|tx| async move { … })` runs the closure on one connection
+between `BEGIN` and `COMMIT`. It commits when the closure returns `Ok`, and
+rolls back when it returns `Err` or panics. `tx` is an ordinary `Database`, so
+repositories, `rainier_orm::repo` and statements built on it all run inside the
+transaction:
+
+```rust
+let post = db.transaction(|tx| async move {
+    let post = EntityRepository::<Post>::new(tx.clone()).create(post).await?;
+    EntityRepository::<PostTopic>::new(tx).create(PostTopic::of(&post, topic)).await?;
+    Ok(post)
+}).await?;
+```
+
+- **Only `tx` is inside.** A statement made through another handle meanwhile
+  runs on another connection, outside the transaction, and on MySQL can wait on
+  its locks. Keep the closure to database work: don't hold a transaction open
+  across a call to another service.
+- **Writes are announced when they commit.** [Hearing about
+  writes](repositories.md#hearing-about-writes) subscribers — and so
+  `ModelCache` and `QueryCache` — hear about the transaction's writes after
+  `COMMIT` succeeds, before `transaction` returns. A rolled-back write is never
+  announced. A commit whose outcome is unknown is announced anyway: retiring a
+  cached value that did not change costs a miss.
+- **Nested calls join.** `tx.transaction(…)` runs in the same transaction;
+  nothing rolls back until the outermost call ends. `tx.in_transaction()` says
+  which kind of handle you have.
+- **Conflicts can be retried.** `db.transaction_retrying(3, |tx| async move { … })`
+  runs the closure again from the start when the database undoes the
+  transaction for a conflict: a deadlock, a serialization failure, or the
+  certification conflict a multi-primary cluster such as Galera reports as a
+  deadlock at `COMMIT`. Its closure is `Fn`, because it may run more than once,
+  and must do nothing outside the transaction that it cannot safely repeat. Any
+  other error is returned at once.
+- On a split connection the transaction runs on the writer. A backend that
+  cannot hold one connection across statements — an HTTP-fronted database, a
+  sharded fleet — refuses before the closure runs.
 
 ## Running queries in parallel
 

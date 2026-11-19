@@ -636,6 +636,9 @@ pub struct PoolSettings {
     max_lifetime: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     test_before_acquire: Option<bool>,
+    /// Seconds; `0` pings on every acquire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    test_after_idle: Option<u64>,
 }
 
 impl PoolSettings {
@@ -693,6 +696,24 @@ impl PoolSettings {
     pub fn test_before_acquire(mut self, test: bool) -> Self {
         self.test_before_acquire = Some(test);
         self
+    }
+
+    /// With `test_before_acquire` on, ping only a connection that has sat idle
+    /// at least this many seconds. `0` pings on every acquire.
+    ///
+    /// The default is one second: the sockets a database restart leaves dead
+    /// are the idle ones, and a connection used a moment ago does not need a
+    /// round trip to prove it is alive. A read that draws a closed connection
+    /// anyway is retried once on another.
+    pub fn test_after_idle(mut self, seconds: u64) -> Self {
+        self.test_after_idle = Some(seconds);
+        self
+    }
+
+    /// The declared idle threshold for the pre-acquire ping: `Some(None)` is
+    /// "every acquire".
+    pub fn test_after_idle_period(&self) -> Option<Option<std::time::Duration>> {
+        self.test_after_idle.map(disableable)
     }
 
     /// The declared ceiling, when one was declared.
@@ -755,6 +776,9 @@ impl PoolSettings {
         }
         if let Some(test) = self.test_before_acquire {
             base.test_before_acquire = test;
+        }
+        if let Some(seconds) = self.test_after_idle {
+            base.test_after_idle = disableable(seconds);
         }
         base
     }
@@ -4743,11 +4767,34 @@ mod tests {
             assert_eq!(pool.idle_timeout, expected.idle_timeout, "{declaration}");
             assert_eq!(pool.max_lifetime, expected.max_lifetime, "{declaration}");
             assert_eq!(pool.test_before_acquire, expected.test_before_acquire, "{declaration}");
+            assert_eq!(pool.test_after_idle, expected.test_after_idle, "{declaration}");
 
             // And with no split, reads are sized by the same declaration.
             assert_eq!(config.read_pool().max_connections, pool.max_connections);
             assert!(config.pool_settings().is_none());
         }
+    }
+
+    #[test]
+    fn the_idle_threshold_for_the_ping_is_declarable_and_zero_means_every_acquire() {
+        let declared = |pool: serde_json::Value| {
+            connection(json!({
+                "driver": "mysql", "host": "db.example.com", "database": "app", "pool": pool,
+            }))
+            .expect("declared")
+            .pool()
+        };
+
+        assert_eq!(
+            declared(json!({ "test_after_idle": 5 })).test_after_idle,
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(declared(json!({ "test_after_idle": 0 })).test_after_idle, None);
+        // Undeclared, it is the server default.
+        assert_eq!(
+            declared(json!({ "max_connections": 4 })).test_after_idle,
+            rainier_orm::PoolConfig::default().test_after_idle
+        );
     }
 
     #[test]

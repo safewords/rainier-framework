@@ -84,6 +84,35 @@ pub trait Cache: Send + Sync + 'static {
         true
     }
 
+    /// Move `key`'s expiry to `ttl` from now without rewriting its value.
+    /// `true` if the key was there; an absent key stays absent.
+    ///
+    /// The default reads the value and writes it back, which is correct
+    /// everywhere and costs two round trips, and between the two another
+    /// process may have removed the key — the write then puts it back. A
+    /// store that can extend an expiry in place overrides it: Redis with
+    /// `PEXPIRE`, memory under its lock. That version is one round trip and
+    /// cannot resurrect a key, which is what a sliding session wants: a
+    /// request finishing after a logout must not restore the session it read.
+    fn touch<'a>(&'a self, key: &'a str, ttl: Option<Duration>) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            match self.get(key).await? {
+                Some(value) => {
+                    self.put(key, &value, ttl).await?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        })
+    }
+
+    /// Whether [`touch`](Self::touch) extends an expiry in place — one round
+    /// trip, and never puts back a key another process removed — rather than
+    /// reading and rewriting the value.
+    fn touches_in_place(&self) -> bool {
+        false
+    }
+
     /// Whether a key is present and unexpired.
     fn has<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move { Ok(self.get(key).await?.is_some()) })

@@ -48,4 +48,4 @@ pub use d1::{D1Executor, D1Response, D1Row, D1Transport};
 #[cfg(feature = "libsql-http")]
 pub use libsql::{LibSqlExecutor, LibSqlResult, LibSqlRow, LibSqlTransport};
 #[cfg(feature = "sea-orm-executor")]
-pub use sea_orm_executor::SeaOrmExecutor;
+pub use sea_orm_executor::{SeaOrmExecutor, SeaOrmTransaction};

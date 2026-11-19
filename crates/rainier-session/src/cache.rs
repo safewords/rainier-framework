@@ -105,6 +105,16 @@ impl SessionStore for CacheSessionStore {
         })
     }
 
+    /// One `PEXPIRE` on a store that can extend in place, rather than the
+    /// default read-and-rewrite: one round trip instead of two, and a session
+    /// destroyed between the read and the write is not put back.
+    fn touch<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.cache.touch(&Self::key(id), Some(self.lifetime)).await?;
+            Ok(())
+        })
+    }
+
     fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.cache.forget(&Self::key(id)).await?;

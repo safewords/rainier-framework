@@ -71,35 +71,44 @@ pub struct PoolConfig {
     /// Ping a connection before handing it out. Costs a round-trip and is what
     /// stops a socket the server has already closed reaching a query.
     pub test_before_acquire: bool,
+    /// With [`test_before_acquire`](Self::test_before_acquire) on, ping only a
+    /// connection that has sat idle in the pool at least this long. `None`
+    /// pings on every acquire.
+    ///
+    /// A connection the pool handed out a moment ago was alive a moment ago;
+    /// the ones a database restart or a proxy leaves dead are the ones that
+    /// were sitting idle while it happened. Pinging only those keeps the
+    /// guarantee that matters — no dead socket served after an outage — without
+    /// a round trip in front of every query on a busy pool. The window it
+    /// leaves (a connection used under this long ago whose server has since
+    /// gone) is the one a reader retries: a read that fails because its
+    /// connection was closed is run again once on a fresh one.
+    pub test_after_idle: Option<Duration>,
 }
 
 impl Default for PoolConfig {
     /// Long-running-server defaults: up to 10 connections, drain when idle,
-    /// recycle every half hour, and ping before handing one out.
+    /// recycle every half hour, and ping a connection that has been idle for a
+    /// second or more before handing it out.
     ///
     /// # Why the ping is on
     ///
-    /// This was `false` until 2026-08-30, on the reasoning that a server —
-    /// unlike a frozen serverless isolate — keeps its sockets alive, so the
-    /// round-trip bought nothing. That holds while the *database* stays up,
-    /// and databases do not.
+    /// A database that restarts — a rolling restart of a replicated cluster, a
+    /// failover — closes every connection it holds. A pool that goes on holding
+    /// those sockets hands one to the next query, and the query fails with a
+    /// closed-connection error from a database that is healthy again.
+    /// `max_lifetime` does not catch it: it retires a connection for being
+    /// *old*, and a connection the server closed a second ago is neither old
+    /// nor alive. Only a ping can tell.
     ///
-    /// On 2026-08-31 a Galera rolling restart took lewd.net's MariaDB through
-    /// its three replicas. The pool went on holding connections to a server
-    /// that had closed them, handed one to the next request that asked, and
-    /// the query came back `peer closed connection without sending TLS
-    /// close_notify` — a `500` on a write somebody had just submitted. The
-    /// module docs on `rainier-database` already describe this exact shape
-    /// ("sockets that look open and fail on first use… intermittent errors
-    /// nobody can reproduce") and name `max_lifetime` as the guard, but
-    /// `max_lifetime` only retires a connection for being *old*. A connection
-    /// the server closed a second ago is neither old nor alive, and only a
-    /// pre-acquire ping can tell.
+    /// # Why only after a second idle
     ///
-    /// The cost is one round-trip per acquire, which against a database in the
-    /// same datacentre is sub-millisecond and is what `sqlx` itself does by
-    /// default — this type was overriding that default to `false`, so every
-    /// Rainier server was less resilient than the pool underneath it.
+    /// A ping on every acquire is a round trip in front of every query, and a
+    /// request that runs fifteen queries pays it fifteen times. The connections
+    /// a restart leaves dead are the ones that were idle while it happened, so
+    /// [`test_after_idle`](Self::test_after_idle) pings those and lets a
+    /// connection used within the last second through. A read that still draws
+    /// a closed connection is retried once on a fresh one by the executor.
     ///
     /// It does not make a restart invisible: a connection that dies *mid*
     /// query still fails that query, and a database that is unreachable is
@@ -113,6 +122,7 @@ impl Default for PoolConfig {
             idle_timeout: Some(Duration::from_secs(10 * 60)),
             max_lifetime: Some(Duration::from_secs(30 * 60)),
             test_before_acquire: true,
+            test_after_idle: Some(Duration::from_secs(1)),
         }
     }
 }
@@ -131,6 +141,9 @@ impl PoolConfig {
             idle_timeout: Some(Duration::from_secs(2)),
             max_lifetime: Some(Duration::from_secs(60)),
             test_before_acquire: true,
+            // Every acquire: a thawed instance cannot trust any socket, however
+            // recently the pool thinks it was used.
+            test_after_idle: None,
         }
     }
 
@@ -157,6 +170,7 @@ impl PoolConfig {
             idle_timeout: None,
             max_lifetime: None,
             test_before_acquire: false,
+            test_after_idle: None,
         }
     }
 
@@ -187,8 +201,8 @@ mod tests {
         // The guard against a database that restarted under a live pool. With
         // this off, the pool keeps sockets the server has already closed and
         // the failure lands on whichever query draws one — which is how a
-        // MariaDB rolling restart became `500`s on lewd.net writes, and why
-        // this default changed. See `Default`'s own doc comment.
+        // rolling restart of a replicated database becomes `500`s on writes,
+        // and why this default changed. See `Default`'s own doc comment.
         //
         // `max_lifetime` is NOT the same guard and does not replace it: it
         // retires a connection for being old, and a connection closed a second
@@ -197,6 +211,23 @@ mod tests {
 
         assert!(pool.test_before_acquire, "a server pool must not hand out a dead socket");
         assert!(pool.max_lifetime.is_some(), "ageing connections out is still worth doing");
+    }
+
+    #[test]
+    fn a_server_pool_pings_only_connections_that_sat_idle() {
+        // A dead socket is one that was idle while its server went away; a
+        // connection handed out a moment ago is not one. Pinging every acquire
+        // put a round trip in front of every query.
+        let pool = PoolConfig::default();
+        assert_eq!(pool.test_after_idle, Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_serverless_pool_pings_every_acquire() {
+        // A thawed instance's pool thinks a socket was used a moment ago when it
+        // was frozen for an hour.
+        assert_eq!(PoolConfig::serverless().test_after_idle, None);
+        assert!(PoolConfig::serverless().test_before_acquire);
     }
 
     #[test]

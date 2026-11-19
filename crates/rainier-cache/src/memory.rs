@@ -82,6 +82,39 @@ impl MemoryCache {
     }
 }
 
+#[cfg(test)]
+mod touch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn touch_moves_a_live_key_and_leaves_an_absent_one_absent() {
+        let cache = MemoryCache::new();
+        cache.put("k", b"v", Some(Duration::from_millis(30))).await.unwrap();
+
+        assert!(cache.touch("k", Some(Duration::from_secs(60))).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            cache.get("k").await.unwrap().as_deref(),
+            Some(&b"v"[..]),
+            "outlived its old ttl"
+        );
+
+        assert!(!cache.touch("gone", Some(Duration::from_secs(60))).await.unwrap());
+        assert!(cache.get("gone").await.unwrap().is_none(), "touching does not create a key");
+        assert!(cache.touches_in_place());
+    }
+
+    #[tokio::test]
+    async fn a_prefixed_cache_touches_the_prefixed_key() {
+        let inner: std::sync::Arc<dyn Cache> = std::sync::Arc::new(MemoryCache::new());
+        let prefixed = crate::PrefixedCache::new(std::sync::Arc::clone(&inner), "app");
+        prefixed.put("k", b"v", Some(Duration::from_millis(30))).await.unwrap();
+
+        assert!(prefixed.touch("k", Some(Duration::from_secs(60))).await.unwrap());
+        assert!(prefixed.touches_in_place());
+    }
+}
+
 impl Cache for MemoryCache {
     fn name(&self) -> &str {
         "memory"
@@ -123,6 +156,27 @@ impl Cache for MemoryCache {
 
     fn forget<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move { Ok(self.lock().remove(key).is_some()) })
+    }
+
+    fn touch<'a>(&'a self, key: &'a str, ttl: Option<Duration>) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            let mut entries = self.lock();
+            match entries.get_mut(key) {
+                Some(entry) if entry.is_live() => {
+                    entry.expires_at = Self::expiry(ttl);
+                    Ok(true)
+                }
+                Some(_) => {
+                    entries.remove(key);
+                    Ok(false)
+                }
+                None => Ok(false),
+            }
+        })
+    }
+
+    fn touches_in_place(&self) -> bool {
+        true
     }
 
     fn flush(&self) -> BoxFuture<'_, Result<()>> {

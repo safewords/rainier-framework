@@ -38,6 +38,7 @@ cache.has("k").await?;
 cache.flush().await?;                             // everything
 cache.increment("hits", 1).await?;
 cache.decrement("hits", 1).await?;
+cache.touch("k", Some(ttl)).await?;               // move the expiry; never creates the key
 
 // Typed, from CacheExt
 cache.get_json::<Post>("post").await?;
@@ -54,6 +55,11 @@ cache.remember_forever("countries", || async { load_countries().await }).await?;
 Bytes rather than strings, because the interesting things to cache — a
 serialised session, a rendered page — are not all text, and forcing them through
 UTF-8 would mean base64 on top of an already-encoded value.
+
+`touch` extends a key's expiry without rewriting its value. Redis does it with
+one `PEXPIRE` and memory in place (`touches_in_place()` is `true`); a store that
+cannot falls back to reading the value and writing it back, which is two round
+trips and can restore a key another process deleted in between.
 
 An **unparseable** cached value reads as a miss rather than an error. A deploy
 that changes a cached shape should make the caller recompute, not poison every
@@ -479,6 +485,55 @@ let user = users
 Use a shared store (Redis) in production: the tombstones and generation are
 what every replica agrees on. `ModelCacheConfig` sets the threshold, window and
 lifetimes; `stats()` counts hits, misses and invalidations.
+
+## Computed results: `QueryCache`
+
+`ModelCache` caches rows in the shared store. `QueryCache` caches what a request
+**computes from** rows — a lookup table a form needs, an aggregate a dashboard
+shows, the few ids currently in some state — and keeps the value itself **in
+this process**. A hit is a hash lookup and an `Arc` clone: no network round
+trip and nothing to decode, which is what makes it worth having when a single
+query costs more than the rest of the request.
+
+```rust
+use rainier_framework::query_cache::QueryCache;
+
+// Once, at boot, in every process that writes these tables — web, worker,
+// scheduler.
+let results = QueryCache::new(&db, Some(Cache::instance().store().clone()))
+    .watching(&["genders", "reports"]);
+
+let genders: Arc<Vec<Gender>> = results
+    .remember("genders:all", &["genders"], Duration::from_secs(3600), || async {
+        genders_repo.all().await
+    })
+    .await?;
+```
+
+- **Invalidated by the write, on every replica.** Each entry is stamped with the
+  generation of every table it names, taken *before* the load reads anything. A
+  builder or `repo` write to one of those tables advances its generation through
+  `Database::on_change` before the write returns, so the writing process's next
+  read misses; it also advances a counter in the shared store, which every other
+  process reads back at most `generation_refresh` later (one second by default),
+  in the background. A load that races a write is stamped behind it and never
+  served again.
+- **Name the tables at boot with `watching`.** A process only announces writes to
+  tables it knows are read. A fresh replica, or a queue worker that never serves
+  the cached read, would otherwise write without telling anyone.
+- **The TTL is a backstop**, for SQL written as a string (call
+  `results.invalidate("table")` after one) and for results that change with the
+  clock rather than with a write.
+- **Bounded.** At most `capacity` entries (10,000 by default) per process; the
+  oldest go first. Concurrent misses of one key load once.
+- **What belongs in it:** results that are the same for every viewer and stay
+  small however large the tables grow. Never a whole growing table, and never
+  something filtered by who is asking. A table written on every request (a view
+  counter) is a poor dependency: each write retires everything read from it and
+  costs a round trip to the shared store.
+- **Never fails a read.** A shared store that cannot be reached is reported as a
+  `CacheFailed` with store `query_cache`; the writing process stays correct and
+  the others fall back to the TTL until it answers.
 
 ### Atomic add, for locks
 

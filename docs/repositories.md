@@ -450,6 +450,26 @@ dot, never interpolated. `contains`/`starts_with`/`ends_with` escape the term's
 own `%` and `_`, so a search for `50%` does not match everything starting with
 `50`.
 
+**A word search uses the index, not a scan.** `words(columns, terms)` holds
+when every term occurs as a word, or the start of one, in at least one of the
+columns. On MySQL and MariaDB it is
+`MATCH (columns) AGAINST ('+term* …' IN BOOLEAN MODE)`, answered by a
+`FULLTEXT` index whose columns are exactly `columns`, in order — where
+`col("title").contains(term)` reads every row. Elsewhere it is a `contains`
+per term, so the SQLite suite still runs it. What a visitor types is bound as
+one value with boolean mode's operator characters taken out, so it is only ever
+searched for.
+
+```rust
+// title or body mention both words
+Criteria::new().where_expr(words([col("title"), col("body")], ["rust", "async"]));
+```
+
+InnoDB does not index words shorter than `innodb_ft_min_token_size` (3 by
+default) or on its stopword list, and a required term it does not index matches
+**nothing**. Send those terms through `contains` instead, or a search for a
+two-letter word comes back empty.
+
 Each function renders per dialect: `GREATEST` is `MAX` on SQLite, `CONCAT` is
 `||` outside MySQL, `CAST(… AS SIGNED)` is `INTEGER` on SQLite and `BIGINT` on
 Postgres. The same query runs in production and in the SQLite test suite.
@@ -570,7 +590,12 @@ Subscribers are awaited before the write's own future completes, so a caller
 that writes and then reads sees what the subscriber did. SQL passed as a string
 (`Executor::execute`, `Database::statement`) reports nothing.
 
-This is what `rainier_framework::model_cache::ModelCache` invalidates by; see
+Inside a [transaction](database.md#transactions) the changes are held until it
+commits and dropped if it rolls back, so a subscriber never hears about a
+write that was undone.
+
+This is what `rainier_framework::model_cache::ModelCache` and
+`rainier_framework::query_cache::QueryCache` invalidate by; see
 [Cache](cache.md#hot-rows-modelcache).
 
 ## Named queries

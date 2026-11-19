@@ -191,6 +191,16 @@ impl Server {
                 }
             };
 
+            // Nagle's algorithm holds a small write back until the previous
+            // one is acknowledged, and the client's delayed ACK can sit on that
+            // acknowledgement for tens of milliseconds. A response written in
+            // more than one piece — a streamed body, a chunked one — would wait
+            // on it. A server answering requests wants every write on the wire
+            // at once.
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::debug!(error = %e, "could not disable Nagle on an accepted connection");
+            }
+
             let kernel = Arc::clone(&self.kernel);
             let options = self.options.clone();
             let websockets = self.websockets.clone();
@@ -452,6 +462,25 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.ends_with("world"), "{response}");
 
+        let _ = shutdown.send(true);
+    }
+
+    #[tokio::test]
+    async fn back_to_back_responses_are_not_held_back_by_nagle() {
+        // A guard on the setting, not a proof of it: five round trips on
+        // loopback should take a few milliseconds, and a Nagle stall on any of
+        // them costs tens.
+        let (address, shutdown) = start().await;
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            let response = request(address, &get("/hello")).await;
+            assert!(response.ends_with("world"), "{response}");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "{:?}",
+            started.elapsed()
+        );
         let _ = shutdown.send(true);
     }
 
