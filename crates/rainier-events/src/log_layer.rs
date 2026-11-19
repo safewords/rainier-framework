@@ -6,7 +6,7 @@
 //! Lookout's log entries, an error tracker — asks with [`request_level`], and
 //! the application adds [`LogLayer`] to its `tracing` subscriber (the
 //! framework's boot does). Each log event is then published on the current
-//! [`bus`](crate::bus) in the current [`Context`](crate::Context), so it
+//! [`bus`](crate::bus::bus) in the current [`Context`](crate::Context), so it
 //! lands in the unit of work that wrote it.
 //!
 //! ```

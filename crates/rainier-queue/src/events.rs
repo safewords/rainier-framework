@@ -9,7 +9,7 @@
 //!
 //! A worker runs each attempt inside a [`Unit`] of kind [`UnitKind::Job`],
 //! named after the job, whose trace is the one the job carries
-//! ([`QueuedJob::traceparent`]) — so a request, the jobs it queued and the
+//! ([`QueuedJob::traceparent`](crate::QueuedJob::traceparent)) — so a request, the jobs it queued and the
 //! jobs those queued share one trace. [`JobRan`] is the unit's root
 //! activity, published inside it when the attempt ends.
 //!

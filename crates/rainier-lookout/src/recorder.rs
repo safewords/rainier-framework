@@ -22,7 +22,7 @@
 //!    root activity — the route stage of [`Scope`](crate::config::Scope) runs
 //!    and an excluded route's batch drops what it buffered.
 //! 3. **Close.** When the bus says the unit is complete
-//!    ([`UnitCompleted`](rainier_events::UnitCompleted), published only
+//!    ([`UnitCompleted`], published only
 //!    after every event of the unit has been handled), the batch is handed
 //!    on. `finalize` runs the rest on the writer: guard and user scope,
 //!    per-watcher rules, slow thresholds, N+1 detection, the keep rule. A

@@ -11,9 +11,9 @@
 //! [`fields`](Activity::fields) under the same OpenTelemetry names the span
 //! carries, how long it took and whether it failed.
 //!
-//! Publish one with [`Dispatcher::publish_activity`]; hear every one with
+//! Publish one with [`Dispatcher::publish_activity`](crate::Dispatcher::publish_activity); hear every one with
 //! [`Subscriber::on_activity`](crate::bus::Subscriber::on_activity) or
-//! [`Dispatcher::on_activity`].
+//! [`Dispatcher::on_activity`](crate::Dispatcher::on_activity).
 
 use std::backtrace::Backtrace;
 use std::borrow::Cow;
@@ -244,7 +244,7 @@ impl crate::Dispatcher {
     }
 }
 
-/// [`Dispatcher::publish_activity_with`] on the current [`bus`](crate::bus).
+/// [`Dispatcher::publish_activity_with`](crate::Dispatcher::publish_activity_with) on the current [`bus`](crate::bus::bus).
 #[inline]
 pub fn publish_activity_with<E: Activity>(build: impl FnOnce() -> E) {
     crate::bus::with_bus(|events| events.publish_activity_with(build));
@@ -256,7 +256,7 @@ pub fn publish_activity<E: Activity>(event: E) {
     publish_activity_with(move || event);
 }
 
-/// Whether the current [`bus`](crate::bus) has a subscriber for activity
+/// Whether the current [`bus`](crate::bus::bus) has a subscriber for activity
 /// `E` — what a publisher that must gather data first asks.
 #[inline]
 pub fn has_activity_subscribers<E: Activity>() -> bool {
@@ -271,7 +271,7 @@ pub fn has_activity_subscribers<E: Activity>() -> bool {
 /// Only the thread that ran a query can say where in the application it was
 /// called from, so the publisher captures it — but only for an operation
 /// already slower than the threshold (a slow query already cost far more than
-/// the capture), only when a subscriber asked ([`request_code_traces`]), and
+/// the capture), only when a subscriber asked ([`request_code_traces`](code_trace::request_code_traces)), and
 /// at most once per kind of statement per unit of work
 /// ([`Unit::claim_trace`](crate::Unit::claim_trace)).
 pub mod code_trace {

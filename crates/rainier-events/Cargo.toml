@@ -13,7 +13,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 arc-swap = "1"
 crossbeam-queue = "0.3"
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
 # Only for `log_layer`, behind `log-layer`.
 tracing-subscriber = { workspace = true, optional = true }

@@ -94,6 +94,8 @@ struct Item {
 /// One of a subscriber's threads: its inbox, and whether it is mid-event.
 struct Shard {
     inbox: SegQueue<Item>,
+    /// Whether its thread has been spawned (no threads on wasm32).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     started: Once,
     /// Events taken off the inbox and not yet finished (async handlers
     /// included), plus one while the thread is looking. Only the subscriber's
@@ -150,8 +152,25 @@ impl Core {
         };
         let shard = &self.shards[index];
         shard.inbox.push(item);
+        #[cfg(not(target_arch = "wasm32"))]
         if !shard.started.is_completed() {
             self.start(index);
+        }
+        #[cfg(target_arch = "wasm32")]
+        self.deliver_here(index);
+    }
+
+    /// wasm32 has no threads to give a subscriber, so there the event is
+    /// handled on the publishing thread: synchronous handlers at once, async
+    /// ones spawned on the current runtime (dropped, with a warning, when
+    /// there is none). The one place the bus is not fire and forget.
+    #[cfg(target_arch = "wasm32")]
+    fn deliver_here(self: &Arc<Self>, index: usize) {
+        let shard = &self.shards[index];
+        while let Some(item) = shard.inbox.pop() {
+            shard.busy.fetch_add(1, Ordering::AcqRel);
+            self.handle(index, item);
+            shard.busy.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
@@ -159,6 +178,7 @@ impl Core {
     /// event it is sent — the only time a publish does anything beyond a
     /// push.
     #[cold]
+    #[cfg(not(target_arch = "wasm32"))]
     fn start(self: &Arc<Self>, index: usize) {
         self.shards[index].started.call_once(|| {
             let core = Arc::clone(self);
@@ -175,6 +195,7 @@ impl Core {
         });
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn run(self: Arc<Self>, index: usize) {
         let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(runtime) => runtime,
@@ -250,6 +271,12 @@ impl Core {
         }
         // On this subscriber's own runtime: a stalled handler stalls only
         // itself, and the next event is taken off the inbox meanwhile.
+        #[cfg(target_arch = "wasm32")]
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::warn!(subscriber = %self.name, "no runtime to run an async subscriber on");
+            self.finish(item, failures);
+            return;
+        }
         self.shards[index].busy.fetch_add(1, Ordering::AcqRel);
         let core = Arc::clone(self);
         tokio::spawn(async move {
@@ -271,9 +298,11 @@ impl Core {
             for error in failures {
                 tracing::error!(event = name, subscriber = %self.name, error = %error, "event subscriber failed");
                 if reportable {
-                    tokio::spawn(crate::report::report(crate::report::ListenerFailed::new(
-                        error, name,
-                    )));
+                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                        runtime.spawn(crate::report::report(crate::report::ListenerFailed::new(
+                            error, name,
+                        )));
+                    }
                 }
             }
         }

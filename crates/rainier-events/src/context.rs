@@ -83,7 +83,7 @@ pub struct Unit {
     started: Instant,
     started_at: SystemTime,
     /// The bus to publish [`UnitCompleted`] on, and to resolve
-    /// [`bus`](crate::bus) to while this unit is current. Held strongly so
+    /// [`bus`](crate::bus::bus) to while this unit is current. Held strongly so
     /// resolving it on the hot path is a borrow, not a reference-count
     /// change every thread contends on.
     events: OnceLock<Arc<Dispatcher>>,
@@ -110,7 +110,7 @@ impl Unit {
     }
 
     /// A new unit that publishes on `events`: events raised inside it go to
-    /// `events` (see [`bus`](crate::bus)), and [`UnitCompleted`] is published
+    /// `events` (see [`bus`](crate::bus::bus)), and [`UnitCompleted`] is published
     /// there when it is done.
     pub fn on(
         events: &Arc<Dispatcher>,
