@@ -1,7 +1,8 @@
 # Events
 
-The dispatcher is Rainier's **hook bus** — the seam where something happens and
-something else reacts without either knowing about the other.
+The dispatcher is Rainier's **event bus** — the seam where something happens and
+something else reacts without either knowing about the other. [The bus](#the-bus)
+below is how it works and what travels on it; the rest of the page is the API.
 
 Raising one works anywhere. Reacting is done on `events`, the `Dispatcher`
 handed to your listener registration at boot — see
@@ -17,6 +18,202 @@ events.listen(|event: Arc<PostPublished>| async move {
     Ok(())
 });
 ```
+
+## The bus
+
+An application has **one** `Dispatcher`. Everything raised in it — by your
+code or by the framework — goes through that one object, and everything that
+reacts registers on it. That is what makes it a bus rather than a set of
+callbacks: a producer never names its consumers, a consumer never names its
+producer, and either side can be added or removed without touching the other.
+
+```mermaid
+flowchart LR
+    subgraph producers["Producers — raise facts"]
+        direction TB
+        app["Your code<br/>PostPublished, OrderPlaced, …"]
+        db["Every committed write<br/>ModelChanged"]
+        repo["Repositories built with_events<br/>Creating&lt;M&gt; … Deleted&lt;M&gt;"]
+        mail["The mailer<br/>MessageSending, MessageSent"]
+        worker["The queue worker<br/>JobProcessing … JobFailed"]
+        reporter["The reporter<br/>ExceptionReported, HttpRequestFailed, …"]
+    end
+
+    bus(("Dispatcher<br/>one per application"))
+
+    subgraph consumers["Consumers — react"]
+        direction TB
+        yours["Your listeners<br/>listen / listen_sync / subscribe"]
+        queued["Queued listeners<br/>listen_queued → a job"]
+        wild["Wildcard listeners<br/>listen_any: every event, by name"]
+        lookout["Lookout<br/>one subscriber among the others"]
+    end
+
+    app --> bus
+    db --> bus
+    repo --> bus
+    mail --> bus
+    worker --> bus
+    reporter --> bus
+    bus --> yours
+    bus --> queued
+    bus --> wild
+    bus --> lookout
+```
+
+Three properties follow from the design, and the rest of this page leans on
+them.
+
+### A dispatch runs where it was raised
+
+There is no background thread and no channel in the middle. `dispatch` calls
+each listener in turn, on the task that raised the event, and returns when the
+last one has finished. The typed listeners for the event run first, highest
+`priority` first and then in the order they registered; the wildcard listeners
+run after them, in the same order.
+
+```mermaid
+sequenceDiagram
+    participant C as Code raising the event<br/>(a request, a job)
+    participant D as Dispatcher
+    participant T as Listeners for E<br/>by priority
+    participant W as Wildcard listeners
+    C->>D: dispatch(event)
+    Note over D: built once, shared as an Arc
+    D->>T: listener 1, listener 2, …
+    T-->>D: Ok / Err
+    D->>W: (name, payload)
+    W-->>D: Ok / Err
+    D-->>C: Ok(()) — or the first Err
+```
+
+Because it runs inline, a listener is **inside the unit of work that raised
+the event**: the request's span, its trace id, its scoped bindings. A log line
+a listener writes carries the request's trace id; Lookout files what a
+listener hears under the request that raised it. It also means a slow listener
+slows the request down — which is what [queued listeners](#queued-listeners)
+are for.
+
+### Producers and consumers are independent
+
+The framework offers its events to the bus whatever is or is not listening,
+and whether or not optional features such as Lookout are compiled in. Nothing
+about a listener changes what is offered, and no listener depends on another
+being there:
+
+- Your listener for `ModelChanged` works in an application without Lookout.
+- Lookout registers its own listeners the same way yours are registered — it
+  is one consumer among the others, not part of the bus.
+- One listener failing does not stop the others when the event is raised with
+  [`dispatch_quietly`](#dispatching), which is how the framework raises the
+  events it only announces (`ModelChanged`, the failure reports).
+
+What *is* shared is the cost of building an event. A producer asks
+[`has_listeners`](#introspection) first and skips building an event nobody
+would hear — and a wildcard listener hears everything, so registering one
+(Lookout does) means every event is built.
+
+```mermaid
+flowchart TD
+    raise["A producer has something to say"] --> ask{"has_listeners::&lt;E&gt;()<br/>typed or wildcard?"}
+    ask -->|no| skip["Nothing is built<br/>— the common case with no listeners"]
+    ask -->|yes| build["Build E once"] --> deliver["Deliver to every listener"]
+```
+
+### Facts, not requests
+
+An event says that something **happened**. It has no recipient and no return
+value. If the code raising it needs an answer — did the card charge? — that is
+a function call, not an event; see [when to reach for an event](#when-to-reach-for-an-event).
+
+## What travels on the bus
+
+Not everything the framework does is an event. There are two channels, and
+knowing which carries what tells you where to hook in.
+
+| | **The bus** — `Dispatcher` | **Spans** — `tracing` |
+|---|---|---|
+| What it carries | facts with a typed payload | the timing and shape of work |
+| Who reads it | listeners: your code, queued jobs, Lookout | the tracing subscriber: logs, an OTLP exporter, Lookout's layer |
+| You hook in with | `events.listen(…)` | a `tracing` layer |
+| Model writes | `ModelChanged`, and the typed hooks | `db.query` |
+| Failures | `ExceptionReported` and one event per kind | `otel.status_code` on the span |
+| Jobs | `JobProcessing`, `JobProcessed`, `JobReleased`, `JobFailed` | `queue.process`, `queue.handle`, … |
+| Mail | `MessageSending`, `MessageSent` | `mail.send` |
+| Requests, queries, cache calls, outgoing HTTP, views, sessions | — | `http.server.request`, `db.query`, `cache.*`, `http.client.request`, … |
+
+The last row is the gap: a request or a query is a span and nothing more, so
+there is no event to listen for. Read those through
+[observability](observability.md), or through Lookout.
+
+Lookout reads both channels and joins them into one batch per unit of work —
+the spans through its tracing layer, the facts through its listeners:
+
+```mermaid
+flowchart LR
+    work["A request or a job"] -->|opens spans| spans["tracing"]
+    work -->|raises events| bus(("Dispatcher"))
+    spans --> layer["Lookout's layer<br/>requests, queries, cache, …"]
+    bus --> listeners["Lookout's listeners<br/>ModelChanged, ExceptionReported,<br/>job outcomes"]
+    bus --> yours["Your listeners"]
+    layer --> batch["One batch per unit of work,<br/>in the trace it belongs to"]
+    listeners --> batch
+```
+
+## A model change, end to end
+
+Every write a statement builder or repository makes reports the rows it
+touched to the connection's change feed once it has succeeded. Boot connects
+each of the application's connections to the bus, so each write becomes one
+`ModelChanged` — for every model, from a repository with or without
+`with_events`, a bulk update or none:
+
+```mermaid
+sequenceDiagram
+    participant R as Request handler
+    participant Repo as Post repository
+    participant DB as Database
+    participant Feed as Change feed
+    participant D as Dispatcher
+    participant A as Your audit listener
+    participant L as Lookout
+    R->>Repo: create(post)
+    Repo->>DB: INSERT INTO posts …
+    DB-->>Repo: ok
+    Repo->>Feed: RowChange { posts, insert, [7] }
+    Note over Feed: inside a transaction: held until COMMIT,<br/>dropped on ROLLBACK
+    Feed->>D: dispatch_quietly(ModelChanged { Post, Created, [7] })
+    D->>A: the shared ModelChanged
+    D->>L: the shared ModelChanged
+    Note over L: recorded in the request's batch
+    D-->>Repo: done
+    Repo-->>R: Post
+```
+
+The typed `Created<Post>` is a separate, older path: it fires only from a
+repository built `with_events`, carries the model itself, and a `Creating`
+listener can veto the write. See [models](models.md#lifecycle-hooks) for both.
+
+## Across the queue
+
+A dispatch inside a job runs inside that job, as anywhere else. What links a
+job to the request that queued it is the trace: the dispatch writes the
+request's `traceparent` onto the job, the worker's span records it, and so
+every event raised in the job — and in any job that job queues — is heard in
+the same trace.
+
+```mermaid
+flowchart LR
+    req["POST /orders<br/>raises OrderPlaced"] -->|queues| j1["SendReceipt<br/>raises MessageSent"]
+    j1 -->|queues| j2["SyncInvoice<br/>raises ModelChanged"]
+    req -.->|trace 4bf9…| t["one trace"]
+    j1 -.-> t
+    j2 -.-> t
+```
+
+A listener in either job runs in that job's span; Lookout shows the three
+batches together on any one of them. See
+[observability](observability.md#the-trace-crosses-every-boundary).
 
 ## Any type is an event
 
@@ -201,7 +398,8 @@ take down the request that raised the event.
 ## Introspection
 
 ```rust
-events.has_listeners::<PostPublished>();
+events.has_listeners::<PostPublished>();        // typed or wildcard: would anything hear it?
+events.has_typed_listeners::<PostPublished>();  // a listener for this type itself
 events.forget::<PostPublished>();
 events.forget_all();
 ```
