@@ -312,6 +312,7 @@ pub async fn run(store: &dyn Store) {
     storing_an_id_again_replaces_it(store).await;
     entries_by_type_are_newest_first_with_a_cursor(store).await;
     family_entries_are_one_keys_occurrences(store).await;
+    model_changes_are_one_models_entries_across_actions(store).await;
     search_matches_summary_route_user_and_ids(store).await;
     aggregate_rows_are_unmerged_buckets(store).await;
     exceptions_become_cases_that_can_be_closed(store).await;
@@ -574,6 +575,34 @@ pub async fn family_entries_are_one_keys_occurrences(store: &dyn Store) {
     assert_eq!(ids(got), ["fa-e0"], "[{name}] family cursor");
     let got = store.family_entries(EntryType::Exception, "select ?", None, 10).await.expect("type");
     assert!(got.is_empty(), "[{name}] family of another type");
+}
+
+/// [`Store::model_changes`] returns every action's entries for one model,
+/// newest first, with the strict cursor — and no other model's.
+pub async fn model_changes_are_one_models_entries_across_actions(store: &dyn Store) {
+    let name = store.name();
+    let mut a = batch("ma", BatchKind::Request, at(10, 0));
+    a.entries = vec![
+        entry("ma", 0, EntryType::Model, "Post created", at(10, 1), None),
+        entry("ma", 1, EntryType::Model, "Comment created", at(10, 2), None),
+        entry("ma", 2, EntryType::Model, "Post updated", at(10, 3), None),
+    ];
+    let mut b = batch("mb", BatchKind::Job, at(20, 0));
+    b.entries = vec![
+        entry("mb", 0, EntryType::Model, "Post deleted", at(20, 1), None),
+        // A query whose family looks like a model change is not one.
+        entry("mb", 1, EntryType::Query, "Post updated", at(20, 2), Some(5)),
+    ];
+    seed(store, vec![a, b]).await;
+
+    let ids = |entries: Vec<Entry>| entries.into_iter().map(|e| e.id).collect::<Vec<_>>();
+    let got = store.model_changes("Post", None, 10).await.expect("model");
+    assert_eq!(ids(got), ["mb-e0", "ma-e2", "ma-e0"], "[{name}] model");
+    let got = store.model_changes("Post", Some(at(20, 1)), 1).await.expect("cursor");
+    assert_eq!(ids(got), ["ma-e2"], "[{name}] model cursor");
+    let got = store.model_changes("Comment", None, 10).await.expect("other");
+    assert_eq!(ids(got), ["ma-e1"], "[{name}] another model");
+    assert!(store.model_changes("Tag", None, 10).await.expect("none").is_empty());
 }
 
 /// `search` matches text in the summary, route name, user, id or trace id.

@@ -62,6 +62,11 @@ export const api = {
   // params: since, until?, period?, family? (16 hex; preferred over key), key?, keys, forecast
   // -> { data: [{bucket_start,count,sum_us,max_us,average_us}], forecast: [{bucket_start,count,average_us}], period, keys: {key: points} }
   series: (type, params) => request('GET', `/series/${path(type)}`, params),
+  // params: since (RFC 3339), period? (60|600|3600)
+  // -> { data: [{model,total,actions:{created,updated,upserted,deleted},last_bucket}], since, period_s }
+  models: (params) => request('GET', '/models', params),
+  // params: before, limit -> entries, newest first; content.batch = {kind,summary,trace_id}
+  modelChanges: (model, params) => request('GET', `/models/${path(model)}`, params),
   // params: window (minutes), min, change (percent), forecast, limit
   // -> { data: [{kind,severity,type,key,current,previous,change_percent}], config, enabled }
   insights: (params) => request('GET', '/insights', params),

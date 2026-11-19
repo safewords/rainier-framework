@@ -14,6 +14,8 @@
 //! | `GET` | `/api/entries/{type}` | `lookout.api.entries` | [`Entry`](crate::entry::Entry) list; `family` is a 16-hex id |
 //! | `GET` | `/api/aggregates/{type}` | `lookout.api.aggregates` | [`Aggregate`](crate::entry::Aggregate) list; `until` ends the window |
 //! | `GET` | `/api/series/{type}` | `lookout.api.series` | Zero-filled points per bucket from `since` to `until` (or now), a forecast, and per-key series with `keys=N`; `family` is a 16-hex id |
+//! | `GET` | `/api/models` | `lookout.api.models` | Every model written since `since`, with its writes per action ([`ModelSummary`](crate::watchers::models::ModelSummary)) |
+//! | `GET` | `/api/models/{model}` | `lookout.api.model` | One model's recorded changes, newest first; `before` pages |
 //! | `GET` | `/api/insights` | `lookout.api.insights` | What changed since the previous window ([`trends`](crate::trends)) |
 //! | `GET` | `/api/cases` | `lookout.api.cases` | [`Case`](crate::cases::Case) list: `status`, `severity` (minimum), `q`, `limit` |
 //! | `GET` | `/api/cases/{id}` | `lookout.api.case` | One case |
@@ -246,6 +248,8 @@ pub fn routes(
             .name("api.aggregates");
         router.get("/api/series/{type}", guarded(&state, api::series)).name("api.series");
         router.get("/api/families/{type}/{id}", guarded(&state, api::family)).name("api.family");
+        router.get("/api/models", guarded(&state, api::models)).name("api.models");
+        router.get("/api/models/{model}", guarded(&state, api::model)).name("api.model");
         router.get("/api/insights", guarded(&state, api::insights)).name("api.insights");
         router.get("/api/cases", guarded(&state, api::cases)).name("api.cases");
         router.get("/api/cases/{id}", guarded(&state, api::case)).name("api.case");

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rainier_database::{Criteria, Database, EntityRepository, Model, Repository};
+use rainier_database::{Criteria, Database, EntityRepository, Model, Repository, Step};
 use rainier_orm::Entity;
 use rainier_support::{BoxFuture, Error, Result};
 
@@ -64,9 +64,47 @@ pub struct JobRow {
     /// worker needs it to release the lock and reading it should not mean
     /// deserialising the job.
     pub unique_key: Option<String>,
+    /// The W3C `traceparent` of whatever dispatched it
+    /// ([`QueuedJob::traceparent`]), so the worker that runs it joins the
+    /// dispatcher's trace. Added by `rainier_queue_0003_jobs_traceparent`;
+    /// `NULL` for a job pushed before it, or by a producer without the
+    /// `telemetry` feature.
+    pub traceparent: Option<String>,
 }
 
 impl Model for JobRow {}
+
+/// `rainier_jobs` as `rainier_queue_0001_jobs` created it, before the
+/// `traceparent` column.
+///
+/// The first migration creates the table from an entity's derived shape; it
+/// cannot use [`JobRow`] itself, whose shape has since grown, or a fresh
+/// database would get the new column from the first migration and then fail
+/// adding it again in the third. Never change this: databases have run it.
+mod v1 {
+    use chrono::{DateTime, Utc};
+    use rainier_orm::Entity;
+
+    #[derive(Entity, Clone, Debug)]
+    #[orm(table = "rainier_jobs")]
+    #[orm(index = "queue, reserved_at")]
+    #[allow(dead_code, reason = "only its derived schema is used")]
+    pub(super) struct JobRow {
+        #[orm(pk)]
+        id: String,
+        #[orm(index)]
+        queue: String,
+        name: String,
+        payload: String,
+        attempts: i64,
+        max_attempts: i64,
+        available_at: DateTime<Utc>,
+        reserved_at: Option<DateTime<Utc>>,
+        reserved_until: Option<DateTime<Utc>>,
+        created_at: DateTime<Utc>,
+        unique_key: Option<String>,
+    }
+}
 
 /// A job that exhausted its attempts, as a row.
 #[derive(Entity, Clone, Debug, PartialEq)]
@@ -104,6 +142,7 @@ impl JobRow {
             reserved_until: None,
             created_at: job.created_at,
             unique_key: job.unique_key.clone(),
+            traceparent: job.traceparent.clone(),
         })
     }
 
@@ -121,7 +160,7 @@ impl JobRow {
             // The row *is* the reservation here — this driver marks it
             // reserved in place — so there is no separate handle to carry.
             delivery_handle: None,
-            traceparent: None,
+            traceparent: self.traceparent,
         })
     }
 }
@@ -173,8 +212,11 @@ impl DatabaseQueue {
     /// The migrations this driver needs.
     pub fn migrations() -> rainier_database::Migrator {
         rainier_database::Migrator::new()
-            .create_table::<JobRow>("rainier_queue_0001_jobs")
+            .create_table::<v1::JobRow>("rainier_queue_0001_jobs")
             .create_table::<FailedJobRow>("rainier_queue_0002_failed_jobs")
+            .add(Step::table("rainier_queue_0003_jobs_traceparent", JobRow::table(), |table| {
+                table.text("traceparent").nullable();
+            }))
     }
 
     /// Release every job whose reservation has lapsed, so a job held by a
@@ -231,6 +273,9 @@ impl DatabaseQueue {
                 // refused by a *fresh* dispatch that happened in between —
                 // which is the opposite of what retrying a failure should do.
                 unique_key: None,
+                // A retry is someone's decision now, not the original
+                // dispatch's: it starts a trace of its own.
+                traceparent: None,
             })
             .await?;
 
@@ -432,8 +477,35 @@ mod tests {
         let migrator = DatabaseQueue::migrations();
         assert_eq!(
             migrator.names(),
-            vec!["rainier_queue_0001_jobs", "rainier_queue_0002_failed_jobs"]
+            vec![
+                "rainier_queue_0001_jobs",
+                "rainier_queue_0002_failed_jobs",
+                "rainier_queue_0003_jobs_traceparent",
+            ]
         );
+    }
+
+    #[test]
+    fn the_first_migration_and_the_column_added_since_make_the_row() {
+        // 0001 is frozen; 0001 plus what was added since must be `JobRow`.
+        let names = |columns: &[rainier_orm::ColumnSpec]| -> Vec<&'static str> {
+            columns.iter().map(|c| c.name).collect()
+        };
+        let mut migrated = names(v1::JobRow::columns());
+        migrated.push("traceparent");
+        assert_eq!(migrated, names(JobRow::columns()));
+        assert_eq!(v1::JobRow::indexes().len(), JobRow::indexes().len());
+    }
+
+    #[test]
+    fn the_dispatchers_trace_survives_the_table() {
+        const PARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let mut queued = QueuedJob::from_job(&Ping).unwrap();
+        queued.traceparent = Some(PARENT.into());
+
+        let row = JobRow::from_queued(&queued).unwrap();
+        assert_eq!(row.traceparent.as_deref(), Some(PARENT));
+        assert_eq!(row.into_queued().unwrap().traceparent.as_deref(), Some(PARENT));
     }
 
     #[test]

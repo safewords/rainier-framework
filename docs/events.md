@@ -241,7 +241,8 @@ You can listen to these without raising them:
 
 | Event | From |
 |---|---|
-| `Creating<M>`, `Created<M>` | [repository writes](models.md#lifecycle-hooks) |
+| `ModelChanged` | [every committed write](models.md#every-write-modelchanged), any model, any repository or none |
+| `Creating<M>`, `Created<M>` | [repository writes](models.md#lifecycle-hooks) built `with_events` |
 | `Updating<M>`, `Updated<M>` | |
 | `Deleting<M>`, `Deleted<M>` | |
 | `MessageSending`, `MessageSent` | [the mailer](mail.md) |

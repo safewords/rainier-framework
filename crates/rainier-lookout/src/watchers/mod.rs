@@ -9,14 +9,17 @@
 //!   [`Exception`](crate::EntryType::Exception) entry; see [`exceptions`].
 //!   Failures ignore sample rates and scope: one with no batch around it gets
 //!   a [`BatchKind::Other`](crate::BatchKind::Other) batch of its own.
-//! - **models and job outcomes** — when the model watcher is on, a wildcard
-//!   listener that reads event *names*. Model events are generic
-//!   (`Created<M>`, `Updated<M>`, `Deleted<M>`), so no single typed listener
-//!   hears all of them; their type names do say what happened and to which
-//!   model, which is all an entry needs. See [`models`]. The same listener
-//!   marks a batch whose job fired `JobFailed` (the `queue.process` span's
-//!   `rainier.job.outcome` and a final `JobAttemptFailed` report already do
-//!   so without it).
+//! - **model changes** — when the model watcher is on, a listener for
+//!   [`ModelChanged`], which boot dispatches for every committed write through
+//!   any of the application's connections. Each becomes a
+//!   [`Model`](crate::EntryType::Model) entry; see [`models`]. The typed
+//!   `Created<M>` / `Updated<M>` / `Deleted<M>` are not recorded: they fire
+//!   only from a repository built `with_events`, and the same write is
+//!   already a `ModelChanged`.
+//! - **job outcomes** — with the model watcher on, a wildcard listener that
+//!   reads event *names*: it marks a batch whose job fired `JobFailed` (the
+//!   `queue.process` span's `rainier.job.outcome` and a final
+//!   `JobAttemptFailed` report already do so without it) or `JobReleased`.
 //!
 //! **Correlation.** Listeners run inline on the dispatching task, so the
 //! batch an event belongs to is the one whose span the dispatching code is
@@ -29,12 +32,14 @@
 //! listener, so with the `telemetry` feature every dispatch opens an
 //! `event.dispatch` span, where unheard events otherwise open none. The layer
 //! does not record `event.dispatch` for the framework's own (`rainier_*`)
-//! events, but an exporter will see them. Turn the model watcher off to avoid
-//! it.
+//! events, but an exporter will see them. It also makes every repository
+//! built `with_events` build and dispatch its typed hooks, since a wildcard
+//! counts as a listener of them. Turn the model watcher off to avoid both.
 
 use std::future::{ready, Ready};
 use std::sync::Arc;
 
+use rainier_database::ModelChanged;
 use rainier_events::report::{ExceptionReported, Failure};
 use rainier_events::Dispatcher;
 use rainier_support::Result;
@@ -59,6 +64,12 @@ pub(crate) fn listen(lookout: &Lookout, events: &Dispatcher) {
     });
 
     if lookout.config().watcher(EntryType::Model).enabled {
+        let changes = lookout.clone();
+        events.listen(move |change: Arc<ModelChanged>| -> Ready<Result<()>> {
+            changes.record_model_change(&change);
+            ready(Ok(()))
+        });
+
         let names = lookout.clone();
         events.listen_any(
             move |name: &'static str,
@@ -101,19 +112,6 @@ impl Lookout {
     pub(crate) fn record_named_event(&self, name: &str) {
         let inner = &self.inner;
         if !inner.active() {
-            return;
-        }
-        if let Some(event) = models::parse(name) {
-            let Some(cell) = inner.current_batch() else { return };
-            let watcher = inner.config.watcher(EntryType::Model);
-            if !watcher.enabled || !crate::recorder::sample(watcher.sample_rate) {
-                return;
-            }
-            let entry = models::entry(&event);
-            if watcher.ignore.iter().any(|p| crate::config::glob(p, &entry.summary)) {
-                return;
-            }
-            inner.push(&cell, entry);
             return;
         }
         match models::job_event(name) {

@@ -585,6 +585,12 @@ one-statement form, for a caller who chunks.
 
 ## Hearing about writes
 
+Most code should listen for [`ModelChanged`](models.md#every-write-modelchanged)
+on the event bus, which boot feeds from every connection's writes as
+described below. `on_change` is the feed underneath, for code that keeps a
+cache of rows or runs without an application;
+`db.dispatch_changes_to(events)` forwards it to a dispatcher.
+
 `db.on_change(|change: RowChange| async move { … })` subscribes to every write
 made through that `Database` — or any clone of it, or a handle derived from it
 — once the statement succeeds. Every statement builder and every

@@ -509,6 +509,18 @@ impl Store for DeferredStore {
         }
     }
 
+    fn model_changes(
+        &self,
+        model: &str,
+        before: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<Entry>>> {
+        match self.get() {
+            Ok(store) => store.model_changes(model, before, limit),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
+    }
+
     fn cases(
         &self,
         query: rainier_lookout::cases::CaseQuery,

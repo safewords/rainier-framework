@@ -1168,6 +1168,7 @@ impl Worker {
             rainier.job.runner = Empty,
             rainier.job.outcome = Empty,
             rainier.job.backoff_ms = Empty,
+            trace_id = Empty,
         );
         if let Some(wait) = wait {
             span.record("messaging.queue.wait_ms", duration_ms(wait));
@@ -1179,11 +1180,23 @@ impl Worker {
         if let Some(parent) = &job.traceparent {
             rainier_telemetry::propagation::adopt(&span, parent);
         }
-        let outbound = job
+        // The trace this run belongs to: the dispatcher's; else the span's own,
+        // when OpenTelemetry started one; else a new one. Recorded as
+        // `trace_id` — what log lines and Lookout key a trace on, so a job's
+        // batch sits in the trace of the request that queued it — and put in
+        // force for what the job calls and queues, so a job a job dispatches
+        // stays in it too, even when nothing upstream had a trace.
+        let trace = job
             .traceparent
             .as_deref()
             .and_then(|header| rainier_telemetry::TraceContext::parse(header).ok())
-            .map(|context| rainier_telemetry::propagation::child_of(&context));
+            .or_else(|| {
+                rainier_telemetry::propagation::for_span(&span)
+                    .and_then(|header| rainier_telemetry::TraceContext::parse(&header).ok())
+            })
+            .unwrap_or_else(|| rainier_telemetry::TraceContext::start(true));
+        span.record("trace_id", trace.trace_id());
+        let outbound = Some(rainier_telemetry::propagation::child_of(&trace));
 
         let (queue, name, attempt) = (job.queue.clone(), job.name.clone(), job.attempts);
         if let Some(observer) = &self.observer {
@@ -3269,6 +3282,8 @@ mod telemetry_tests {
 
     /// What the handler saw of the trace.
     static SEEN_TRACE: Mutex<Option<String>> = Mutex::new(None);
+    /// The same, for the job queued with no trace at all.
+    static SEEN_FRESH: Mutex<Option<String>> = Mutex::new(None);
 
     #[derive(Serialize, Deserialize)]
     struct Charge {
@@ -3289,6 +3304,9 @@ mod telemetry_tests {
         async fn handle(&self, _: &JobContext) -> Result<()> {
             if self.card_number == "traced" {
                 *SEEN_TRACE.lock().unwrap() = rainier_telemetry::propagation::current();
+            }
+            if self.card_number == "untraced" {
+                *SEEN_FRESH.lock().unwrap() = rainier_telemetry::propagation::current();
             }
             if self.card_number == "declined" {
                 return Err(Error::internal("card declined"));
@@ -3447,6 +3465,103 @@ mod telemetry_tests {
         let seen = SEEN_TRACE.lock().unwrap().clone().expect("the handler saw a trace");
         let seen = rainier_telemetry::TraceContext::parse(&seen).unwrap();
         assert_eq!(seen.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736", "the same trace");
+    }
+
+    /// The manager `Relay` dispatches through, as an application's job would
+    /// resolve one.
+    static RELAY_MANAGER: std::sync::OnceLock<Arc<crate::QueueManager>> =
+        std::sync::OnceLock::new();
+
+    /// A job that queues another: request → job → job.
+    #[derive(Serialize, Deserialize)]
+    struct Relay;
+
+    #[async_trait::async_trait]
+    impl Job for Relay {
+        const NAME: &'static str = "test.relay";
+
+        async fn handle(&self, _: &JobContext) -> Result<()> {
+            let manager = RELAY_MANAGER.get().expect("the test set it");
+            manager.dispatch(Charge { card_number: "relayed".into() }).await?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_its_job_and_that_jobs_job_are_one_trace() {
+        let recorder = Recorder::new();
+        let _guard = recorder.install();
+        let queue = Arc::new(MemoryQueue::new());
+        let registry = Arc::new(JobRegistry::new().with::<Relay>().with::<Charge>());
+        let manager =
+            Arc::new(crate::QueueManager::new(Arc::clone(&queue) as _, Arc::clone(&registry)));
+        let _ = RELAY_MANAGER.set(Arc::clone(&manager));
+
+        // The request: what the `Trace` middleware puts in force.
+        rainier_telemetry::propagation::scope(Some(UPSTREAM.to_string()), async {
+            manager.dispatch(Relay).await.unwrap();
+        })
+        .await;
+
+        let worker = Worker::new(queue.clone(), registry, Arc::new(Container::new()))
+            .with_options(WorkerOptions::default().stop_when_empty());
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Processed, "the relay");
+        let relayed = queue.pending("default");
+        assert_eq!(relayed.len(), 1, "the relay queued its job");
+        let carried = relayed[0].traceparent.as_deref().expect("carries the trace");
+        assert_eq!(
+            rainier_telemetry::TraceContext::parse(carried).unwrap().trace_id(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(worker.run_next().await.unwrap(), Outcome::Processed, "the relayed job");
+
+        let traces: Vec<Option<String>> = recorder
+            .spans()
+            .into_iter()
+            .filter(|s| s.name == "queue.process")
+            .map(|s| s.field("trace_id").map(str::to_string))
+            .collect();
+        assert_eq!(traces.len(), 2);
+        assert!(
+            traces.iter().all(|t| t.as_deref() == Some("4bf92f3577b34da6a3ce929d0e0e4736")),
+            "{traces:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_process_span_records_the_trace_it_joined() {
+        // `trace_id` is what log lines and Lookout read: without it a job's
+        // batch was a trace of its own, apart from the request that queued it.
+        let recorder = Recorder::new();
+        let _guard = recorder.install();
+        let queue = Arc::new(MemoryQueue::new());
+        let mut job = charge("4242");
+        job.traceparent = Some(UPSTREAM.to_string());
+        queue.push(job).await.unwrap();
+
+        worker(queue, Arc::new(Observed::default())).run_next().await.unwrap();
+
+        let process = recorder.span("queue.process");
+        assert_eq!(process.field("trace_id"), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+    }
+
+    #[tokio::test]
+    async fn a_job_queued_with_no_trace_starts_one_that_its_own_dispatches_join() {
+        let recorder = Recorder::new();
+        let _guard = recorder.install();
+        let queue = Arc::new(MemoryQueue::new());
+        queue.push(charge("untraced")).await.unwrap();
+        assert_eq!(queue.pending("default")[0].traceparent, None);
+
+        worker(queue, Arc::new(Observed::default())).run_next().await.unwrap();
+
+        let process = recorder.span("queue.process");
+        let started = process.field("trace_id").expect("a trace of its own");
+        assert_eq!(started.len(), 32);
+        // What a dispatch from inside the job would carry: the same trace.
+        let seen = SEEN_FRESH.lock().unwrap().clone().expect("the handler saw a trace");
+        let seen = rainier_telemetry::TraceContext::parse(&seen).unwrap();
+        assert_eq!(seen.trace_id(), started);
     }
 
     #[tokio::test]

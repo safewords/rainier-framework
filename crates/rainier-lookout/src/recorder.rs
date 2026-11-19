@@ -1604,6 +1604,19 @@ pub(crate) fn finalize(
     }
 
     let summary = batch_summary(&pending);
+    // A model change says which unit of work made it, so a list of one
+    // model's changes can say "by `POST /posts`" and link to its trace without
+    // loading every batch.
+    let made_by = serde_json::json!({
+        "kind": pending.kind,
+        "summary": summary,
+        "trace_id": trace_id,
+    });
+    for entry in pending.entries.iter_mut().filter(|e| e.entry_type == EntryType::Model) {
+        if let Some(map) = entry.content.as_object_mut() {
+            map.insert("batch".into(), made_by.clone());
+        }
+    }
     let batch = Batch {
         id,
         trace_id,
@@ -2562,6 +2575,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_job_joins_the_trace_its_span_records_after_opening() {
+        for config in [local(), local().disable(EntryType::Job)] {
+            let rig = rig(config);
+            let job = tracing::info_span!(
+                "queue.process",
+                rainier.job.name = "SendInvoice",
+                trace_id = Empty,
+            );
+            job.record("trace_id", "4bf92f3577b34da6a3ce929d0e0e4736");
+            job.in_scope(|| query("UPDATE invoices SET sent = 1"));
+            drop(job);
+            rig.lookout.flush().await;
+            let batches = rig.store.all();
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].kind, BatchKind::Job);
+            assert_eq!(batches[0].trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+        }
+    }
+
+    #[tokio::test]
     async fn jobs_and_commands_can_be_scoped_out() {
         let rig = rig(local().scope(Scope { jobs: false, ..LookoutConfig::default().scope }));
         tracing::info_span!("queue.process", rainier.job.name = "J").in_scope(|| query("SELECT 1"));
@@ -2574,23 +2607,122 @@ mod tests {
         assert_eq!(summaries, vec!["command migrate"]);
     }
 
+    #[derive(rainier_orm::Entity, Clone, Debug)]
+    #[orm(table = "posts")]
+    struct Post {
+        #[orm(pk)]
+        id: u64,
+        title: String,
+    }
+
+    impl rainier_database::Model for Post {}
+
+    /// A request whose `work` runs inside its span, across awaits.
+    async fn request_async<F: std::future::Future>(path: &str, work: F) -> F::Output {
+        let span = request_span(path);
+        span.record("trace_id", "4bf92f3577b34da6a3ce929d0e0e4736");
+        let out = work.instrument_in(span.clone()).await;
+        span.record("http.response.status_code", 200);
+        drop(span);
+        out
+    }
+
+    /// A fake database whose writes go to a dispatcher Lookout listens on —
+    /// what boot wires for every connection.
+    fn on_the_bus(rig: &Rig) -> rainier_database::Database {
+        use rainier_database::testing::{fake_database, MemoryConnection};
+        let events = Arc::new(Dispatcher::new());
+        rig.lookout.listen(&events);
+        let (db, _) = fake_database(MemoryConnection::new(rainier_orm::Dialect::Sqlite));
+        db.dispatch_changes_to(events);
+        db
+    }
+
+    fn models(batch: &Batch) -> Vec<&Entry> {
+        batch.entries.iter().filter(|e| e.entry_type == EntryType::Model).collect()
+    }
+
     #[tokio::test]
-    async fn model_events_are_recorded_by_name() {
+    async fn a_write_through_a_plain_repository_is_a_model_entry() {
+        use rainier_database::{Criteria, EntityRepository, Repository};
+
         let rig = rig(local());
+        let db = on_the_bus(&rig);
+        // No `with_events`: the typed `Created<Post>` never fires. The
+        // write is on the bus as a `ModelChanged` all the same.
+        let posts = EntityRepository::<Post>::new(db.clone());
+
+        request_async("/posts", async {
+            posts.create(Post { id: 7, title: "Hello".into() }).await.expect("create");
+            posts
+                .update_matching(
+                    Criteria::new().where_eq("title", "Hello"),
+                    vec![("title".into(), "Hi".into())],
+                )
+                .await
+                .expect("bulk update");
+            posts.delete(7u64.into()).await.expect("delete");
+        })
+        .await;
+        // Outside every batch: Lookout's own store, a background task.
+        posts.delete(8u64.into()).await.expect("delete");
+
+        rig.lookout.flush().await;
+        let batches = rig.store.all();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        let summaries: Vec<&str> = models(batch).iter().map(|e| e.summary.as_str()).collect();
+        assert_eq!(summaries, vec!["Post created #7", "Post updated", "Post deleted #7"]);
+
+        let created = models(batch)[0];
+        assert_eq!(created.batch_id, batch.id);
+        assert_eq!(created.family_key(), "Post created");
+        assert_eq!(created.content["keys"], serde_json::json!(["7"]));
+        assert!(created.content["model_type"].as_str().is_some_and(|t| t.ends_with("::Post")));
+        // Who made it, for a list of one model's changes.
+        assert_eq!(created.content["batch"]["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(created.content["batch"]["kind"], "request");
+        assert_eq!(created.content["batch"]["summary"], batch.summary);
+        assert_eq!(models(batch)[1].content["keys"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn model_changes_are_counted_when_their_batch_is_not_kept() {
+        let rig = rig(production());
         let probe = rig.lookout.clone();
-        request("/posts", 201, || {
-            probe.record_named_event("rainier_database::model::Created<shop::models::Post>");
-            probe.record_named_event("rainier_database::model::Creating<shop::models::Post>");
+        request("/posts", 200, || {
+            probe.record_model_change(&rainier_database::ModelChanged {
+                model: "Post".into(),
+                model_type: Some("shop::Post"),
+                table: "posts".into(),
+                action: rainier_database::ModelAction::Updated,
+                keys: Some(vec!["7".into()]),
+            });
         });
         rig.lookout.flush().await;
-        let batch = &rig.store.all()[0];
-        let models: Vec<&str> = batch
-            .entries
-            .iter()
-            .filter(|e| e.entry_type == EntryType::Model)
-            .map(|e| e.summary.as_str())
-            .collect();
-        assert_eq!(models, vec!["Post created"]);
+        assert!(rig.store.all().is_empty(), "an ordinary request is not kept in production");
+        let counted = rig
+            .store
+            .aggregate_rows(EntryType::Model, 3600, Utc::now() - chrono::Duration::hours(1))
+            .await
+            .expect("rows");
+        assert_eq!(counted.len(), 1);
+        assert_eq!((counted[0].key.as_str(), counted[0].count), ("Post updated", 1));
+    }
+
+    #[tokio::test]
+    async fn the_model_watcher_off_records_no_model_change() {
+        use rainier_database::{EntityRepository, Repository};
+
+        let rig = rig(local().disable(EntryType::Model));
+        let db = on_the_bus(&rig);
+        let posts = EntityRepository::<Post>::new(db);
+        request_async("/posts", async {
+            posts.create(Post { id: 7, title: "Hello".into() }).await.expect("create");
+        })
+        .await;
+        rig.lookout.flush().await;
+        assert!(models(&rig.store.all()[0]).is_empty());
     }
 
     #[tokio::test]

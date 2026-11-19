@@ -608,6 +608,43 @@ impl Database {
         }
     }
 
+    /// Announce every write through this handle — and its clones, derived
+    /// handles and transactions — on `events`, as a
+    /// [`ModelChanged`](crate::ModelChanged), once it has committed.
+    ///
+    /// Boot does this for every connection the application declares, so the
+    /// event bus hears every model change and an application listens there
+    /// rather than here. The event is built only when something would hear
+    /// it ([`Dispatcher::has_listeners`](rainier_events::Dispatcher::has_listeners),
+    /// wildcards included), and delivered with
+    /// [`dispatch_quietly`](rainier_events::Dispatcher::dispatch_quietly): the
+    /// write has happened, so a failing listener is logged and cannot undo or
+    /// fail it. Call it once per handle family — see
+    /// [`shares_changes_with`](Self::shares_changes_with) — or each change is
+    /// announced once per call.
+    pub fn dispatch_changes_to(&self, events: Arc<rainier_events::Dispatcher>) {
+        self.on_change(move |change: RowChange| {
+            let events = Arc::clone(&events);
+            async move {
+                if events.has_listeners::<crate::ModelChanged>() {
+                    events.dispatch_quietly(crate::ModelChanged::from(change)).await;
+                }
+            }
+        });
+    }
+
+    /// Whether a write through `other` reaches the same
+    /// [`on_change`](Self::on_change) subscribers as one through `self` — true
+    /// for clones, derived handles and a transaction's handle; false for two
+    /// connections opened separately, even to the same database.
+    ///
+    /// What lets something subscribing to several handles — every connection
+    /// a [`DatabaseManager`](crate::DatabaseManager) holds, where the default
+    /// is also registered by name — subscribe to each feed once.
+    pub fn shares_changes_with(&self, other: &Database) -> bool {
+        Arc::ptr_eq(&self.subscribers, &other.subscribers)
+    }
+
     /// Hand `change` to every subscriber, in the order they subscribed.
     ///
     /// Inside a [transaction](Self::transaction) it is held until the commit.

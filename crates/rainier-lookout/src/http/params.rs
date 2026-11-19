@@ -224,7 +224,7 @@ pub(crate) struct SeriesQuery {
     pub(crate) forecast: usize,
 }
 
-fn period(params: &mut Params<'_>) -> Option<u32> {
+pub(crate) fn period(params: &mut Params<'_>) -> Option<u32> {
     match params.raw("period")?.as_str() {
         "60" => Some(60),
         "600" => Some(600),

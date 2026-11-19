@@ -5,8 +5,10 @@
 //! 1. an application booted with Lookout on and the in-memory store — the
 //!    framework builds the recorder, puts its layer in the subscriber, its
 //!    middleware in the global stack and its dashboard on the router;
-//! 2. three requests through the real kernel: a page, a page with a slow
-//!    query in it, and a route that fails;
+//! 2. four requests through the real kernel: a page, a page with a slow
+//!    query in it, a route that fails, and one that writes models through a
+//!    plain repository — each write a `ModelChanged` on the event bus, which
+//!    Lookout hears and the Models page lists;
 //! 3. what Lookout recorded for each, read back through the store the
 //!    dashboard reads;
 //! 4. where the dashboard is, and that browsing it records nothing.
@@ -31,14 +33,33 @@
 
 use std::time::Duration;
 
+use rainier_framework::database::testing::{fake_database, MemoryConnection};
+use rainier_framework::database::{Criteria, EntityRepository, Repository};
 use rainier_framework::lookout::config::WatcherConfig;
 use rainier_framework::lookout::{BatchQuery, EntryType, Lookout, Store};
 use rainier_framework::support::{Error, Result};
 use rainier_framework::testing::TestApp;
 use rainier_framework::Rainier;
 
+/// A model, written through a repository built without `with_events`: no
+/// typed hook fires, and the write is on the bus all the same.
+#[derive(rainier_orm::Entity, Clone, Debug)]
+#[orm(table = "posts")]
+struct Post {
+    #[orm(pk)]
+    id: u64,
+    title: String,
+}
+
+impl rainier_framework::database::Model for Post {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // A stand-in database that accepts every write, so the demo needs no
+    // server; a real connection announces its writes the same way.
+    let (database, _) = fake_database(MemoryConnection::new(rainier_orm::Dialect::Sqlite));
+    let posts = EntityRepository::<Post>::new(database.clone());
+
     // `with_lookout` adjusts what `LOOKOUT_*` set. Here it turns Lookout on
     // and marks the environment local — where every batch is kept and the
     // dashboard needs no login — and makes 20 ms a slow query, so the demo
@@ -50,8 +71,24 @@ async fn main() -> Result<()> {
                 .local(true)
                 .watch(EntryType::Query, |w| WatcherConfig { slow_ms: Some(20), ..w })
         })
-        .with_routes(|router| {
+        .with_database(database)
+        .with_routes(move |router| {
             router.get("/", || async { "home" }).name("home");
+            router
+                .post("/posts", move || {
+                    let posts = posts.clone();
+                    async move {
+                        posts.create(Post { id: 7, title: "Hello".into() }).await?;
+                        posts
+                            .update_matching(
+                                Criteria::new().where_eq("title", "Hello"),
+                                vec![("title".into(), "Hello, world".into())],
+                            )
+                            .await?;
+                        Ok::<_, Error>("saved")
+                    }
+                })
+                .name("posts.store");
             router
                 .get("/posts/{post}", || async {
                     // What the database layer's `db.query` span looks like;
@@ -75,11 +112,12 @@ async fn main() -> Result<()> {
     let path = lookout.config().dashboard.path.clone();
     let client = TestApp::new(app.clone())?;
 
-    println!("\n== Three requests ==");
+    println!("\n== Four requests ==");
     for uri in ["/", "/posts/1", "/boom"] {
         let response = client.get(uri).await;
         println!("GET {uri} -> {}", response.status());
     }
+    println!("POST /posts -> {}", client.post("/posts", &serde_json::json!({})).await.status());
 
     // Browsing the dashboard is not itself recorded.
     let dashboard = client.get(&path).await;

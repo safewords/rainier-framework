@@ -179,8 +179,23 @@ impl Dispatcher {
         subscriber.subscribe(self);
     }
 
-    /// Whether anything listens for `E` (wildcards excluded).
+    /// Whether anything would hear `E`: a listener for it, or a wildcard
+    /// listener, which hears every event.
+    ///
+    /// What code that builds an event only when it will be heard asks first.
+    /// Wildcards count: a wildcard listener — Lookout's, an audit log's — is
+    /// a listener of every event, and leaving it out skipped exactly the
+    /// events it registered to hear. Use
+    /// [`has_typed_listeners`](Self::has_typed_listeners) to ask about `E`'s
+    /// own.
     pub fn has_listeners<E: Event>(&self) -> bool {
+        self.has_typed_listeners::<E>()
+            || !self.wildcards.read().expect("wildcards lock poisoned").is_empty()
+    }
+
+    /// Whether a listener registered for `E` itself exists — wildcards not
+    /// counted.
+    pub fn has_typed_listeners<E: Event>(&self) -> bool {
         self.listeners
             .read()
             .expect("listeners lock poisoned")
@@ -674,6 +689,18 @@ mod tests {
 
         events.forget::<Shipped>();
         assert!(!events.has_listeners::<Shipped>());
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_listener_is_a_listener_of_every_event() {
+        // Code that skips building an event nobody hears asks
+        // `has_listeners`; leaving wildcards out of it skipped every event a
+        // wildcard listener registered to hear.
+        let events = Dispatcher::new();
+        assert!(!events.has_listeners::<Shipped>());
+        events.listen_any(|_: &'static str, _: Arc<dyn Any + Send + Sync>| async { Ok(()) });
+        assert!(events.has_listeners::<Shipped>());
+        assert!(!events.has_typed_listeners::<Shipped>());
     }
 
     #[tokio::test]

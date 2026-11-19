@@ -336,8 +336,8 @@ key."` — so a `404` says which model it was about.
 
 ## Lifecycle hooks
 
-Every repository write dispatches events through the
-[dispatcher](events.md). This is how the classic ORM lifecycle hooks —
+A repository built `with_events` dispatches events through the
+[dispatcher](events.md) around every write it makes. This is how the classic ORM lifecycle hooks —
 creating, created, saved, deleted — are spelled here.
 
 Each is a **distinct type**, so a listener registers for exactly the moment it
@@ -386,6 +386,41 @@ Hooks only fire on a repository configured with a dispatcher:
 ```rust
 EntityRepository::<Post>::new(db).with_events(events)
 ```
+
+### Every write: `ModelChanged`
+
+The typed hooks above fire only from a repository built `with_events`, and
+never for a bulk write — `update_matching`, `delete_matching`, a counter
+increment — which has no model to hand them. To hear **every** write, of every
+model, listen for `ModelChanged`:
+
+```rust
+events.listen(|change: Arc<ModelChanged>| async move {
+    // change.model: "Post"; change.action: Created | Updated | Upserted | Deleted;
+    // change.keys: Some(["7"]) when the write named its rows, None for a bulk one.
+    audit_log.record(&change.model, change.action.as_str(), change.keys.as_deref()).await;
+    Ok(())
+});
+```
+
+Boot forwards every connection's writes to the application's dispatcher, so
+nothing else is needed. It is one type for every model, so one listener hears
+them all; a [wildcard listener](events.md#listening) hears it too.
+
+- **When**: once the write has succeeded — inside a
+  [transaction](database.md#transactions), once it commits, and never if it rolls back —
+  on the task that made it, so a listener runs inside the request or job
+  responsible.
+- **What it carries**: `model` (the short type name, or the table for a change
+  described by table alone), `model_type` (the full path), `table`, `action`
+  and `keys`. Not the row: the ORM keeps no copy of what a row held, and a bulk
+  write never loaded one. Use the typed hooks when you need the model.
+- **A failing listener** is logged and cannot fail or undo the write.
+- **Cost**: the event is built only when something listens. SQL passed as a
+  string is not seen.
+
+Outside an application, `db.dispatch_changes_to(events)` does what boot does
+for one handle (see [hearing about writes](repositories.md#hearing-about-writes)).
 
 ### What a hook can and cannot do
 

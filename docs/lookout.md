@@ -238,6 +238,29 @@ need line tables (`[profile.release] debug = "line-tables-only"`).
 `broadcast`, `session`, `auth_attempt`, `n_plus_one`, `slow`, `custom`. The
 span each comes from is catalogued in `rainier_lookout::layer`.
 
+### Model changes
+
+A `model` entry is a [`ModelChanged`](models.md#every-write-modelchanged) heard
+on the event bus: every committed write through any of the application's
+connections — a repository with or without `with_events`, a bulk
+`update_matching` or `delete_matching`, a `rainier_orm::repo` call. Lookout is
+one listener of it like any other, so what it shows is what an application can
+listen to. Each entry is recorded in the batch whose work made the write and
+carries the model, the action (`created`, `updated`, `upserted`, `deleted`),
+the keys when the write named them, and — once the batch closes — the batch's
+kind, summary and trace id. Its family is `"<model> <action>"`, so the
+aggregates count every model's writes whether or not the batch was kept.
+
+A rolled-back write is never recorded, SQL passed as a string is not seen, and
+neither is a write outside any request or job. What a row held is not
+recorded: the ORM keeps no copy of it. Turn it off in code, with
+`.disable(EntryType::Model)` in `with_lookout`.
+
+A job's batch is in the trace of the request that queued it — and of the job
+that queued it, however deep — since every queue driver carries the
+`traceparent` and the worker records it ([propagation](observability.md#the-trace-crosses-every-boundary)).
+A batch's page lists the other batches in its trace.
+
 ---
 
 ## Storage
@@ -720,6 +743,13 @@ on a refused request, which is the next point.
   before an upgrade have no histogram and show no percentiles until they age
   out. The time chart draws the average with p90, p95 and p99 per bucket, so
   a tail that grows while the average holds still shows up over time.
+- **Models** — every model written in the range, from the aggregates (every
+  write counted, kept batch or not), with its writes per action and when it
+  was last written. Pick one for its recorded changes, newest first: the
+  action, the rows, the request or job that made it (linked) and its trace
+  (linked to every batch in it). Outside the local environment only kept
+  batches' changes are listed — failed, slow and monitored ones — while the
+  counts include them all. See [model changes](#model-changes).
 - **Cases** — see [below](#cases).
 - **Search** — the header's search box looks through batches, entries and
   cases.
@@ -882,6 +912,8 @@ shape.
 | `GET` | `/api/families/{type}/{id}` | the key a family id names — `{"id", "key"}`, or `404`. The id is `family_id(type, key)`: FNV-1a over the type, a newline and the key, sixteen hex digits, so the dashboard can make one without asking |
 | `GET` | `/api/aggregates/{type}` | rolled-up counts and durations, with `average_us`, `p50_us`, `p90_us`, `p95_us`, `p99_us`, the `histogram` (`{slot: count}`) and the row's `family_id` — `period` (60, 600, 3600), `since`, `until` (omit it to run to now), `order` (`count`, `average`, `max`) |
 | `GET` | `/api/series/{type}` | one zero-filled point per bucket from `since` to `until` (or now), each with `count`, `average_us`, `max_us` and, where the bucket kept a histogram, `p50_us`, `p90_us`, `p95_us` and `p99_us`; `percentiles` holds the same four over the whole range — `period` (default: a dozen points or more), `family` (the 16 hex id; resolved server-side, and wins over `key`), `key`, `keys` (that many busiest keys' own series), `forecast` (buckets) |
+| `GET` | `/api/models` | every model written since `since` (24 hours by default), most written first: `{"model", "total", "actions": {"created": n, …}, "last_bucket"}` — `period` (60, 600, 3600; 600 by default, 3600 past a day) |
+| `GET` | `/api/models/{model}` | one model's recorded changes, every action, newest first — `before`, `limit`. `content.batch` says what made each: `{"kind", "summary", "trace_id"}` |
 | `GET` | `/api/insights` | what changed since the previous window — `window`, `min`, `change`, `forecast`, `limit` |
 | `GET` | `/api/cases` | cases — `status` (`open`, `resolved`, `ignored`, `all`), `severity` (minimum), `q`, `limit` |
 | `GET` | `/api/cases/{id}` | one case |

@@ -96,6 +96,8 @@ const EVERY_GET: &[&str] = &[
     "/_lookout/api/batches/b1",
     "/_lookout/api/entries/query",
     "/_lookout/api/aggregates/query",
+    "/_lookout/api/models",
+    "/_lookout/api/models/Post",
     "/_lookout/api/status",
 ];
 
@@ -203,6 +205,8 @@ fn routes_are_named_under_lookout() {
             "lookout.api.entries",
             "lookout.api.family",
             "lookout.api.insights",
+            "lookout.api.model",
+            "lookout.api.models",
             "lookout.api.series",
             "lookout.api.status",
             "lookout.api.stream",
@@ -480,6 +484,49 @@ async fn rolls_up_aggregates() {
     for field in ["type", "period", "order", "since", "limit"] {
         assert!(body["errors"][field].is_array(), "{field}: {body}");
     }
+}
+
+#[tokio::test]
+async fn lists_models_by_writes_and_one_models_changes() {
+    let e = epoch();
+    let change = |id: &str, key: &str, offset: i64| {
+        let mut change = entry("m1", id, EntryType::Model, key, e, offset, None);
+        change.content = serde_json::json!({ "batch": { "trace_id": "trace-m1" } });
+        change
+    };
+    let one = request(
+        "m1",
+        "posts.store",
+        201,
+        20,
+        vec![
+            change("p1", "Post created", 1),
+            change("t1", "Tag created", 2),
+            change("p2", "Post updated", 3),
+        ],
+    );
+    let router = app(Arc::new(FakeStore::with(vec![one])));
+
+    let body = get(&router, "/_lookout/api/models").await.json();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2, "{body}");
+    assert_eq!(data[0]["model"], "Post", "most written first");
+    assert_eq!(data[0]["total"], 2);
+    assert_eq!(data[0]["actions"]["created"], 1);
+    assert_eq!(data[0]["actions"]["updated"], 1);
+    assert_eq!(body["period_s"], 600);
+
+    let body = get(&router, "/_lookout/api/models/Post").await.json();
+    let ids: Vec<&str> =
+        body["data"].as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["p2", "p1"], "newest first, every action, no other model");
+    assert_eq!(body["data"][0]["batch_id"], "m1");
+    assert_eq!(body["data"][0]["content"]["batch"]["trace_id"], "trace-m1");
+
+    let body = get(&router, "/_lookout/api/models/Post?limit=1").await.json();
+    assert!(body["next"]["before"].is_string());
+    let answer = get(&router, "/_lookout/api/models?period=7").await;
+    assert_eq!(answer.status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]

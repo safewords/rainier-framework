@@ -206,6 +206,32 @@ pub trait Store: Send + Sync + 'static {
         })
     }
 
+    /// One model's recorded changes — every action — newest first, with the
+    /// same strict `before` cursor as [`entries`](Self::entries). `model` is
+    /// the short name a [`Model`](EntryType::Model) entry records (`Post`).
+    ///
+    /// The default merges [`family_entries`](Self::family_entries) for each
+    /// action's family (`Post created`, `Post updated`, …), so a store that
+    /// answers families from an index answers this from it too.
+    fn model_changes(
+        &self,
+        model: &str,
+        before: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<Entry>>> {
+        let model = model.to_string();
+        Box::pin(async move {
+            let mut found = Vec::new();
+            for action in rainier_database::ModelAction::ALL {
+                let key = crate::watchers::models::family_key(&model, action.as_str());
+                found.extend(self.family_entries(EntryType::Model, &key, before, limit).await?);
+            }
+            found.sort_by(|a, b| b.occurred_at.cmp(&a.occurred_at).then(b.id.cmp(&a.id)));
+            found.truncate(limit);
+            Ok(found)
+        })
+    }
+
     /// The cases matching `query`, ordered by
     /// [`select_cases`](crate::cases::select_cases). A store keeps cases by
     /// folding each stored batch's exceptions in with

@@ -476,7 +476,14 @@ readers and other retention than the log line the message is still on.
 - **Through the queue.** A dispatch writes the `traceparent` in force onto the
   job's envelope, and the worker's `queue.process` span adopts it: a job run
   ten minutes later in another process is part of the request that queued it.
-  Anything the job calls joins the same trace.
+  Anything the job calls joins the same trace, and so does any job it
+  queues: a request, its job and that job's job are one trace. A job queued
+  with no trace (from a console command, say) starts one of its own, which
+  the jobs it queues join. Every driver carries the header, the database
+  driver in a `traceparent` column ([its migration](queues.md#databasequeue)).
+  `queue.process` records the trace's id as `trace_id`, like the request span
+  does, so log lines and [Lookout](lookout.md) put the whole chain under one
+  trace.
 
 Without the exporter there are no span ids to cite, and what travels is the
 trace id the request arrived with plus an id this service mints for itself —
@@ -511,9 +518,7 @@ becomes runnable onto its envelope, so the wait is `reserved − available_at` �
 and it is on every envelope ever written, including the ones sitting in a
 queue across the deploy that turned this on. One exception: SQS releases a
 message by changing its visibility without rewriting it, so a retried SQS
-job's wait includes the backoff and the attempt before it. The database driver
-stores jobs as columns and has none for `traceparent`, so its jobs start
-traces of their own; their timings are unaffected.
+job's wait includes the backoff and the attempt before it.
 
 **Outcomes** are `processed`, `released`, `failed`, `timed_out` (a timeout,
 whether or not attempts remain — the fix is a different limit, not a code

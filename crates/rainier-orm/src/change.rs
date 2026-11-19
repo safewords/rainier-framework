@@ -60,17 +60,42 @@ pub struct RowChange {
     pub table: String,
     pub kind: ChangeKind,
     pub keys: ChangedKeys,
+    /// The entity the write was built for — its Rust type name
+    /// (`std::any::type_name`), such as `shop::models::Order` — when a builder
+    /// generic over one made it. `None` for a change described by table alone
+    /// ([`unknown`](Self::unknown), [`keys`](Self::keys)).
+    ///
+    /// What lets something watching every write name the model rather than
+    /// the table: Lookout's model watcher does.
+    pub entity: Option<&'static str>,
 }
 
 impl RowChange {
     /// A write to `table` touching rows it does not name.
     pub fn unknown(table: impl Into<String>, kind: ChangeKind) -> Self {
-        Self { table: table.into(), kind, keys: ChangedKeys::Unknown }
+        Self { table: table.into(), kind, keys: ChangedKeys::Unknown, entity: None }
+    }
+
+    /// A write to `E`'s table touching rows it does not name.
+    pub fn unknown_of<E: Entity>(kind: ChangeKind) -> Self {
+        Self::unknown(E::table(), kind).of_entity::<E>()
+    }
+
+    /// The same change, naming `E` as the entity it was built for.
+    pub fn of_entity<E: Entity>(mut self) -> Self {
+        self.entity = Some(std::any::type_name::<E>());
+        self
+    }
+
+    /// The entity's short name — `Order` for `shop::models::Order` — or
+    /// `None` when [`entity`](Self::entity) is.
+    pub fn entity_name(&self) -> Option<&'static str> {
+        self.entity.map(short_type_name)
     }
 
     /// A write to `table` touching `keys`.
     pub fn keys(table: impl Into<String>, kind: ChangeKind, keys: Vec<String>) -> Self {
-        Self { table: table.into(), kind, keys: ChangedKeys::Keys(keys) }
+        Self { table: table.into(), kind, keys: ChangedKeys::Keys(keys), entity: None }
     }
 
     /// A write of `rows` of `E`, by their own primary keys. Unknown when `E`'s
@@ -81,16 +106,16 @@ impl RowChange {
         rows: impl IntoIterator<Item = &'a E>,
     ) -> Self {
         if E::primary_key_columns().len() != 1 {
-            return Self::unknown(E::table(), kind);
+            return Self::unknown_of::<E>(kind);
         }
         let mut keys = Vec::new();
         for row in rows {
             match row.pk_values().first().and_then(key_string) {
                 Some(key) => keys.push(key),
-                None => return Self::unknown(E::table(), kind),
+                None => return Self::unknown_of::<E>(kind),
             }
         }
-        Self::keys(E::table(), kind, keys)
+        Self::keys(E::table(), kind, keys).of_entity::<E>()
     }
 
     /// A write of `E` restricted to `keys` (primary-key values), or unknown
@@ -100,11 +125,11 @@ impl RowChange {
             Some(keys) if E::primary_key_columns().len() == 1 => {
                 let strings: Option<Vec<String>> = keys.iter().map(key_string).collect();
                 match strings {
-                    Some(keys) => Self::keys(E::table(), kind, keys),
-                    None => Self::unknown(E::table(), kind),
+                    Some(keys) => Self::keys(E::table(), kind, keys).of_entity::<E>(),
+                    None => Self::unknown_of::<E>(kind),
                 }
             }
-            _ => Self::unknown(E::table(), kind),
+            _ => Self::unknown_of::<E>(kind),
         }
     }
 
@@ -116,6 +141,12 @@ impl RowChange {
                 ChangedKeys::Unknown => true,
             }
     }
+}
+
+/// `Order` for `shop::models::Order`, `Page` for `cms::Page<cms::Draft>`.
+fn short_type_name(path: &'static str) -> &'static str {
+    let head = path.split('<').next().unwrap_or(path);
+    head.rsplit("::").next().unwrap_or(head)
 }
 
 /// A primary-key value as a string: integers in decimal, strings as they are.
@@ -170,5 +201,31 @@ mod tests {
 
         let unknown = RowChange::unknown("posts", ChangeKind::Update);
         assert!(unknown.may_touch("posts", "8"));
+    }
+
+    #[derive(crate::Entity, Clone)]
+    #[orm(table = "posts")]
+    struct Post {
+        #[orm(pk)]
+        id: u64,
+        title: String,
+    }
+
+    #[test]
+    fn a_change_built_for_an_entity_names_it() {
+        let post = Post { id: 7, title: "Hello".into() };
+        let _ = &post.title;
+        let written = RowChange::of_rows(ChangeKind::Update, [&post]);
+        assert_eq!(written.table, "posts");
+        assert_eq!(written.keys, ChangedKeys::Keys(vec!["7".into()]));
+        assert_eq!(written.entity_name(), Some("Post"));
+        assert!(written.entity.is_some_and(|path| path.ends_with("::Post")));
+
+        let bulk = RowChange::of_keys::<Post>(ChangeKind::Delete, None);
+        assert_eq!(bulk.keys, ChangedKeys::Unknown);
+        assert_eq!(bulk.entity_name(), Some("Post"));
+
+        assert_eq!(RowChange::unknown("posts", ChangeKind::Update).entity_name(), None);
+        assert_eq!(short_type_name("cms::Page<cms::Draft>"), "Page");
     }
 }

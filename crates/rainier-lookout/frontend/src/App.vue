@@ -47,6 +47,7 @@ const sections = [
       { label: 'Cases', to: { name: 'cases' }, match: (r) => r.name === 'cases' || r.name === 'case' },
       { label: 'Requests', to: { name: 'requests' }, match: (r) => r.name === 'requests' || (r.name === 'batches' && (r.query.kind || 'request') === 'request') },
       { label: 'Jobs', to: { name: 'jobs' }, match: (r) => r.name === 'jobs' || (r.name === 'batches' && r.query.kind === 'job') },
+      { label: 'Models', to: { name: 'models' }, match: (r) => r.name === 'models' || r.name === 'model' },
     ],
   },
   {
@@ -91,7 +92,6 @@ const sections = [
       ['mail', 'Mail'],
       ['notification', 'Notifications'],
       ['event', 'Events'],
-      ['model', 'Models'],
       ['view', 'Views'],
       ['auth_attempt', 'Auth attempts'],
     ].map(([type, label]) => ({

@@ -223,3 +223,103 @@ mod tests {
         assert_eq!(created.id, 7);
     }
 }
+
+/// Fired after a write through a [`Database`](crate::Database) has committed
+/// — every write a statement builder or `rainier_orm::repo` makes, for every
+/// model, from any repository or none.
+///
+/// Where [`Created`], [`Updated`] and [`Deleted`] are typed per model, carry
+/// the model itself, and fire only from a repository built `with_events`,
+/// this is one type for all of them, so a single listener hears every model:
+///
+/// ```ignore
+/// events.listen(|change: Arc<ModelChanged>| async move {
+///     tracing::info!(model = %change.model, action = %change.action, "changed");
+///     Ok(())
+/// });
+/// ```
+///
+/// It is announced once the write has succeeded — inside a transaction, once
+/// it commits, and never if it rolls back — on the task that made the write,
+/// so a listener runs inside the request or job responsible. What a row held
+/// is not carried: the ORM keeps no copy of it, and a bulk write never loaded
+/// one. SQL passed as a string is not seen. Boot forwards every connection's
+/// writes to the application's dispatcher; see
+/// [`Database::dispatch_changes_to`](crate::Database::dispatch_changes_to).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChanged {
+    /// The model's short type name — `Post` — or, for a change described by
+    /// table alone, the table.
+    pub model: String,
+    /// The model's full type path — `shop::models::Post` — when the write
+    /// was built for an entity.
+    pub model_type: Option<&'static str>,
+    /// The table written.
+    pub table: String,
+    /// What the write did.
+    pub action: ModelAction,
+    /// The primary keys written, when the write named them; `None` for a bulk
+    /// write that did not say which rows.
+    pub keys: Option<Vec<String>>,
+}
+
+/// What a [`ModelChanged`] write did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModelAction {
+    /// New rows.
+    Created,
+    /// Existing rows, rewritten in whole or in part.
+    Updated,
+    /// Rows inserted or, on a conflict, rewritten.
+    Upserted,
+    /// Rows removed.
+    Deleted,
+}
+
+impl ModelAction {
+    /// Every action, in the order a list shows them.
+    pub const ALL: &'static [ModelAction] =
+        &[ModelAction::Created, ModelAction::Updated, ModelAction::Upserted, ModelAction::Deleted];
+
+    /// `created`, `updated`, `upserted` or `deleted`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelAction::Created => "created",
+            ModelAction::Updated => "updated",
+            ModelAction::Upserted => "upserted",
+            ModelAction::Deleted => "deleted",
+        }
+    }
+}
+
+impl std::fmt::Display for ModelAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<rainier_orm::ChangeKind> for ModelAction {
+    fn from(kind: rainier_orm::ChangeKind) -> Self {
+        match kind {
+            rainier_orm::ChangeKind::Insert => ModelAction::Created,
+            rainier_orm::ChangeKind::Update => ModelAction::Updated,
+            rainier_orm::ChangeKind::Upsert => ModelAction::Upserted,
+            rainier_orm::ChangeKind::Delete => ModelAction::Deleted,
+        }
+    }
+}
+
+impl From<rainier_orm::RowChange> for ModelChanged {
+    fn from(change: rainier_orm::RowChange) -> Self {
+        Self {
+            model: change.entity_name().map_or_else(|| change.table.clone(), str::to_string),
+            model_type: change.entity,
+            action: change.kind.into(),
+            keys: match change.keys {
+                rainier_orm::ChangedKeys::Keys(keys) => Some(keys),
+                rainier_orm::ChangedKeys::Unknown => None,
+            },
+            table: change.table,
+        }
+    }
+}

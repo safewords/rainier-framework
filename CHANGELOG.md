@@ -12,6 +12,26 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **`ModelChanged`** (`rainier-database`): one event on the bus for every
+  committed write, of every model — through a repository with or without
+  `with_events`, a bulk `update_matching` / `delete_matching`, a counter
+  increment or `rainier_orm::repo` — carrying the model's name and type path,
+  the table, the action (`ModelAction`: created, updated, upserted, deleted)
+  and the keys when the write named them. Boot forwards every distinct
+  connection's writes (`Database::dispatch_changes_to`); it is announced once
+  the write commits, never on rollback, on the task that wrote, and built only
+  when something listens. A failing listener is logged and cannot fail the
+  write. `RowChange` gains `entity`, the type the write was built for. See
+  [models](docs/models.md#every-write-modelchanged).
+- **The Models page** (`rainier-lookout`): every model written in the range,
+  with its writes per action, and for one model its recorded changes — each
+  linked to the request or job that made it and to that trace. Lookout's model
+  watcher now records `ModelChanged` from the bus (it heard nothing before),
+  model changes are counted in the aggregates, and `GET /api/models` and
+  `GET /api/models/{model}` serve the page; `Store::model_changes` is the store
+  query, with a default every store inherits. See
+  [Lookout](docs/lookout.md#model-changes).
+
 - **`defer`** (`rainier-framework`): run work in the background of a request
   without the response waiting on it, like Laravel's `defer()`. The task
   carries the request's span (and so its trace id) and facade application;
@@ -68,6 +88,20 @@ the release as a whole and names the crate it landed in.
   `0` pings every acquire, as `PoolConfig::serverless()` does.
 
 ### Changed
+
+- **`Dispatcher::has_listeners` counts wildcard listeners** (`rainier-events`):
+  a wildcard listener hears every event, and leaving it out skipped the
+  events it registered for. A repository built `with_events` therefore builds
+  and dispatches its typed hooks whenever any wildcard listener is
+  registered — Lookout's model watcher registers one.
+  `has_typed_listeners` is the old question.
+- **A job is in the trace that queued it, whatever the driver**
+  (`rainier-queue`): `queue.process` records `trace_id`, so log lines and
+  Lookout put a request, its job and that job's job in one trace; a job
+  queued with no trace starts one that what it queues joins. The database
+  driver keeps the `traceparent` in a new column — **run
+  `rainier_queue_0003_jobs_traceparent` before deploying** (it comes with
+  `DatabaseQueue::migrations()`). `JobRow` gains `traceparent`.
 
 - **Idle WebSocket connections use less memory** (`rainier-server`): an
   upgraded connection starts with a 4 KiB read buffer instead of tungstenite's

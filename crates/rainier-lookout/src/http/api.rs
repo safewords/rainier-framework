@@ -108,6 +108,36 @@ pub(crate) async fn entries(state: Arc<Shared>, request: Req) -> Result<Response
     Ok(Response::json(&json!({ "data": found, "next": next })))
 }
 
+/// `GET /api/models`: every model written since `since` (24 hours by
+/// default), most written first, with its writes per action — from the
+/// aggregates, so every write is counted, in kept batches or not. `period`
+/// picks the buckets read (600 by default; 3600 for a window past a day).
+pub(crate) async fn models(state: Arc<Shared>, request: Req) -> Result<Response> {
+    let mut params = Params::new(request.query());
+    let now = Utc::now();
+    let since = params.time("since").unwrap_or(now - chrono::Duration::hours(24));
+    let period = params::period(&mut params);
+    params.finish()?;
+    let period =
+        period.unwrap_or(if now - since > chrono::Duration::hours(24) { 3600 } else { 600 });
+    let rows = state.store.aggregate_rows(EntryType::Model, period, since).await?;
+    let models = crate::watchers::models::summarize(&rows);
+    Ok(Response::json(&json!({ "data": models, "since": since.to_rfc3339(), "period_s": period })))
+}
+
+/// `GET /api/models/{model}`: one model's recorded changes, every action,
+/// newest first; `before` pages. Each entry's `content.batch` says what made
+/// it — its kind, summary and trace id — and `batch_id` links to the batch.
+pub(crate) async fn model(state: Arc<Shared>, request: Req) -> Result<Response> {
+    let mut params = Params::new(request.query());
+    let before = params.time("before");
+    let limit = params.limit(params::MAX_LIMIT, params::DEFAULT_LIMIT);
+    params.finish()?;
+    let model = request.route_param("model").unwrap_or_default();
+    let found = state.store.model_changes(model, before, limit).await?;
+    Ok(Response::json(&page(&found, limit, |e| e.occurred_at)))
+}
+
 /// One aggregate row as the API shows it: the stored fields plus the average
 /// and the p50/p90/p95/p99 read off its histogram (`null` without one).
 fn aggregate_json(row: &Aggregate) -> Value {

@@ -308,9 +308,21 @@ where
         let Some(span) = ctx.span(id) else { return };
         let mut extensions = span.extensions_mut();
         let Some(state) = extensions.get_mut::<SpanState>() else { return };
-        let Some(draft) = state.draft.as_mut() else { return };
         let mut recorded = Vec::new();
         values.record(&mut Fields(&mut recorded));
+        let Some(draft) = state.draft.as_mut() else {
+            // A root with no entry of its own (its watcher is off) still
+            // learns which trace its batch is in.
+            if state.root {
+                let batch = Arc::clone(&state.batch);
+                let trace = text(&recorded, "trace_id").map(str::to_string);
+                drop(extensions);
+                if let Some(trace) = trace {
+                    self.inner.set_trace_id(&batch, &trace);
+                }
+            }
+            return;
+        };
         let trace_recorded = recorded.iter().any(|(k, _)| *k == "trace_id");
         let route_recorded =
             recorded.iter().any(|(k, _)| matches!(*k, "http.route" | "rainier.route.name"));

@@ -489,7 +489,12 @@ let queue = DatabaseQueue::new(db).with_reservation(Duration::from_secs(90));   
 ```
 
 Two tables, contributed to your migrator (`src/database/migrations/mod.rs` in
-the sample project; see [Migrations](migrations.md)):
+the sample project; see [Migrations](migrations.md)). The third migration,
+`rainier_queue_0003_jobs_traceparent`, adds a nullable `traceparent` column to
+`rainier_jobs`, so a job's worker joins the trace of whatever dispatched it
+([observability](observability.md#the-trace-crosses-every-boundary)). **Run it before deploying a
+build with it**: inserting a job writes the column. Jobs already queued read
+it as `NULL` and start traces of their own.
 
 ```rust
 Migrator::new()

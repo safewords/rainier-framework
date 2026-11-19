@@ -1143,7 +1143,7 @@ pub fn insert_select<E: Entity>(
         sql,
         params: params.0,
         route: ShardRoute::Global,
-        change: Some(RowChange::unknown(E::table(), ChangeKind::Insert)),
+        change: Some(RowChange::unknown_of::<E>(ChangeKind::Insert)),
     })
 }
 
@@ -1213,7 +1213,7 @@ pub fn upsert_select<E: Entity>(
         sql,
         params: params.0,
         route: ShardRoute::Global,
-        change: Some(RowChange::unknown(E::table(), ChangeKind::Upsert)),
+        change: Some(RowChange::unknown_of::<E>(ChangeKind::Upsert)),
     })
 }
 

@@ -41,8 +41,11 @@
 //! ([`QueuedJob::traceparent`]), and the worker's `queue.process` span adopts
 //! it as its parent: the job joins the trace of the request that queued it,
 //! minutes and processes later. An envelope without one starts a trace of its
-//! own. The database driver stores jobs as columns and has none for it, so
-//! its jobs start fresh traces — the wait and the timings are unaffected.
+//! own, which whatever the job dispatches joins in turn. Either way the span
+//! records the trace's id as `trace_id`, the field log lines and Lookout read:
+//! a request and every job it set off, directly or through other jobs, are one
+//! trace there as well. Every driver carries the header — the database driver
+//! in a `traceparent` column of its own.
 //!
 //! # Never the payload
 //!

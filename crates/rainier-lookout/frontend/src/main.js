@@ -10,6 +10,7 @@ import Batches from './views/Batches.vue'
 import BatchDetail from './views/BatchDetail.vue'
 import Entries from './views/Entries.vue'
 import Status from './views/Status.vue'
+import Models from './views/Models.vue'
 import Issue from './views/Issue.vue'
 import Timing from './views/Timing.vue'
 import Cases from './views/Cases.vue'
@@ -27,6 +28,9 @@ const router = createRouter({
     { path: '/batches/:id', name: 'batch', component: BatchDetail, props: true },
     { path: '/entries/:type', name: 'entries', component: Entries, props: true },
     { path: '/status', name: 'status', component: Status },
+    // Every model written, and one model's changes: what made each, and its trace.
+    { path: '/models', name: 'models', component: Models },
+    { path: '/models/:model', name: 'model', component: Models, props: true },
     // One family of one type: ?key=<family key>
     // `/issues/:type/:id`; `/issues/:type?key=…`, the earlier form, still works.
     { path: '/issues/:type/:id?', name: 'issue', component: Issue, props: true },

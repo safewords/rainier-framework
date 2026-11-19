@@ -86,7 +86,8 @@ pub fn add_histogram(into: &mut Histogram, from: &Histogram) {
 /// The bucket lengths every entry is rolled into, in seconds.
 pub const PERIODS: &[u32] = &[60, 600, 3600];
 
-/// The entry types worth rolling up, and only when they have a duration.
+/// The entry types worth rolling up — timed, or (exceptions, model changes)
+/// counted.
 pub const AGGREGATED: &[EntryType] = &[
     EntryType::Request,
     EntryType::Query,
@@ -98,7 +99,14 @@ pub const AGGREGATED: &[EntryType] = &[
     EntryType::Mail,
     EntryType::Notification,
     EntryType::Exception,
+    EntryType::Model,
 ];
+
+/// The types aggregated by count alone: an exception and a model change have
+/// no duration, and are counted rather than skipped.
+fn counted_untimed(entry_type: EntryType) -> bool {
+    matches!(entry_type, EntryType::Exception | EntryType::Model)
+}
 
 /// The start of the `period_s`-second bucket holding `at`.
 pub fn bucket_start(at: DateTime<Utc>, period_s: u32) -> DateTime<Utc> {
@@ -110,8 +118,8 @@ pub fn bucket_start(at: DateTime<Utc>, period_s: u32) -> DateTime<Utc> {
 /// Roll `batches` into aggregates, one per (bucket, period, type, key).
 ///
 /// The key is the entry's family key ([`Entry::family_hash`](crate::entry::Entry::family_hash)),
-/// falling back to its summary. Exceptions are counted even without a
-/// duration.
+/// falling back to its summary. Exceptions and model changes are counted
+/// without a duration.
 pub fn rollup(batches: &[Batch]) -> Vec<Aggregate> {
     rollup_entries(batches.iter().flat_map(|b| &b.entries))
 }
@@ -125,7 +133,7 @@ pub fn rollup_entries<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> Vec<A
             if !AGGREGATED.contains(&entry.entry_type) {
                 continue;
             }
-            if entry.duration_us.is_none() && entry.entry_type != EntryType::Exception {
+            if entry.duration_us.is_none() && !counted_untimed(entry.entry_type) {
                 continue;
             }
             let duration = entry.duration_us.unwrap_or(0);

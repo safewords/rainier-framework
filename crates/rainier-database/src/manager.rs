@@ -94,6 +94,20 @@ impl DatabaseManager {
         self.connections.contains_key(name)
     }
 
+    /// Every distinct connection: the default first, then each declared one
+    /// that is not the same handle as one already listed (see
+    /// [`Database::shares_changes_with`]). What to subscribe to, to hear every
+    /// write the application makes, each once.
+    pub fn distinct_connections(&self) -> Vec<&Database> {
+        let mut distinct = vec![&self.database];
+        for database in self.connections.values() {
+            if !distinct.iter().any(|seen| seen.shares_changes_with(database)) {
+                distinct.push(database);
+            }
+        }
+        distinct
+    }
+
     /// Every declared connection name, in a stable order.
     pub fn connection_names(&self) -> impl Iterator<Item = &str> {
         self.connections.keys().map(String::as_str)
@@ -175,6 +189,22 @@ mod tests {
         // report.
         assert!(manager.connection("reportng").is_none());
         assert!(!manager.has_connection("reportng"));
+    }
+
+    #[test]
+    fn the_default_declared_by_name_is_one_distinct_connection() {
+        let (primary, _) = fake_database(MemoryConnection::new(Dialect::MySql));
+        let (reporting, _) = fake_database(MemoryConnection::new(Dialect::Postgres));
+
+        let manager = DatabaseManager::new(primary.clone())
+            .with_connection("primary", primary.clone())
+            .with_connection("reporting", reporting.clone());
+
+        let distinct = manager.distinct_connections();
+        assert_eq!(distinct.len(), 2, "the default and its name are one handle");
+        assert!(distinct[0].shares_changes_with(&primary));
+        assert!(distinct[1].shares_changes_with(&reporting));
+        assert!(!primary.shares_changes_with(&reporting));
     }
 
     #[tokio::test]

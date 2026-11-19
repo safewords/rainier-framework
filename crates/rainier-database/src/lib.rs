@@ -98,7 +98,9 @@ pub use expression::{Expression, Predicate, SubSelect};
 pub use factory::{Factory, HasFactory};
 pub use manager::DatabaseManager;
 pub use migrator::{Down, Migration, Migrator, Step};
-pub use model::{Created, Creating, Deleted, Deleting, Model, Updated, Updating};
+pub use model::{
+    Created, Creating, Deleted, Deleting, Model, ModelAction, ModelChanged, Updated, Updating,
+};
 pub use pagination::Paginated;
 pub use rainier_orm::{ChangeKind, ChangedKeys, RowChange};
 pub use raw::RawQuery;

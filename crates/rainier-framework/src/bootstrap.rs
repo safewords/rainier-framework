@@ -977,6 +977,15 @@ impl Rainier {
             }
         };
         if let Some(databases) = databases {
+            // Every committed write, through whichever connection, on the
+            // event bus as a `ModelChanged` — where an application, and
+            // Lookout, listen for model changes. Built only when something
+            // listens. Once per connection: the default is also declared by
+            // name, and two subscriptions would announce each write twice.
+            let events = app.resolve::<Dispatcher>()?;
+            for database in databases.distinct_connections() {
+                database.dispatch_changes_to(Arc::clone(&events));
+            }
             app.instance(databases.default_connection().clone());
             app.instance(databases);
         }
@@ -2872,6 +2881,44 @@ mod database_and_queue_tests {
         // …and the manager over it, with no names, because there is nothing to
         // distinguish.
         assert_eq!(app.resolve::<DatabaseManager>().unwrap().connection_names().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn every_write_is_a_model_change_on_the_bus() {
+        use rainier_database::{EntityRepository, ModelAction, ModelChanged, Repository};
+
+        #[derive(rainier_orm::Entity, Clone, Debug)]
+        #[orm(table = "posts")]
+        struct Post {
+            #[orm(pk)]
+            id: u64,
+            title: String,
+        }
+        impl rainier_database::Model for Post {}
+
+        let (database, _) = fake_database(MemoryConnection::new(Dialect::Sqlite));
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        let app = Rainier::new(".")
+            .without_facades()
+            .without_tracing()
+            .with_database(database)
+            .with_events(move |events| {
+                events.listen(move |change: Arc<ModelChanged>| {
+                    sink.lock().unwrap().push((change.model.clone(), change.action));
+                    async { Ok(()) }
+                });
+            })
+            .boot()
+            .await
+            .unwrap();
+
+        // A plain repository over the bound handle: no `with_events`.
+        let posts =
+            EntityRepository::<Post>::new(app.resolve::<Database>().unwrap().as_ref().clone());
+        posts.create(Post { id: 1, title: "Hello".into() }).await.unwrap();
+
+        assert_eq!(*heard.lock().unwrap(), [("Post".to_string(), ModelAction::Created)]);
     }
 
     #[tokio::test]
