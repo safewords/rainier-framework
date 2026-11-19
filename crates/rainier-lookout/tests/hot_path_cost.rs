@@ -7,20 +7,27 @@
 //! cargo test -p rainier-lookout --release --test hot_path_cost -- --ignored --nocapture
 //! ```
 //!
-//! Each request is a `http.server.request` span holding twenty `db.query`
-//! spans of five shapes and three `cache.get` spans — the spans the framework
-//! emits with its `telemetry` features — run through a `tracing` registry
-//! with nothing but Lookout's layer on it. The batches go to a memory store
-//! that is flushed outside the timed part, so what is measured is the request
-//! thread's share alone.
+//! Each request is a unit of work publishing what the framework publishes
+//! for one: twenty `db.query` activities of five shapes, three `cache.get`
+//! and the `http.server.request` root, built by the same constructors the
+//! database, cache and server use, on a bus with nothing but Lookout
+//! subscribed to it. Lookout hears them on its subscriber's own thread; the
+//! timed part is the request thread's share alone. The subscriber's catching
+//! up, and the writer's flush to a memory store, are measured apart.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rainier_cache::events::CacheOperation;
+use rainier_database::events::QueryExecuted;
+use rainier_events::activity::publish_activity_with;
+use rainier_events::{Dispatcher, Unit, UnitKind};
 use rainier_lookout::entry::EntryType;
 use rainier_lookout::{Lookout, LookoutConfig, MemoryStore};
-use tracing::field::Empty;
-use tracing_subscriber::layer::SubscriberExt;
+use rainier_orm::Dialect;
+use rainier_server::events::RequestHandled;
+
+const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 
 const SHAPES: &[&str] = &[
     "SELECT `posts`.* FROM `posts` WHERE `posts`.`id` = ? LIMIT ?",
@@ -31,60 +38,93 @@ const SHAPES: &[&str] = &[
 ];
 
 #[inline(never)]
-fn request(status: u16) {
-    let span = tracing::info_span!(
-        "http.server.request",
-        otel.name = "GET",
-        http.request.method = "GET",
-        url.path = "/posts/42",
-        http.route = Empty,
-        rainier.route.name = Empty,
-        http.response.status_code = Empty,
-        trace_id = Empty,
-    );
+fn request(events: &Arc<Dispatcher>, status: u16) {
+    let unit = Unit::on(events, UnitKind::Request, None, Some("/posts/42".to_string()));
+    unit.set_trace(Some(TRACE), None);
     {
-        let _entered = span.enter();
-        span.record("trace_id", "4bf92f3577b34da6a3ce929d0e0e4736");
-        span.record("http.route", "/posts/{post}");
-        span.record("rainier.route.name", "posts.show");
+        let _entered = unit.enter();
+        let started = Instant::now();
         for i in 0..20 {
-            let q = tracing::info_span!(
-                "db.query",
-                db.system.name = "mysql",
-                db.query.text = SHAPES[i % SHAPES.len()],
-                db.namespace = "app",
-                otel.status_code = Empty,
-            );
-            let _entered = q.enter();
+            let ran = Instant::now();
+            publish_activity_with(|| {
+                QueryExecuted::new(
+                    Dialect::MySql,
+                    SHAPES[i % SHAPES.len()],
+                    ran.elapsed(),
+                    Some(1),
+                    false,
+                )
+            });
         }
         for _ in 0..3 {
-            let c = tracing::info_span!(
-                "cache.get",
-                cache.operation = "get",
-                cache.store = "redis",
-                cache.key = "posts:42",
-                cache.hit = true,
-            );
-            let _entered = c.enter();
+            let ran = Instant::now();
+            publish_activity_with(|| CacheOperation {
+                kind: "cache.get",
+                operation: "get",
+                otel_name: "cache get",
+                store: "redis".to_string(),
+                key: Some("posts:42".to_string()),
+                hit: Some(true),
+                duration: ran.elapsed(),
+                error: None,
+            });
         }
+        publish_activity_with(|| RequestHandled {
+            method: "GET".to_string(),
+            path: "/posts/42".to_string(),
+            route: Some("/posts/{post}".to_string()),
+            route_name: Some("posts.show".to_string()),
+            status,
+            user_agent: None,
+            trace_id: Some(TRACE.to_string()),
+            duration: started.elapsed(),
+        });
     }
-    span.record("http.response.status_code", status);
+    // The unit's end: `UnitCompleted`, which closes the batch.
+    drop(unit);
 }
 
-fn measure(label: &str, lookout: Option<&Lookout>, status: u16, n: u32) -> Duration {
-    let subscriber = tracing_subscriber::registry().with(lookout.map(Lookout::layer));
-    tracing::subscriber::with_default(subscriber, || {
-        for _ in 0..200 {
-            request(status);
-        }
+/// A bus with `lookout` (if any) subscribed.
+fn bus(lookout: Option<&Lookout>) -> Arc<Dispatcher> {
+    let events = Arc::new(Dispatcher::new());
+    if let Some(lookout) = lookout {
+        lookout.subscribe(&events);
+    }
+    events
+}
+
+fn print(label: &str, per: Duration) {
+    println!("{label:<58} {:>8.2} µs/request", per.as_secs_f64() * 1e6);
+}
+
+/// The request thread's share per request; then, apart, the subscriber
+/// catching up and the writer's flush.
+async fn measure(label: &str, lookout: Option<&Lookout>, status: u16, n: u32) -> Duration {
+    let events = bus(lookout);
+    for _ in 0..200 {
+        request(&events, status);
+    }
+    events.settled().await;
+    if let Some(lookout) = lookout {
+        lookout.flush().await;
+    }
+    let t = Instant::now();
+    for _ in 0..n {
+        request(&events, status);
+    }
+    let per = t.elapsed() / n;
+    print(label, per);
+    if let Some(lookout) = lookout.filter(|l| l.is_enabled()) {
         let t = Instant::now();
-        for _ in 0..n {
-            request(status);
-        }
-        let per = t.elapsed() / n;
-        println!("{label:<58} {:>8.2} µs/request", per.as_secs_f64() * 1e6);
-        per
-    })
+        events.settled().await;
+        let heard = t.elapsed();
+        let t = Instant::now();
+        lookout.flush().await;
+        let written = t.elapsed();
+        print("  … the subscriber's thread, after", heard / n);
+        print("  … the writer's flush, after", written / n);
+    }
+    per
 }
 
 fn config(local: bool) -> LookoutConfig {
@@ -99,43 +139,44 @@ fn config(local: bool) -> LookoutConfig {
 async fn what_recording_costs_a_request() {
     let n = 20_000;
     let store = Arc::new(MemoryStore::new(100));
+    rainier_events::code_trace::reset();
 
-    measure("no Lookout layer", None, 200, n);
+    measure("nothing subscribed", None, 200, n).await;
 
     let off = Lookout::new(LookoutConfig::default(), store.clone());
-    measure("Lookout off", Some(&off), 200, n);
+    measure("Lookout off", Some(&off), 200, n).await;
 
     let production = Lookout::new(config(false), store.clone());
-    measure("production, an ordinary request (not kept)", Some(&production), 200, n);
-    production.flush().await;
+    measure("production, an ordinary request (not kept)", Some(&production), 200, n).await;
+
+    for threads in [1, 4] {
+        let mut sharded = config(false);
+        sharded.ingest.threads = threads;
+        let sharded = Lookout::new(sharded, store.clone());
+        let label = format!("production, Lookout on {threads} thread(s)");
+        measure(&label, Some(&sharded), 200, n).await;
+    }
 
     let local = Lookout::new(config(true), store.clone());
-    measure("local, every request kept", Some(&local), 200, n);
-    local.flush().await;
+    measure("local, every request kept", Some(&local), 200, n).await;
 
-    // Every query over its threshold: kept, with a code trace on each.
+    // Every query over its threshold: kept, with a code trace on each shape.
     let mut slow = config(false);
     slow.watchers.entry(EntryType::Query).or_default().slow_ms = Some(0);
     let slow = Lookout::new(slow, store.clone());
-    measure("production, 20 slow queries with code traces", Some(&slow), 200, 2_000);
-    let t = Instant::now();
-    slow.flush().await;
-    println!(
-        "{:<58} {:>8.2} µs/request",
-        "  … and the writer's share of those",
-        t.elapsed().as_secs_f64() * 1e6 / 2_200.0
-    );
+    measure("production, 20 slow queries with code traces", Some(&slow), 200, 2_000).await;
 
+    // The code-trace request is process-wide: withdraw the one above.
+    rainier_events::code_trace::reset();
     let mut untraced = config(false);
     untraced.watchers.entry(EntryType::Query).or_default().slow_ms = Some(0);
     untraced.capture.code_traces = false;
     let untraced = Lookout::new(untraced, store.clone());
-    measure("production, 20 slow queries, code traces off", Some(&untraced), 200, 2_000);
-    untraced.flush().await;
+    measure("production, 20 slow queries, code traces off", Some(&untraced), 200, 2_000).await;
 }
 
-/// A slow query's `code.trace` names the code that ran it — symbolised by the
-/// writer, not the request — and one batch walks at most
+/// A slow query's `code.trace` names the code that ran it — captured by the
+/// publisher, symbolised by the writer — and one batch walks at most
 /// `MAX_CODE_TRACES_PER_BATCH` stacks however many slow queries it runs.
 #[tokio::test]
 async fn slow_queries_get_one_code_trace_per_shape() {
@@ -146,8 +187,9 @@ async fn slow_queries_get_one_code_trace_per_shape() {
     let mut slow = config(false);
     slow.watchers.entry(EntryType::Query).or_default().slow_ms = Some(0);
     let lookout = Lookout::new(slow, store.clone());
-    let subscriber = tracing_subscriber::registry().with(lookout.layer());
-    tracing::subscriber::with_default(subscriber, || request(200));
+    let events = bus(Some(&lookout));
+    request(&events, 200);
+    events.settled().await;
     lookout.flush().await;
 
     let listed = store.batches(Default::default()).await.unwrap();

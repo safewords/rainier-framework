@@ -52,6 +52,8 @@ pub mod bus;
 pub mod context;
 pub mod dispatcher;
 pub mod event;
+#[cfg(feature = "log-layer")]
+pub mod log_layer;
 pub mod report;
 
 pub use activity::{code_trace, Activity, Fields, Value};

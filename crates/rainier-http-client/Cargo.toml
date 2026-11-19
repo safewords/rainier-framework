@@ -13,6 +13,8 @@ categories = ["web-programming::http-client", "web-programming"]
 
 [dependencies]
 rainier-support = { workspace = true }
+# An `HttpClientRequestSent` per attempt, on the event bus.
+rainier-events = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

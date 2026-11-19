@@ -521,16 +521,10 @@ impl Database {
         let run =
             self.read_connection().fetch(prepared.route, &prepared.sql, prepared.params, columns);
 
-        #[cfg(feature = "telemetry")]
-        return crate::telemetry::traced(
-            crate::telemetry::span(self.dialect(), &prepared.sql),
-            run,
-            |rows: &Vec<OwnedRow>| Some(rows.len()),
-        )
-        .await;
-
-        #[cfg(not(feature = "telemetry"))]
-        run.await
+        crate::events::observed(self.dialect(), &prepared.sql, run, |rows: &Vec<OwnedRow>| {
+            Some(rows.len())
+        })
+        .await
     }
 
     /// Run a prepared query and decode every row into `E`.
@@ -567,12 +561,7 @@ impl Database {
     pub async fn execute(&self, prepared: Prepared) -> Result<ExecOutcome> {
         let Prepared { sql, params, route, change } = prepared;
         let run = self.write_connection().execute(route, &sql, params);
-
-        #[cfg(feature = "telemetry")]
-        let run =
-            crate::telemetry::traced(crate::telemetry::span(self.dialect(), &sql), run, |_| None);
-
-        let outcomes = run.await?;
+        let outcomes = crate::events::observed(self.dialect(), &sql, run, |_| None).await?;
         if let Some(change) = change {
             self.notify(change).await;
         }
@@ -614,22 +603,18 @@ impl Database {
     ///
     /// Boot does this for every connection the application declares, so the
     /// event bus hears every model change and an application listens there
-    /// rather than here. The event is built only when something would hear
-    /// it ([`Dispatcher::has_listeners`](rainier_events::Dispatcher::has_listeners),
-    /// wildcards included), and delivered with
-    /// [`dispatch_quietly`](rainier_events::Dispatcher::dispatch_quietly): the
-    /// write has happened, so a failing listener is logged and cannot undo or
-    /// fail it. Call it once per handle family — see
+    /// rather than here. The event is [published](rainier_events::Dispatcher::publish_with):
+    /// fire and forget, built only when something would hear it, in the
+    /// writer's [`Context`](rainier_events::Context), and delivered after the
+    /// write has returned — a listener never delays the write, and a failing
+    /// one is logged and reported rather than failing or undoing it. Call it
+    /// once per handle family — see
     /// [`shares_changes_with`](Self::shares_changes_with) — or each change is
     /// announced once per call.
     pub fn dispatch_changes_to(&self, events: Arc<rainier_events::Dispatcher>) {
         self.on_change(move |change: RowChange| {
-            let events = Arc::clone(&events);
-            async move {
-                if events.has_listeners::<crate::ModelChanged>() {
-                    events.dispatch_quietly(crate::ModelChanged::from(change)).await;
-                }
-            }
+            events.publish_with(|| crate::ModelChanged::from(change));
+            std::future::ready(())
         });
     }
 
@@ -775,12 +760,7 @@ impl Database {
     /// Run a raw statement with no bindings — for DDL.
     pub async fn statement(&self, sql: &str) -> Result<ExecOutcome> {
         let run = self.write_connection().execute(ShardRoute::Global, sql, Vec::new());
-
-        #[cfg(feature = "telemetry")]
-        let run =
-            crate::telemetry::traced(crate::telemetry::span(self.dialect(), sql), run, |_| None);
-
-        let outcomes = run.await?;
+        let outcomes = crate::events::observed(self.dialect(), sql, run, |_| None).await?;
         Ok(outcomes.into_iter().next().unwrap_or_default())
     }
 }
@@ -954,14 +934,11 @@ impl Executor for Database {
     ) -> rainier_orm::Result<Vec<Box<dyn Row>>> {
         let run = self.read_connection().fetch_raw(route, sql, params);
 
-        #[cfg(feature = "telemetry")]
-        let run = crate::telemetry::traced(
-            crate::telemetry::span(Executor::dialect(self), sql),
-            run,
-            |rows: &Vec<Box<dyn Row>>| Some(rows.len()),
-        );
-
-        run.await.map_err(into_anyhow)
+        crate::events::observed(Executor::dialect(self), sql, run, |rows: &Vec<Box<dyn Row>>| {
+            Some(rows.len())
+        })
+        .await
+        .map_err(into_anyhow)
     }
 
     async fn execute_routed(
@@ -971,15 +948,9 @@ impl Executor for Database {
         params: Vec<Value>,
     ) -> rainier_orm::Result<ExecOutcome> {
         let run = self.write_connection().execute(route, sql, params);
-
-        #[cfg(feature = "telemetry")]
-        let run = crate::telemetry::traced(
-            crate::telemetry::span(Executor::dialect(self), sql),
-            run,
-            |_| None,
-        );
-
-        let outcomes = run.await.map_err(into_anyhow)?;
+        let outcomes = crate::events::observed(Executor::dialect(self), sql, run, |_| None)
+            .await
+            .map_err(into_anyhow)?;
         Ok(outcomes.into_iter().next().unwrap_or_default())
     }
 

@@ -495,7 +495,7 @@ impl<U: AccountUser> Accounts<U> {
 
         let user = Arc::new(creator.create(NewUser { email, password_hash, input: rest }).await?);
         self.guard.login(request, &user).await?;
-        self.announce(Registered { user: Arc::clone(&user) }).await;
+        self.announce(|| Registered { user: Arc::clone(&user) });
 
         if self.features.email_verification && !user.has_verified_email() {
             // Registration has happened; a mail server having a bad minute
@@ -532,7 +532,7 @@ impl<U: AccountUser> Accounts<U> {
 
         if let Some(hit) = limiter.peek(&key).await? {
             if hit.count >= self.features.max_login_attempts {
-                self.announce(Lockout { email, ip, retry_after: hit.resets_in }).await;
+                self.announce(|| Lockout { email, ip, retry_after: hit.resets_in });
                 return Ok(too_many(
                     "Too many login attempts. Please try again later.",
                     hit.resets_in,
@@ -554,7 +554,7 @@ impl<U: AccountUser> Accounts<U> {
 
         let Some(user) = user.filter(|_| verified) else {
             limiter.hit(&key, self.features.login_decay).await?;
-            self.announce(Failed { email, ip }).await;
+            self.announce(|| Failed { email, ip });
             return Err(Error::validation(json!({
                 "email": ["These credentials do not match our records."],
             })));
@@ -591,7 +591,7 @@ impl<U: AccountUser> Accounts<U> {
     pub(crate) async fn complete_login(&self, request: &Request, user: U) -> Result<Response> {
         let user = Arc::new(user);
         self.guard.login(request, &user).await?;
-        self.announce(Login { user, guard: self.guard.name().to_string() }).await;
+        self.announce(|| Login { user, guard: self.guard.name().to_string() });
 
         Ok(self.respond(request, StatusCode::OK, json!({ "authenticated": true }), &self.home))
     }
@@ -601,7 +601,7 @@ impl<U: AccountUser> Accounts<U> {
         let user = self.guard.user(request).await?;
         self.guard.logout(request).await?;
         if let Some(user) = user {
-            self.announce(Logout { user: Arc::new(user) }).await;
+            self.announce(|| Logout { user: Arc::new(user) });
         }
 
         Ok(if request.expects_json() {
@@ -694,7 +694,7 @@ impl<U: AccountUser> Accounts<U> {
 
         let hash = self.hasher.hash(&string(&input, "password"))?;
         self.users.set_password_hash(&user, &hash).await?;
-        self.announce(PasswordReset { user: Arc::new(user) }).await;
+        self.announce(|| PasswordReset { user: Arc::new(user) });
 
         Ok(self.respond(
             request,
@@ -726,7 +726,7 @@ impl<U: AccountUser> Accounts<U> {
 
         if !user.has_verified_email() {
             self.users.mark_email_verified(&user).await?;
-            self.announce(Verified { user: Arc::new(user) }).await;
+            self.announce(|| Verified { user: Arc::new(user) });
         }
 
         Ok(self.respond(
@@ -833,7 +833,7 @@ impl<U: AccountUser> Accounts<U> {
         if let Some(session) = request.session() {
             session.regenerate();
         }
-        self.announce(PasswordUpdated { user: Arc::new(user) }).await;
+        self.announce(|| PasswordUpdated { user: Arc::new(user) });
 
         Ok(self.respond(request, StatusCode::OK, json!({ "status": "password-updated" }), "back"))
     }
@@ -889,9 +889,12 @@ impl<U: AccountUser> Accounts<U> {
         self.guard.user(request).await?.ok_or_else(|| Error::unauthenticated("Unauthenticated."))
     }
 
-    pub(crate) async fn announce<E: Send + Sync + 'static>(&self, event: E) {
+    /// Publish an event on the accounts bus: fire-and-forget, built only
+    /// when somebody listens. Its listeners run after the response is on its
+    /// way, and nothing they do — fail, stall — reaches the request.
+    pub(crate) fn announce<E: Send + Sync + 'static>(&self, build: impl FnOnce() -> E) {
         if let Some(events) = &self.events {
-            events.dispatch_quietly(event).await;
+            events.publish_with(build);
         }
     }
 

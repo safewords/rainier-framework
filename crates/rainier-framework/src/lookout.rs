@@ -14,7 +14,8 @@
 //! adjustment on top, and — when the result is enabled:
 //!
 //! 1. builds the [`Lookout`] **before** the tracing subscriber, and installs
-//!    its layer unfiltered beside the log lines (see
+//!    [`rainier_events::log_layer::LogLayer`] beside the log lines, so log
+//!    lines reach the bus at the level Lookout asks for (see
 //!    [`TelemetrySettings::subscriber`](crate::observability::TelemetrySettings::subscriber));
 //! 2. builds the store — [`MemoryStore`], a [`DatabaseStore`] on the named
 //!    connection, or a [`CacheStore`] on the named cache store — and binds
@@ -22,7 +23,9 @@
 //! 3. reads who a request was for from the
 //!    [`Authenticated`](rainier_auth::Authenticated) marker the `Authenticate`
 //!    middleware leaves on the response;
-//! 4. listens on the application's event bus;
+//! 4. subscribes to the application's event bus ([`Lookout::subscribe`]):
+//!    one subscriber, `lookout`, hearing what each request, job, command and
+//!    scheduled task did, in the unit of work it did it in;
 //! 5. puts Lookout's middleware in the global stack, just inside `Trace`;
 //! 6. mounts the dashboard at [`Dashboard::path`](config::Dashboard::path),
 //!    outside every middleware group, behind the [`LookoutGate`] described
@@ -81,23 +84,25 @@
 //! An error in it should answer `false`: the dashboard is refused, never
 //! opened, when the check cannot be made.
 //!
-//! # A subscriber of your own
+//! # A tracing subscriber of your own
 //!
-//! An application that installs its own subscriber (or boots
-//! [`without_tracing`](crate::Rainier::without_tracing)) adds Lookout's layer
-//! to it itself; boot logs a warning saying it could not. Resolve the booted
-//! recorder and install the subscriber after boot — no request, job or
-//! command runs before boot returns, so nothing is missed:
+//! Everything but log lines reaches Lookout on the event bus, whatever
+//! subscriber the application installs. Log lines need the log layer in it:
+//! an application that installs its own (or boots
+//! [`without_tracing`](crate::Rainier::without_tracing)) adds the layer
+//! itself, and boot logs a warning saying it could not:
 //!
 //! ```ignore
 //! let app = Rainier::new(".").without_tracing().boot().await?;
-//! let lookout = app.resolve::<rainier_framework::lookout::Lookout>()?;
-//! tracing_subscriber::registry().with(my_layers).with(lookout.layer()).init();
+//! tracing_subscriber::registry()
+//!     .with(my_layers)
+//!     .with(rainier_events::log_layer::LogLayer::new())
+//!     .init();
 //! ```
 //!
-//! Keep `RUST_LOG` off Lookout's layer: a global filter decides for every
-//! layer, and Lookout needs the `info` spans a `warn` filter would drop. Put
-//! the filter on your own layers with `.with_filter(...)`.
+//! Keep `RUST_LOG` off the log layer: a global filter decides for every
+//! layer, and would drop the lines below its level that Lookout asked for.
+//! Put the filter on your own layers with `.with_filter(...)`.
 
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -384,11 +389,28 @@ pub(crate) fn build_store(app: &Application, kind: &config::StoreKind) -> Result
     })
 }
 
+/// The layer boot adds to the tracing subscriber for Lookout: log lines on
+/// the bus ([`rainier_events::log_layer`]), at the level Lookout asks for.
+///
+/// Only events reach it, and the spans that mark Lookout's own work — what
+/// it needs to skip lines written inside them. Every other span stays as
+/// `RUST_LOG` has it: the layer's filter is its own, so it neither builds
+/// spans nobody else wanted nor switches off any that another layer wants.
+pub(crate) fn log_layer() -> crate::observability::SubscriberLayer {
+    use rainier_events::log_layer::{LogLayer, INTERNAL_FIELD};
+    use tracing_subscriber::Layer as _;
+    LogLayer::new()
+        .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+            meta.is_event() || meta.fields().field(INTERNAL_FIELD).is_some()
+        }))
+        .boxed()
+}
+
 /// The store the recorder writes to, filled in once boot has built the real
 /// one.
 ///
-/// The recorder has to exist before the tracing subscriber — its layer is
-/// part of it — and the subscriber has to exist before boot opens databases
+/// The recorder has to exist before the tracing subscriber — whether the
+/// subscriber carries the log layer depends on it — and the subscriber has to exist before boot opens databases
 /// and caches, so their failures are logged. The store needs those databases
 /// and caches. So the recorder starts with this, and boot fills it in; the
 /// writer is not started until it has been.

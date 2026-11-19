@@ -180,6 +180,22 @@ Http::get(url).through(Arc::clone(&other)).send().await?;
 A transport reports **transport** failures. A `500` from the other end is a
 successful send of a request that got an unhappy answer.
 
+## Events
+
+Every attempt a transport makes — the real one and the fake alike, so a retry
+is one event per attempt — publishes an `HttpClientRequestSent` on the
+[event bus](events.md), whether or not the `telemetry` feature is on. Its kind
+is `http.client.request`, and it carries the span's fields under the same
+names: `otel.name` (the method), `otel.kind`, `http.request.method`,
+`server.address`, `server.port`, `url.scheme`, `url.full` **without its query
+or credentials**, `http.response.status_code`, and `otel.status_code` with
+`error.type` (the status for a 4xx/5xx, the error's kind for a transport
+failure). Plus its duration and, for an attempt slower than a threshold a
+subscriber asked for, a code trace of where it was sent from.
+
+With nothing subscribed (and without `telemetry`), a send asks the bus once
+and runs the transport's own future — no copy of the URL, no clock read.
+
 ## What is not here
 
 **No connection pooling knobs, no proxy configuration, no cookie jar, no

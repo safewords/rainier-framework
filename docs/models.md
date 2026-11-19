@@ -336,8 +336,11 @@ key."` — so a `404` says which model it was about.
 
 ## Lifecycle hooks
 
-A repository built `with_events` dispatches events through the
-[dispatcher](events.md) around every write it makes. This is how the classic ORM lifecycle hooks —
+A repository built `with_events` raises events on the
+[dispatcher](events.md) around every write it makes: the `-ing` hooks are
+**dispatched** and awaited before the write, so a listener can veto it; the
+`-ed` hooks are **published** after it — fire and forget, so a listener never
+delays or fails a write that has already happened. This is how the classic ORM lifecycle hooks —
 creating, created, saved, deleted — are spelled here.
 
 Each is a **distinct type**, so a listener registers for exactly the moment it
@@ -350,22 +353,27 @@ events.listen(|event: Arc<Created<Post>>| async move {
 });
 ```
 
-| Event | When | Returning `Err` |
-|---|---|---|
-| `Creating<M>` | before an insert | **cancels it** |
-| `Created<M>` | after a successful insert | surfaces to the caller |
-| `Updating<M>` | before an update | **cancels it** |
-| `Updated<M>` | after a successful update | surfaces to the caller |
-| `Deleting<M>` | before a delete | **cancels it** |
-| `Deleted<M>` | after a successful delete | surfaces to the caller |
+| Event | When | Delivered | Returning `Err` |
+|---|---|---|---|
+| `Creating<M>` | before an insert | dispatched, awaited | **cancels it** |
+| `Created<M>` | after a successful insert | published | logged and reported; the caller never sees it |
+| `Updating<M>` | before an update | dispatched, awaited | **cancels it** |
+| `Updated<M>` | after a successful update | published | logged and reported; the caller never sees it |
+| `Deleting<M>` | before a delete | dispatched, awaited | **cancels it** |
+| `Deleted<M>` | after a successful delete | published | logged and reported; the caller never sees it |
+
+A published hook's listeners run after `create`/`update`/`delete` has
+returned, in the writer's [context](events.md), so a test that asserts on one
+waits for delivery first with `events.settled().await`.
 
 ```mermaid
 flowchart LR
     A["repository.create(post)"] --> B["dispatch Creating&lt;Post&gt;"]
     B -->|any listener Err| C[no write happens,<br/>the error propagates]
     B -->|all Ok| D[INSERT]
-    D --> E["dispatch Created&lt;Post&gt;"]
+    D --> E["publish Created&lt;Post&gt;"]
     E --> F[return the model]
+    E -.->|after returning| G[Created listeners run]
 
     style C fill:#633,stroke:#a66,color:#fff
 ```
@@ -408,16 +416,58 @@ nothing else is needed. It is one type for every model, so one listener hears
 them all; a [wildcard listener](events.md#listening) hears it too.
 
 - **When**: once the write has succeeded — inside a
-  [transaction](database.md#transactions), once it commits, and never if it rolls back —
-  on the task that made it, so a listener runs inside the request or job
-  responsible.
+  [transaction](database.md#transactions), once it commits, and never if it rolls back.
+  It is **published**, fire and forget: listeners run after the write has
+  returned, with the [context](events.md) of the task that made it, so a
+  listener still sees the request or job responsible.
 - **What it carries**: `model` (the short type name, or the table for a change
   described by table alone), `model_type` (the full path), `table`, `action`
   and `keys`. Not the row: the ORM keeps no copy of what a row held, and a bulk
   write never loaded one. Use the typed hooks when you need the model.
-- **A failing listener** is logged and cannot fail or undo the write.
+- **A failing listener** is logged and reported, and cannot delay, fail or
+  undo the write.
 - **Cost**: the event is built only when something listens. SQL passed as a
   string is not seen.
+
+#### One model, one row: `on_model`
+
+To react to one model — or one row of it — without matching on `change.model`
+yourself, subscribe declaratively with the `OnModel` extension on the
+dispatcher:
+
+```rust
+use rainier_database::{ModelAction, OnModel};
+
+// Every time user 42 is updated or deleted, from any repository or none.
+events
+    .on_model::<User>()
+    .key(42)
+    .actions(&[ModelAction::Updated, ModelAction::Deleted])
+    .run(|change, _cx| async move {
+        sessions.revoke_for_user(42).await?;
+        Ok(())
+    });
+
+// Synchronous, every action, any row of `Post`.
+events.on_model::<Post>().run_sync(|change, _cx| {
+    search_index.mark_stale(change.keys.as_deref());
+    Ok(())
+});
+```
+
+- **Which model**: a change built for `User` names its type, and that is what
+  matches; a change described by table alone matches on `User`'s table.
+- **`key`**: the primary key as `ModelChanged` carries it — an integer in
+  decimal, a string as it is. Call it again, or use `keys([..])`, to watch
+  several rows. A write that did not say which rows it touched
+  (`update_matching`, an insert whose key the database assigns) **also
+  matches**, because it may have touched this row — its `keys` is `None`.
+- **`actions`**: `Created`, `Updated`, `Upserted`, `Deleted`; every action when
+  left out.
+- It is a subscriber like any other (`events.on::<ModelChanged>().when(..)`
+  underneath): its own thread, run after the write returns, and an `Err` is
+  logged and reported. Each `on_model(..).run(..)` is one subscriber thread, so
+  for many rows prefer one subscription with `keys([..])` over one per row.
 
 Outside an application, `db.dispatch_changes_to(events)` does what boot does
 for one handle (see [hearing about writes](repositories.md#hearing-about-writes)).
@@ -451,8 +501,9 @@ impl Post {
 }
 ```
 
-**A `-ed` hook cannot roll back.** It runs after a successful write; returning
-`Err` surfaces to the caller but the row is already there. Use it for things
+**A `-ed` hook cannot roll back.** It is published after a successful write
+and runs once the write has returned; returning `Err` is logged and reported,
+and the caller never sees it — the row is already there. Use it for things
 that follow the write — raising a domain event, queueing a job — not for
 things the write depends on.
 

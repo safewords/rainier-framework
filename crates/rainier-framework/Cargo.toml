@@ -166,29 +166,11 @@ telemetry = [
 ]
 # Lookout: the opt-in diagnostics suite — every request, query, job, cache
 # call and failure recorded per unit of work and browsable at `/_lookout`.
-# Turns on the same per-component spans `telemetry` does, but **not** the OTLP
-# exporter: Lookout reads the spans in-process. Combine with `telemetry` to
-# export them as well. See `docs/lookout.md`.
-lookout = [
-    "dep:rainier-lookout",
-    "rainier-support/telemetry",
-    "rainier-server/telemetry",
-    "rainier-routing/telemetry",
-    "rainier-http-client/telemetry",
-    "rainier-database/telemetry",
-    "rainier-cache/telemetry",
-    "rainier-queue/telemetry",
-    "rainier-mail/telemetry",
-    "rainier-notify/telemetry",
-    "rainier-events/telemetry",
-    "rainier-broadcast/telemetry",
-    "rainier-filesystem/telemetry",
-    "rainier-scheduler/telemetry",
-    "rainier-console/telemetry",
-    "rainier-session/telemetry",
-    "rainier-auth/telemetry",
-    "rainier-view/telemetry",
-]
+# Lookout is a subscriber on the event bus, which the framework publishes on
+# whatever features are on, and hears log lines through `rainier-events`' log
+# layer. It needs no `telemetry`: that feature is OpenTelemetry — spans and
+# the OTLP exporter — and is independent of Lookout. See `docs/lookout.md`.
+lookout = ["dep:rainier-lookout", "rainier-events/log-layer"]
 # Stripe: customers, Checkout, the billing portal, subscriptions, payment
 # intents and refunds over the framework's outbound client, plus verified,
 # deduplicated webhooks dispatched onto the event bus. See `rainier_billing`.

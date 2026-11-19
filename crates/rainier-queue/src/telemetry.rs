@@ -1,5 +1,7 @@
-//! Job performance — spans, timings and a [`QueueObserver`] — behind the
-//! `telemetry` feature.
+//! Job performance — spans, timings and a [`QueueObserver`]. The spans and
+//! the observer port's wiring are behind the `telemetry` feature; the types
+//! here are always compiled, because the bus's [`JobRan`](crate::events::JobRan)
+//! reports the same outcome and wait.
 //!
 //! "The job is slow" has four different causes, and a single span per job
 //! cannot tell them apart:
@@ -83,6 +85,19 @@ pub enum JobOutcome {
 }
 
 impl JobOutcome {
+    /// How an attempt that returned `result` ended; `timed_out` when it ran
+    /// past its timeout.
+    pub(crate) fn of(result: &rainier_support::Result<crate::Outcome>, timed_out: bool) -> Self {
+        use crate::Outcome;
+        match result {
+            Err(_) => JobOutcome::Error,
+            Ok(Outcome::Released | Outcome::Failed) if timed_out => JobOutcome::TimedOut,
+            Ok(Outcome::Released) => JobOutcome::Released,
+            Ok(Outcome::Failed) => JobOutcome::Failed,
+            Ok(Outcome::Processed | Outcome::Idle) => JobOutcome::Processed,
+        }
+    }
+
     /// The label value — `processed`, `released`, `failed`, `timed_out`.
     pub fn as_str(self) -> &'static str {
         match self {

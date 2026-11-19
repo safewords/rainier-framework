@@ -108,6 +108,7 @@
 pub mod connections;
 pub mod database;
 pub mod driver;
+pub mod events;
 pub mod job;
 #[cfg(feature = "kafka")]
 pub mod kafka;
@@ -119,7 +120,6 @@ pub mod redis;
 mod reporting;
 #[cfg(feature = "sqs")]
 pub mod sqs;
-#[cfg(feature = "telemetry")]
 pub mod telemetry;
 pub mod worker;
 
@@ -129,6 +129,7 @@ pub use connections::{
 };
 pub use database::{DatabaseQueue, FailedJobRow, JobRow};
 pub use driver::QueueDriver;
+pub use events::{JobQueued, JobRan};
 pub use job::{Job, JobContext, JobRegistry, QueuedJob};
 #[cfg(feature = "kafka")]
 pub use kafka::{require_shared as require_shared_locks, KafkaQueue};
@@ -144,7 +145,6 @@ pub use queue::{FailedJob, MemoryQueue, Queue};
 pub use redis::{Keys as RedisQueueKeys, RedisQueue};
 #[cfg(feature = "sqs")]
 pub use sqs::SqsQueue;
-#[cfg(feature = "telemetry")]
 pub use telemetry::{JobOutcome, JobTiming, QueueObserver};
 pub use worker::{
     JobFailed, JobProcessed, JobProcessing, JobReleased, Outcome, Worker, WorkerOptions,

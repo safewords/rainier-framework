@@ -50,7 +50,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Once, RwLock};
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use crossbeam_queue::SegQueue;
@@ -91,7 +91,23 @@ struct Item {
     activity: Option<AsActivity>,
 }
 
-/// A subscriber: its handlers, its inbox, and the thread that drains it.
+/// One of a subscriber's threads: its inbox, and whether it is mid-event.
+struct Shard {
+    inbox: SegQueue<Item>,
+    started: Once,
+    /// Events taken off the inbox and not yet finished (async handlers
+    /// included), plus one while the thread is looking. Only the subscriber's
+    /// own threads touch it: the publisher's push is the push alone.
+    busy: AtomicU64,
+}
+
+impl Shard {
+    fn new() -> Self {
+        Self { inbox: SegQueue::new(), started: Once::new(), busy: AtomicU64::new(0) }
+    }
+}
+
+/// A subscriber: its handlers, its inboxes, and the threads that drain them.
 pub(crate) struct Core {
     name: String,
     typed: HashMap<TypeId, Vec<TypedHandler>>,
@@ -100,13 +116,11 @@ pub(crate) struct Core {
     /// Registered with `listen`/`listen_any`: `dispatch` runs it inline, so
     /// a dispatched event is not also sent here.
     inline: bool,
-    inbox: SegQueue<Item>,
-    started: Once,
-    /// Set when the subscriber is forgotten: its thread finishes the inbox
-    /// and ends.
+    /// One per thread. Events of one unit of work always go to the same one.
+    shards: Box<[Shard]>,
+    /// Set when the subscriber is forgotten: its threads finish their inboxes
+    /// and end.
     retired: AtomicBool,
-    sent: AtomicU64,
-    handled: AtomicU64,
     failed: AtomicU64,
 }
 
@@ -118,41 +132,50 @@ impl Core {
             any: Vec::new(),
             activities: Vec::new(),
             inline,
-            inbox: SegQueue::new(),
-            started: Once::new(),
+            shards: vec![Shard::new()].into_boxed_slice(),
             retired: AtomicBool::new(false),
-            sent: AtomicU64::new(0),
-            handled: AtomicU64::new(0),
             failed: AtomicU64::new(0),
         }
     }
 
+    fn set_threads(&mut self, threads: usize) {
+        self.shards = (0..threads.clamp(1, 64)).map(|_| Shard::new()).collect();
+    }
+
     #[inline]
     fn send(self: &Arc<Self>, item: Item) {
-        self.sent.fetch_add(1, Ordering::Relaxed);
-        self.inbox.push(item);
-        if !self.started.is_completed() {
-            self.start();
+        let index = match self.shards.len() {
+            1 => 0,
+            n => (item.cx.partition() % n as u64) as usize,
+        };
+        let shard = &self.shards[index];
+        shard.inbox.push(item);
+        if !shard.started.is_completed() {
+            self.start(index);
         }
     }
 
-    /// Spawn the subscriber's thread, once. Happens on the first event it is
-    /// sent — the only time a publish does anything beyond a push.
+    /// Spawn one of the subscriber's threads, once. Happens on the first
+    /// event it is sent — the only time a publish does anything beyond a
+    /// push.
     #[cold]
-    fn start(self: &Arc<Self>) {
-        self.started.call_once(|| {
+    fn start(self: &Arc<Self>, index: usize) {
+        self.shards[index].started.call_once(|| {
             let core = Arc::clone(self);
-            let name = format!("rainier-sub-{}", core.name);
+            let name = match self.shards.len() {
+                1 => format!("rainier-sub-{}", core.name),
+                _ => format!("rainier-sub-{}-{index}", core.name),
+            };
             let spawned = std::thread::Builder::new()
                 .name(name.chars().take(60).collect())
-                .spawn(move || core.run());
+                .spawn(move || core.run(index));
             if let Err(error) = spawned {
                 tracing::error!(subscriber = %self.name, %error, "could not start a subscriber thread");
             }
         });
     }
 
-    fn run(self: Arc<Self>) {
+    fn run(self: Arc<Self>, index: usize) {
         let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -161,12 +184,22 @@ impl Core {
             }
         };
         runtime.block_on(async move {
+            let shard = &self.shards[index];
             let mut idle = 0u32;
             loop {
                 let mut worked = false;
-                while let Some(item) = self.inbox.pop() {
+                loop {
+                    // Counted busy before looking, so `settled` never sees an
+                    // empty inbox and an idle thread between the pop and the
+                    // handling.
+                    shard.busy.fetch_add(1, Ordering::AcqRel);
+                    let Some(item) = shard.inbox.pop() else {
+                        shard.busy.fetch_sub(1, Ordering::AcqRel);
+                        break;
+                    };
                     worked = true;
-                    self.handle(item);
+                    self.handle(index, item);
+                    shard.busy.fetch_sub(1, Ordering::AcqRel);
                 }
                 if worked {
                     idle = 0;
@@ -174,7 +207,7 @@ impl Core {
                     tokio::task::yield_now().await;
                     continue;
                 }
-                if self.retired.load(Ordering::Acquire) && self.inbox.is_empty() {
+                if self.retired.load(Ordering::Acquire) && shard.inbox.is_empty() {
                     break;
                 }
                 idle = idle.saturating_add(1);
@@ -185,13 +218,13 @@ impl Core {
                 }
             }
             // Let async handlers already running finish.
-            while self.handled.load(Ordering::Acquire) < self.sent.load(Ordering::Acquire) {
+            while shard.busy.load(Ordering::Acquire) > 0 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         });
     }
 
-    fn handle(self: &Arc<Self>, item: Item) {
+    fn handle(self: &Arc<Self>, index: usize, item: Item) {
         let mut pending = Vec::new();
         let mut failures = Vec::new();
         if let Some(handlers) = self.typed.get(&item.type_id) {
@@ -217,6 +250,7 @@ impl Core {
         }
         // On this subscriber's own runtime: a stalled handler stalls only
         // itself, and the next event is taken off the inbox meanwhile.
+        self.shards[index].busy.fetch_add(1, Ordering::AcqRel);
         let core = Arc::clone(self);
         tokio::spawn(async move {
             for future in pending {
@@ -225,6 +259,7 @@ impl Core {
                 }
             }
             core.finish(item, failures);
+            core.shards[index].busy.fetch_sub(1, Ordering::AcqRel);
         });
     }
 
@@ -246,11 +281,10 @@ impl Core {
         // every handler: what makes `UnitCompleted` mean "all delivered".
         drop(cx);
         drop(payload);
-        self.handled.fetch_add(1, Ordering::Release);
     }
 
     fn settled(&self) -> bool {
-        self.handled.load(Ordering::Acquire) >= self.sent.load(Ordering::Acquire)
+        self.shards.iter().all(|s| s.inbox.is_empty() && s.busy.load(Ordering::Acquire) == 0)
     }
 }
 
@@ -646,6 +680,17 @@ impl Subscriber<'_> {
         self
     }
 
+    /// Run the subscriber on `threads` threads instead of one — for a
+    /// subscriber with more work per event than one thread keeps up with.
+    /// Every event of one unit of work goes to the same thread, in order, its
+    /// [`UnitCompleted`](crate::UnitCompleted) last; events outside every
+    /// unit are spread by the thread that published them. The publisher's
+    /// cost is unchanged: one push.
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.core.set_threads(threads);
+        self
+    }
+
     /// Register the subscriber. Its thread starts with the first event it is
     /// sent.
     pub fn start(self) {
@@ -799,8 +844,7 @@ fn short(name: &'static str) -> &'static str {
 
 // --- the process-wide bus -----------------------------------------------------
 
-static INSTALLED: RwLock<Option<Arc<Dispatcher>>> = RwLock::new(None);
-static HAS_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static INSTALLED: arc_swap::ArcSwapOption<Dispatcher> = arc_swap::ArcSwapOption::const_empty();
 
 thread_local! {
     static OVERRIDE: std::cell::RefCell<Vec<Arc<Dispatcher>>> =
@@ -811,16 +855,31 @@ thread_local! {
 /// unit, and what framework components with no dispatcher of their own
 /// publish on. Boot does this; the last call wins.
 pub fn install(events: Arc<Dispatcher>) {
-    *INSTALLED.write().expect("bus lock poisoned") = Some(events);
-    HAS_INSTALLED.store(true, Ordering::Release);
+    INSTALLED.store(Some(events));
 }
 
 /// The installed process-wide bus, if any.
 pub fn installed() -> Option<Arc<Dispatcher>> {
-    if !HAS_INSTALLED.load(Ordering::Acquire) {
-        return None;
+    INSTALLED.load_full()
+}
+
+/// Run `f` with the bus the calling code publishes on — the current unit's,
+/// else this thread's [`set_default`], else the [`install`]ed one — borrowed:
+/// no lock, and no reference count touched. What every hot-path publish goes
+/// through.
+#[inline]
+pub fn with_bus<R>(f: impl FnOnce(&Dispatcher) -> R) -> Option<R> {
+    let mut f = Some(f);
+    if let Ok(result) = Context::with_unit_events(|events| (f.take().expect("called once"))(events))
+    {
+        return Some(result);
     }
-    INSTALLED.read().expect("bus lock poisoned").clone()
+    let f = f.expect("not called");
+    if let Ok(Some(events)) = OVERRIDE.try_with(|o| o.borrow().last().cloned()) {
+        return Some(f(&events));
+    }
+    let guard = INSTALLED.load();
+    guard.as_ref().map(|events| f(events))
 }
 
 /// Make `events` the bus for this thread until the guard drops — a test's
@@ -866,9 +925,7 @@ pub fn bus() -> Option<Arc<Dispatcher>> {
 /// nobody subscribed, the event is never built.
 #[inline]
 pub fn publish_with<E: Event>(build: impl FnOnce() -> E) {
-    if let Some(events) = bus() {
-        events.publish_with(build);
-    }
+    with_bus(|events| events.publish_with(build));
 }
 
 /// [`publish_with`] for an event already built.
@@ -881,5 +938,5 @@ pub fn publish<E: Event>(event: E) {
 /// gather data before building its event asks first.
 #[inline]
 pub fn has_subscribers<E: Event>() -> bool {
-    bus().is_some_and(|events| events.has_subscribers::<E>())
+    with_bus(|events| events.has_subscribers::<E>()).unwrap_or(false)
 }

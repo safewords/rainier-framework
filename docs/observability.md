@@ -638,8 +638,10 @@ settings.install_logging(&app.environment(), &env.string("RUST_LOG", "info"));
 
 `RUST_LOG` filters the log lines (and, with `telemetry`, the exporter) as a
 **per-layer** filter rather than one over the whole subscriber, so a layer
-installed beside them with `install_logging_with` — [Lookout's](lookout.md#the-subscriber)
-— still sees the `info` spans a `warn` filter keeps out of the log.
+installed beside them with `install_logging_with` — the
+[log layer](#log-lines-on-the-event-bus) boot adds for
+[Lookout](lookout.md#the-subscriber) — still sees the `info` lines a `warn`
+filter keeps out of the log.
 `TelemetrySettings::subscriber` builds the same subscriber without installing
 it.
 
@@ -647,6 +649,22 @@ It returns whether it installed one. `false` means a subscriber was already set
 — by the application, or by an earlier boot in the same test binary — and that
 one is left alone, because replacing somebody else's logging configuration is
 worse than not installing yours.
+
+### Log lines on the event bus
+
+With `rainier-events`' `log-layer` feature, `rainier_events::log_layer::LogLayer`
+is a `tracing_subscriber::Layer` that publishes log events as `LogWritten`
+activities (kind `log`; fields `level`, `target`, `message` and the event's own
+fields) on the current [event bus](events.md), in the unit of work that wrote
+them. It does nothing until a subscriber asks with
+`log_layer::request_level(Level::WARN)` — the most verbose level asked for
+wins — and then publishes only events at or above it. It never switches a
+callsite off for the other layers, and it skips anything inside a span that
+declares `rainier.lookout.internal`.
+
+With the `lookout` feature and Lookout on, boot adds it to the subscriber it
+installs, behind a filter that passes only events and the spans that mark
+Lookout's own work, and Lookout asks for `LOOKOUT_LOG_LEVEL`.
 
 ### With tracing on, every line carries the trace id
 

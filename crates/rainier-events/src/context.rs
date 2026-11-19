@@ -36,7 +36,7 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Instant, SystemTime};
 
@@ -83,8 +83,10 @@ pub struct Unit {
     started: Instant,
     started_at: SystemTime,
     /// The bus to publish [`UnitCompleted`] on, and to resolve
-    /// [`bus`](crate::bus) to while this unit is current.
-    events: OnceLock<Weak<Dispatcher>>,
+    /// [`bus`](crate::bus) to while this unit is current. Held strongly so
+    /// resolving it on the hot path is a borrow, not a reference-count
+    /// change every thread contends on.
+    events: OnceLock<Arc<Dispatcher>>,
     /// Families a code trace has been taken for in this unit.
     traced: std::sync::Mutex<Vec<u64>>,
 }
@@ -117,7 +119,7 @@ impl Unit {
         path: Option<String>,
     ) -> Arc<Self> {
         let unit = Self::new(kind, name, path);
-        let _ = unit.events.set(Arc::downgrade(events));
+        let _ = unit.events.set(Arc::clone(events));
         unit
     }
 
@@ -142,10 +144,10 @@ impl Unit {
         if !opens {
             return None;
         }
-        let events = current
-            .as_ref()
-            .and_then(|u| u.events.get().and_then(Weak::upgrade))
-            .or_else(crate::bus::installed);
+        // The current unit's bus, else this thread's `set_default`, else the
+        // installed one.
+        let events =
+            current.as_ref().and_then(|u| u.events.get().cloned()).or_else(crate::bus::bus);
         Some(match events {
             Some(events) => Self::on(&events, kind, name, path),
             None => Self::new(kind, name, path),
@@ -231,7 +233,7 @@ impl Unit {
 
     /// The bus this unit publishes on, if it was opened with one.
     pub fn events(&self) -> Option<Arc<Dispatcher>> {
-        self.events.get().and_then(Weak::upgrade)
+        self.events.get().cloned()
     }
 
     /// Run `future` with this unit current.
@@ -256,9 +258,9 @@ impl Unit {
 
 impl Drop for Unit {
     fn drop(&mut self) {
-        let Some(events) = self.events.get().and_then(Weak::upgrade) else { return };
+        let Some(events) = self.events.take() else { return };
         events.publish_in(
-            Context::none(),
+            Context::completed(self.id),
             UnitCompleted {
                 id: self.id,
                 kind: self.kind,
@@ -343,6 +345,9 @@ impl Default for Operation {
 #[derive(Clone)]
 pub struct Context {
     unit: Option<Arc<Unit>>,
+    /// The unit's id — kept apart so [`UnitCompleted`], whose unit is gone,
+    /// still names it.
+    unit_id: Option<u64>,
     parent: Option<u64>,
     at: SystemTime,
 }
@@ -357,12 +362,56 @@ impl Context {
             Some(frame) => (frame.unit.clone(), frame.op),
             None => (None, None),
         });
-        Self { unit, parent, at: SystemTime::now() }
+        let unit_id = unit.as_ref().map(|u| u.id);
+        Self { unit, unit_id, parent, at: SystemTime::now() }
     }
 
     /// No unit, no parent: an event raised outside every unit of work.
     pub fn none() -> Self {
-        Self { unit: None, parent: None, at: SystemTime::now() }
+        Self { unit: None, unit_id: None, parent: None, at: SystemTime::now() }
+    }
+
+    /// The context [`UnitCompleted`] is published in: no unit — it is gone —
+    /// but its id, so a subscriber spread over threads gets the completion on
+    /// the thread that had the unit's events.
+    pub(crate) fn completed(id: u64) -> Self {
+        Self { unit: None, unit_id: Some(id), parent: None, at: SystemTime::now() }
+    }
+
+    /// The id of the unit the event belongs to — for an event with a unit,
+    /// its id; for [`UnitCompleted`], the completed unit's.
+    pub fn unit_id(&self) -> Option<u64> {
+        self.unit_id
+    }
+
+    /// Which of a multi-threaded subscriber's threads gets this event: by
+    /// unit, else by publishing thread.
+    #[inline]
+    pub(crate) fn partition(&self) -> u64 {
+        match self.unit_id {
+            Some(id) => id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32,
+            None => thread_partition(),
+        }
+    }
+
+    /// Run `f` with the current unit's dispatcher, borrowed — no reference
+    /// count touched. `None` outside every unit, or in one opened without a
+    /// dispatcher.
+    #[inline]
+    pub(crate) fn with_unit_events<R>(f: impl FnOnce(&Arc<Dispatcher>) -> R) -> Result<R, ()> {
+        STACK
+            .try_with(|stack| {
+                let stack = stack.borrow();
+                match stack
+                    .last()
+                    .and_then(|frame| frame.unit.as_ref())
+                    .and_then(|u| u.events.get())
+                {
+                    Some(events) => Ok(f(events)),
+                    None => Err(()),
+                }
+            })
+            .unwrap_or(Err(()))
     }
 
     /// The innermost unit the calling code runs in.
@@ -482,6 +531,14 @@ impl<F> std::fmt::Debug for Scoped<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Scoped").field("unit", &self.frame.unit).finish_non_exhaustive()
     }
+}
+
+/// A per-thread number, for spreading events with no unit.
+fn thread_partition() -> u64 {
+    thread_local! {
+        static PARTITION: u64 = next_id().wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
+    }
+    PARTITION.try_with(|p| *p).unwrap_or(0)
 }
 
 fn next_id() -> u64 {

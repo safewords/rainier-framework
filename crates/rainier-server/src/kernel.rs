@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use rainier_events::report::HttpRequestFailed;
-use rainier_events::{Exception, Failure, Reporter};
+use rainier_events::{Dispatcher, Exception, Failure, Reporter, UnitKind};
 use rainier_http::{http, OriginalError, RenderedError, Request, Response, StatusCode};
 use rainier_middleware::{Destination, Middleware, MiddlewareRegistry, Pipeline, ReadyPipeline};
 use rainier_routing::{CompiledRouter, MatchedRoute};
@@ -119,6 +119,8 @@ pub struct Kernel {
     pipeline: ReadyPipeline,
     renderer: Arc<dyn ExceptionRenderer>,
     reporter: Option<Reporter>,
+    /// The bus each request's unit of work publishes on.
+    events: Option<Arc<Dispatcher>>,
     debug: bool,
 }
 
@@ -144,6 +146,7 @@ impl Kernel {
             pipeline: Pipeline::new().through_all(global).then_arc(destination),
             renderer: Arc::new(DefaultExceptionRenderer),
             reporter: None,
+            events: None,
             debug: false,
         }
     }
@@ -183,6 +186,20 @@ impl Kernel {
     /// only logged otherwise.
     pub fn with_reporter(mut self, reporter: Reporter) -> Self {
         self.reporter = Some(reporter);
+        self
+    }
+
+    /// Open each request's unit of work on `events`, the application's
+    /// dispatcher: what the request's activities — [`RequestHandled`]
+    /// included — are published on, and where
+    /// [`UnitCompleted`](rainier_events::UnitCompleted) follows.
+    ///
+    /// Without one, a request's unit publishes on the process-wide bus
+    /// ([`rainier_events::install`]), when one is installed.
+    ///
+    /// [`RequestHandled`]: crate::events::RequestHandled
+    pub fn with_events(mut self, events: Arc<Dispatcher>) -> Self {
+        self.events = Some(events);
         self
     }
 
@@ -302,11 +319,60 @@ impl Kernel {
     /// here — whether or not its message is disclosable, since which errors
     /// are worth reporting is the reporter's policy, not the renderer's.
     pub async fn handle_request(&self, request: Request) -> Response {
+        // The request's unit of work: what everything published while it is
+        // handled — by middleware, the handler, deferred work — names as its
+        // request. Its trace is known now when a caller sent one; otherwise
+        // the `Trace` middleware records the one it starts.
+        let path = request.path().to_string();
+        let unit = crate::events::open_unit(
+            self.events.as_ref(),
+            UnitKind::Request,
+            None,
+            Some(path.clone()),
+        );
+        let Some(unit) = unit else { return self.handle_published(request, path).await };
+        if let Some(traceparent) =
+            request.header("traceparent").filter(|h| crate::events::is_traceparent(h))
+        {
+            unit.set_trace(None, Some(traceparent));
+        }
+        unit.scope(self.handle_published(request, path)).await
+    }
+
+    /// [`handle_request`](Self::handle_request) inside the request's unit,
+    /// publishing [`RequestHandled`](crate::events::RequestHandled) when the
+    /// response is ready.
+    async fn handle_published(&self, request: Request, path: String) -> Response {
+        let started = std::time::Instant::now();
+        // Gathered only for a listener: nothing is copied for nobody.
+        let user_agent =
+            rainier_events::activity::has_activity_subscribers::<crate::events::RequestHandled>()
+                .then(|| request.header("user-agent").map(str::to_string))
+                .flatten();
+        let method = request.method().as_str().to_string();
+        let response = self.handle_rendered(request, &method, &path).await;
+
+        rainier_events::activity::publish_activity_with(|| {
+            let matched = response.extensions().get::<MatchedRoute>();
+            crate::events::RequestHandled {
+                method,
+                path,
+                route: matched.map(|m| m.uri.clone()),
+                route_name: matched.and_then(|m| m.name.clone()),
+                status: response.status().as_u16(),
+                user_agent,
+                trace_id: rainier_events::Context::current_unit()
+                    .and_then(|unit| unit.trace_id().map(str::to_string)),
+                duration: started.elapsed(),
+            }
+        });
+        response
+    }
+
+    async fn handle_rendered(&self, request: Request, method: &str, path: &str) -> Response {
         // Snapshot what the renderer and the reporter need before the
         // pipeline takes the request.
         let expects_json = request.expects_json();
-        let method = request.method().as_str().to_string();
-        let path = request.path().to_string();
         let response = self.handle(request).await;
 
         let Some(error) = response.extensions().get::<RenderedError>().cloned() else {
@@ -321,7 +387,7 @@ impl Kernel {
             };
             let route =
                 response.extensions().get::<MatchedRoute>().map(|matched| matched.uri.clone());
-            self.report(exception, method, path, route).await;
+            self.report(exception, method.to_string(), path.to_string(), route).await;
         }
 
         if error.disclosable && expects_json {
@@ -339,7 +405,14 @@ impl Kernel {
             tracing::error!(status = error.status, error = %error.message, "server error");
         }
 
-        let rendered = self.renderer.render(&stand_in, &error, self.debug);
+        let mut rendered = self.renderer.render(&stand_in, &error, self.debug);
+        // The route rides on, for what reads it after the kernel — the
+        // request's `RequestHandled`.
+        if let Some(matched) = response.extensions().get::<MatchedRoute>() {
+            if rendered.extensions().get::<MatchedRoute>().is_none() {
+                rendered.extensions_mut().insert(matched.clone());
+            }
+        }
         carry_over_headers(&response, rendered)
     }
 

@@ -748,8 +748,8 @@ impl Rainier {
             return Err(error);
         }
 
-        // Lookout is built before the subscriber, because its layer is part
-        // of it. Its store needs databases and caches that do not exist yet,
+        // Lookout is built before the subscriber, which carries its log
+        // lines. Its store needs databases and caches that do not exist yet,
         // so it starts on a deferred one that is filled in below.
         #[cfg(feature = "lookout")]
         let lookout = {
@@ -766,20 +766,22 @@ impl Rainier {
         };
         #[allow(unused_mut, reason = "only the `lookout` feature adds a layer")]
         let mut layers: Vec<crate::observability::SubscriberLayer> = Vec::new();
+        // Log lines on the bus, at the level Lookout asks for when it
+        // subscribes. Only events reach the layer, and the spans that mark
+        // Lookout's own work: every other span stays as `RUST_LOG` has it.
         #[cfg(feature = "lookout")]
-        if let Some((lookout, _)) = &lookout {
-            use tracing_subscriber::Layer as _;
-            layers.push(lookout.layer().boxed());
+        if lookout.is_some() {
+            layers.push(crate::lookout::log_layer());
         }
         let has_layers = !layers.is_empty();
 
         let installed = self.install_tracing && install_tracing(&self.env, &self.config, layers);
         if has_layers && !installed {
             tracing::warn!(
-                "lookout: Lookout's layer is not in the tracing subscriber — one was already \
-                 installed, or the application boots without tracing — so nothing will be \
-                 recorded until the application adds `Lookout::layer()` to its own (see \
-                 docs/lookout.md)"
+                "lookout: the log layer is not in the tracing subscriber — one was already \
+                 installed, or the application boots without tracing — so Lookout records no \
+                 log lines until the application adds `rainier_events::log_layer::LogLayer` \
+                 to its own (see docs/lookout.md)"
             );
         }
 
@@ -1034,7 +1036,7 @@ impl Rainier {
                     .get::<rainier_auth::Authenticated>()
                     .map(|who| (who.guard.clone(), Some(who.user_id.clone())))
             });
-            lookout.listen(app.resolve::<Dispatcher>()?.as_ref());
+            lookout.subscribe(&app.resolve::<Dispatcher>()?);
             app.instance(store);
             app.instance(lookout.clone());
         }
@@ -1043,6 +1045,18 @@ impl Rainier {
         // resolves a service gets one a provider bound.
         for provider in self.providers {
             app.register_arc(provider)?;
+        }
+
+        // The application's dispatcher, now that the providers have
+        // registered their listeners, as the process-wide bus: what a unit
+        // of work opened without a dispatcher in hand — a job run by the
+        // `sync` driver, a query outside every request — publishes on, and
+        // what framework code with no handle to the application publishes
+        // to. The kernel, the worker, the console and the scheduler open
+        // their units on this same dispatcher directly. Like the reporter,
+        // left alone by an application that leaves the facades alone.
+        if self.install_facades {
+            rainier_events::install(app.resolve::<Dispatcher>()?);
         }
 
         // The `public/` directory, if this application has one.
@@ -1162,9 +1176,12 @@ impl Rainier {
 
         let settings_for_kernel = app.resolve::<Config>()?;
         let debug = settings_for_kernel.get_or(keys::APP_DEBUG, false);
+        // Each request a unit of work on the application's bus, with its
+        // `RequestHandled`.
         let mut kernel = Kernel::from_shared(Arc::clone(&compiled), global)
             .with_debug(debug)
-            .with_reporter(reporter.clone());
+            .with_reporter(reporter.clone())
+            .with_events(app.resolve::<Dispatcher>()?);
 
         // The exception renderer, in order of preference:
         //
@@ -1921,6 +1938,45 @@ mod tests {
         let response =
             kernel.handle_request(Request::builder().method(Method::GET).uri("/").build()).await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_request_is_a_unit_of_work_on_the_applications_dispatcher() {
+        use rainier_events::{Context, UnitCompleted, UnitKind};
+        use rainier_server::RequestHandled;
+
+        let app = app().await;
+        let events = app.resolve::<Dispatcher>().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (a, b) = (Arc::clone(&seen), Arc::clone(&seen));
+        events
+            .subscriber("test")
+            .on(move |handled: &RequestHandled, cx: &Context| {
+                let unit = cx.unit().map(|u| (u.id(), u.kind()));
+                a.lock().unwrap().push((handled.route.clone(), unit));
+                Ok(())
+            })
+            .on(move |done: &UnitCompleted, _| {
+                b.lock().unwrap().push((None, Some((done.id, done.kind))));
+                Ok(())
+            })
+            .start();
+
+        let kernel = app.resolve::<Kernel>().unwrap();
+        kernel.handle_request(Request::builder().method(Method::GET).uri("/posts/7").build()).await;
+
+        for _ in 0..2000 {
+            events.settled().await;
+            if seen.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0].0.as_deref(), Some("/posts/{post}"));
+        assert_eq!(seen[0].1.map(|u| u.1), Some(UnitKind::Request));
+        assert_eq!(seen[0].1, seen[1].1, "UnitCompleted follows, for the same unit");
     }
 
     #[tokio::test]
@@ -2918,6 +2974,8 @@ mod database_and_queue_tests {
             EntityRepository::<Post>::new(app.resolve::<Database>().unwrap().as_ref().clone());
         posts.create(Post { id: 1, title: "Hello".into() }).await.unwrap();
 
+        // Published, not awaited: the listener runs on its own thread.
+        app.resolve::<rainier_events::Dispatcher>().unwrap().settled().await;
         assert_eq!(*heard.lock().unwrap(), [("Post".to_string(), ModelAction::Created)]);
     }
 

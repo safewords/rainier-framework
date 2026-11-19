@@ -58,9 +58,10 @@
 //! Derive values in the model's own constructor, or in the repository, where
 //! there is exactly one place to look.
 //!
-//! A `-ed` hook (`Created`, `Updated`, `Deleted`) runs **after** a successful
-//! write. Returning `Err` from one does not roll anything back; it only
-//! surfaces to the caller.
+//! A `-ed` hook (`Created`, `Updated`, `Deleted`) is **published** after a
+//! successful write: fire and forget, so its listeners run after the write
+//! has returned and never delay it. Returning `Err` from one rolls nothing
+//! back and does not reach the caller; it is logged and reported.
 
 use std::any::type_name;
 
@@ -239,9 +240,12 @@ mod tests {
 /// });
 /// ```
 ///
-/// It is announced once the write has succeeded — inside a transaction, once
-/// it commits, and never if it rolls back — on the task that made the write,
-/// so a listener runs inside the request or job responsible. What a row held
+/// It is published once the write has succeeded — inside a transaction, once
+/// it commits, and never if it rolls back — in the [`Context`](rainier_events::Context)
+/// of the task that made the write, so a listener sees the request or job
+/// responsible. Publishing is fire and forget: listeners run after the write
+/// has returned. To hear one model, or one row of it, see
+/// [`OnModel::on_model`](crate::OnModel::on_model). What a row held
 /// is not carried: the ORM keeps no copy of it, and a bulk write never loaded
 /// one. SQL passed as a string is not seen. Boot forwards every connection's
 /// writes to the application's dispatcher; see

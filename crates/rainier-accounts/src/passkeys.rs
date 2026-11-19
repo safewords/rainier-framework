@@ -158,11 +158,10 @@ impl<U: AccountUser> Accounts<U> {
         verified.apply_to(&mut credential);
         passkeys.store.update_passkey(&credential).await?;
 
-        self.announce(PasskeyUsed {
+        self.announce(|| PasskeyUsed {
             user_id: stored.user_id,
             credential_id: credential.id_base64url(),
-        })
-        .await;
+        });
         self.complete_login(request, user).await
     }
 
@@ -209,7 +208,7 @@ impl<U: AccountUser> Accounts<U> {
             name => name.chars().take(100).collect(),
         };
         passkeys.store.store_passkey(&user, &name, &credential).await?;
-        self.announce(PasskeyRegistered { user: Arc::new(user), name }).await;
+        self.announce(|| PasskeyRegistered { user: Arc::new(user), name });
 
         Ok(Response::json(&json!({ "id": credential.id_base64url() }))
             .with_status(StatusCode::CREATED))
@@ -225,7 +224,7 @@ impl<U: AccountUser> Accounts<U> {
         if !self.passkeys()?.store.delete_passkey(&user, &credential_id).await? {
             return Err(Error::not_found("No such passkey."));
         }
-        self.announce(PasskeyDeleted { user: Arc::new(user), credential_id: id }).await;
+        self.announce(|| PasskeyDeleted { user: Arc::new(user), credential_id: id });
 
         Ok(Response::no_content())
     }

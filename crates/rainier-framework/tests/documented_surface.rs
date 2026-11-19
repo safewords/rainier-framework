@@ -183,6 +183,51 @@ fn queued_listeners(events: &rainier_framework::events::Dispatcher, queue: Arc<Q
     events.listen_queued_on::<UserRegistered, SendWelcomeEmail>(queue);
 }
 
+/// `docs/events.md` — the bus: publish, subscribe, context, activities.
+#[allow(dead_code, reason = "compiling is the point")]
+fn the_bus(events: &Arc<rainier_framework::events::Dispatcher>) {
+    use rainier_framework::database::QueryExecuted;
+    use rainier_framework::events::{Context, UnitCompleted};
+
+    events.publish(UserRegistered { user_id: 1 });
+    events.publish_with(|| UserRegistered { user_id: 2 });
+    rainier_framework::events::publish(UserRegistered { user_id: 3 });
+
+    events.on::<UserRegistered>().when(|e| e.user_id == 42).run(
+        |e: Arc<UserRegistered>, cx: Context| async move {
+            let _ = (e.user_id, cx.unit().map(|u| u.id()), cx.trace_id(), cx.parent());
+            Ok(())
+        },
+    );
+    events
+        .subscriber("metrics")
+        .threads(2)
+        .on(|q: &QueryExecuted, _cx| {
+            let _ = (q.duration, q.sql());
+            Ok(())
+        })
+        .on(|done: &UnitCompleted, _cx| {
+            let _ = (done.id, done.kind, done.duration);
+            Ok(())
+        })
+        .on_activity(|activity, _cx| {
+            let _ = (activity.kind(), activity.duration(), activity.collect_fields());
+            Ok(())
+        })
+        .start();
+
+    drop(tokio::spawn(Context::current().scope(async {})));
+}
+
+/// `docs/events.md` / `docs/models.md` — one model's, one row's changes.
+#[allow(dead_code, reason = "compiling is the point")]
+fn on_one_row<M: rainier_framework::database::Model>(
+    events: &rainier_framework::events::Dispatcher,
+) {
+    use rainier_framework::database::{ModelAction, OnModel};
+    events.on_model::<M>().key(42).actions(&[ModelAction::Updated]).run_sync(|_, _| Ok(()));
+}
+
 /// `docs/scheduling.md` — the lock check.
 #[allow(dead_code, reason = "compiling is the point")]
 fn the_lock_check(app: &Application) -> Result<()> {

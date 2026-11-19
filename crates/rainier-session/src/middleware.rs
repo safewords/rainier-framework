@@ -133,6 +133,10 @@ impl StartSession {
             rainier.session.store = self.store.name(),
             rainier.session.found = tracing::field::Empty,
         );
+        // And a `SessionOperation` for whoever subscribes; with nobody, no
+        // clock read.
+        let events = crate::events::listening();
+        let started = events.as_ref().map(|_| std::time::Instant::now());
         let read = self.store.read(&id);
         #[cfg(feature = "telemetry")]
         let read = tracing::Instrument::instrument(read, span.clone());
@@ -143,6 +147,12 @@ impl StartSession {
                 span.record("rainier.session.found", found.is_some());
             }
             Err(error) => rainier_support::telemetry::record_error(&span, error),
+        }
+        if let (Some(events), Some(started)) = (events, started) {
+            let duration = started.elapsed();
+            events.publish_activity_with(|| {
+                crate::events::SessionOperation::load(self.store.name(), &read, duration)
+            });
         }
 
         match read {
@@ -185,15 +195,18 @@ impl StartSession {
     /// Returns the cookie value to send, which for a client-side store *is* the
     /// session.
     async fn save(&self, session: &Session) -> Result<String> {
+        let events = crate::events::listening();
+        let started = events.as_ref().map(|_| std::time::Instant::now());
+
         #[cfg(feature = "telemetry")]
-        {
+        let saved = {
             let span = rainier_support::span!(
                 "session.save",
                 otel.name = "session save",
                 rainier.session.store = self.store.name(),
             );
             let traced = span.clone();
-            return tracing::Instrument::instrument(
+            tracing::Instrument::instrument(
                 async move {
                     rainier_support::telemetry::record_result(
                         &traced,
@@ -202,11 +215,19 @@ impl StartSession {
                 },
                 span,
             )
-            .await;
-        }
+            .await
+        };
 
         #[cfg(not(feature = "telemetry"))]
-        self.save_untraced(session).await
+        let saved = self.save_untraced(session).await;
+
+        if let (Some(events), Some(started)) = (events, started) {
+            let duration = started.elapsed();
+            events.publish_activity_with(|| {
+                crate::events::SessionOperation::save(self.store.name(), &saved, duration)
+            });
+        }
+        saved
     }
 
     async fn save_untraced(&self, session: &Session) -> Result<String> {
@@ -933,5 +954,96 @@ mod tests {
 
         assert_eq!(response.status(), rainier_http::StatusCode::OK);
         assert_eq!(*writes.lock().unwrap(), 1, "an absent session is still replaced and saved");
+    }
+
+    // --- events ---------------------------------------------------------------
+
+    /// Every `SessionOperation` published on `events`: kind, fields, failed.
+    #[allow(clippy::type_complexity)]
+    fn heard_sessions(
+        events: &rainier_events::Dispatcher,
+    ) -> Arc<Mutex<Vec<(&'static str, rainier_events::Fields, bool)>>> {
+        use rainier_events::Activity as _;
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        events.on::<crate::SessionOperation>().run_sync(move |op, _| {
+            sink.lock().unwrap().push((op.kind(), op.collect_fields(), op.failed()));
+            Ok(())
+        });
+        heard
+    }
+
+    #[tokio::test]
+    async fn a_save_and_a_load_are_published_with_the_spans_fields_and_never_the_id() {
+        let events = Arc::new(rainier_events::Dispatcher::new());
+        let _bus = rainier_events::bus::set_default(Arc::clone(&events));
+        let heard = heard_sessions(&events);
+        let (start, _store) = middleware();
+
+        let first = run(&start, Request::builder().build(), |request| {
+            Box::pin(async move {
+                request.session().unwrap().put("user_id", 7u64).unwrap();
+                Response::text("ok")
+            })
+        })
+        .await;
+        let id = session_cookie(&first).unwrap();
+        run(
+            &start,
+            Request::builder().header("cookie", &format!("rainier_session={id}")).build(),
+            |_| Box::pin(async move { Response::text("ok") }),
+        )
+        .await;
+        events.settled().await;
+
+        let heard = heard.lock().unwrap();
+        let kinds: Vec<_> = heard.iter().map(|(kind, _, _)| *kind).collect();
+        assert_eq!(kinds, ["session.save", "session.load"], "no cookie, nothing to load first");
+        let save = &heard[0].1;
+        assert_eq!(save.text("otel.name"), Some("session save"));
+        assert_eq!(save.text("rainier.session.store"), Some("memory"));
+        let load = &heard[1].1;
+        assert_eq!(load.text("otel.name"), Some("session load"));
+        assert_eq!(load.get("rainier.session.found"), Some(&rainier_events::Value::Bool(true)));
+        assert!(heard.iter().all(|(_, _, failed)| !failed));
+        assert!(!format!("{heard:?}").contains(&id), "never the session id");
+    }
+
+    #[tokio::test]
+    async fn a_failed_load_is_published_failed() {
+        let events = Arc::new(rainier_events::Dispatcher::new());
+        let _bus = rainier_events::bus::set_default(Arc::clone(&events));
+        let heard = heard_sessions(&events);
+        let store = Arc::new(UnreadableStore::new());
+        let start = Arc::new(StartSession::new(store as Arc<dyn SessionStore>));
+        let (request, _) = with_session_cookie(&SessionConfig::default());
+
+        run(&start, request, |_| Box::pin(async move { Response::text("ok") })).await;
+        events.settled().await;
+
+        let heard = heard.lock().unwrap();
+        assert_eq!(heard[0].0, "session.load");
+        assert!(heard[0].2);
+        assert_eq!(heard[0].1.text("otel.status_code"), Some("ERROR"));
+        assert_eq!(heard[0].1.text("error.type"), Some("service_unavailable"));
+        assert_eq!(heard[0].1.get("rainier.session.found"), None);
+    }
+
+    #[tokio::test]
+    async fn with_nobody_subscribed_nothing_is_built() {
+        let events = Arc::new(rainier_events::Dispatcher::new());
+        let _bus = rainier_events::bus::set_default(Arc::clone(&events));
+        events.on::<String>().run_sync(|_, _| Ok(()));
+        assert!(crate::events::listening().is_none());
+
+        let (start, store) = middleware();
+        run(&start, Request::builder().build(), |request| {
+            Box::pin(async move {
+                request.session().unwrap().put("k", 1u64).unwrap();
+                Response::text("ok")
+            })
+        })
+        .await;
+        assert_eq!(store.len(), 1);
     }
 }

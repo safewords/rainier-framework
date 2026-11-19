@@ -1,9 +1,8 @@
 use super::*;
 
 use rainier_auth::{Authenticate, Credentials, TokenGuard, UserProvider};
+use rainier_events::Dispatcher;
 use rainier_http::StatusCode;
-use tracing_subscriber::layer::SubscriberExt as _;
-use tracing_subscriber::Layer as _;
 
 use crate::observability::TelemetrySettings;
 use crate::testing::TestApp;
@@ -72,13 +71,25 @@ fn builder() -> Rainier {
         router.get("/posts/{post}", || async { "post" }).name("posts.show");
         router
             .get("/slow", || async {
-                let span = tracing::info_span!(
-                    "db.query",
-                    db.system.name = "sqlite",
-                    db.query.text = "SELECT * FROM posts WHERE id = ?",
+                // What the database publishes for a statement, in the
+                // request's unit of work.
+                rainier_events::activity::publish_activity(
+                    rainier_database::events::QueryExecuted::new(
+                        rainier_orm::Dialect::Sqlite,
+                        "SELECT * FROM posts WHERE id = ?",
+                        std::time::Duration::from_millis(5),
+                        Some(1),
+                        false,
+                    ),
                 );
-                let _entered = span.enter();
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                tracing::info!("served slowly");
+                // Lookout's own work, and anything under it: not recorded.
+                let internal =
+                    tracing::info_span!("lookout.flush", rainier.lookout.internal = true);
+                let _internal = internal.enter();
+                let nested = tracing::info_span!("inner");
+                let _nested = nested.enter();
+                tracing::warn!("lookout's own");
                 "slow"
             })
             .name("slow");
@@ -86,17 +97,13 @@ fn builder() -> Rainier {
     })
 }
 
+/// What Lookout stored, once the bus has delivered everything published so
+/// far to its subscriber.
 async fn batches(app: &TestApp) -> Vec<BatchSummary> {
+    app.resolve::<Dispatcher>().unwrap().settled().await;
     app.resolve::<Lookout>().unwrap().flush().await;
     let store = app.resolve::<Arc<dyn Store>>().unwrap();
     store.batches(BatchQuery::default()).await.unwrap()
-}
-
-/// The booted recorder's layer, as the current thread's subscriber — the
-/// tests boot `without_tracing`, so the global one is not theirs to set.
-fn record(app: &TestApp) -> tracing::subscriber::DefaultGuard {
-    let lookout = app.resolve::<Lookout>().unwrap();
-    tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()))
 }
 
 #[tokio::test]
@@ -135,7 +142,6 @@ async fn a_bad_setting_fails_the_boot_and_names_itself() {
 #[tokio::test]
 async fn a_request_through_the_kernel_becomes_a_batch_with_its_route_and_status() {
     let app = TestApp::new(builder().with_lookout(on(true)).boot().await.unwrap()).unwrap();
-    let _recording = record(&app);
 
     app.get("/posts/1").await.assert_ok();
     app.get("/nowhere").await.assert_not_found();
@@ -152,7 +158,6 @@ async fn a_request_through_the_kernel_becomes_a_batch_with_its_route_and_status(
 #[tokio::test]
 async fn an_authenticated_request_carries_its_guard_and_user() {
     let app = TestApp::new(builder().with_lookout(on(true)).boot().await.unwrap()).unwrap();
-    let _recording = record(&app);
 
     app.send(
         rainier_http::Request::builder()
@@ -173,7 +178,6 @@ async fn an_authenticated_request_carries_its_guard_and_user() {
 #[tokio::test]
 async fn the_dashboard_is_open_locally() {
     let app = TestApp::new(builder().with_lookout(on(true)).boot().await.unwrap()).unwrap();
-    let _recording = record(&app);
 
     app.get("/_lookout").await.assert_ok();
     app.get("/_lookout/api/status").await.assert_ok();
@@ -260,17 +264,21 @@ async fn outside_local_a_viewer_predicate_decides_from_the_user_and_the_request(
 }
 
 #[tokio::test]
-async fn the_framework_subscriber_lets_lookout_see_info_spans_under_a_warn_filter() {
-    let app = TestApp::new(builder().with_lookout(on(true)).boot().await.unwrap()).unwrap();
-    let lookout = app.resolve::<Lookout>().unwrap();
+async fn lookout_hears_the_bus_and_info_log_lines_under_a_warn_filter() {
+    let app = builder()
+        .with_lookout(|config| LookoutConfig { log_level: "info".into(), ..on(true)(config) })
+        .boot()
+        .await
+        .unwrap();
+    let app = TestApp::new(app).unwrap();
 
     // What boot installs globally, built with `RUST_LOG=warn` and set for
-    // this thread only.
+    // this thread only: the log layer beside the log lines.
     let subscriber = TelemetrySettings::from_config(&Config::new()).subscriber(
         "production",
         "warn",
         None,
-        vec![lookout.layer().boxed()],
+        vec![log_layer()],
     );
     let _recording = tracing::subscriber::set_default(subscriber);
 
@@ -278,13 +286,20 @@ async fn the_framework_subscriber_lets_lookout_see_info_spans_under_a_warn_filte
 
     let found = batches(&app).await;
     let slow = found.iter().find(|b| b.route_name.as_deref() == Some("slow"));
-    let slow = slow.unwrap_or_else(|| panic!("the info request span was filtered: {found:#?}"));
-    assert_eq!(slow.counts.get(&EntryType::Query), Some(&1), "the info db.query span too");
+    let slow = slow.unwrap_or_else(|| panic!("no batch for the request: {found:#?}"));
+    assert_eq!(slow.counts.get(&EntryType::Query), Some(&1), "the query, from the bus");
 
     let store = app.resolve::<Arc<dyn Store>>().unwrap();
     let batch = store.batch(&slow.id).await.unwrap().expect("stored");
     let query = batch.entries.iter().find(|e| e.entry_type == EntryType::Query).expect("query");
     assert!(query.summary.contains("SELECT"), "{}", query.summary);
+    let roots = batch.entries.iter().filter(|e| e.entry_type == EntryType::Request).count();
+    assert_eq!(roots, 1, "one request entry per request: {:#?}", batch.entries);
+    let log = batch.entries.iter().find(|e| e.entry_type == EntryType::Log);
+    let log = log.unwrap_or_else(|| panic!("the info line was filtered: {:#?}", batch.entries));
+    assert!(log.summary.contains("served slowly"), "{}", log.summary);
+    let logs = batch.entries.iter().filter(|e| e.entry_type == EntryType::Log).count();
+    assert_eq!(logs, 1, "nothing from inside Lookout's own work: {:#?}", batch.entries);
 }
 
 #[tokio::test]

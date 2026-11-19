@@ -22,8 +22,9 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
-# A flush that fails is reported on the bus; only the exporter can fail one.
-rainier-events = { workspace = true, optional = true }
+# The trace goes onto the request's unit of work, and a flush that fails is
+# reported on the bus.
+rainier-events = { workspace = true }
 
 [features]
 default = []
@@ -33,7 +34,6 @@ otlp = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
     "dep:tracing-subscriber",
-    "dep:rainier-events",
 ]
 
 [dev-dependencies]

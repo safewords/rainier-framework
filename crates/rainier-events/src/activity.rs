@@ -247,9 +247,7 @@ impl crate::Dispatcher {
 /// [`Dispatcher::publish_activity_with`] on the current [`bus`](crate::bus).
 #[inline]
 pub fn publish_activity_with<E: Activity>(build: impl FnOnce() -> E) {
-    if let Some(events) = crate::bus::bus() {
-        events.publish_activity_with(build);
-    }
+    crate::bus::with_bus(|events| events.publish_activity_with(build));
 }
 
 /// [`publish_activity_with`] for an event already built.
@@ -262,7 +260,7 @@ pub fn publish_activity<E: Activity>(event: E) {
 /// `E` — what a publisher that must gather data first asks.
 #[inline]
 pub fn has_activity_subscribers<E: Activity>() -> bool {
-    crate::bus::bus().is_some_and(|events| events.has_activity_subscribers::<E>())
+    crate::bus::with_bus(|events| events.has_activity_subscribers::<E>()).unwrap_or(false)
 }
 
 // --- code traces ----------------------------------------------------------------
@@ -295,14 +293,16 @@ pub mod code_trace {
     }
 
     /// A backtrace of the calling code, when `elapsed` is over the requested
-    /// threshold and this unit has not already had one for `family`.
+    /// threshold and this unit has not already had one for the statement
+    /// `family` names. `family` is only called past the threshold, so a fast
+    /// operation builds nothing.
     #[inline]
-    pub fn capture(elapsed: Duration, family: &str) -> Option<Arc<Backtrace>> {
+    pub fn capture(elapsed: Duration, family: impl FnOnce() -> String) -> Option<Arc<Backtrace>> {
         let threshold = THRESHOLD_US.load(Ordering::Relaxed);
         if threshold == u64::MAX || (elapsed.as_micros() as u64) < threshold {
             return None;
         }
-        capture_slow(family)
+        capture_slow(&family())
     }
 
     #[cold]

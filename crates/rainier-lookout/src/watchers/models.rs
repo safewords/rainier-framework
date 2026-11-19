@@ -8,10 +8,9 @@
 //! `rainier_orm::repo` makes, including the ones no typed hook sees: a
 //! repository built without `with_events`, `update_matching`,
 //! `delete_matching`, a counter increment. Lookout is one listener of it,
-//! like any other ([`Lookout::listen`] registers it), and each change becomes
+//! like any other ([`Lookout::subscribe`] registers it), and each change becomes
 //! a [`Model`](EntryType::Model) entry in the batch whose work made it — the
-//! event is dispatched on the task that wrote, inside the request's or the
-//! job's span:
+//! event carries the unit of work (request, job) the write was made in:
 //!
 //! - **model** — the entity's short type name, `Post`; its full path is
 //!   `model_type`. A change described by table alone is named by its table.
@@ -26,7 +25,7 @@
 //! model's writes per action, in batches that were kept and in those that were
 //! only counted. What a row held before or after is not recorded: the ORM
 //! keeps no copy of the original row. A rolled-back write is never announced;
-//! SQL passed as a string is not seen; a write with no batch around it
+//! SQL passed as a string is not seen; a write outside every unit of work
 //! (Lookout's own store, a task outside any request or job) records nothing.
 
 use chrono::Utc;
@@ -117,20 +116,32 @@ pub fn summarize(rows: &[crate::entry::Aggregate]) -> Vec<ModelSummary> {
 }
 
 impl Lookout {
-    /// Record one model change in the current batch — what Lookout's
-    /// [`ModelChanged`] listener does. A no-op outside a batch, or with the
+    /// Record one model change in the batch of the unit of work the calling
+    /// code runs in — what Lookout's [`ModelChanged`] handler does for a
+    /// change heard on the bus. A no-op outside a unit of work, or with the
     /// model watcher off.
     ///
     /// Public so a write the bus does not hear — SQL passed as a string — can
-    /// be described and recorded by the code that made it. Dispatching the
-    /// [`ModelChanged`] yourself does the same, and every other listener hears
-    /// it too.
+    /// be described and recorded by the code that made it. Publishing the
+    /// [`ModelChanged`] yourself does the same, and every other subscriber
+    /// hears it too.
     pub fn record_model_change(&self, change: &ModelChanged) {
+        let unit = rainier_events::Context::current_unit();
+        self.record_model_change_in(unit.as_ref(), change);
+    }
+
+    /// Record a model change made in `unit`.
+    pub(crate) fn record_model_change_in(
+        &self,
+        unit: Option<&std::sync::Arc<rainier_events::Unit>>,
+        change: &ModelChanged,
+    ) {
         let inner = &self.inner;
-        if !inner.active() {
+        let Some(unit) = unit else { return };
+        let Some(cell) = inner.cell_for(unit) else { return };
+        if cell.ignored {
             return;
         }
-        let Some(cell) = inner.current_batch() else { return };
         let watcher = inner.config.watcher(EntryType::Model);
         if !watcher.enabled || !crate::recorder::sample(watcher.sample_rate) {
             return;

@@ -3898,6 +3898,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4006,6 +4007,7 @@ dependencies = [
 name = "rainier-http-client"
 version = "2.0.0"
 dependencies = [
+ "rainier-events",
  "rainier-support",
  "rainier-telemetry",
  "reqwest",
@@ -4045,7 +4047,6 @@ dependencies = [
  "subtle",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -4239,6 +4240,7 @@ dependencies = [
  "chrono",
  "rainier-cache",
  "rainier-container",
+ "rainier-events",
  "rainier-support",
  "tokio",
  "tracing",
@@ -4359,6 +4361,7 @@ dependencies = [
 name = "rainier-view"
 version = "2.0.0"
 dependencies = [
+ "rainier-events",
  "rainier-support",
  "serde",
  "serde_json",
@@ -4370,6 +4373,7 @@ name = "rainier-websocket"
 version = "2.0.0"
 dependencies = [
  "async-trait",
+ "rainier-events",
  "rainier-http",
  "rainier-support",
  "serde",

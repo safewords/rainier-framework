@@ -42,10 +42,12 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod events;
 pub mod kernel;
 pub mod server;
 pub mod upgrade;
 
+pub use events::RequestHandled;
 pub use kernel::{read_body, DefaultExceptionRenderer, ExceptionRenderer, Kernel};
 pub use server::{Server, ServerOptions};
 pub use upgrade::{accept_key, is_websocket_upgrade};

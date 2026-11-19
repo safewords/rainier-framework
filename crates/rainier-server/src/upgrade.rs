@@ -234,7 +234,12 @@ async fn run<S>(
         rainier_support::span!("websocket.connect", otel.name = "websocket connect"),
     );
 
-    if let Err(e) = connected.await {
+    let started = std::time::Instant::now();
+    let connected = connected.await;
+    rainier_events::activity::publish_activity_with(|| {
+        rainier_websocket::WebSocketConnected::new(started.elapsed(), &connected)
+    });
+    if let Err(e) = connected {
         if is_disconnect(&e) {
             tracing::debug!(socket = %id, path, "the client left during on_connect");
         } else {
@@ -343,10 +348,21 @@ async fn run<S>(
                                 rainier_websocket::Message::Close(_) => 0,
                             },
                         );
+                        // Before the message moves into the handler.
+                        let shape = rainier_websocket::WebSocketMessageHandled::shape(&message);
+                        let started = std::time::Instant::now();
                         let handled = handler.on_message(&socket, message);
                         #[cfg(feature = "telemetry")]
                         let handled = tracing::Instrument::instrument(handled, span);
-                        if let Err(e) = handled.await {
+                        let handled = handled.await;
+                        rainier_events::activity::publish_activity_with(|| {
+                            rainier_websocket::WebSocketMessageHandled::new(
+                                shape,
+                                started.elapsed(),
+                                &handled,
+                            )
+                        });
+                        if let Err(e) = handled {
                             if is_disconnect(&e) {
                                 // A send found the client gone; the handler
                                 // passed that up. The connection has ended.
@@ -721,6 +737,47 @@ mod tests {
         running.await.unwrap();
 
         assert_eq!(*handler.sizes.lock().unwrap(), vec![big, 5]);
+    }
+
+    #[tokio::test]
+    async fn connect_and_each_message_are_published_as_activities() {
+        use rainier_events::Dispatcher;
+
+        let events = Arc::new(Dispatcher::new());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        events.on_activity("test", move |activity, _| {
+            let fields = activity.collect_fields();
+            sink.lock().unwrap().push(format!(
+                "{} {} {}",
+                activity.kind(),
+                fields.text("rainier.websocket.kind").unwrap_or("-"),
+                fields.get("rainier.websocket.bytes").map(|v| v.render()).unwrap_or_default(),
+            ));
+            Ok(())
+        });
+        // This thread's bus: the test runtime runs the spawned connection here.
+        let _bus = rainier_events::set_default(Arc::clone(&events));
+
+        let (server, client) = tokio::io::duplex(4096);
+        let server =
+            WebSocketStream::from_raw_socket(server, Role::Server, Some(socket_config())).await;
+        let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let running = tokio::spawn(run(
+            Arc::new(Measures::default()),
+            server,
+            "/ws/events".into(),
+            Vec::new(),
+            Liveness::default(),
+        ));
+        client.send(WsMessage::Text("hello".into())).await.unwrap();
+        client.close(None).await.unwrap();
+        running.await.unwrap();
+        events.settled().await;
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen[0], "websocket.connect - ");
+        assert_eq!(seen[1], "websocket.message text 5");
     }
 
     #[test]

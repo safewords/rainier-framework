@@ -742,6 +742,29 @@ rendering explicit at the framework seam, where you can see and test them.
 `repo::` and the query builder work directly against a `Database` too, and a
 test asserts it.
 
+## Events
+
+Published on the [event bus](events.md) whether or not the `telemetry`
+feature is on, and built only when something subscribes:
+
+| Event | Kind | When |
+|---|---|---|
+| `QueryExecuted` | `db.query` | every statement through a `Database` handle — repositories, `Criteria`, raw SQL, the migrator |
+| `ModelChanged` | — | every committed write; see [models](models.md#every-write-modelchanged) |
+| `Created<M>`, `Updated<M>`, `Deleted<M>` | — | after a write by a repository built `with_events` (`Creating<M>`/… are dispatched and awaited instead) |
+
+`QueryExecuted` is an [activity](events.md) carrying the `db.query` span's
+fields under the same names — `otel.name` (`SELECT users`), `otel.kind`,
+`db.system.name`, `db.operation.name`, `db.collection.name`, `db.query.text`
+(sanitised: every literal is `?`, and the bound values are never carried),
+`db.response.returned_rows` for a read, and `otel.status_code = "ERROR"` with
+`error.type = "db_error"` on a failure — plus its duration and, for a statement
+slower than a threshold a subscriber asked for, a code trace of where it was
+run from.
+
+With nobody subscribed a statement pays one question to the bus: no clock
+read, no sanitising, no allocation.
+
 ## Testing
 
 `MemoryConnection` records statements instead of running them:

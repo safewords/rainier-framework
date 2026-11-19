@@ -41,10 +41,12 @@
 
 pub mod arguments;
 pub mod console;
+pub mod events;
 pub mod io;
 
 pub use arguments::Arguments;
 pub use console::{exit, Command, Console};
+pub use events::CommandRan;
 
 // Re-exported so command implementations get the attribute macro without
 // adding the dependency themselves.

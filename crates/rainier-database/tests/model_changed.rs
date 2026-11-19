@@ -54,7 +54,7 @@ async fn world() -> (Database, Arc<Dispatcher>, Arc<Mutex<Vec<ModelChanged>>>) {
 
 #[tokio::test]
 async fn a_write_through_a_plain_repository_is_on_the_bus() {
-    let (db, _events, heard) = world().await;
+    let (db, events, heard) = world().await;
     // No `with_events`: the typed `Created<Article>` never fires.
     let articles = EntityRepository::<Article>::new(db);
 
@@ -67,6 +67,7 @@ async fn a_write_through_a_plain_repository_is_on_the_bus() {
         .await
         .unwrap();
     articles.delete(7_i64.into()).await.unwrap();
+    events.settled().await;
 
     let heard = heard.lock().unwrap().clone();
     let actions: Vec<ModelAction> = heard.iter().map(|c| c.action).collect();
@@ -79,7 +80,7 @@ async fn a_write_through_a_plain_repository_is_on_the_bus() {
 
 #[tokio::test]
 async fn a_rolled_back_write_is_never_announced() {
-    let (db, _events, heard) = world().await;
+    let (db, events, heard) = world().await;
 
     let undone: Result<()> = db
         .transaction(|tx| async move {
@@ -88,6 +89,7 @@ async fn a_rolled_back_write_is_never_announced() {
         })
         .await;
     assert!(undone.is_err());
+    events.settled().await;
     assert!(heard.lock().unwrap().is_empty());
 
     db.transaction(|tx| async move {
@@ -95,6 +97,7 @@ async fn a_rolled_back_write_is_never_announced() {
     })
     .await
     .unwrap();
+    events.settled().await;
     assert_eq!(heard.lock().unwrap().len(), 1, "announced on commit");
 }
 
@@ -111,6 +114,7 @@ async fn a_wildcard_listener_hears_model_changes_too() {
     });
 
     EntityRepository::<Article>::new(db).create(article(3)).await.unwrap();
+    events.settled().await;
 
     assert_eq!(*names.lock().unwrap(), ["rainier_database::model::ModelChanged"]);
 }
@@ -125,4 +129,6 @@ async fn a_failing_listener_does_not_fail_the_write() {
     let created = EntityRepository::<Article>::new(db.clone()).create(article(4)).await;
     assert!(created.is_ok(), "the write committed; a listener cannot undo it");
     assert!(EntityRepository::<Article>::new(db).find(4_i64.into()).await.unwrap().is_some());
+    events.settled().await;
+    assert_eq!(events.subscriber_failures(), 1, "logged and counted, never returned");
 }

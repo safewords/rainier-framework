@@ -219,6 +219,15 @@ feature that needs a conversation. For sockets, a relay and a worker fleet
 composed into one design, see
 [the feed scenario](scenarios.md#a-twitter-shaped-feed).
 
+## Events
+
+This crate defines the activities for a socket's work, so a subscriber can
+name them without depending on the server: `WebSocketConnected` (kind
+`websocket.connect`) for a handler's `on_connect`, and
+`WebSocketMessageHandled` (kind `websocket.message`, with
+`rainier.websocket.kind` and `rainier.websocket.bytes`) for each `on_message`.
+The kind and the size — never the path or a message's contents.
+
 ## What is not here
 
 **No reconnection or idle policy.** The transport pings and drops a client that

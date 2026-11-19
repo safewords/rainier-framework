@@ -220,6 +220,15 @@ up the stack, and on Windows `Path::join` with a rooted path *discards the
 base* — so `path_for("..secrets")` had to be made incapable of escaping
 `resources/views`. It is.
 
+## Events
+
+Every render through `TemplateEngine` publishes `ViewRendered` on the current
+[event bus](events.md) — with or without `telemetry` — an activity (kind
+`view.render`) with the span's fields: `rainier.view.name`, its duration, and
+`otel.status_code` / `error.type` when it failed. The template's name, never
+the data it was given. A view rendered for a mail names the mail's send as its
+parent.
+
 ## Testing views
 
 `MemoryEngine` holds templates as strings, so a test needs no files:

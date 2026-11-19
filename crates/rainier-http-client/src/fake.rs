@@ -201,11 +201,7 @@ fn describe(recorded: &[RecordedRequest]) -> String {
 
 impl Transport for FakeTransport {
     fn send<'a>(&'a self, request: OutboundRequest) -> BoxFuture<'a, Result<RawResponse>> {
-        #[cfg(feature = "telemetry")]
-        return crate::telemetry::instrument(request, move |request| self.answer(request));
-
-        #[cfg(not(feature = "telemetry"))]
-        self.answer(request)
+        crate::telemetry::instrument(request, move |request| self.answer(request))
     }
 
     fn name(&self) -> &str {

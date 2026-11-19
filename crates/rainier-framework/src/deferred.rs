@@ -16,6 +16,7 @@
 //! | | `tokio::spawn` | [`defer`] |
 //! |---|---|---|
 //! | the request's span, trace id and facade application | lost | carried into the task |
+//! | the request's unit of work on the event bus | lost | carried: what it publishes names the request |
 //! | an `Err` | dropped unless you log it | logged at `warn` with the task's name |
 //! | a panic | logged by tokio, unnamed | logged at `error` with the task's name |
 //! | metrics | none | `deferred_tasks_total` and `deferred_task_duration_seconds` per name |
@@ -301,7 +302,11 @@ impl Deferrer {
         }
 
         let span = tracing::info_span!("deferred", deferred = name);
-        let task = run(name, work, guard).instrument(span);
+        // And the unit of work it was deferred from, so what it publishes
+        // names the request it belongs to — which stays open on the bus
+        // until this is done.
+        let task =
+            rainier_events::Context::current().scope(run(name, work, guard).instrument(span));
 
         match try_facade_application() {
             Some(app) => drop(runtime.spawn(with_facade_application(app, task))),
@@ -760,6 +765,27 @@ mod tests {
         .await;
 
         assert_eq!(rx.await.unwrap(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn the_task_runs_in_the_callers_unit_of_work() {
+        use rainier_events::{Context, Operation, Unit, UnitKind};
+
+        let request = Unit::new(UnitKind::Request, None, Some("/posts".into()));
+        let operation = Operation::new();
+        let deferrer = Deferrer::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        request
+            .scope(operation.scope(async {
+                deferrer.spawn("unit", async move {
+                    let cx = Context::current();
+                    let _ = tx.send((cx.unit().map(|u| u.id()), cx.parent()));
+                });
+            }))
+            .await;
+
+        assert_eq!(rx.await.unwrap(), (Some(request.id()), Some(operation.id())));
     }
 
     #[tokio::test]

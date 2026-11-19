@@ -7,7 +7,8 @@
 //! 1. **A contract to depend on.** A controller takes
 //!    `Arc<dyn Repository<Post>>`, so it can be handed the real thing in
 //!    production and a fake in a test, with neither knowing about the other.
-//! 2. **Model lifecycle hooks.** Writes dispatch `Creating`/`Created`/… through
+//! 2. **Model lifecycle hooks.** Writes dispatch `Creating`/… (awaited, so a
+//!    listener can veto) and publish `Created`/… (fire and forget) on
 //!    the event bus — where audit logs, cache busting and search indexing hang
 //!    off without the repository knowing they exist.
 //!
@@ -402,11 +403,12 @@ impl<E: Entity> EntityRepository<E> {
 }
 
 impl<M: Model> EntityRepository<M> {
-    /// Dispatch a lifecycle hook.
+    /// Dispatch a `-ing` hook (`Creating`, `Updating`, `Deleting`) and wait
+    /// for its listeners: the first `Err` vetoes the write and is returned.
     ///
     /// The event is only *built* when something is listening, so the model
     /// clone a hook needs costs nothing in an application that uses none.
-    async fn fire<E>(&self, build: impl FnOnce() -> E) -> Result<()>
+    async fn veto<E>(&self, build: impl FnOnce() -> E) -> Result<()>
     where
         E: Send + Sync + 'static,
     {
@@ -415,6 +417,19 @@ impl<M: Model> EntityRepository<M> {
             return Ok(());
         }
         events.dispatch(build()).await
+    }
+
+    /// Publish an `-ed` hook (`Created`, `Updated`, `Deleted`): fire and
+    /// forget. The write has happened; its listeners run after this returns,
+    /// and one that fails is logged and reported rather than failing the
+    /// write. Built only when something would hear it.
+    fn announce<E>(&self, build: impl FnOnce() -> E)
+    where
+        E: Send + Sync + 'static,
+    {
+        if let Some(events) = &self.events {
+            events.publish_with(build);
+        }
     }
 }
 
@@ -538,7 +553,7 @@ impl<M: Model> Repository<M> for EntityRepository<M> {
     }
 
     async fn create(&self, model: M) -> Result<M> {
-        self.fire(|| Creating { model: model.clone() }).await?;
+        self.veto(|| Creating { model: model.clone() }).await?;
 
         // A sharded entity whose primary key is itself the shard key has no
         // auto-increment to fall back on, so the connector mints the id.
@@ -565,17 +580,17 @@ impl<M: Model> Repository<M> for EntityRepository<M> {
             model
         };
 
-        self.fire(|| Created { model: stored.clone(), id }).await?;
+        self.announce(|| Created { model: stored.clone(), id });
         Ok(stored)
     }
 
     async fn update(&self, model: &M) -> Result<u64> {
-        self.fire(|| Updating { model: model.clone() }).await?;
+        self.veto(|| Updating { model: model.clone() }).await?;
 
         let prepared = statement::update::<M>(self.db.dialect(), model);
         let rows_affected = self.db.execute(prepared).await?.rows_affected;
 
-        self.fire(|| Updated { model: model.clone(), rows_affected }).await?;
+        self.announce(|| Updated { model: model.clone(), rows_affected });
         Ok(rows_affected)
     }
 
@@ -609,12 +624,12 @@ impl<M: Model> Repository<M> for EntityRepository<M> {
 
     async fn delete(&self, key: Value) -> Result<u64> {
         let described = describe(&key);
-        self.fire(|| Deleting::<M> { key: described.clone(), model: PhantomData }).await?;
+        self.veto(|| Deleting::<M> { key: described.clone(), model: PhantomData }).await?;
 
         let prepared = statement::delete_by_pk::<M>(self.db.dialect(), key);
         let rows_affected = self.db.execute(prepared).await?.rows_affected;
 
-        self.fire(|| Deleted::<M> { key: described, rows_affected, model: PhantomData }).await?;
+        self.announce(|| Deleted::<M> { key: described, rows_affected, model: PhantomData });
         Ok(rows_affected)
     }
 
@@ -1072,7 +1087,24 @@ mod tests {
         });
 
         posts.create(Post { id: 0, title: "sent".into(), published: false }).await.unwrap();
+        // `Creating` was awaited; `Created` is published, so it is heard once
+        // the bus has delivered it.
+        assert_eq!(*log.lock().unwrap(), vec!["creating:sent"]);
+        events.settled().await;
         assert_eq!(*log.lock().unwrap(), vec!["creating:sent", "created:7"]);
+    }
+
+    #[tokio::test]
+    async fn a_failing_created_listener_does_not_fail_the_insert() {
+        let (posts, events, connection) = with_hooks();
+        events.listen(|_: Arc<Created<Post>>| async { Err(Error::internal("listener broke")) });
+
+        let created = posts.create(Post { id: 0, title: "kept".into(), published: false }).await;
+
+        assert!(created.is_ok(), "the row is written; a past-tense hook cannot fail it");
+        assert!(connection.statement_count() > 0);
+        events.settled().await;
+        assert_eq!(events.subscriber_failures(), 1, "the failure is counted, not returned");
     }
 
     #[tokio::test]
@@ -1134,6 +1166,7 @@ mod tests {
 
         posts.update(&Post { id: 1, title: "x".into(), published: true }).await.unwrap();
         posts.delete(1_i64.into()).await.unwrap();
+        events.settled().await;
 
         assert_eq!(seen.load(Ordering::SeqCst), 1111);
     }
@@ -1172,6 +1205,7 @@ mod tests {
             )
             .await
             .unwrap();
+        events.settled().await;
 
         assert_eq!(seen.load(Ordering::SeqCst), 0);
     }

@@ -258,18 +258,25 @@ and emailing all of those customers. Set it in staging and leave it set.
 
 ## Events
 
-The mailer dispatches through the [event bus](events.md):
+The mailer raises two events through the [event bus](events.md) it is given:
 
-| Event | When |
-|---|---|
-| `MessageSending` | before the transport is called |
-| `MessageSent` | after it succeeds |
+| Event | When | How |
+|---|---|---|
+| `MessageSending` | before the transport is called | dispatched — a listener returning `Err` cancels the send |
+| `MessageSent` | after it succeeds | published — fire-and-forget; listeners run after `send` has returned |
 
 ```rust
 Mailer::new(views, transport).with_events(events)
 ```
 
 Useful for a send log, or a metric per campaign header.
+
+Every delivery also publishes `MailSent` on the current bus — with or without
+`telemetry` — an activity (kind `mail.send`) carrying what the `mail.send` span
+carries: `mail.transport`, `mail.recipients` and `mail.attachments` (counts —
+never who, never the subject), its duration, and `otel.status_code` /
+`error.type` when the send failed. The send runs as an operation, so the views
+rendered for it name it as their parent.
 
 ## Testing
 

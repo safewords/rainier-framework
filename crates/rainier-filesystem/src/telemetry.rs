@@ -1,17 +1,22 @@
-//! A `storage.*` span per disk operation — behind the `telemetry` feature.
-//!
-//! [`TracedFilesystem`] wraps a disk; [`Storage`](crate::Storage) applies it
-//! to every disk it holds, so uploads, downloads and listings are traced
-//! without the code doing them knowing.
+//! The wrapper [`Storage`](crate::Storage) applies to every disk it holds: a
+//! [`StorageOperation`](crate::StorageOperation) event per call, always, and a
+//! `storage.*` span per call with the `telemetry` feature — so uploads,
+//! downloads and listings are observed without the code doing them knowing.
 //!
 //! # Never the path
 //!
 //! An object path is routinely personal data — `avatars/{user_id}.jpg`,
 //! `exports/ada@example.com.zip`, `invoices/2026/acme-corp.pdf` — and it is
-//! unbounded besides. A span records the disk's driver, the operation and,
-//! for a read or a write, how many bytes moved. Never the path, and never the
-//! contents. `as_any` is passed through, so a caller downcasting to a concrete
-//! driver still reaches it.
+//! unbounded besides. A span and an event record the disk's driver, the
+//! operation and, for a read or a write, how many bytes moved. Never the path,
+//! and never the contents. `as_any` is passed through, so a caller downcasting
+//! to a concrete driver still reaches it.
+//!
+//! # With nobody listening
+//!
+//! Without the `telemetry` feature and with nothing subscribed, a call asks
+//! the bus once and returns the disk's own future: no clock read, no
+//! allocation, no extra future.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,13 +26,13 @@ use rainier_support::{BoxFuture, Result};
 
 use crate::filesystem::{Filesystem, Metadata};
 
-/// A disk, with a span around each call.
+/// A disk, observed: an event per call, and a span with `telemetry`.
 pub struct TracedFilesystem {
     inner: Arc<dyn Filesystem>,
 }
 
 impl TracedFilesystem {
-    /// Trace `inner` — unless it already is.
+    /// Observe `inner` — unless it already is.
     pub fn wrap(inner: Arc<dyn Filesystem>) -> Arc<dyn Filesystem> {
         if inner.is_traced() {
             return inner;
@@ -36,12 +41,20 @@ impl TracedFilesystem {
     }
 }
 
-/// One operation's span. A macro because a span's name must be a constant.
+/// One operation's span and event. A macro because a span's name must be a
+/// constant.
 macro_rules! traced {
     ($self:ident, $name:literal, $operation:literal, $call:expr) => {{
         traced!($self, $name, $operation, $call, |_| None::<usize>)
     }};
     ($self:ident, $name:literal, $operation:literal, $call:expr, $bytes:expr) => {{
+        let events = crate::events::listening();
+        // Nothing to trace and nobody to tell: the disk's own future, as is.
+        #[cfg(not(feature = "telemetry"))]
+        if events.is_none() {
+            return $call;
+        }
+        #[cfg(feature = "telemetry")]
         let span = rainier_support::span!(
             $name,
             otel.name = concat!("storage ", $operation),
@@ -49,25 +62,43 @@ macro_rules! traced {
             storage.driver = $self.inner.name(),
             storage.bytes = tracing::field::Empty,
         );
+        #[cfg(feature = "telemetry")]
         let traced = span.clone();
+        let started = events.as_ref().map(|_| std::time::Instant::now());
         let call = $call;
-        Box::pin(tracing::Instrument::instrument(
-            async move {
-                let result = call.await;
-                match &result {
-                    Ok(value) =>
-                    {
-                        #[allow(clippy::redundant_closure_call)]
-                        if let Some(bytes) = ($bytes)(value) {
-                            traced.record("storage.bytes", bytes);
-                        }
+        let observed = async move {
+            let result = call.await;
+            #[allow(clippy::redundant_closure_call)]
+            let bytes = match &result {
+                Ok(value) => ($bytes)(value),
+                Err(_) => None,
+            };
+            #[cfg(feature = "telemetry")]
+            match &result {
+                Ok(_) => {
+                    if let Some(bytes) = bytes {
+                        traced.record("storage.bytes", bytes);
                     }
-                    Err(error) => rainier_support::telemetry::record_error(&traced, error),
                 }
-                result
-            },
-            span,
-        ))
+                Err(error) => rainier_support::telemetry::record_error(&traced, error),
+            }
+            if let (Some(events), Some(started)) = (events, started) {
+                let duration = started.elapsed();
+                events.publish_activity_with(|| crate::events::StorageOperation {
+                    kind: $name,
+                    operation: $operation,
+                    otel_name: concat!("storage ", $operation),
+                    driver: $self.inner.name().to_string(),
+                    bytes,
+                    duration,
+                    error: result.as_ref().err().map(|error| error.kind()),
+                });
+            }
+            result
+        };
+        #[cfg(feature = "telemetry")]
+        let observed = tracing::Instrument::instrument(observed, span);
+        Box::pin(observed)
     }};
 }
 
@@ -165,7 +196,7 @@ impl std::fmt::Debug for TracedFilesystem {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "telemetry"))]
 mod tests {
     use super::*;
     use crate::{MemoryFilesystem, Storage};

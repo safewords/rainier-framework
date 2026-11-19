@@ -2,10 +2,14 @@
 //!
 //! # Events
 //!
-//! With [`with_events`](Worker::with_events), every job fires
+//! With [`with_events`](Worker::with_events), every job publishes
 //! [`JobProcessing`] before it runs and then exactly one of
 //! [`JobProcessed`], [`JobReleased`] (failed, with attempts left) or
-//! [`JobFailed`] (failed on its last attempt). The two failure events carry
+//! [`JobFailed`] (failed on its last attempt). They are informational, so
+//! they are **published**, not dispatched: listeners run after the worker
+//! has moved on, each on its own thread, and one that fails is logged and
+//! reported without the job ever seeing it. Every attempt is also a unit of
+//! work with a [`JobRan`](crate::JobRan) — see [`crate::events`]. The two failure events carry
 //! the failure twice: [`error`](JobFailed::error), the `Display` form that is
 //! also what the queue stores, and [`exception`](JobFailed::exception), the
 //! structured [`Exception`] — kind, status, cause chain, backtrace, and
@@ -1131,26 +1135,77 @@ impl Worker {
         Ok(stats)
     }
 
+    /// One attempt at `job`, in its unit of work — see [`crate::events`].
     async fn process(&self, job: QueuedJob, reservation: Reservation) -> Result<Outcome> {
-        #[cfg(feature = "telemetry")]
-        return self.process_traced(job, reservation).await;
+        let name = job.name.clone();
+        let traceparent = job.traceparent.clone();
+        crate::events::in_job_unit(
+            self.events.as_ref(),
+            &name,
+            traceparent.as_deref(),
+            |operation| self.attempt(job, reservation, operation),
+        )
+        .await
+    }
 
+    /// [`process`](Self::process) inside the attempt's unit, publishing its
+    /// [`JobRan`](crate::events::JobRan) when it ends.
+    async fn attempt(
+        &self,
+        job: QueuedJob,
+        reservation: Reservation,
+        operation: Option<u64>,
+    ) -> Result<Outcome> {
+        let started = std::time::Instant::now();
+        // What the event names the job by, copied only for a listener.
+        let heard = rainier_events::activity::has_activity_subscribers::<crate::events::JobRan>()
+            .then(|| (job.name.clone(), job.queue.clone(), job.id.clone()));
+        let (attempt, max_attempts) = (job.attempts, job.max_attempts);
+        let wait = crate::telemetry::wait_time(&job, reservation.at);
+
+        let mut ran = Ran::default();
+        #[cfg(feature = "telemetry")]
+        let result = self.process_traced(job, &reservation, wait, &mut ran).await;
         #[cfg(not(feature = "telemetry"))]
-        {
-            let _ = reservation;
-            self.process_untraced(job, &mut Ran::default()).await
+        let result = self.process_untraced(job, &mut ran).await;
+
+        if let Some((name, queue, id)) = heard {
+            let outcome = crate::telemetry::JobOutcome::of(&result, ran.timed_out);
+            rainier_events::activity::publish_activity_with(|| crate::events::JobRan {
+                name,
+                queue,
+                id,
+                driver: self.queue.name().to_string(),
+                attempt,
+                max_attempts,
+                outcome: outcome.as_str(),
+                runner: if ran.kubernetes_job.is_some() { "kubernetes" } else { "in_process" },
+                reserve: reservation.took,
+                wait,
+                backoff: ran.backoff,
+                error: crate::events::error_of(&result),
+                trace_id: crate::events::current_trace_id(),
+                duration: started.elapsed(),
+                operation,
+            });
         }
+        result
     }
 
     /// [`process`](Self::process) inside a `queue.process` span, reporting to
     /// the observer — see `rainier_queue::telemetry`.
     #[cfg(feature = "telemetry")]
-    async fn process_traced(&self, job: QueuedJob, reservation: Reservation) -> Result<Outcome> {
-        use crate::telemetry::{wait_time, JobOutcome, JobTiming};
+    async fn process_traced(
+        &self,
+        job: QueuedJob,
+        reservation: &Reservation,
+        wait: Option<Duration>,
+        ran: &mut Ran,
+    ) -> Result<Outcome> {
+        use crate::telemetry::{JobOutcome, JobTiming};
         use tracing::field::Empty;
 
         let driver = self.queue.name().to_string();
-        let wait = wait_time(&job, reservation.at);
 
         let span = rainier_support::span!(
             "queue.process",
@@ -1196,6 +1251,13 @@ impl Worker {
             })
             .unwrap_or_else(|| rainier_telemetry::TraceContext::start(true));
         span.record("trace_id", trace.trace_id());
+        // And on the attempt's own unit, when it has one: a job joined into a
+        // request keeps the request's trace.
+        if let Some(unit) = rainier_events::Context::current_unit()
+            .filter(|u| u.kind() == rainier_events::UnitKind::Job)
+        {
+            unit.set_trace(Some(trace.trace_id()), None);
+        }
         let outbound = Some(rainier_telemetry::propagation::child_of(&trace));
 
         let (queue, name, attempt) = (job.queue.clone(), job.name.clone(), job.attempts);
@@ -1203,20 +1265,13 @@ impl Worker {
             observer.started(&queue, &name);
         }
 
-        let mut ran = Ran::default();
         let result = tracing::Instrument::instrument(
-            rainier_telemetry::propagation::scope(outbound, self.process_untraced(job, &mut ran)),
+            rainier_telemetry::propagation::scope(outbound, self.process_untraced(job, ran)),
             span.clone(),
         )
         .await;
 
-        let outcome = match &result {
-            Err(_) => JobOutcome::Error,
-            Ok(Outcome::Released | Outcome::Failed) if ran.timed_out => JobOutcome::TimedOut,
-            Ok(Outcome::Released) => JobOutcome::Released,
-            Ok(Outcome::Failed) => JobOutcome::Failed,
-            Ok(Outcome::Processed | Outcome::Idle) => JobOutcome::Processed,
-        };
+        let outcome = JobOutcome::of(&result, ran.timed_out);
         span.record("rainier.job.outcome", outcome.as_str());
         if let Some(backoff) = ran.backoff {
             span.record("rainier.job.backoff_ms", duration_ms(backoff));
@@ -1250,7 +1305,7 @@ impl Worker {
     }
 
     async fn process_untraced(&self, job: QueuedJob, ran: &mut Ran) -> Result<Outcome> {
-        self.dispatch(JobProcessing { job: job.clone() }).await;
+        self.publish(|| JobProcessing { job: job.clone() });
 
         let context = Arc::new(JobContext::new(
             Arc::clone(&self.container),
@@ -1293,7 +1348,7 @@ impl Worker {
 
                 let duration = started.elapsed();
                 tracing::info!(job = %job.name, id = %job.id, ?duration, "job processed");
-                self.dispatch(JobProcessed { job, duration }).await;
+                self.publish(|| JobProcessed { job, duration });
                 Ok(Outcome::Processed)
             }
             Err(failure) => self.handle_failure(job, failure, ran).await,
@@ -1452,7 +1507,7 @@ impl Worker {
             self.release_uniqueness(&job).await;
 
             tracing::error!(job = %job.name, id = %job.id, error = %message, "job failed");
-            self.dispatch(JobFailed { job, error: message, exception }).await;
+            self.publish(|| JobFailed { job, error: message, exception });
             return Ok(Outcome::Failed);
         }
 
@@ -1473,7 +1528,7 @@ impl Worker {
             error = %message,
             "job failed; retrying"
         );
-        self.dispatch(JobReleased { job, delay, error: message, exception }).await;
+        self.publish(|| JobReleased { job, delay, error: message, exception });
         Ok(Outcome::Released)
     }
 
@@ -1517,11 +1572,13 @@ impl Worker {
         crate::reporting::report_to(self.reporter.as_ref(), failure).await;
     }
 
-    /// Worker events are informational, so a failing listener is logged and
-    /// otherwise ignored — a broken metrics hook must not stop the queue.
-    async fn dispatch<E: Send + Sync + 'static>(&self, event: E) {
+    /// Worker events are informational, so they are published: a listener
+    /// runs after the worker has moved on, and one that fails is logged and
+    /// reported without the job ever seeing it — a broken metrics hook must
+    /// not stop, or slow, the queue. Built only when somebody listens.
+    fn publish<E: rainier_events::Event>(&self, build: impl FnOnce() -> E) {
         if let Some(events) = &self.events {
-            events.dispatch_quietly(event).await;
+            events.publish_with(build);
         }
     }
 }
@@ -2426,8 +2483,13 @@ mod tests {
             }
         });
 
-        worker(Arc::clone(&queue)).with_events(events).run_next().await.unwrap();
-        assert_eq!(*log.lock().unwrap(), vec!["processing", "processed"]);
+        worker(Arc::clone(&queue)).with_events(Arc::clone(&events)).run_next().await.unwrap();
+        // Published, so heard once the worker has moved on — each listener
+        // on its own thread, so in no particular order between them.
+        events.settled().await;
+        let mut log = log.lock().unwrap().clone();
+        log.sort_unstable();
+        assert_eq!(log, vec!["processed", "processing"]);
     }
 
     #[tokio::test]
@@ -2439,8 +2501,11 @@ mod tests {
         let events = Arc::new(Dispatcher::new());
         events.listen(|_: Arc<JobProcessed>| async { Err(Error::internal("metrics down")) });
 
-        let outcome = worker(Arc::clone(&queue)).with_events(events).run_next().await.unwrap();
+        let outcome =
+            worker(Arc::clone(&queue)).with_events(Arc::clone(&events)).run_next().await.unwrap();
         assert_eq!(outcome, Outcome::Processed, "the job still succeeded");
+        events.settled().await;
+        assert_eq!(events.subscriber_failures(), 1, "the failure is logged, not returned");
     }
 
     // --- exception reporting ----------------------------------------------
@@ -2571,10 +2636,12 @@ mod tests {
         let (reporting, seen) = reports();
         let events = Arc::new(Dispatcher::new());
         let failed = record::<JobFailed>(&events);
-        let worker =
-            worker(Arc::clone(&queue)).with_events(events).with_reporter(Reporter::new(reporting));
+        let worker = worker(Arc::clone(&queue))
+            .with_events(Arc::clone(&events))
+            .with_reporter(Reporter::new(reporting));
 
         assert_eq!(worker.run_next().await.unwrap(), Outcome::Failed);
+        events.settled().await;
 
         let seen = attempts(&seen.lock().unwrap());
         assert_eq!(seen.len(), 1);
@@ -2613,9 +2680,10 @@ mod tests {
             Arc::new(JobRegistry::new().with::<Chained>()),
             Arc::new(Container::new()),
         )
-        .with_events(events);
+        .with_events(Arc::clone(&events));
 
         assert_eq!(worker.run_next().await.unwrap(), Outcome::Failed);
+        events.settled().await;
 
         let failed = failed.lock().unwrap();
         let exception = &failed[0].exception;
@@ -2639,9 +2707,10 @@ mod tests {
         let released = record::<JobReleased>(&events);
 
         assert_eq!(
-            worker(Arc::clone(&queue)).with_events(events).run_next().await.unwrap(),
+            worker(Arc::clone(&queue)).with_events(Arc::clone(&events)).run_next().await.unwrap(),
             Outcome::Released
         );
+        events.settled().await;
 
         let released = released.lock().unwrap();
         assert_eq!(released[0].error, "not yet");
@@ -3025,11 +3094,12 @@ mod tests {
         let failed = record::<JobFailed>(&events);
 
         let outcome = worker(Arc::clone(&queue))
-            .with_events(events)
+            .with_events(Arc::clone(&events))
             .with_reporter(Reporter::new(reporting))
             .run_next()
             .await
             .unwrap();
+        events.settled().await;
 
         assert_eq!(outcome, Outcome::Failed);
         assert_eq!(queue.failed_jobs().len(), 1, "the job is still recorded as failed");

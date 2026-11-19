@@ -1,10 +1,13 @@
 //! The thing an application holds — [`Broadcasting`].
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use rainier_support::Result;
+use rainier_events::activity::publish_activity_with;
+use rainier_events::{Activity, Fields};
+use rainier_support::{Error, ErrorKind, Result};
 
 use crate::broadcaster::{Broadcaster, LogBroadcaster};
 use crate::channel::Channel;
@@ -81,6 +84,9 @@ impl Broadcasting {
     }
 
     /// Publish an already-rendered broadcast.
+    ///
+    /// Publishes [`BroadcastSent`] on the event bus once the driver has
+    /// answered.
     pub async fn send(&self, broadcast: Broadcast) -> Result<()> {
         // No channels is not a failure — an event whose `broadcast_on`
         // returned nothing has decided this instance is not visible to anyone.
@@ -88,6 +94,20 @@ impl Broadcasting {
             return Ok(());
         }
 
+        let started = Instant::now();
+        let result = self.send_traced(&broadcast).await;
+        publish_activity_with(|| BroadcastSent {
+            driver: self.driver.name(),
+            event: broadcast.event.clone(),
+            channels: broadcast.channels.len(),
+            duration: started.elapsed(),
+            error_type: result.as_ref().err().map(error_type),
+        });
+        result
+    }
+
+    /// The publish, in a `broadcast.publish` span when `telemetry` is on.
+    async fn send_traced(&self, broadcast: &Broadcast) -> Result<()> {
         // The event and how many channels — not the channels' names, which
         // carry ids (`private-user.42`), and never the payload.
         #[cfg(feature = "telemetry")]
@@ -105,7 +125,7 @@ impl Broadcasting {
                 async move {
                     rainier_support::telemetry::record_result(
                         &traced,
-                        self.driver.publish(&broadcast).await,
+                        self.driver.publish(broadcast).await,
                     )
                 },
                 span,
@@ -114,7 +134,71 @@ impl Broadcasting {
         }
 
         #[cfg(not(feature = "telemetry"))]
-        self.driver.publish(&broadcast).await
+        self.driver.publish(broadcast).await
+    }
+}
+
+/// A broadcast was handed to the driver — or the driver refused it.
+///
+/// The bus's view of a `broadcast.publish` span, published whether or not the
+/// crate's `telemetry` feature is on, with the same fields. Carries the event
+/// and how many channels — not the channels' names, which carry ids
+/// (`private-user.42`), and never the payload.
+#[derive(Debug, Clone)]
+pub struct BroadcastSent {
+    /// The driver's name: `redis`, `kafka`, `log`, `memory`, …
+    pub driver: &'static str,
+    /// The event name clients listen for.
+    pub event: String,
+    /// How many channels it went to.
+    pub channels: usize,
+    /// How long the driver took.
+    pub duration: Duration,
+    /// The failure's kind, in `snake_case`, when the driver failed.
+    pub error_type: Option<&'static str>,
+}
+
+impl Activity for BroadcastSent {
+    fn kind(&self) -> &'static str {
+        "broadcast.publish"
+    }
+
+    fn fields(&self, fields: &mut Fields) {
+        fields
+            .set("otel.name", format!("broadcast {}", self.event))
+            .set("otel.kind", "producer")
+            .set("rainier.broadcast.driver", self.driver)
+            .set("rainier.broadcast.event", self.event.clone())
+            .set("rainier.broadcast.channels", self.channels);
+        if let Some(error_type) = self.error_type {
+            fields.set("otel.status_code", "ERROR").set("error.type", error_type);
+        }
+    }
+
+    fn duration(&self) -> Option<Duration> {
+        Some(self.duration)
+    }
+
+    fn failed(&self) -> bool {
+        self.error_type.is_some()
+    }
+}
+
+/// An error's kind as a span's `error.type` records it.
+fn error_type(error: &Error) -> &'static str {
+    match error.kind() {
+        ErrorKind::BadRequest => "bad_request",
+        ErrorKind::Unauthenticated => "unauthenticated",
+        ErrorKind::Unauthorized => "unauthorized",
+        ErrorKind::NotFound => "not_found",
+        ErrorKind::MethodNotAllowed => "method_not_allowed",
+        ErrorKind::Conflict => "conflict",
+        ErrorKind::PayloadTooLarge => "payload_too_large",
+        ErrorKind::Validation => "validation",
+        ErrorKind::TooManyRequests => "too_many_requests",
+        ErrorKind::Internal => "internal",
+        ErrorKind::ServiceUnavailable => "service_unavailable",
+        ErrorKind::Status(_) => "status",
     }
 }
 
@@ -149,6 +233,38 @@ mod tests {
     fn manager() -> (Broadcasting, Arc<MemoryBroadcaster>) {
         let driver = Arc::new(MemoryBroadcaster::new());
         (Broadcasting::new(driver.clone()), driver)
+    }
+
+    #[tokio::test]
+    async fn a_publish_is_a_broadcast_sent_with_the_spans_fields() {
+        use rainier_events::{Dispatcher, Value as Field};
+
+        let events = Arc::new(Dispatcher::new());
+        let _bus = rainier_events::set_default(Arc::clone(&events));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        events.on::<BroadcastSent>().run_sync(move |sent, _| {
+            s.lock().unwrap().push((*sent).clone());
+            Ok(())
+        });
+        let (broadcasting, _) = manager();
+
+        broadcasting.event(&Ping { room: 1, visible: true }).await.unwrap();
+        // Nothing to publish, nothing published.
+        broadcasting.event(&Ping { room: 1, visible: false }).await.unwrap();
+        events.settled().await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].kind(), "broadcast.publish");
+        assert!(!seen[0].failed());
+        let fields = seen[0].collect_fields();
+        assert_eq!(fields.text("otel.name"), Some("broadcast Ping"));
+        assert_eq!(fields.text("otel.kind"), Some("producer"));
+        assert_eq!(fields.text("rainier.broadcast.driver"), Some("memory"));
+        assert_eq!(fields.text("rainier.broadcast.event"), Some("Ping"));
+        assert_eq!(fields.get("rainier.broadcast.channels"), Some(&Field::U64(1)));
+        assert!(!format!("{fields:?}").contains("room.1"), "never the channel names");
     }
 
     #[tokio::test]

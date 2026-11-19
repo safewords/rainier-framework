@@ -43,6 +43,7 @@
 pub mod abilities;
 pub mod challenge;
 pub mod confirm;
+pub mod events;
 pub mod gate;
 pub mod guard;
 pub mod impersonate;
@@ -61,6 +62,7 @@ pub use rainier_crypt::hash::legacy;
 pub use abilities::Abilities;
 pub use challenge::Challenges;
 pub use confirm::{confirm_password, ConfirmPassword};
+pub use events::AuthAttempted;
 pub use gate::{Actor, Gate};
 pub use guard::{AuthManager, Guard, GuardExt, SessionGuard, StatefulGuard, TokenGuard};
 pub use impersonate::{

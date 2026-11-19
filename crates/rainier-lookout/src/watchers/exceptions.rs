@@ -15,9 +15,9 @@ use serde_json::Value;
 
 use crate::config::LookoutConfig;
 use crate::entry::{Entry, EntryType};
-use crate::layer::normalize_digits;
 use crate::recorder::new_entry_id;
 use crate::redact::{redact_json, truncate};
+use crate::subscriber::normalize_digits;
 
 /// How many lines of a backtrace are kept.
 pub const BACKTRACE_LINES: usize = 60;

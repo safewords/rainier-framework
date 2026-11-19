@@ -4,10 +4,15 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use std::time::Instant;
+
+use rainier_events::activity::{has_activity_subscribers, publish_activity_with};
 use rainier_events::report::{report, Exception, NotificationFailed};
+use rainier_events::Operation;
 use rainier_support::{Error, ErrorKind, Result};
 
 use crate::channel::Channel;
+use crate::events::{error_type, NotificationSent};
 use crate::notification::{Delivery, Notifiable, Notification, Receipt, Sent};
 
 /// Holds the configured channels and fans a notification out across them.
@@ -96,7 +101,35 @@ impl Notifier {
     /// The [`Receipt`] says what happened on each. `Ok` unless *every* channel
     /// failed; call [`Receipt::into_result`] to make "nothing got through" an
     /// error at the call site.
+    ///
+    /// Publishes [`NotificationSent`], and runs as an [`Operation`] when
+    /// somebody hears it, so the mail a channel sends nests under it.
     pub async fn send<N, T>(&self, to: &N, notification: &T) -> Result<Receipt>
+    where
+        N: Notifiable + ?Sized,
+        T: Notification<N> + ?Sized,
+    {
+        let started = Instant::now();
+        let op = has_activity_subscribers::<NotificationSent>().then(Operation::new);
+        let send = self.send_traced(to, notification);
+        let result = match &op {
+            Some(op) => op.scope(send).await,
+            None => send.await,
+        };
+        // Outside the operation: the notification is the parent of what its
+        // channels published, not of itself.
+        publish_activity_with(|| NotificationSent {
+            notification: notification.notification_name(),
+            channels: result.as_ref().ok().map(|receipt| receipt.outcomes.len()),
+            duration: started.elapsed(),
+            error_type: result.as_ref().err().map(error_type),
+            operation: op.as_ref().map(Operation::id),
+        });
+        result
+    }
+
+    /// The send, in a `notification.send` span when `telemetry` is on.
+    async fn send_traced<N, T>(&self, to: &N, notification: &T) -> Result<Receipt>
     where
         N: Notifiable + ?Sized,
         T: Notification<N> + ?Sized,
@@ -311,6 +344,67 @@ mod tests {
 
     fn user() -> User {
         User { id: 7, email: Some("ada@example.com".into()) }
+    }
+
+    /// Records the operation each delivery runs inside.
+    #[derive(Default)]
+    struct Watching(std::sync::Mutex<Vec<Option<u64>>>);
+
+    impl Channel for Watching {
+        fn name(&self) -> &'static str {
+            "memory"
+        }
+        fn send<'a>(&'a self, _: &'a Delivery) -> BoxFuture<'a, Result<()>> {
+            self.0.lock().unwrap().push(rainier_events::Context::current().parent());
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_send_publishes_notification_sent_and_its_channels_run_inside_it() {
+        use rainier_events::{Activity, Dispatcher, Value};
+
+        let events = Arc::new(Dispatcher::new());
+        let _bus = rainier_events::set_default(Arc::clone(&events));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        events.on::<NotificationSent>().run_sync(move |sent, cx| {
+            s.lock().unwrap().push(((*sent).clone(), cx.parent()));
+            Ok(())
+        });
+        let watching = Arc::new(Watching::default());
+        let notifier = Notifier::new().with(LogChannel).with_arc(Arc::clone(&watching));
+
+        notifier
+            .send(&user(), &Welcome(Channels::new().with::<LogChannel>().with::<Watching>()))
+            .await
+            .unwrap();
+        events.settled().await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (sent, parent) = &seen[0];
+        assert_eq!(*parent, None);
+        assert_eq!(sent.kind(), "notification.send");
+        assert!(!sent.failed());
+        let fields = sent.collect_fields();
+        assert_eq!(fields.text("otel.name"), Some("notify user.welcome"));
+        assert_eq!(fields.text("rainier.notification.name"), Some("user.welcome"));
+        assert_eq!(fields.get("rainier.notification.channels"), Some(&Value::U64(2)));
+        assert!(sent.operation.is_some());
+        assert_eq!(*watching.0.lock().unwrap(), vec![sent.operation]);
+    }
+
+    #[tokio::test]
+    async fn nobody_listening_opens_no_operation() {
+        let events = Arc::new(rainier_events::Dispatcher::new());
+        let _bus = rainier_events::set_default(events);
+        let watching = Arc::new(Watching::default());
+        let notifier = Notifier::new().with_arc(Arc::clone(&watching));
+
+        notifier.send(&user(), &Welcome(Channels::new().with::<Watching>())).await.unwrap();
+
+        assert_eq!(*watching.0.lock().unwrap(), vec![None]);
     }
 
     #[tokio::test]

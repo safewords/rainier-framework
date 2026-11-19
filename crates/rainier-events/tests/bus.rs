@@ -266,3 +266,65 @@ async fn each_subscriber_runs_on_a_thread_of_its_own() {
     names.sort();
     assert_eq!(names, vec!["rainier-sub-audit", "rainier-sub-metrics"]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subscriber_on_several_threads_keeps_each_units_events_together_and_in_order() {
+    let events = Arc::new(Dispatcher::new());
+    // unit id → (thread name, events seen, completed after them?)
+    type Seen = std::collections::HashMap<u64, (String, Vec<u64>, bool)>;
+    let seen: Arc<Mutex<Seen>> = Arc::new(Mutex::new(Default::default()));
+    let (a, b) = (Arc::clone(&seen), Arc::clone(&seen));
+    events
+        .subscriber("sharded")
+        .threads(4)
+        .on(move |e: &UserChanged, cx| {
+            let thread = std::thread::current().name().unwrap_or("").to_string();
+            let mut seen = a.lock().unwrap();
+            let entry =
+                seen.entry(cx.unit_id().unwrap()).or_insert((thread.clone(), vec![], false));
+            assert_eq!(entry.0, thread, "a unit's events moved threads");
+            assert!(!entry.2, "an event arrived after its unit completed");
+            entry.1.push(e.id);
+            Ok(())
+        })
+        .on(move |done: &UnitCompleted, cx| {
+            assert_eq!(cx.unit_id(), Some(done.id));
+            let thread = std::thread::current().name().unwrap_or("").to_string();
+            let mut seen = b.lock().unwrap();
+            let entry = seen.get_mut(&done.id).expect("events before completion");
+            assert_eq!(entry.0, thread, "completion went to another thread");
+            entry.2 = true;
+            Ok(())
+        })
+        .start();
+
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let events = Arc::clone(&events);
+        tasks.push(tokio::spawn(async move {
+            let unit = Unit::on(&events, UnitKind::Request, None, None);
+            let publisher = Arc::clone(&events);
+            unit.scope(async move {
+                for id in 0..50 {
+                    publisher.publish(UserChanged { id });
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    events.settled().await;
+    events.settled().await;
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 16);
+    let threads: std::collections::HashSet<_> = seen.values().map(|v| v.0.clone()).collect();
+    assert!(threads.len() > 1, "all units landed on one thread");
+    for (events_seen, ids, completed) in seen.values().map(|v| (&v.0, &v.1, v.2)) {
+        let _ = events_seen;
+        assert!(completed);
+        assert_eq!(*ids, (0..50).collect::<Vec<_>>());
+    }
+}

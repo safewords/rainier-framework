@@ -12,6 +12,44 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **The event bus** (`rainier-events`): everything the framework does is now
+  published as a typed event, and anything — your code, Lookout — subscribes
+  to what it wants. `Dispatcher::publish` / `publish_with` are fire and
+  forget: with nobody subscribed one atomic load (about 5 ns), otherwise one
+  lock-free push per subscriber (about 120 ns) — never an `await`, a lock, a
+  syscall, or a dropped event. **Every subscriber runs on a thread of its
+  own** (`subscriber(..).threads(n)` spreads one over several, a unit of
+  work's events always on the same one), so a slow or failing subscriber
+  never touches the code that published. Declarative subscriptions:
+  `events.on::<E>().when(..).run(..)` / `.run_sync(..)`,
+  `events.subscriber("name").on(..).on_activity(..).start()`, `on_any`. The
+  publisher's **`Context`** travels with every event: the unit of work
+  (`Unit`: request, job attempt, command, scheduled task — id, trace id,
+  `traceparent`), the enclosing `Operation`, the time; `UnitCompleted` is
+  published once a unit and every event of it have been delivered. Every
+  framework event is also an **`Activity`** (its span's name and
+  OpenTelemetry fields, duration, failure, code trace) for subscribers that
+  want everything; `code_trace::request_code_traces` asks publishers for a
+  backtrace of operations slower than a threshold. The process-wide bus:
+  `install`, `bus`, `with_bus`, `set_default` (tests), `settled()` (tests).
+  See [events](docs/events.md#the-bus).
+- **Typed events for everything the framework does**, published with or
+  without the `telemetry` feature: `RequestHandled` (`rainier-server`),
+  `QueryExecuted` (`rainier-database`; the SQL is sanitised on the
+  subscriber's side, not the request's), `CacheOperation`, `StorageOperation`,
+  `SessionOperation`, `HttpClientRequestSent`, `JobQueued` and `JobRan`
+  (`rainier-queue`), `CommandRan`, `ScheduledTaskRan`, `MailSent`,
+  `NotificationSent`, `ViewRendered`, `AuthAttempted`, `BroadcastSent`,
+  `WebSocketConnected`, `WebSocketMessageHandled`, and `LogWritten` from the
+  new `rainier-events` `log-layer` feature. The server, worker, console and
+  scheduler open a unit of work for each request, attempt, command and task;
+  a job carries its request's trace, so a request, the job it queued and the
+  job that job queued share one trace.
+- **`on_model`** (`rainier-database`): `events.on_model::<User>().key(42)
+  .actions(&[ModelAction::Updated]).run(..)` — a declarative subscription to
+  one model's, or one row's, `ModelChanged`.
+- **`ingest.threads`** (`rainier-lookout`): how many threads Lookout's bus
+  subscriber records on (default a quarter of the cores, one to four).
 - **`ModelChanged`** (`rainier-database`): one event on the bus for every
   committed write, of every model — through a repository with or without
   `with_events`, a bulk `update_matching` / `delete_matching`, a counter
@@ -89,6 +127,29 @@ the release as a whole and names the crate it landed in.
 
 ### Changed
 
+- **Lookout records from the event bus**, not a `tracing` layer:
+  `Lookout::subscribe(&events)` replaces `Lookout::layer` and
+  `Lookout::listen`. The request thread's share of recording a request of
+  twenty queries and three cache calls fell from about 59 µs to about 5 µs;
+  the rest happens on Lookout's own threads. Batches, trace correlation,
+  sampling, scope rules, aggregates and the dashboard are as before; the
+  batch id is the unit of work's id. The framework's `lookout` feature no
+  longer turns on any crate's `telemetry` feature — that is OpenTelemetry,
+  and Lookout does not need it. See [lookout](docs/lookout.md).
+- **Published, not dispatched** — listeners run after the raising code has
+  moved on, each subscriber on its own thread; a failing one is logged and
+  reported and never returned to the raiser. Tests that read what such a
+  listener recorded need `events.settled().await` first: `ModelChanged`;
+  `Created<M>`, `Updated<M>`, `Deleted<M>` (a failing listener no longer
+  fails the write's caller); `MessageSent`; `JobProcessing`, `JobProcessed`,
+  `JobReleased`, `JobFailed`; the accounts events. The hooks that can veto —
+  `Creating<M>`, `Updating<M>`, `Deleting<M>`, `MessageSending` — are still
+  dispatched and awaited. `listen_queued` stays an inline listener, so a
+  `dispatch` still returns its queue write's error. See
+  [hooks and events](docs/events.md#hooks-and-events-the-two-ideas).
+- `rainier-cache` / `rainier-filesystem`: the store and disk wrappers that
+  publish their events are applied always; only their spans need
+  `telemetry`.
 - **`Dispatcher::has_listeners` counts wildcard listeners** (`rainier-events`):
   a wildcard listener hears every event, and leaving it out skipped the
   events it registered for. A repository built `with_events` therefore builds

@@ -1,7 +1,7 @@
 //! What Lookout records: [`Entry`] values, grouped into a [`Batch`] per unit
 //! of work (a request, a job, a command, a scheduled task).
 //!
-//! These types are the contract between the recorder ([`crate::layer`]), the
+//! These types are the contract between the recorder ([`crate::subscriber`]), the
 //! stores ([`crate::store`]) and the dashboard ([`crate::http`]). They are all
 //! `Serialize + Deserialize`: a store may keep them as JSON.
 
