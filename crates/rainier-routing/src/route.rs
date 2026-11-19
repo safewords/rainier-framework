@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use percent_encoding::percent_decode_str;
-use rainier_http::Method;
+use rainier_http::{AbandonPolicy, Method};
 use rainier_middleware::{IntoMiddlewareStack, Middleware, MiddlewareStack};
 
 use crate::handler::RouteHandler;
@@ -109,6 +109,7 @@ pub struct Route {
     excluded_middleware: Vec<TypeId>,
     name: Option<String>,
     constraints: HashMap<String, ParamConstraint>,
+    abandon: AbandonPolicy,
 }
 
 impl Route {
@@ -138,6 +139,7 @@ impl Route {
             excluded_middleware: Vec::new(),
             name: None,
             constraints: HashMap::new(),
+            abandon: AbandonPolicy::new(),
         }
     }
 
@@ -172,6 +174,27 @@ impl Route {
     pub fn middleware(&mut self, middleware: impl IntoMiddlewareStack) -> &mut Self {
         self.middleware =
             std::mem::take(&mut self.middleware).with_stack(middleware.into_middleware_stack());
+        self
+    }
+
+    /// What to do with this route's work when its request is abandoned — the
+    /// client hangs up, or a `Timeout` gives up on it.
+    ///
+    /// Whatever this leaves unset comes from the route's group, and then from
+    /// [`AbandonPolicy::DEFAULT`]: finish when the client hangs up, cancel at
+    /// a timeout. Calling it again replaces only what the new policy sets.
+    ///
+    /// ```ignore
+    /// // A webhook that must record what it was sent, however long it takes.
+    /// router.post("/webhooks/stripe", stripe).when_abandoned(AbandonPolicy::finish());
+    ///
+    /// // A search nobody is waiting for is worth nothing.
+    /// router.get("/search", search).when_abandoned(AbandonPolicy::cancel());
+    /// ```
+    ///
+    /// See `docs/abandoned-requests.md`.
+    pub fn when_abandoned(&mut self, policy: AbandonPolicy) -> &mut Self {
+        self.abandon = policy.or(self.abandon);
         self
     }
 
@@ -252,6 +275,12 @@ impl Route {
         &self.segments
     }
 
+    /// What the route does with abandoned work, as declared — unset halves
+    /// fall back to [`AbandonPolicy::DEFAULT`] when it is served.
+    pub fn abandon_policy(&self) -> AbandonPolicy {
+        self.abandon
+    }
+
     /// The route's name, if it has one.
     pub fn route_name(&self) -> Option<&str> {
         self.name.as_deref()
@@ -308,6 +337,11 @@ impl Route {
         // A group name prefix alone does not name an unnamed route — `admin.`
         // is a prefix, not a route name — so `None` stays `None`.
         self.name = self.name.take().map(|name| format!("{prefix}{name}"));
+    }
+
+    pub(crate) fn inherit_abandon_policy(&mut self, group: AbandonPolicy) {
+        // A route's own choice wins over the group's.
+        self.abandon = self.abandon.or(group);
     }
 
     pub(crate) fn add_constraints(&mut self, constraints: &HashMap<String, ParamConstraint>) {

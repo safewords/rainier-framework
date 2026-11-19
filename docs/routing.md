@@ -162,6 +162,7 @@ router.group(
 | `.name(n)` | prepends `n` to each route name |
 | `.middleware([…])` | prepends middleware, so outer runs first |
 | `.where_param(k, c)` | applies a constraint to every route in the group |
+| `.when_abandoned(p)` | what routes that don't say for themselves do when their request is [abandoned](abandoned-requests.md) |
 
 Groups nest. Each attribute is applied **after** any inner group has applied
 its own, so the outer prefix ends up outermost and the outer middleware runs
@@ -253,6 +254,17 @@ follow — see [Middleware](middleware.md#why-values-and-not-names).
 `without_middleware::<T>()` opts out **by type**, because that is the only
 identity a value has. It drops every stage of that concrete type the group
 applied.
+
+## When the client hangs up
+
+```rust
+router.post("/webhooks/stripe", stripe).when_abandoned(AbandonPolicy::finish());
+router.get("/search", search).when_abandoned(AbandonPolicy::cancel());
+```
+
+What a route's work does when its client hangs up or a timeout gives up on it.
+By default the work finishes after a hang-up and is cancelled at a timeout. See
+[Abandoned requests](abandoned-requests.md).
 
 ## Inspecting the table
 

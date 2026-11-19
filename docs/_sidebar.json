@@ -5,7 +5,7 @@
     "architecture", "lifecycle", "container", "providers", "facades"
   ] },
   { "group": "The Basics", "items": [
-    "routing", "middleware", "controllers", "requests", "responses",
+    "routing", "middleware", "abandoned-requests", "controllers", "requests", "responses",
     "views", "vite", "urls", "validation", "errors"
   ] },
   { "group": "Database", "items": [

@@ -12,6 +12,16 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Abandoned requests** (`rainier-http`, `rainier-routing`,
+  `rainier-middleware`, `rainier-server`): each route declares what happens to
+  its work when the client hangs up or a `Timeout` gives up on it.
+  `OnAbandon::Finish` runs it to the end in a task of its own and discards the
+  response; `OnAbandon::Cancel` stops it at its next `await`. Declare it with
+  `.when_abandoned(AbandonPolicy::…)` on a route or a `GroupAttributes`, or
+  with `ResourceController::when_abandoned` per action. A handler can read
+  `request.abandonment()` to stop early on its own terms. The new page is
+  `docs/abandoned-requests.md`.
+
 - **`ErrorKind::name`** (`rainier-support`): the stable `error.type` string
   for a kind — `"not_found"`, `"internal"`, … — always available, where
   `telemetry::kind_name` needed the `telemetry` feature (it now calls this).
@@ -131,6 +141,17 @@ the release as a whole and names the crate it landed in.
   `0` pings every acquire, as `PoolConfig::serverless()` does.
 
 ### Changed
+
+- **A client hanging up no longer cancels the handler** (`rainier-server`).
+  The server now runs each request's work in a task of its own. The default
+  policy finishes the work when the client hangs up, and still cancels it at
+  a timeout. Before, hyper dropped the handler at whichever `await` it was on,
+  which could leave the first of two writes behind. It also made the database
+  driver discard a connection whose query had been cut off mid-flight. For
+  the old behaviour, declare `.when_abandoned(AbandonPolicy::cancel())`; a
+  route cancelled that way answers `499`, which is not reported as an error.
+  `Timeout` marks the request `TimedOut` before it drops the work, and it
+  honours a route-level finish policy.
 
 - **Lookout records from the event bus**, not a `tracing` layer:
   `Lookout::subscribe(&events)` replaces `Lookout::layer` and
@@ -1224,7 +1245,6 @@ restarts at this release.
   add up — measured at 145 seconds to give up on a "10 second" timeout. Every
   operation now runs under a wall-clock `timeout`, so the number in
   `with_timeout` is the number.
-
 
 ## 1.1.0 - 2026-07-27
 

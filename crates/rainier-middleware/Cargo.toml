@@ -27,6 +27,10 @@ tracing = { workspace = true }
 # mio, which does not build for wasm32 — and this crate must.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rainier-events = { workspace = true }
+# `rt` for `run_detachable`, which moves a route's work into a task of its own
+# so it can outlive a client that hung up. There is no runtime to spawn on in
+# wasm, where the work runs in place instead.
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

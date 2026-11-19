@@ -284,7 +284,7 @@ so a group's session still wraps the controller's authorisation check.
 | `StartSession` | `groups::session()` | load and persist the [session](sessions.md) |
 | `Authenticate` | `Authenticate::<User>::resolved()` | see [Authentication](authentication.md) |
 | `RedirectIfAuthenticated` | `RedirectIfAuthenticated::new(auth, "/")` | bounce a logged-in user off `/login` |
-| `Timeout` | `Timeout::seconds(30)` | cancel a handler that overruns, answering `408` |
+| `Timeout` | `Timeout::seconds(30)` | answer `408` when a handler overruns, cancelling it unless its route [finishes abandoned work](abandoned-requests.md) |
 | `Compress` | `Compress::new()` | gzip a text response the client asked for |
 | `MethodOverride` | `MethodOverride::new()` | let an HTML form spell `PUT`/`PATCH`/`DELETE` |
 
@@ -521,7 +521,10 @@ SERVER_REQUEST_TIMEOUT=30
 Two things it does not do, both worth knowing before relying on it:
 
 **Cancelling is not undoing.** At the deadline the handler's future is dropped,
-which stops the part that had not run yet. Work already handed to somebody else
+which stops the part that had not run yet. A route that declares
+`.when_abandoned(AbandonPolicy::new().on_timeout(OnAbandon::Finish))` instead
+gets its `408` on time while its work runs on to the end. See
+[Abandoned requests](abandoned-requests.md). Work already handed to somebody else
 keeps going: a query in flight was already sent and the row will be written, an
 HTTP request already issued reaches the other service, a job already pushed
 will be worked. This bounds *your* latency. A handler that must be

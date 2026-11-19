@@ -38,13 +38,17 @@
 //! ```
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use rainier_container::Container;
-use rainier_http::{IntoResponse, Method, Request, Response};
+use rainier_http::{
+    AbandonPolicy, AbandonReason, Abandonment, IntoResponse, Method, OnAbandon, Request, Response,
+    StatusCode,
+};
 use rainier_middleware::{
-    ConcreteMiddleware, Destination, IntoMiddlewareStack, Middleware, MiddlewareStack, Pipeline,
-    ReadyPipeline,
+    run_detachable, ConcreteMiddleware, Destination, IntoMiddlewareStack, Middleware,
+    MiddlewareStack, Pipeline, ReadyPipeline,
 };
 use rainier_support::{BoxedFuture, Error, Result};
 
@@ -73,6 +77,7 @@ pub struct GroupAttributes {
     name_prefix: String,
     middleware: MiddlewareStack,
     constraints: HashMap<String, ParamConstraint>,
+    abandon: AbandonPolicy,
 }
 
 impl GroupAttributes {
@@ -106,6 +111,19 @@ impl GroupAttributes {
     /// ```
     pub fn middleware(mut self, middleware: impl IntoMiddlewareStack) -> Self {
         self.middleware = self.middleware.with_stack(middleware.into_middleware_stack());
+        self
+    }
+
+    /// What every route in the group does with abandoned work, where the route
+    /// does not say for itself. See [`Route::when_abandoned`].
+    ///
+    /// ```ignore
+    /// router.group(GroupAttributes::new().prefix("webhooks").when_abandoned(AbandonPolicy::finish()), |router| {
+    ///     router.post("/stripe", stripe);
+    /// });
+    /// ```
+    pub fn when_abandoned(mut self, policy: AbandonPolicy) -> Self {
+        self.abandon = policy.or(self.abandon);
         self
     }
 
@@ -271,6 +289,7 @@ impl Router {
             route.prepend_middleware(&attributes.middleware);
             route.prepend_name(&attributes.name_prefix);
             route.add_constraints(&attributes.constraints);
+            route.inherit_abandon_policy(attributes.abandon);
         }
     }
 
@@ -464,6 +483,59 @@ impl RouteIndex {
     }
 }
 
+/// Run a matched route the way its [`AbandonPolicy`] asks.
+///
+/// - Finishing at a timeout: the route's work goes into a task of its own
+///   ([`run_detachable`]), so a global `Timeout` that gives up and drops this
+///   future leaves the work running. Its own task costs well under a
+///   microsecond, and only routes that ask for it pay it.
+/// - Cancelling when the client hangs up: the work is raced against the
+///   hang-up and dropped when it comes first. The server runs every request
+///   in its own task, so without this the work would always finish.
+///
+/// The default — finish on hang-up, cancel at a timeout — does neither and
+/// runs the route in place.
+async fn run_route(
+    pipeline: &ReadyPipeline,
+    request: Request,
+    abandonment: Abandonment,
+    policy: AbandonPolicy,
+) -> Response {
+    let work: std::pin::Pin<Box<dyn Future<Output = Response> + Send + '_>> =
+        if policy.for_reason(AbandonReason::TimedOut) == OnAbandon::Finish {
+            let pipeline = pipeline.clone();
+            Box::pin(run_detachable(
+                async move { pipeline.run(request).await },
+                abandonment.clone(),
+                policy,
+            ))
+        } else {
+            Box::pin(pipeline.run(request))
+        };
+
+    if policy.for_reason(AbandonReason::ClientGone) == OnAbandon::Finish {
+        return work.await;
+    }
+
+    let mut work = work;
+    let mut gone = std::pin::pin!(abandonment.abandoned_for(AbandonReason::ClientGone));
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(response) = work.as_mut().poll(cx) {
+            return std::task::Poll::Ready(response);
+        }
+        if gone.as_mut().poll(cx).is_ready() {
+            // Nobody will read this. 499 is the status proxies log for a
+            // client that closed the request, and it is not an error to
+            // report: the kernel reports error responses, and this one has no
+            // error attached.
+            let status = StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST);
+            return std::task::Poll::Ready(Response::text("").with_status(status));
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
 /// A router with every route's middleware resolved and pipeline built.
 pub struct CompiledRouter {
     routes: Vec<CompiledRoute>,
@@ -526,11 +598,23 @@ impl CompiledRouter {
             };
             request.extensions_mut().insert(matched.clone());
 
+            // The route's policy for abandoned work, recorded for the route's
+            // own middleware — a route-level `Timeout` reads it.
+            let policy = compiled.route.abandon_policy().resolved();
+            request.extensions_mut().insert(policy);
+
             // And onto the response, for whoever runs after the request is
             // gone: the HTTP kernel reports a failed request against its
             // route pattern, and by then the pipeline has consumed the
             // request. A response that already names a route keeps it.
-            let mut response = compiled.pipeline.run(request).await;
+            let mut response = match request.extensions().get::<Abandonment>().cloned() {
+                Some(abandonment) => {
+                    run_route(&compiled.pipeline, request, abandonment, policy).await
+                }
+                // Nobody can abandon a request that was given no signal — one
+                // driven straight into the router by a test.
+                None => compiled.pipeline.run(request).await,
+            };
             if response.extensions().get::<MatchedRoute>().is_none() {
                 response.extensions_mut().insert(matched);
             }

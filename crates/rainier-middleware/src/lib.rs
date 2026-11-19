@@ -60,6 +60,7 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod abandon;
 pub mod builtin;
 pub mod compression;
 pub mod method_override;
@@ -70,6 +71,7 @@ pub mod registry;
 pub mod stack;
 pub mod timeout;
 
+pub use abandon::run_detachable;
 pub use builtin::{
     AddHeaders, AllowedOrigins, ConvertEmptyStringsToNull, HandleCors, SharedThrottle,
     ThrottleRequests, TrimStrings,

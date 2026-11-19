@@ -12,7 +12,9 @@ use hyper_util::rt::TokioIo;
 use rainier_container::{with_facade_application, Application};
 use rainier_events::report::{HttpRequestFailed, ServerFailed};
 use rainier_events::Exception;
-use rainier_http::{ClientIp, IntoResponse, OriginalError, Request, Response};
+use rainier_http::{
+    AbandonReason, Abandonment, ClientIp, IntoResponse, OriginalError, Request, Response,
+};
 use rainier_support::{Error, Result};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -330,8 +332,46 @@ async fn serve_one(
         if options.trust_forwarded_for { forwarded_for(&request).unwrap_or(peer) } else { peer };
     request.extensions_mut().insert(ClientIp(client_ip));
 
-    let response: Response = kernel.handle_request(request).await;
+    // The request's work runs in a task of its own, with this future only
+    // waiting on it. hyper drops this future when the client hangs up; the
+    // guard marks the request abandoned as it goes, and the task carries on
+    // or stops as the matched route's `AbandonPolicy` says — finishing, by
+    // default, rather than stopping between two writes.
+    let abandonment = Abandonment::new();
+    request.extensions_mut().insert(abandonment.clone());
+    let mut hang_up = HangUp { abandonment, answered: false };
+
+    let task =
+        rainier_container::spawn_with_facades(async move { kernel.handle_request(request).await });
+    let response: Response = match task.await {
+        Ok(response) => response,
+        // The kernel catches a handler's panic and renders it; one here is a
+        // panic in the kernel itself, which had nothing to report it to.
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(_) => Error::new(
+            rainier_support::ErrorKind::ServiceUnavailable,
+            "The server is shutting down.",
+        )
+        .into_response(),
+    };
+    hang_up.answered = true;
     Ok(response.into_http())
+}
+
+/// Marks a request abandoned by its client when hyper drops the future serving
+/// it before it was answered — the one sign of a hang-up a handler's future
+/// gets.
+struct HangUp {
+    abandonment: Abandonment,
+    answered: bool,
+}
+
+impl Drop for HangUp {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.abandonment.abandon(AbandonReason::ClientGone);
+        }
+    }
 }
 
 /// A `Request` carrying everything but the body, for a handshake to inspect.
@@ -594,6 +634,162 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("the server was still accepting connections after shutdown");
+    }
+
+    /// Serve `kernel` on an ephemeral port.
+    async fn start_kernel(kernel: Kernel) -> (SocketAddr, watch::Sender<bool>) {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (tx, rx) = watch::channel(false);
+        let server = Server::new(kernel).with_options(ServerOptions::default().bind(address));
+        tokio::spawn(async move {
+            let _ = server.run_until(rx).await;
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(address).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (address, tx)
+    }
+
+    /// Send a request, then hang up before the answer comes.
+    async fn hang_up_on(address: SocketAddr, path: &str) {
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(stream);
+    }
+
+    /// A route that sleeps, then records that it got to the end — and whether
+    /// it saw its request abandoned on the way.
+    fn slow_route<'r>(
+        router: &'r mut Router,
+        path: &str,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+        saw: Arc<std::sync::Mutex<Option<rainier_http::AbandonReason>>>,
+    ) -> &'r mut rainier_routing::Route {
+        router.get(path, move |request: rainier_routing::Req| {
+            let finished = Arc::clone(&finished);
+            let saw = Arc::clone(&saw);
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                *saw.lock().unwrap() = request.abandonment().reason();
+                finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                "done"
+            }
+        })
+    }
+
+    fn flags() -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::Mutex<Option<rainier_http::AbandonReason>>>,
+    ) {
+        (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(std::sync::Mutex::new(None)))
+    }
+
+    #[tokio::test]
+    async fn by_default_a_hang_up_lets_the_work_finish() {
+        let (finished, saw) = flags();
+        let mut router = Router::new();
+        slow_route(&mut router, "/slow", Arc::clone(&finished), Arc::clone(&saw));
+        let kernel =
+            Kernel::new(router.compile(&rainier_container::Container::new()).expect("compiles"));
+        let (address, shutdown) = start_kernel(kernel).await;
+
+        hang_up_on(address, "/slow").await;
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst), "the work was cancelled");
+        assert_eq!(*saw.lock().unwrap(), Some(rainier_http::AbandonReason::ClientGone));
+        let _ = shutdown.send(true);
+    }
+
+    #[tokio::test]
+    async fn a_route_that_cancels_on_hang_up_stops() {
+        let (finished, saw) = flags();
+        let mut router = Router::new();
+        slow_route(&mut router, "/slow", Arc::clone(&finished), saw)
+            .when_abandoned(rainier_http::AbandonPolicy::cancel());
+        let kernel =
+            Kernel::new(router.compile(&rainier_container::Container::new()).expect("compiles"));
+        let (address, shutdown) = start_kernel(kernel).await;
+
+        hang_up_on(address, "/slow").await;
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        assert!(!finished.load(std::sync::atomic::Ordering::SeqCst), "the work ran on");
+        let _ = shutdown.send(true);
+    }
+
+    #[tokio::test]
+    async fn a_group_policy_reaches_its_routes() {
+        let (finished, saw) = flags();
+        let mut router = Router::new();
+        router.group(
+            rainier_routing::GroupAttributes::new()
+                .when_abandoned(rainier_http::AbandonPolicy::cancel()),
+            |router| {
+                slow_route(router, "/slow", Arc::clone(&finished), Arc::clone(&saw));
+            },
+        );
+        let kernel =
+            Kernel::new(router.compile(&rainier_container::Container::new()).expect("compiles"));
+        let (address, shutdown) = start_kernel(kernel).await;
+
+        hang_up_on(address, "/slow").await;
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        assert!(!finished.load(std::sync::atomic::Ordering::SeqCst), "the work ran on");
+        let _ = shutdown.send(true);
+    }
+
+    fn with_global_timeout(router: Router) -> Kernel {
+        Kernel::with_middleware(
+            router.compile(&rainier_container::Container::new()).expect("compiles"),
+            vec![Arc::new(rainier_middleware::Timeout::millis(50))],
+        )
+    }
+
+    #[tokio::test]
+    async fn by_default_a_global_timeout_cancels_the_work() {
+        let (finished, saw) = flags();
+        let mut router = Router::new();
+        slow_route(&mut router, "/slow", Arc::clone(&finished), saw);
+        let (address, shutdown) = start_kernel(with_global_timeout(router)).await;
+
+        let response = request(address, &get("/slow")).await;
+        assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert!(!finished.load(std::sync::atomic::Ordering::SeqCst), "the work ran on");
+        let _ = shutdown.send(true);
+    }
+
+    #[tokio::test]
+    async fn a_route_that_finishes_on_timeout_outlives_a_global_timeout() {
+        let (finished, saw) = flags();
+        let mut router = Router::new();
+        slow_route(&mut router, "/slow", Arc::clone(&finished), Arc::clone(&saw)).when_abandoned(
+            rainier_http::AbandonPolicy::new().on_timeout(rainier_http::OnAbandon::Finish),
+        );
+        let (address, shutdown) = start_kernel(with_global_timeout(router)).await;
+
+        let response = request(address, &get("/slow")).await;
+        assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst), "the work was cancelled");
+        assert_eq!(*saw.lock().unwrap(), Some(rainier_http::AbandonReason::TimedOut));
+        let _ = shutdown.send(true);
     }
 
     #[test]

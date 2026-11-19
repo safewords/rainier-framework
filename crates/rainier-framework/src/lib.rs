@@ -247,7 +247,8 @@ pub mod prelude {
     pub use crate::deferred::defer;
     pub use rainier_http::extract::{Bearer, Form, Json, Path, Query, RawBody};
     pub use rainier_http::{
-        Cookie, FromRequest, Html, IntoResponse, Method, Redirect, Request, Response, StatusCode,
+        AbandonPolicy, AbandonReason, Abandonment, Cookie, FromRequest, Html, IntoResponse, Method,
+        OnAbandon, Redirect, Request, Response, StatusCode,
     };
 
     pub use rainier_cache::{Cache as CacheContract, CacheDriver, CacheExt as _, CacheManager};
@@ -261,7 +262,7 @@ pub mod prelude {
         Compress, MethodOverride, Middleware as MiddlewareContract, Next, Timeout, TrustProxies,
     };
     pub use rainier_routing::{
-        GroupAttributes, ParamConstraint, Req, ResourceController, Route, Router,
+        GroupAttributes, ParamConstraint, Req, ResourceAction, ResourceController, Route, Router,
     };
     pub use rainier_session::{
         Session as SessionBag, SessionDriver, SessionManager, SessionRequestExt as _, StartSession,
