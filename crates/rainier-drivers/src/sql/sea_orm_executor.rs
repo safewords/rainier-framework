@@ -16,6 +16,16 @@ use sea_orm::{
     QueryResult, Statement, TransactionTrait, Value as SeaValue,
 };
 
+/// The level sqlx logs every statement at.
+///
+/// sqlx's default is `INFO`, under the `sqlx::query` target, so an
+/// application at `RUST_LOG=info` wrote one log line per statement — the SQL,
+/// its timing and its row counts, which Rainier's own `db.query` spans already
+/// record. A worker polling a database queue wrote one a second, forever. At
+/// `DEBUG` it is still there for `RUST_LOG=sqlx::query=debug`. sqlx's
+/// slow-statement warning is a separate setting and is left as it is.
+const STATEMENT_LOG_LEVEL: log::LevelFilter = log::LevelFilter::Debug;
+
 /// Wraps a live sea-orm connection and runs rendered SQL through it.
 ///
 /// The inner `DatabaseConnection` *is* a connection pool; `Clone` is cheap and
@@ -98,7 +108,8 @@ impl SeaOrmExecutor {
             opts.max_connections(pool.max_connections)
                 .min_connections(pool.min_connections)
                 .acquire_timeout(pool.acquire_timeout)
-                .test_before_acquire(pool.test_before_acquire);
+                .test_before_acquire(pool.test_before_acquire)
+                .sqlx_logging_level(STATEMENT_LOG_LEVEL);
             // After `test_before_acquire`, which it turns off: sea-orm runs the
             // idle check in sqlx's `before_acquire` instead of pinging every time.
             if let (true, Some(idle)) = (pool.test_before_acquire, pool.test_after_idle) {
@@ -127,10 +138,11 @@ impl SeaOrmExecutor {
         // existing deployment opens is byte-for-byte the one it opened before.
         let statements: Vec<String> = session.to_vec();
         let options = url.parse::<sea_orm::sqlx::mysql::MySqlConnectOptions>().map_err(|e| {
-            // Never the URL: a DSN carries its password inline, and this is a
-            // log line.
+            // Never the URL: a DSN carries its password inline, and this
+            // is a log line.
             Error::msg(format!("this MySQL connection string cannot be parsed: {e}"))
         })?;
+        let options = sea_orm::sqlx::ConnectOptions::log_statements(options, STATEMENT_LOG_LEVEL);
 
         let mut pool_options = sea_orm::sqlx::mysql::MySqlPoolOptions::new()
             .max_connections(pool.max_connections)

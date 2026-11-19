@@ -120,6 +120,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal", "fs"] }
 tracing = "0.1"
+# Only to name a level for sqlx's statement logging (`rainier-drivers`).
+log = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 rpassword = "7"
 flate2 = "1"

@@ -38,6 +38,8 @@ sea-orm = { workspace = true, optional = true, features = [
     "with-rust_decimal",
 ] }
 rust_decimal = { workspace = true, optional = true }
+# sqlx names its statement-log level with `log`; see `SeaOrmExecutor::connect`.
+log = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
@@ -71,7 +73,7 @@ aws-dynamodb = ["aws", "dep:aws-sdk-dynamodb"]
 # without one of them, so it brings no dependency: each executor names its own.
 sql = []
 # Native MySQL / Postgres / SQLite. Not available on wasm32.
-sea-orm-executor = ["sql", "dep:rainier-orm", "dep:chrono", "dep:sea-orm", "dep:rust_decimal"]
+sea-orm-executor = ["sql", "dep:rainier-orm", "dep:chrono", "dep:sea-orm", "dep:rust_decimal", "dep:log"]
 # Cloudflare D1 over the HTTP /query API.
 d1-http = ["sql", "dep:rainier-orm", "dep:chrono", "dep:serde_json"]
 # Turso / libSQL over the Hrana HTTP /v2/pipeline API. Blobs travel as base64.

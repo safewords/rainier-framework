@@ -57,6 +57,12 @@ the release as a whole and names the crate it landed in.
 
 ### Changed
 
+- **sqlx no longer logs every statement at INFO** (`rainier-drivers`): the
+  sea-orm executor sets sqlx's statement logging to `DEBUG`. At
+  `RUST_LOG=info` an application wrote a log line per SQL statement under
+  `sqlx::query` — duplicating Rainier's `db.query` spans, and once a second
+  forever for a worker polling a database queue. `RUST_LOG=sqlx::query=debug`
+  brings them back; sqlx's slow-statement warning is unchanged.
 - **A query no longer pays a ping** (`rainier-drivers`): with the new
   `test_after_idle` default, a connection used within the last second is handed
   out without one, halving the round trips of a plain read. A plain `SELECT`
