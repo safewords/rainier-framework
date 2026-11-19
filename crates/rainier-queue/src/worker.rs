@@ -315,6 +315,16 @@ pub struct WorkerOptions {
     pub queues: Vec<String>,
     /// How long to wait before looking again when every queue is empty.
     pub sleep: Duration,
+    /// The longest an idle worker waits between looks, when it backs off.
+    ///
+    /// `None` (the default) waits [`sleep`](Self::sleep) every time. With a
+    /// ceiling, each empty look in a row doubles the wait from `sleep` up to
+    /// it, and the first job resets it — so a queue that is empty for an hour
+    /// is asked a few times a minute rather than every second, at the cost of a
+    /// job that arrives after a long quiet waiting up to the ceiling to start.
+    /// For a database-backed queue every look is a query; that is what this
+    /// saves.
+    pub max_idle_sleep: Option<Duration>,
     /// Stop after this many jobs. `None` runs forever.
     pub max_jobs: Option<u64>,
     /// Stop as soon as the queues are empty, rather than waiting for more.
@@ -443,6 +453,7 @@ impl Default for WorkerOptions {
         Self {
             queues: vec!["default".to_string()],
             sleep: Duration::from_secs(1),
+            max_idle_sleep: None,
             max_jobs: None,
             stop_when_empty: false,
             timeout: Some(Duration::from_secs(60)),
@@ -477,6 +488,24 @@ impl WorkerOptions {
     pub fn sleep(mut self, sleep: Duration) -> Self {
         self.sleep = sleep;
         self
+    }
+
+    /// Back off while idle: double the wait after each empty poll in a row, up
+    /// to `max`. See [`max_idle_sleep`](Self::max_idle_sleep).
+    pub fn idle_backoff(mut self, max: Duration) -> Self {
+        self.max_idle_sleep = Some(max);
+        self
+    }
+
+    /// The wait after `consecutive` empty polls in a row (the first is `1`).
+    pub fn idle_sleep(&self, consecutive: u32) -> Duration {
+        match self.max_idle_sleep {
+            None => self.sleep,
+            Some(max) => {
+                let doublings = consecutive.saturating_sub(1).min(16);
+                self.sleep.saturating_mul(1u32 << doublings).min(max.max(self.sleep))
+            }
+        }
     }
 
     /// Stop after `max` jobs — for a worker that should recycle periodically.
@@ -957,6 +986,7 @@ impl Worker {
         let mut stats = WorkerStats::default();
         let started = std::time::Instant::now();
         let mut consecutive_errors: u32 = 0;
+        let mut consecutive_idles: u32 = 0;
 
         // Off the job path entirely: its own task, its own clock, stopped when
         // this run ends.
@@ -1006,6 +1036,7 @@ impl Worker {
                 match self.reserve_within(&running).await {
                     Ok(Some((job, reservation))) => {
                         consecutive_errors = 0;
+                        consecutive_idles = 0;
                         let queue = job.queue.clone();
                         *running.entry(queue.clone()).or_insert(0) += 1;
                         in_flight.push(async move {
@@ -1027,7 +1058,8 @@ impl Worker {
                                 break;
                             }
                             self.container.flush_scoped();
-                            tokio::time::sleep(self.options.sleep).await;
+                            consecutive_idles = consecutive_idles.saturating_add(1);
+                            tokio::time::sleep(self.options.idle_sleep(consecutive_idles)).await;
                             continue;
                         }
                     }
@@ -1595,6 +1627,23 @@ impl std::fmt::Debug for Worker {
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_idle_worker_waits_the_same_every_time_unless_it_backs_off() {
+        let fixed = WorkerOptions::default();
+        assert_eq!(fixed.idle_sleep(1), Duration::from_secs(1));
+        assert_eq!(fixed.idle_sleep(50), Duration::from_secs(1), "no backoff by default");
+
+        let backing = WorkerOptions::default().idle_backoff(Duration::from_secs(5));
+        let waits: Vec<u64> = (1..=6).map(|n| backing.idle_sleep(n).as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 5, 5, 5], "doubles, then holds at the ceiling");
+
+        // A ceiling below the sleep is not a way to poll faster than asked.
+        let odd = WorkerOptions::default()
+            .sleep(Duration::from_secs(3))
+            .idle_backoff(Duration::from_secs(1));
+        assert_eq!(odd.idle_sleep(4), Duration::from_secs(3));
+    }
     use crate::job::{Job, QueuedJob};
     use crate::queue::MemoryQueue;
     use rainier_support::BoxFuture;

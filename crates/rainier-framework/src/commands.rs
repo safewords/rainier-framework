@@ -445,7 +445,7 @@ impl Command for QueueWorkCommand {
 
     fn help(&self) -> Option<&str> {
         Some(
-            "Usage:\n  queue:work [--queue=default,high] [--once] [--max-jobs=N] [--sleep=1]\n\n\
+            "Usage:\n  queue:work [--queue=default,high] [--once] [--max-jobs=N] [--sleep=1] [--max-sleep=N]\n\n\
              Options:\n  \
              --connection Which declared connection to drain. Defaults to the default one.\n  \
              --concurrency How many jobs at once. Defaults to the connection's declaration.\n  \
@@ -455,7 +455,8 @@ impl Command for QueueWorkCommand {
              --timeout   Abandon a job after N seconds, OVERRIDING what the job\n  \
              and its queue declared; 0 is no limit. For an operator\n  \
              draining or debugging, not for a chart to pass by habit.\n  \
-             --sleep     Seconds to wait when the queue is empty",
+             --sleep     Seconds to wait when the queue is empty\n  \
+             --max-sleep Back off while idle, doubling the wait up to N seconds",
         )
     }
 
@@ -499,6 +500,14 @@ impl Command for QueueWorkCommand {
 
         if args.flag("once") {
             options = options.stop_when_empty();
+        }
+        // Back off while idle, doubling the sleep up to this many seconds: a
+        // database-backed queue is otherwise asked once a second forever.
+        if let Some(seconds) = args.option("max-sleep").and_then(|value| value.parse::<u64>().ok())
+        {
+            if seconds > 0 {
+                options = options.idle_backoff(Duration::from_secs(seconds));
+            }
         }
         if let Some(max) = args.option("max-jobs").and_then(|value| value.parse().ok()) {
             options = options.max_jobs(max);

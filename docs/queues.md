@@ -578,6 +578,15 @@ cargo run -- queue:work --once
 | `--once` | process what is waiting, then stop |
 | `--max-jobs=N` | stop after N — a worker that recycles |
 | `--sleep=N` | seconds to wait when the queue is empty |
+| `--max-sleep=N` | back off while idle: each empty look in a row doubles the wait from `--sleep`, up to N seconds; the first job resets it |
+
+**An idle worker asks once per `--sleep`, forever** — no driver here blocks.
+Against a `DatabaseQueue` every look is a query, so a worker on a quiet queue
+runs one a second, all day, with a ping in front of it. `--max-sleep=5` (or
+`WorkerOptions::idle_backoff`) cuts that to one every five seconds once the
+queue has been quiet a few seconds. The price is a job that arrives after a
+long quiet waiting up to N seconds to start, so leave it off for a queue whose
+jobs a request waits on. Off by default.
 
 Queues are tried in the order given: the worker takes everything from `high`
 before looking at `default`.

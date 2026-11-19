@@ -21,6 +21,12 @@ the release as a whole and names the crate it landed in.
   names the tables at boot, so a process that never serves the read still
   announces its writes. Bounded, single-flight per key, never fails a read. See
   [cache](docs/cache.md#computed-results-querycache).
+- **Idle backoff for workers** (`rainier-queue`, `rainier-framework`):
+  `WorkerOptions::idle_backoff(max)` and `queue:work --max-sleep=N` double
+  the sleep after each empty poll in a row, up to `max`, and reset on the
+  first job. Against a database-backed queue every poll is a query; a quiet
+  worker no longer runs one a second forever. Off by default, because it lets
+  a job that arrives after a quiet spell wait up to `max` to start.
 - **Transactions** (`rainier-database`, `rainier-drivers`):
   `Database::transaction(|tx| …)` commits on `Ok` and rolls back on `Err` or a
   panic; `tx` is an ordinary handle, so repositories and `repo::` run inside.
