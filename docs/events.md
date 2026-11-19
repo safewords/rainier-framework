@@ -108,6 +108,48 @@ model write is a typed event. Your code subscribes to the ones it wants.
 [Lookout](lookout.md) is one subscriber among them. It has no special access,
 and other subscribers neither know nor care that it is there.
 
+An application has **one** `Dispatcher`. Everything raised in it, by your
+code or by the framework, goes through that one object, and everything that
+reacts subscribes on it. That is what makes it a bus rather than a set of
+callbacks. A producer never names its consumers, a consumer never names its
+producer, and either side can be added or removed without touching the other:
+
+```mermaid
+flowchart LR
+    subgraph producers["Producers — publish facts"]
+        direction TB
+        app["Your code<br/>PostPublished, OrderPlaced, …"]
+        work["The framework's work<br/>RequestHandled, QueryExecuted,<br/>CacheOperation, JobRan, MailSent, …"]
+        db["Every committed write<br/>ModelChanged, Created&lt;M&gt; …"]
+        reporter["The reporter<br/>ExceptionReported, HttpRequestFailed, …"]
+    end
+
+    bus(("Dispatcher<br/>one per application"))
+
+    subgraph consumers["Subscribers — each on its own thread"]
+        direction TB
+        yours["Your subscribers<br/>on::&lt;E&gt;(), on_model, subscriber(..)"]
+        queued["Queued listeners<br/>listen_queued → a job"]
+        wild["Wildcards and activity subscribers<br/>on_any, on_activity"]
+        lookout["Lookout<br/>one subscriber among the others"]
+    end
+
+    app --> bus
+    work --> bus
+    db --> bus
+    reporter --> bus
+    bus --> yours
+    bus --> queued
+    bus --> wild
+    bus --> lookout
+```
+
+The framework publishes whatever is or isn't subscribed, and whether or not
+optional features such as Lookout or OpenTelemetry are compiled in. Nothing
+about one subscriber changes what another hears, and none depends on another
+being there. Your `ModelChanged` subscriber works in an application without
+Lookout, and Lookout registers the same way yours does.
+
 There are two ways to raise an event, and the raiser picks:
 
 | | `publish(event)` | `dispatch(event).await` |
@@ -245,6 +287,78 @@ Four mechanisms that all mean "tell someone", and they don't overlap:
 They compose. A subscriber on the bus can queue a job, the job sends a
 notification, and the notification broadcasts so the bell moves. Each step is
 also an event on the bus.
+
+## What travels on the bus
+
+Everything the framework does. The `tracing` spans it also opens carry the same
+work for OpenTelemetry exporters and log lines, and nothing else reads them:
+
+| | **The bus** (`Dispatcher`) | **Spans** (`tracing`) |
+|---|---|---|
+| Carries | typed facts, with the unit of work they belong to | the timing and shape of work |
+| Read by | subscribers: your code, queued jobs, Lookout | the tracing subscriber: logs, an OTLP exporter |
+| Needs | nothing; always on | each crate's `telemetry` feature |
+| Requests | `RequestHandled` | `http.server.request` |
+| Queries, model writes | `QueryExecuted`, `ModelChanged`, `Created<M>` … | `db.query` |
+| Cache, storage, sessions | `CacheOperation`, `StorageOperation`, `SessionOperation` | `cache.*`, `storage.*`, `session.*` |
+| Outgoing HTTP | `HttpClientRequestSent` | `http.client.request` |
+| Jobs | `JobQueued`, `JobRan`, `JobProcessing` … `JobFailed` | `queue.publish`, `queue.process`, … |
+| Mail, notifications, views | `MailSent`, `NotificationSent`, `ViewRendered` | `mail.send`, `notification.send`, `view.render` |
+| Auth, broadcasts, WebSockets | `AuthAttempted`, `BroadcastSent`, `WebSocket…` | `auth.attempt`, `broadcast.publish`, `websocket.*` |
+| Commands, scheduled tasks | `CommandRan`, `ScheduledTaskRan` | `console.command`, `schedule.task` |
+| Log lines | `LogWritten` (the `log-layer` feature) | the log event itself |
+| Failures | `ExceptionReported` and one event per kind | `otel.status_code` on the span |
+
+An activity's `kind()` is its span's name and its fields are the span's
+attributes. So a subscriber that knows spans already knows the events.
+
+## A model change, end to end
+
+Every write a statement builder or repository makes reports the rows it
+touched to the connection's change feed once it has succeeded. Boot connects
+each of the application's connections to the bus, so every write becomes one
+published `ModelChanged`, for every model. That covers a repository with or
+without `with_events`, a bulk update, or no repository at all:
+
+```mermaid
+sequenceDiagram
+    participant R as Request handler
+    participant Repo as Post repository
+    participant DB as Database
+    participant D as Dispatcher
+    participant A as Your audit subscriber<br/>(its own thread)
+    participant L as Lookout<br/>(its own threads)
+    R->>Repo: create(post)
+    Repo->>D: dispatch(Creating&lt;Post&gt;) — a hook: awaited, can veto
+    Repo->>DB: INSERT INTO posts …
+    DB-->>Repo: ok
+    Note over Repo,D: inside a transaction: held until COMMIT,<br/>dropped on ROLLBACK
+    Repo->>D: publish(ModelChanged { Post, Created, [7] }), publish(Created&lt;Post&gt;)
+    D-->>Repo: returned at once
+    Repo-->>R: Post
+    D-)A: ModelChanged, in the request's context
+    D-)L: ModelChanged, in the request's context
+    Note over L: recorded in the request's batch
+```
+
+## Across the queue
+
+What links a job to the request that queued it is the trace. The dispatch
+writes the request's `traceparent` onto the job, and the worker opens the job's
+unit of work in that trace. Every event raised in the job, and in any job that
+job queues, carries the same trace id:
+
+```mermaid
+flowchart LR
+    req["POST /orders<br/>publishes OrderPlaced"] -->|queues| j1["SendReceipt<br/>publishes MailSent"]
+    j1 -->|queues| j2["SyncInvoice<br/>publishes ModelChanged"]
+    req -.->|trace 4bf9…| t["one trace"]
+    j1 -.-> t
+    j2 -.-> t
+```
+
+Lookout shows the three batches together from any one of them. See
+[observability](observability.md#the-trace-crosses-every-boundary).
 
 ## Any type is an event
 
@@ -449,7 +563,11 @@ take down the request that raised the event.
 ## Introspection
 
 ```rust
-events.has_listeners::<PostPublished>();
+events.has_listeners::<PostPublished>();        // would anything hear it, published?
+events.has_typed_listeners::<PostPublished>();  // a hook listener for this type itself
+events.has_subscribers::<PostPublished>();      // the same as has_listeners: one atomic load
+events.subscriber_count();                      // subscribers registered (threads, once they hear)
+events.subscriber_failures();                   // subscriber runs that returned Err
 events.forget::<PostPublished>();
 events.forget_all();
 ```
