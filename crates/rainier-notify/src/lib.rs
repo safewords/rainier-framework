@@ -106,10 +106,12 @@
 pub mod channel;
 #[cfg(feature = "discord")]
 pub mod discord;
+pub mod events;
 pub mod notification;
 pub mod notifier;
 
 pub use channel::{Channel, LogChannel, MailChannel, MemoryChannel, Recorded};
+pub use events::NotificationSent;
 pub use notification::{Channels, Delivery, Notifiable, Notification, Receipt, Sent};
 pub use notifier::Notifier;
 

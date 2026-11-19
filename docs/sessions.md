@@ -472,6 +472,20 @@ request.session().unwrap().id()    // a freshly generated id
 Ids are 256 bits from the OS CSPRNG. A session id is a bearer credential, so
 anything guessable here is an account takeover.
 
+## Events
+
+`StartSession` publishes a `SessionOperation` on the [event bus](events.md)
+for each session it reads from its store (kind `session.load`) and each it
+writes back (`session.save`), whether or not the `telemetry` feature is on.
+It carries the span's fields under the same names — `otel.name`
+(`session load`/`session save`), `rainier.session.store`,
+`rainier.session.found` for a load, `otel.status_code`/`error.type` on a
+failure — and its duration. Never the session id, never the data. A
+client-side (cookie) store reads nothing, so it publishes no `session.load`.
+
+With nothing subscribed it asks the bus once per load and save and reads no
+clock.
+
 ## Testing
 
 ```rust

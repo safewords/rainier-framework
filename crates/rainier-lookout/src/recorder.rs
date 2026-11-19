@@ -3,75 +3,75 @@
 //!
 //! # The life of a batch
 //!
-//! 1. **Open.** The [layer](crate::layer) sees a unit-of-work span start —
-//!    `http.server.request`, `queue.process`, `console.command`,
-//!    `schedule.task` — with no batch around it, and opens one. Scope and
-//!    sampling that can be decided now are decided now: the request's path
-//!    against the dashboard's own, whether jobs / commands / tasks are watched
-//!    at all, and the sample rate. A rejected batch still exists — so its
-//!    failures have somewhere to go — but buffers nothing else.
-//! 2. **Fill.** Every span inside it that Lookout knows (`db.query`,
-//!    `cache.*`, …) becomes an [`Entry`] when it closes; the bus watchers add
-//!    failures and model changes; the middleware adds the route, the status
-//!    and who was signed in. As soon as the router names the route, the route
-//!    stage of [`Scope`](crate::config::Scope) runs — before the handler, so
-//!    an excluded route's queries are never buffered.
-//! 3. **Close.** When the root span closes, `finalize` runs the rest: guard
-//!    and user scope, per-watcher rules, slow thresholds, N+1 detection, the
-//!    keep rule. A kept batch is `try_send`-ed into a bounded channel; when
-//!    the channel is full the batch is dropped and [`Lookout::dropped`]
-//!    counts it. Nothing on the request path waits for the store.
+//! A batch is one [`Unit`] of work — a request, a job's run, a console
+//! command, a scheduled task — as the event bus names it. Lookout hears about
+//! it on its [subscriber](crate::subscriber), on a thread of its own.
+//!
+//! 1. **Open.** The first thing heard about a unit opens its batch: an
+//!    activity published in it, a failure reported in it, or the middleware
+//!    on the request's own thread. Its id is the unit's
+//!    [`id_string`](Unit::id_string). Scope and sampling that can be decided
+//!    now are decided now, from the unit's kind, name and path: the request's
+//!    path against the dashboard's own, whether jobs / commands / tasks are
+//!    watched at all, and the sample rate. A rejected batch still exists — so
+//!    its failures have somewhere to go — but buffers nothing else.
+//! 2. **Fill.** Every activity Lookout knows (`db.query`, `cache.*`, …)
+//!    becomes an [`Entry`]; failures and model changes heard on the same
+//!    subscriber are added; the middleware adds the route, the status and who
+//!    was signed in. When the route is known — from the middleware, or the
+//!    root activity — the route stage of [`Scope`](crate::config::Scope) runs
+//!    and an excluded route's batch drops what it buffered.
+//! 3. **Close.** When the bus says the unit is complete
+//!    ([`UnitCompleted`], published only
+//!    after every event of the unit has been handled), the batch is handed
+//!    on. `finalize` runs the rest on the writer: guard and user scope,
+//!    per-watcher rules, slow thresholds, N+1 detection, the keep rule. A
+//!    closed batch is `try_send`-ed into a bounded channel; when the channel
+//!    is full the batch is dropped and [`Lookout::dropped`] counts it.
 //! 4. **Write.** The writer task ([`Lookout::start_writer`]) drains the
 //!    channel every `flush_interval_ms`, or as soon as `flush_batch_size`
-//!    batches are waiting, and hands them to [`Store::store`] inside a span
-//!    marked `rainier.lookout.internal`, which the layer ignores — the
-//!    database store's own queries are not recorded.
+//!    batches are waiting, and hands them to [`Store::store`] **outside every
+//!    unit** — so what the database store's own queries publish lands in no
+//!    batch.
 //!
-//! # Correlating the bus with a batch
+//! # A failure reported after its request
 //!
-//! Event listeners run inline, on the task that dispatched the event. The
-//! layer keeps a per-thread stack of the batches whose spans are entered on
-//! that thread (pushed in `on_enter`, popped in `on_exit`), so a listener asks
-//! "which batch is the code that called me in?" and gets the innermost one.
-//! No task-local is needed, and it works in any code that runs inside an
-//! instrumented future.
-//!
-//! One report arrives *after* its span: the HTTP kernel reports a failed
-//! request once `handle` has returned, and the server span closed with it. So
-//! a request batch that closes with a status of 500 or more (400 with
-//! `capture.client_errors`, which records client errors) is **parked** for
-//! a moment instead of finalized, and remembered on the closing thread; the
-//! `HttpRequestFailed` that follows on the same thread joins it and releases
-//! it. Parked batches nobody claims are released by the writer's next tick
-//! (or [`Lookout::flush`]).
+//! The HTTP kernel may report a failed request once its unit is over. So a
+//! request batch that closes with a status of 500 or more (400 with
+//! `capture.client_errors`, which records client errors) and no failure in it
+//! yet is **parked** for a moment instead of finalized; an `HttpRequestFailed`
+//! with no unit, for the same method and path, joins it and releases it.
+//! Parked batches nobody claims are released by the writer's next tick (or
+//! [`Lookout::flush`]).
 //!
 //! # Work outside any unit of work
 //!
-//! Spans that are not inside a batch — a query at boot, a cache read in a
-//! background task — are **not recorded**. A batch per stray span would bury
+//! Activities that are not inside a unit — a query at boot, a cache read in a
+//! background task — are **not recorded**. A batch per stray query would bury
 //! the batches people look for under a heap of one-entry ones. Failures are
-//! the exception: a failure with no batch around it becomes a
+//! the exception: a failure with no unit around it becomes a
 //! [`BatchKind::Other`] batch holding just that failure, so nothing reported
 //! is lost to scoping or sampling.
 
 use std::backtrace::Backtrace;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use rainier_events::{Context, Dispatcher, Unit, UnitCompleted, UnitKind};
 use rainier_http::Response;
 use tokio::sync::{mpsc, Notify};
 
 use crate::config::{glob, LookoutConfig};
 use crate::entry::{Batch, BatchKind, Entry, EntryType};
-use crate::layer::LookoutLayer;
 use crate::middleware::LookoutMiddleware;
 use crate::store::Store;
 
-/// The span field that marks Lookout's own work. Anything inside a span that
-/// declares it is not recorded.
+/// The span field Lookout's stores mark their own work with. Lookout's
+/// writer runs outside every unit of work, so nothing it does is recorded;
+/// the field still tells a log reader whose work a line was.
 pub const INTERNAL_FIELD: &str = "rainier.lookout.internal";
 
 /// The most entries one batch holds. A long command that runs a million
@@ -116,13 +116,10 @@ type SessionContext = Vec<(String, String)>;
 /// ```no_run
 /// use std::sync::Arc;
 /// use rainier_lookout::{Lookout, LookoutConfig, MemoryStore};
-/// use tracing_subscriber::layer::SubscriberExt;
 ///
-/// # async fn boot(events: &rainier_events::Dispatcher) {
+/// # async fn boot(events: &Arc<rainier_events::Dispatcher>) {
 /// let lookout = Lookout::new(LookoutConfig::from_env().unwrap(), Arc::new(MemoryStore::new(500)));
-/// let subscriber = tracing_subscriber::registry().with(lookout.layer());
-/// tracing::subscriber::set_global_default(subscriber).unwrap();
-/// lookout.listen(events);
+/// lookout.subscribe(events);
 /// let writer = lookout.start_writer();
 /// // … serve, with `lookout.middleware()` in the global stack …
 /// writer.shutdown().await;
@@ -147,8 +144,8 @@ impl std::fmt::Debug for Lookout {
 impl Lookout {
     /// A recorder for `config`, writing to `store`.
     ///
-    /// With `config.enabled` off every part of it — the layer, the
-    /// middleware, the listeners, the writer — does nothing.
+    /// With `config.enabled` off every part of it — the subscriber, the
+    /// middleware, the writer — does nothing.
     pub fn new(config: LookoutConfig, store: Arc<dyn Store>) -> Self {
         let (tx, rx) = mpsc::channel(config.ingest.channel_capacity.max(1));
         let log_level = parse_level(&config.log_level);
@@ -171,6 +168,7 @@ impl Lookout {
                 last_store_error: Mutex::new(None),
                 counts: Mutex::new(Vec::new()),
                 counts_written: Mutex::new(Instant::now()),
+                events: OnceLock::new(),
             }),
         }
     }
@@ -190,23 +188,43 @@ impl Lookout {
         self.inner.config.enabled
     }
 
-    /// The `tracing` layer that turns spans into entries. Add it to the
-    /// application's subscriber.
-    pub fn layer(&self) -> LookoutLayer {
-        LookoutLayer::new(Arc::clone(&self.inner))
+    /// Subscribe to `events`: one subscriber, `lookout`, on a thread of its
+    /// own, hearing every activity the framework publishes about its work,
+    /// the failures it reports, model changes and the end of each unit of
+    /// work. See [`subscriber`](crate::subscriber) and
+    /// [`watchers`](crate::watchers).
+    ///
+    /// Also asks publishers for what only they can capture: a code trace for
+    /// work over the lowest slow threshold of the traced watchers (with
+    /// [`Capture::code_traces`](crate::config::Capture::code_traces) on), and
+    /// log lines at or above [`log_level`](LookoutConfig::log_level).
+    ///
+    /// A disabled Lookout subscribes to nothing, so the bus costs the
+    /// application what it costs with no subscriber at all. Subscribe once:
+    /// a second call registers a second subscriber that records everything
+    /// again.
+    pub fn subscribe(&self, events: &Arc<Dispatcher>) {
+        if !self.inner.config.enabled {
+            return;
+        }
+        let _ = self.inner.events.set(Arc::downgrade(events));
+        if self.inner.config.capture.code_traces {
+            if let Some(threshold) = crate::subscriber::code_trace_threshold(&self.inner.config) {
+                rainier_events::code_trace::request_code_traces(threshold);
+            }
+        }
+        if let Some(level) = self.inner.log_level {
+            if self.inner.config.watcher(EntryType::Log).enabled {
+                rainier_events::log_layer::request_level(level);
+            }
+        }
+        crate::watchers::subscribe(self, events);
     }
 
     /// The global middleware that attaches the route, status and user to a
     /// request's batch. Put it anywhere in the global stack.
     pub fn middleware(&self) -> LookoutMiddleware {
         LookoutMiddleware::new(self.clone())
-    }
-
-    /// Register the bus watchers on `events`: failures, and — when the model
-    /// watcher is on — model and job lifecycle events. See
-    /// [`watchers`](crate::watchers).
-    pub fn listen(&self, events: &rainier_events::Dispatcher) {
-        crate::watchers::listen(self, events);
     }
 
     /// Decide the guard and user of a request from its response.
@@ -243,11 +261,13 @@ impl Lookout {
                     _ = tick.tick() => {}
                     _ = inner.wake.notified() => {}
                     _ = &mut stop_rx => {
+                        inner.sweep();
                         inner.release_parked(Duration::ZERO);
                         inner.drain_and_store(true).await;
                         break;
                     }
                 }
+                inner.sweep();
                 inner.release_parked(PARK_FOR);
                 inner.drain_and_store(false).await;
             }
@@ -257,10 +277,15 @@ impl Lookout {
 
     /// Write everything closed so far, now: parked batches are released and
     /// the channel is drained into the store. For tests and shutdown.
+    ///
+    /// A batch closes when the subscriber hears its unit is complete, on its
+    /// own thread; a test that wants everything published so far written
+    /// waits for the bus first (`events.settled().await`).
     pub async fn flush(&self) {
         if !self.inner.config.enabled {
             return;
         }
+        self.inner.sweep();
         self.inner.release_parked(Duration::ZERO);
         self.inner.drain_and_store(true).await;
     }
@@ -293,16 +318,7 @@ impl Lookout {
     /// keeps the batch whatever the sampling and keep rule. Returns whether a
     /// batch was found.
     pub fn tag(&self, batch: Option<&str>, tag: impl Into<String>) -> bool {
-        let cell = match batch {
-            None => self.inner.current_batch(),
-            Some(id) => self
-                .inner
-                .open
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(id)
-                .and_then(Weak::upgrade),
-        };
+        let cell = self.inner.find(batch);
         match cell {
             Some(cell) => {
                 let mut state = cell.lock();
@@ -339,16 +355,7 @@ impl Lookout {
         if !self.inner.config.capture.user && !self.inner.config.capture.user_id {
             return false;
         }
-        let cell = match batch {
-            None => self.inner.current_batch(),
-            Some(id) => self
-                .inner
-                .open
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(id)
-                .and_then(Weak::upgrade),
-        };
+        let cell = self.inner.find(batch);
         let Some(cell) = cell else { return false };
         let mut state = cell.lock();
         let Some(pending) = state.as_mut() else { return false };
@@ -395,16 +402,7 @@ impl Lookout {
         if !crate::rum::valid_context_name(name) || !crate::rum::valid_context_value(&value) {
             return false;
         }
-        let cell = match batch {
-            None => self.inner.current_batch(),
-            Some(id) => self
-                .inner
-                .open
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(id)
-                .and_then(Weak::upgrade),
-        };
+        let cell = self.inner.find(batch);
         let Some(cell) = cell else { return false };
         let mut state = cell.lock();
         let Some(pending) = state.as_mut() else { return false };
@@ -470,13 +468,20 @@ impl Lookout {
     fn rum_context(
         &self,
     ) -> Option<(String, crate::rum::ServerSide, SessionContext, Option<String>)> {
-        let cell = self.inner.current_batch()?;
+        let unit = Context::current_unit()?;
+        let cell = self.inner.cell_for(&unit)?;
+        if cell.ignored {
+            return None;
+        }
+        if let Some(trace) = unit.trace_id() {
+            cell.learn_trace(trace);
+        }
         let state = cell.lock();
         let pending = state.as_ref()?;
         Some((
             pending.trace_id.clone().unwrap_or_else(|| pending.id.clone()),
             crate::rum::ServerSide {
-                duration_ms: pending.started.elapsed().as_secs_f64() * 1000.0,
+                duration_ms: unit.elapsed().as_secs_f64() * 1000.0,
                 route: pending.route_name.clone(),
             },
             pending.context.clone(),
@@ -486,10 +491,19 @@ impl Lookout {
 
     /// The id of the batch the calling code is running in, if any — its
     /// trace id once one is known.
+    ///
+    /// Answered from the unit of work the calling code runs in, without
+    /// waiting on the subscriber: a batch's id is its unit's
+    /// [`id_string`](Unit::id_string).
     pub fn current_batch_id(&self) -> Option<String> {
-        let cell = self.inner.current_batch()?;
-        let state = cell.lock();
-        state.as_ref().map(|p| p.trace_id.clone().unwrap_or_else(|| p.id.clone()))
+        if !self.inner.active() {
+            return None;
+        }
+        let unit = Context::current_unit()?;
+        Some(match unit.trace_id() {
+            Some(trace) => trace.to_string(),
+            None => unit.id_string(),
+        })
     }
 }
 
@@ -539,7 +553,8 @@ pub(crate) enum Rejection {
     Sampled,
 }
 
-/// An open batch, shared by every span inside it.
+/// An open batch: one unit of work's, shared by the subscriber's thread and
+/// the request's (the middleware, `describe_user`, …).
 pub(crate) struct BatchCell {
     /// `None` once closed.
     state: Mutex<Option<Pending>>,
@@ -552,6 +567,17 @@ pub(crate) struct BatchCell {
     traces: Mutex<HashSet<u64>>,
     /// What started it.
     pub(crate) kind: BatchKind,
+    /// The unit's id.
+    pub(crate) unit: u64,
+    /// The unit itself, not kept alive: a unit that ends without the bus
+    /// saying so (one opened with no bus) is closed once it is gone.
+    unit_ref: Weak<Unit>,
+    /// The root entry's span id: what entries with no other parent hang off.
+    pub(crate) root_span: String,
+    /// Opened while Lookout was paused: records nothing.
+    pub(crate) ignored: bool,
+    /// Whether the root activity has been heard.
+    root_taken: AtomicBool,
 }
 
 impl BatchCell {
@@ -561,6 +587,27 @@ impl BatchCell {
 
     pub(crate) fn is_rejected(&self) -> bool {
         self.rejected.load(Ordering::Relaxed)
+    }
+
+    /// Claim the root: `true` for the first activity of the unit's own kind.
+    pub(crate) fn take_root(&self) -> bool {
+        !self.root_taken.swap(true, Ordering::Relaxed)
+    }
+
+    /// The unit's trace id, once known. The first one wins.
+    pub(crate) fn learn_trace(&self, trace: &str) {
+        if let Some(pending) = self.lock().as_mut() {
+            if pending.trace_id.is_none() {
+                pending.trace_id = Some(trace.to_string());
+            }
+        }
+    }
+
+    /// Operation `op` ran inside `parent` (`None`: directly in the unit).
+    pub(crate) fn note_operation(&self, op: String, parent: Option<String>) {
+        if let Some(pending) = self.lock().as_mut() {
+            pending.operations.insert(op, parent);
+        }
     }
 
     /// Claim the batch's code trace for `family`: `false` if one was already
@@ -619,9 +666,25 @@ pub(crate) struct Pending {
     /// From a listed frontend, so held for a browser report to pair with if
     /// it would otherwise be dropped.
     pub(crate) rum_hold: bool,
+    /// The root entry, once its activity is heard. It joins the entries when
+    /// the batch closes.
+    pub(crate) root: Option<Entry>,
+    /// Operation span ids, and the span id each ran inside — for entries
+    /// whose parent is an operation that was not itself recorded.
+    pub(crate) operations: HashMap<String, Option<String>>,
 }
 
 impl Pending {
+    /// An open batch for `unit`: its id is the unit's.
+    fn for_unit(kind: BatchKind, unit: &Unit) -> Self {
+        let mut pending = Self::new(kind);
+        pending.id = unit.id_string();
+        pending.started_at = DateTime::<Utc>::from(unit.started_at());
+        pending.started = Instant::now().checked_sub(unit.elapsed()).unwrap_or_else(Instant::now);
+        pending.trace_id = unit.trace_id().map(str::to_string);
+        pending
+    }
+
     pub(crate) fn new(kind: BatchKind) -> Self {
         Self {
             id: new_id(),
@@ -652,6 +715,8 @@ impl Pending {
             client: None,
             context: Vec::new(),
             rum_hold: false,
+            root: None,
+            operations: HashMap::new(),
         }
     }
 
@@ -677,8 +742,8 @@ pub(crate) struct Inner {
     rx: tokio::sync::Mutex<mpsc::Receiver<Closed>>,
     wake: Notify,
     writer_started: AtomicBool,
-    /// Open batches by id (and trace id), for [`Lookout::tag`].
-    open: Mutex<HashMap<String, Weak<BatchCell>>>,
+    /// Open batches by unit id.
+    pub(crate) open: Mutex<HashMap<u64, Arc<BatchCell>>>,
     /// Closed request batches waiting for their failure report.
     parked: Mutex<Vec<(Instant, Pending)>>,
     identify: RwLock<Option<IdentifyHook>>,
@@ -687,65 +752,88 @@ pub(crate) struct Inner {
     counts: Mutex<Vec<crate::entry::Aggregate>>,
     /// When `counts` was last written.
     counts_written: Mutex<Instant>,
-}
-
-thread_local! {
-    /// The batches whose spans are entered on this thread, innermost last,
-    /// tagged with the `Inner` they belong to.
-    static CURRENT: std::cell::RefCell<Vec<(usize, Arc<BatchCell>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-
-    /// The request batch this thread parked last: `(inner, batch id)`.
-    static RECENT: std::cell::RefCell<Option<(usize, String)>> =
-        const { std::cell::RefCell::new(None) };
+    /// The bus [`Lookout::subscribe`] subscribed to: where the middleware
+    /// opens a request's unit when nothing else has.
+    events: OnceLock<Weak<Dispatcher>>,
 }
 
 impl Inner {
-    fn key(&self) -> usize {
-        self as *const Inner as usize
-    }
-
     /// Whether to do anything at all right now.
     pub(crate) fn active(&self) -> bool {
         self.config.enabled && !self.paused.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn enter(&self, cell: &Arc<BatchCell>) {
-        let key = self.key();
-        CURRENT.with(|stack| stack.borrow_mut().push((key, Arc::clone(cell))));
+    /// The bus Lookout subscribed to, while it lives.
+    pub(crate) fn events(&self) -> Option<Arc<Dispatcher>> {
+        self.events.get().and_then(Weak::upgrade)
     }
 
-    pub(crate) fn exit(&self, cell: &Arc<BatchCell>) {
-        let key = self.key();
-        CURRENT.with(|stack| {
-            let mut stack = stack.borrow_mut();
-            if let Some(at) = stack.iter().rposition(|(k, c)| *k == key && Arc::ptr_eq(c, cell)) {
-                stack.remove(at);
-            }
-        });
-    }
-
-    /// The innermost open batch of this Lookout the calling code runs in.
+    /// The open batch of the unit of work the calling code runs in.
     pub(crate) fn current_batch(&self) -> Option<Arc<BatchCell>> {
-        let key = self.key();
-        CURRENT.with(|stack| {
-            stack.borrow().iter().rev().find(|(k, _)| *k == key).map(|(_, c)| Arc::clone(c))
-        })
+        let unit = Context::current_unit()?;
+        self.cell_for(&unit).filter(|cell| !cell.ignored)
+    }
+
+    /// The open batch with id `batch` (its own id or its trace id), or with
+    /// `None` the one the calling code runs in.
+    pub(crate) fn find(&self, batch: Option<&str>) -> Option<Arc<BatchCell>> {
+        let Some(id) = batch else { return self.current_batch() };
+        if let Some(unit) = Context::current_unit() {
+            if unit.trace_id() == Some(id) || unit.id_string() == id {
+                return self.current_batch();
+            }
+        }
+        let open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        if id.len() == 16 {
+            if let Some(cell) = u64::from_str_radix(id, 16).ok().and_then(|u| open.get(&u)) {
+                return Some(Arc::clone(cell)).filter(|cell| !cell.ignored);
+            }
+        }
+        open.values()
+            .filter(|cell| !cell.ignored)
+            .find(|cell| {
+                cell.lock().as_ref().is_some_and(|p| p.trace_id.as_deref() == Some(id))
+                    || cell.unit_ref.upgrade().is_some_and(|u| u.trace_id() == Some(id))
+            })
+            .cloned()
     }
 
     // --- opening ---------------------------------------------------------
 
-    /// Open a batch for a root span. `path` and `name` are what the root span
-    /// carried at creation.
-    pub(crate) fn open_batch(
-        &self,
-        kind: BatchKind,
-        path: Option<&str>,
-        name: Option<&str>,
-    ) -> Arc<BatchCell> {
-        let mut pending = Pending::new(kind);
+    /// The open batch of `unit`, opened now if this is the first Lookout has
+    /// heard of it. `None` when Lookout is off.
+    ///
+    /// Scope and sampling that the unit's kind, name and path decide are
+    /// decided here, once.
+    pub(crate) fn cell_for(&self, unit: &Arc<Unit>) -> Option<Arc<BatchCell>> {
+        if !self.config.enabled {
+            return None;
+        }
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cell) = open.get(&unit.id()) {
+            return Some(Arc::clone(cell));
+        }
+        let cell = Arc::new(self.open_batch(unit));
+        open.insert(unit.id(), Arc::clone(&cell));
+        Some(cell)
+    }
+
+    /// A new batch for `unit`.
+    fn open_batch(&self, unit: &Arc<Unit>) -> BatchCell {
+        let kind = match unit.kind() {
+            UnitKind::Request => BatchKind::Request,
+            UnitKind::Job => BatchKind::Job,
+            UnitKind::Command => BatchKind::Command,
+            UnitKind::ScheduledTask => BatchKind::ScheduledTask,
+            _ => BatchKind::Other,
+        };
+        let path = unit.path();
+        let name = unit.name();
+        let mut pending = Pending::for_unit(kind, unit);
         pending.path = path.map(str::to_string);
-        pending.name = name.map(str::to_string);
+        if kind != BatchKind::Request {
+            pending.name = name.map(str::to_string);
+        }
         let scope = &self.config.scope;
         let (watched, rate) = match kind {
             BatchKind::Request => {
@@ -768,16 +856,39 @@ impl Inner {
                 pending.sampled_out = true;
             }
         }
-        let rejected = pending.rejected.is_some();
-        let id = pending.id.clone();
-        let cell = Arc::new(BatchCell {
+        // Paused: the batch exists, so the unit's events find it, but it
+        // records nothing.
+        let ignored = self.paused.load(Ordering::Relaxed);
+        let rejected = pending.rejected.is_some() || ignored;
+        BatchCell {
+            root_span: pending.id.clone(),
             state: Mutex::new(Some(pending)),
             rejected: AtomicBool::new(rejected),
             traces: Mutex::new(HashSet::new()),
             kind,
-        });
-        self.open.lock().unwrap_or_else(|e| e.into_inner()).insert(id, Arc::downgrade(&cell));
-        cell
+            unit: unit.id(),
+            unit_ref: Arc::downgrade(unit),
+            ignored,
+            root_taken: AtomicBool::new(false),
+        }
+    }
+
+    /// Close the open batches whose unit is gone without the bus saying so —
+    /// a unit opened with no bus never publishes `UnitCompleted`. Once a unit
+    /// is gone every event of it has been handled, so nothing is lost.
+    pub(crate) fn sweep(&self) {
+        let gone: Vec<Arc<BatchCell>> = {
+            let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+            let ids: Vec<u64> = open
+                .iter()
+                .filter(|(_, cell)| cell.unit_ref.strong_count() == 0)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter().filter_map(|id| open.remove(&id)).collect()
+        };
+        for cell in gone {
+            self.close_batch(&cell, None);
+        }
     }
 
     pub(crate) fn is_dashboard_path(&self, path: &str) -> bool {
@@ -800,15 +911,11 @@ impl Inner {
         cell.rejected.store(true, Ordering::Relaxed);
     }
 
-    /// The root span recorded its trace id.
-    pub(crate) fn set_trace_id(&self, cell: &Arc<BatchCell>, trace_id: &str) {
+    /// The root activity was heard: kept aside until the batch closes.
+    pub(crate) fn set_root(&self, cell: &BatchCell, root: Entry) {
         if let Some(pending) = cell.lock().as_mut() {
-            pending.trace_id = Some(trace_id.to_string());
+            pending.root = Some(root);
         }
-        self.open
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(trace_id.to_string(), Arc::downgrade(cell));
     }
 
     /// The route became known: the route stage of the scope.
@@ -962,7 +1069,12 @@ impl Inner {
     }
 
     /// [`push`](Self::push), with the stack its code trace is made from.
-    pub(crate) fn push_traced(&self, cell: &BatchCell, entry: Entry, trace: Option<Backtrace>) {
+    pub(crate) fn push_traced(
+        &self,
+        cell: &BatchCell,
+        entry: Entry,
+        trace: Option<Arc<Backtrace>>,
+    ) {
         if cell.is_rejected() && entry.entry_type != EntryType::Exception {
             return;
         }
@@ -975,47 +1087,61 @@ impl Inner {
             pending.push(entry);
             if let (Some(id), Some(trace)) = (id, trace) {
                 if pending.entries.len() > before {
-                    pending.traces.push((id, Arc::new(trace)));
+                    pending.traces.push((id, trace));
                 }
             }
         }
     }
 
-    /// Mark the current batch as a failed job.
-    pub(crate) fn mark_current(&self, failed_job: bool, tag: Option<&str>) {
-        let Some(cell) = self.current_batch() else { return };
-        let mut state = cell.lock();
-        if let Some(pending) = state.as_mut() {
-            pending.failed_job |= failed_job;
-            if let Some(tag) = tag {
-                pending.tags.insert(tag.to_string());
-            }
-        }
-    }
-
-    /// A failure was reported. Into the batch it happened in; or the request
-    /// batch this thread just parked; or a batch of its own.
-    pub(crate) fn record_failure(&self, entry: Entry, failed_job: bool, after_request: bool) {
-        if let Some(cell) = self.current_batch() {
+    /// A failure was reported, in `unit` or outside every unit. Into the
+    /// unit's batch; or, for a request's failure reported after its unit,
+    /// that request's batch (`request`: its method and path); or a batch of
+    /// its own.
+    pub(crate) fn record_failure(
+        &self,
+        entry: Entry,
+        failed_job: bool,
+        unit: Option<&Arc<Unit>>,
+        request: Option<(&str, &str)>,
+    ) {
+        if let Some(cell) = unit.and_then(|u| self.cell_for(u)).filter(|c| !c.ignored) {
             if let Some(pending) = cell.lock().as_mut() {
                 pending.failed_job |= failed_job;
                 pending.push(entry);
                 return;
             }
         }
-        if after_request {
-            let key = self.key();
-            let recent = RECENT.with(|r| r.borrow_mut().take());
-            if let Some((k, id)) = recent {
-                if k == key {
-                    let claimed = {
-                        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
-                        parked.iter().position(|(_, p)| p.id == id).map(|at| parked.remove(at).1)
-                    };
-                    if let Some(mut pending) = claimed {
-                        pending.push(entry);
-                        self.finish(pending);
-                        return;
+        if unit.is_none() {
+            if let Some((method, path)) = request {
+                // Parked: the request's batch closed, waiting for this.
+                let claimed = {
+                    let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+                    parked
+                        .iter()
+                        .rposition(|(_, p)| request_is(p, method, path))
+                        .map(|at| parked.remove(at).1)
+                };
+                if let Some(mut pending) = claimed {
+                    pending.push(entry);
+                    self.finish(pending);
+                    return;
+                }
+                // Still open: its unit is over but not yet completed.
+                let open: Vec<Arc<BatchCell>> = self
+                    .open
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .filter(|c| c.kind == BatchKind::Request && !c.ignored)
+                    .cloned()
+                    .collect();
+                for cell in open {
+                    let mut state = cell.lock();
+                    if let Some(pending) = state.as_mut() {
+                        if pending.root.is_some() && request_is(pending, method, path) {
+                            pending.push(entry);
+                            return;
+                        }
                     }
                 }
             }
@@ -1030,21 +1156,44 @@ impl Inner {
 
     // --- closing ----------------------------------------------------------
 
-    /// The root span closed with `root` as its entry.
-    pub(crate) fn close_batch(&self, cell: &Arc<BatchCell>, root: Option<Entry>) {
+    /// The batch's unit is over: `done` when the bus said so, `None` when
+    /// the unit went without a word ([`sweep`](Self::sweep)).
+    pub(crate) fn close_batch(&self, cell: &Arc<BatchCell>, done: Option<&UnitCompleted>) {
         let Some(mut pending) = cell.lock().take() else { return };
-        {
-            let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
-            open.remove(&pending.id);
-            if let Some(trace) = &pending.trace_id {
-                open.remove(trace);
+        self.open.lock().unwrap_or_else(|e| e.into_inner()).remove(&cell.unit);
+        if cell.ignored {
+            return;
+        }
+        if let Some(done) = done {
+            if pending.trace_id.is_none() {
+                pending.trace_id = done.trace_id.clone();
+            }
+            if pending.name.is_none() && pending.kind != BatchKind::Request {
+                pending.name = done.name.clone();
             }
         }
-        if let Some(root) = root {
-            pending.duration_us = root.duration_us;
-            pending.started_at = root.occurred_at;
-            fill_from_root(&mut pending, &root);
-            pending.entries.insert(0, root);
+        match pending.root.take() {
+            Some(root) => {
+                pending.duration_us = root.duration_us;
+                pending.started_at = root.occurred_at;
+                fill_from_root(&mut pending, &root);
+                pending.entries.insert(0, root);
+            }
+            None => {
+                if let Some(done) = done {
+                    pending.duration_us =
+                        Some(u64::try_from(done.duration.as_micros()).unwrap_or(u64::MAX));
+                    pending.started_at = DateTime::<Utc>::from(done.started_at);
+                }
+            }
+        }
+        // A command's name may only have come with its root: Lookout's own
+        // commands are never recorded.
+        if pending.kind == BatchKind::Command
+            && pending.rejected.is_none()
+            && pending.name.as_deref().is_some_and(|n| n.starts_with("lookout:"))
+        {
+            pending.rejected = Some(Rejection::Scope);
         }
         // The route stage again, for requests whose route (or lack of one)
         // only the root span's final fields say.
@@ -1057,15 +1206,19 @@ impl Inner {
         // Only a status whose failure will be recorded is worth waiting for:
         // client errors are not, unless `capture.client_errors` says so.
         let awaited = if self.config.capture.client_errors { 400 } else { 500 };
-        if pending.kind == BatchKind::Request && pending.status.is_some_and(|s| s >= awaited) {
-            let key = self.key();
-            let id = pending.id.clone();
+        let reported = pending.entries.iter().any(|e| {
+            e.entry_type == EntryType::Exception
+                && e.content.get("type").and_then(|t| t.as_str()) == Some("HttpRequest")
+        });
+        if pending.kind == BatchKind::Request
+            && !reported
+            && pending.status.is_some_and(|s| s >= awaited)
+        {
             let overflow = {
                 let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
                 parked.push((Instant::now(), pending));
                 (parked.len() > MAX_PARKED).then(|| parked.remove(0).1)
             };
-            RECENT.with(|r| *r.borrow_mut() = Some((key, id)));
             if let Some(oldest) = overflow {
                 self.finish(oldest);
             }
@@ -1139,6 +1292,9 @@ impl Inner {
             Some(q.saturating_sub(waiting.len()))
         });
         let size = self.config.ingest.flush_batch_size.max(1);
+        // Lookout's own work: outside every unit of work (`Context::none`),
+        // so what the store's queries publish lands in no batch, even when
+        // `flush` is called from inside a request or a command.
         let span = tracing::info_span!("lookout.write", rainier.lookout.internal = true);
         let mut kept_any = false;
         while !waiting.is_empty() {
@@ -1148,8 +1304,11 @@ impl Inner {
             let (kept, counted, held) = sort_closed(&self.config, &self.host, chunk);
             if !held.is_empty() {
                 let ttl = Duration::from_secs(self.config.rum.hold_seconds);
-                let result =
-                    tracing::Instrument::instrument(self.store.hold(held, ttl), span.clone()).await;
+                let result = tracing::Instrument::instrument(
+                    Context::none().scope(async { self.store.hold(held, ttl).await }),
+                    span.clone(),
+                )
+                .await;
                 if let Err(error) = result {
                     self.log_store_error(&span, &error);
                 }
@@ -1195,9 +1354,11 @@ impl Inner {
         kept: Vec<Batch>,
         counted: Vec<crate::entry::Aggregate>,
     ) {
-        let result =
-            tracing::Instrument::instrument(self.store.store_counting(kept, counted), span.clone())
-                .await;
+        let result = tracing::Instrument::instrument(
+            Context::none().scope(async { self.store.store_counting(kept, counted).await }),
+            span.clone(),
+        )
+        .await;
         if let Err(error) = result {
             self.log_store_error(span, &error);
         }
@@ -1309,7 +1470,19 @@ async fn resolve_code_traces(closed: Vec<Kept>) -> Vec<Batch> {
 /// How many of the application's frames a code trace keeps.
 const CODE_TRACE_FRAMES: usize = 12;
 
-/// Copy what the root span said onto the batch, where the middleware did not.
+/// Whether `pending` is the request `method path`.
+fn request_is(pending: &Pending, method: &str, path: &str) -> bool {
+    let root = pending
+        .root
+        .as_ref()
+        .or_else(|| pending.entries.iter().find(|e| e.entry_type == EntryType::Request));
+    let field = |key: &str| root.and_then(|r| r.content.get(key)).and_then(|v| v.as_str());
+    let m = pending.method.as_deref().or_else(|| field("http.request.method"));
+    let p = pending.path.as_deref().or_else(|| field("url.path"));
+    m.is_some_and(|m| m.eq_ignore_ascii_case(method)) && p == Some(path)
+}
+
+/// Copy what the root activity said onto the batch, where the middleware did not.
 fn fill_from_root(pending: &mut Pending, root: &Entry) {
     let content = &root.content;
     let text = |key: &str| content.get(key).and_then(|v| v.as_str()).map(str::to_string);
@@ -1328,10 +1501,11 @@ fn fill_from_root(pending: &mut Pending, root: &Entry) {
                 pending.route_name = text("rainier.route.name");
             }
             if pending.status.is_none() {
-                pending.status = content
-                    .get("http.response.status_code")
-                    .and_then(|v| v.as_u64())
-                    .and_then(|s| u16::try_from(s).ok());
+                pending.status = content.get("http.response.status_code").and_then(|v| {
+                    v.as_u64()
+                        .and_then(|s| u16::try_from(s).ok())
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                });
             }
         }
         BatchKind::Job => {
@@ -1339,6 +1513,10 @@ fn fill_from_root(pending: &mut Pending, root: &Entry) {
             if let Some(outcome) = text("rainier.job.outcome") {
                 if matches!(outcome.as_str(), "failed" | "timed_out" | "error") {
                     pending.failed_job = true;
+                }
+                // A job put back on the queue for another attempt.
+                if outcome == "released" {
+                    pending.tags.insert("released".to_string());
                 }
                 pending.tags.insert(format!("outcome:{outcome}"));
             }
@@ -1527,6 +1705,7 @@ pub(crate) fn finalize(
         derive_n_plus_one(config, &mut pending.entries);
     }
 
+    resolve_parents(&mut pending);
     pending.entries.sort_by_key(|e| e.occurred_at);
     // Unique per batch: a job shares its trace with the request that queued
     // it, and a store replaces on equal ids.
@@ -1652,6 +1831,30 @@ pub(crate) fn finalize(
         Finalized::Held(Box::new(batch))
     } else {
         Finalized::Counted(batch.entries)
+    }
+}
+
+/// Point every entry whose parent is an operation that was not recorded —
+/// its watcher off, sampled out — at the nearest enclosing one that was, or
+/// at the root.
+fn resolve_parents(pending: &mut Pending) {
+    if pending.operations.is_empty() {
+        return;
+    }
+    let root = pending.id.clone();
+    let known: HashSet<String> = pending.entries.iter().filter_map(|e| e.span_id.clone()).collect();
+    let operations = std::mem::take(&mut pending.operations);
+    for entry in &mut pending.entries {
+        let Some(mut parent) = entry.parent_span_id.clone() else { continue };
+        let mut hops = 0;
+        while parent != root && !known.contains(&parent) && hops < 64 {
+            parent = match operations.get(&parent) {
+                Some(Some(up)) => up.clone(),
+                _ => root.clone(),
+            };
+            hops += 1;
+        }
+        entry.parent_span_id = Some(parent);
     }
 }
 
@@ -1810,7 +2013,7 @@ fn derive_n_plus_one(config: &LookoutConfig, entries: &mut Vec<Entry>) {
 
 // --- small things ------------------------------------------------------------
 
-fn parse_level(level: &str) -> Option<tracing::Level> {
+pub(crate) fn parse_level(level: &str) -> Option<tracing::Level> {
     match level.to_ascii_lowercase().as_str() {
         "error" => Some(tracing::Level::ERROR),
         "warn" => Some(tracing::Level::WARN),
@@ -1871,26 +2074,34 @@ mod tests {
     use super::*;
     use crate::config::{Patterns, Scope, WatcherConfig};
     use crate::store::memory::MemoryStore;
+    use crate::testing::{inside, query, served, timed, Did, TRACE};
     use rainier_events::report::{ApplicationFailed, ExceptionReported, HttpRequestFailed};
-    use rainier_events::Dispatcher;
+    use rainier_events::{Operation, UnitKind};
     use rainier_support::Error;
-    use tracing::field::Empty;
-    use tracing_subscriber::layer::SubscriberExt;
 
-    /// An enabled Lookout over a fresh memory store, its layer installed as
-    /// this thread's subscriber for as long as the guard lives.
+    /// An enabled Lookout over a fresh memory store, subscribed to a bus of
+    /// its own.
     struct Rig {
         lookout: Lookout,
         store: Arc<MemoryStore>,
-        _guard: tracing::subscriber::DefaultGuard,
+        events: Arc<Dispatcher>,
+    }
+
+    impl Rig {
+        /// Wait for the subscriber to hear everything published so far, then
+        /// write what closed.
+        async fn flush(&self) {
+            self.events.settled().await;
+            self.lookout.flush().await;
+        }
     }
 
     fn rig(config: LookoutConfig) -> Rig {
         let store = Arc::new(MemoryStore::new(100));
         let lookout = Lookout::new(config, store.clone());
-        let subscriber = tracing_subscriber::registry().with(lookout.layer());
-        let guard = tracing::subscriber::set_default(subscriber);
-        Rig { lookout, store, _guard: guard }
+        let events = Arc::new(Dispatcher::new());
+        lookout.subscribe(&events);
+        Rig { lookout, store, events }
     }
 
     fn local() -> LookoutConfig {
@@ -1901,63 +2112,57 @@ mod tests {
         LookoutConfig::default().enabled(true).local(false)
     }
 
-    fn request_span(path: &str) -> tracing::Span {
-        tracing::info_span!(
-            "http.server.request",
-            otel.name = "GET",
-            http.request.method = "GET",
-            url.path = path,
-            http.route = Empty,
-            rainier.route.name = Empty,
-            http.response.status_code = Empty,
-            trace_id = Empty,
-        )
-    }
-
-    fn query(sql: &str) {
-        let span = tracing::info_span!(
-            "db.query",
-            db.system.name = "sqlite",
-            db.query.text = sql,
-            otel.status_code = Empty,
-        );
-        let _entered = span.enter();
+    /// A request unit for `path`, in trace [`TRACE`], on the rig's bus.
+    fn request_unit(rig: &Rig, path: &str) -> Arc<Unit> {
+        let unit = Unit::on(&rig.events, UnitKind::Request, None, Some(path.to_string()));
+        unit.set_trace(Some(TRACE), None);
+        unit
     }
 
     /// One request: route `posts.show`, status `status`, `work` inside it.
-    fn request(path: &str, status: u16, work: impl FnOnce()) {
-        let span = request_span(path);
-        {
-            let _entered = span.enter();
-            span.record("trace_id", "4bf92f3577b34da6a3ce929d0e0e4736");
-            span.record("http.route", "/posts/{post}");
-            span.record("rainier.route.name", "posts.show");
-            work();
-        }
-        span.record("http.response.status_code", status);
+    fn request(rig: &Rig, path: &str, status: u16, work: impl FnOnce()) {
+        let unit = request_unit(rig, path);
+        let _entered = unit.enter();
+        // The server's clock starts before the work inside it.
+        let started = Instant::now();
+        timed(work);
+        served(path, Some(status), Some(("/posts/{post}", "posts.show")), started.elapsed())
+            .publish();
+    }
+
+    /// A request with no route, `work` inside it.
+    fn unrouted(rig: &Rig, path: &str, status: u16, work: impl FnOnce()) {
+        let unit = request_unit(rig, path);
+        let _entered = unit.enter();
+        let started = Instant::now();
+        timed(work);
+        served(path, Some(status), None, started.elapsed()).publish();
     }
 
     #[tokio::test]
     async fn a_request_becomes_a_batch_with_its_queries_nested() {
         let rig = rig(local());
-        request("/posts/1", 200, || {
+        request(&rig, "/posts/1", 200, || {
             query("SELECT * FROM posts WHERE id = ?");
-            let cache = tracing::info_span!(
-                "cache.get",
-                cache.store = "memory",
-                cache.operation = "get",
-                cache.hit = true,
-                cache.key = "posts:1",
-            );
-            let _e = cache.enter();
-            query("SELECT * FROM users WHERE id = ?");
+            // A cache read that ran a query of its own: an operation, which
+            // the query names as its parent.
+            let op = Operation::new();
+            let ((), took) = timed(|| inside(&op, || query("SELECT * FROM users WHERE id = ?")));
+            Did::new("cache.get")
+                .with("cache.store", "memory")
+                .with("cache.operation", "get")
+                .with("cache.hit", true)
+                .with("cache.key", "posts:1")
+                .for_operation(&op)
+                .took(took)
+                .publish();
         });
-        rig.lookout.flush().await;
+        rig.flush().await;
 
         let batches = rig.store.all();
         assert_eq!(batches.len(), 1);
         let batch = &batches[0];
-        assert_eq!(batch.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736", "the trace id");
+        assert_eq!(batch.trace_id, TRACE, "the trace id");
         assert_ne!(batch.id, batch.trace_id, "ids are unique per batch");
         assert_eq!(batch.kind, BatchKind::Request);
         assert_eq!(batch.summary, "GET /posts/{post} 200");
@@ -1989,16 +2194,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_batch_id_is_the_unit_id() {
+        let rig = rig(local());
+        let unit = request_unit(&rig, "/posts/1");
+        let id = unit.id_string();
+        {
+            let _entered = unit.enter();
+            assert_eq!(rig.lookout.current_batch_id().as_deref(), Some(TRACE), "its trace");
+            served("/posts/1", Some(200), None, Duration::from_millis(1)).publish();
+        }
+        drop(unit);
+        rig.flush().await;
+        assert_eq!(rig.store.all()[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn an_entry_under_an_operation_that_is_not_recorded_hangs_off_the_nearest_that_is() {
+        // The cache watcher off: the query ran inside a cache read that is
+        // not an entry, so it hangs off the request.
+        let rig = rig(local().disable(EntryType::Cache));
+        request(&rig, "/posts/1", 200, || {
+            let op = Operation::new();
+            inside(&op, || query("SELECT 1"));
+            Did::new("cache.get").with("cache.operation", "get").for_operation(&op).publish();
+        });
+        rig.flush().await;
+        let batch = &rig.store.all()[0];
+        let root = &batch.entries[0];
+        let query = batch.entries.iter().find(|e| e.entry_type == EntryType::Query).unwrap();
+        assert_eq!(query.parent_span_id, root.span_id);
+    }
+
+    #[tokio::test]
     async fn cache_keys_are_kept_only_when_opted_in() {
         let mut config = local();
         config.capture.cache_keys = true;
         let rig = rig(config);
-        request("/posts/1", 200, || {
-            let cache =
-                tracing::info_span!("cache.get", cache.operation = "get", cache.key = "posts:1");
-            let _e = cache.enter();
+        request(&rig, "/posts/1", 200, || {
+            Did::new("cache.get")
+                .with("cache.operation", "get")
+                .with("cache.key", "posts:1")
+                .publish();
         });
-        rig.lookout.flush().await;
+        rig.flush().await;
         let cache = &rig.store.all()[0].entries[1];
         assert_eq!(cache.content["cache.key"], "posts:1");
         assert_eq!(cache.summary, "cache get posts:1");
@@ -2010,8 +2248,8 @@ mod tests {
             .watch(EntryType::Query, |w| WatcherConfig { slow_ms: Some(0), ..w })
             .watch(EntryType::Request, |w| WatcherConfig { slow_ms: Some(60_000), ..w });
         let rig = rig(config);
-        request("/posts/1", 200, || query("SELECT 1"));
-        rig.lookout.flush().await;
+        request(&rig, "/posts/1", 200, || query("SELECT 1"));
+        rig.flush().await;
 
         let batches = rig.store.all();
         assert_eq!(batches.len(), 1, "slow keeps the batch outside local");
@@ -2035,9 +2273,9 @@ mod tests {
         use crate::store::Store as _;
         let rig = rig(production());
         for _ in 0..3 {
-            request("/posts/1", 200, || query("SELECT 1"));
+            request(&rig, "/posts/1", 200, || query("SELECT 1"));
         }
-        rig.lookout.flush().await;
+        rig.flush().await;
 
         assert!(rig.store.all().is_empty(), "none kept");
         let since = chrono::Utc::now() - chrono::Duration::hours(1);
@@ -2057,8 +2295,8 @@ mod tests {
             ..LookoutConfig::default().scope
         });
         let rig = rig(config);
-        request("/posts/1", 200, || query("SELECT 1"));
-        rig.lookout.flush().await;
+        request(&rig, "/posts/1", 200, || query("SELECT 1"));
+        rig.flush().await;
 
         let since = chrono::Utc::now() - chrono::Duration::hours(1);
         assert!(rig.store.aggregate_rows(EntryType::Request, 60, since).await.unwrap().is_empty());
@@ -2073,8 +2311,8 @@ mod tests {
             w
         });
         let rig = rig(config);
-        request("/r", 200, || query("SELECT * FROM reports WHERE year = ?"));
-        rig.lookout.flush().await;
+        request(&rig, "/r", 200, || query("SELECT * FROM reports WHERE year = ?"));
+        rig.flush().await;
         assert!(rig.store.all().is_empty(), "the override raised the bar: nothing slow, not kept");
     }
 
@@ -2083,7 +2321,7 @@ mod tests {
         let mut config = local();
         config.n_plus_one.min_total_ms = 0;
         let rig = rig(config);
-        request("/posts", 200, || {
+        request(&rig, "/posts", 200, || {
             query("SELECT * FROM posts");
             for _ in 0..5 {
                 query("SELECT * FROM users WHERE id = ?");
@@ -2091,7 +2329,7 @@ mod tests {
             }
             query("SELECT * FROM tags WHERE id = ?");
         });
-        rig.lookout.flush().await;
+        rig.flush().await;
 
         let batch = &rig.store.all()[0];
         let n1: Vec<&Entry> =
@@ -2117,27 +2355,37 @@ mod tests {
         let mut config = local();
         config.n_plus_one.min_total_ms = 0;
         let rig = rig(config);
-        request("/posts", 200, || (0..4).for_each(|_| query("SELECT 1")));
-        rig.lookout.flush().await;
+        request(&rig, "/posts", 200, || (0..4).for_each(|_| query("SELECT 1")));
+        rig.flush().await;
         let batch = &rig.store.all()[0];
         assert!(!batch.entries.iter().any(|e| e.entry_type == EntryType::NPlusOne));
     }
 
     #[tokio::test]
-    async fn an_excluded_route_records_nothing_and_buffers_nothing_after_the_match() {
+    async fn an_excluded_route_records_nothing_and_buffers_nothing_once_its_route_is_known() {
         let config = local().scope(Scope {
             routes: Patterns { include: vec![], exclude: vec!["posts.*".into()] },
             ..LookoutConfig::default().scope
         });
         let rig = rig(config);
-        let probe = rig.lookout.clone();
-        request("/posts/1", 200, || {
+        let unit = request_unit(&rig, "/posts/1");
+        {
+            let _entered = unit.enter();
             query("SELECT 1");
-            let cell = probe.inner.current_batch().expect("inside the batch");
-            assert!(cell.is_rejected(), "rejected as soon as the route was recorded");
+            served("/posts/1", Some(200), Some(("/posts/{post}", "posts.show")), Duration::ZERO)
+                .publish();
+            query("SELECT 2");
+        }
+        // The unit is still open: its batch is there to look at.
+        rig.events.settled().await;
+        {
+            let cell = rig.lookout.inner.open.lock().unwrap().get(&unit.id()).cloned();
+            let cell = cell.expect("open until its unit completes");
+            assert!(cell.is_rejected(), "rejected as soon as the route was known");
             assert!(cell.lock().as_ref().unwrap().entries.is_empty(), "nothing buffered");
-        });
-        rig.lookout.flush().await;
+        }
+        drop(unit);
+        rig.flush().await;
         assert!(rig.store.all().is_empty());
     }
 
@@ -2149,14 +2397,9 @@ mod tests {
         });
         let rig = rig(config);
         for path in ["/assets/app.js", "/_lookout", "/_lookout/api/batches", "/missing"] {
-            let span = request_span(path);
-            {
-                let _e = span.enter();
-                query("SELECT 1");
-            }
-            span.record("http.response.status_code", 404);
+            unrouted(&rig, path, 404, || query("SELECT 1"));
         }
-        rig.lookout.flush().await;
+        rig.flush().await;
         let paths: Vec<String> = rig
             .store
             .all()
@@ -2169,18 +2412,17 @@ mod tests {
     #[tokio::test]
     async fn a_zero_sample_rate_records_nothing() {
         let rig = rig(LookoutConfig { request_sample_rate: 0.0, ..local() });
-        request("/posts/1", 200, || query("SELECT 1"));
-        rig.lookout.flush().await;
+        request(&rig, "/posts/1", 200, || query("SELECT 1"));
+        rig.flush().await;
         assert!(rig.store.all().is_empty());
     }
 
     #[tokio::test]
     async fn failures_are_kept_even_when_sampled_out() {
         let rig = rig(LookoutConfig { request_sample_rate: 0.0, ..production() });
-        let events = Arc::new(Dispatcher::new());
-        rig.lookout.listen(&events);
-        let span = request_span("/posts/1");
-        async {
+        let unit = request_unit(&rig, "/posts/1");
+        let events = Arc::clone(&rig.events);
+        unit.scope(async {
             query("SELECT 1");
             events
                 .dispatch(ExceptionReported {
@@ -2188,12 +2430,11 @@ mod tests {
                 })
                 .await
                 .unwrap();
-        }
-        .instrument_in(span.clone())
+            served("/posts/1", Some(200), None, Duration::from_millis(1)).publish();
+        })
         .await;
-        span.record("http.response.status_code", 200);
-        drop(span);
-        rig.lookout.flush().await;
+        drop(unit);
+        rig.flush().await;
 
         let batches = rig.store.all();
         assert_eq!(batches.len(), 1);
@@ -2208,15 +2449,13 @@ mod tests {
     #[tokio::test]
     async fn a_failure_outside_any_batch_gets_one_of_its_own() {
         let rig = rig(production());
-        let events = Arc::new(Dispatcher::new());
-        rig.lookout.listen(&events);
-        events
+        rig.events
             .dispatch(ExceptionReported {
                 failure: ApplicationFailed::new(Error::internal("cron 12 broke")).into(),
             })
             .await
             .unwrap();
-        rig.lookout.flush().await;
+        rig.flush().await;
         let batches = rig.store.all();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].kind, BatchKind::Other);
@@ -2227,32 +2466,64 @@ mod tests {
         );
     }
 
+    fn boom() -> ExceptionReported {
+        ExceptionReported {
+            failure: HttpRequestFailed::new(
+                Error::internal("boom"),
+                "GET",
+                "/posts/1",
+                Some("/posts/{post}".to_string()),
+            )
+            .into(),
+        }
+    }
+
     #[tokio::test]
-    async fn a_failed_request_reported_after_its_span_joins_its_batch() {
+    async fn a_failed_request_reported_after_its_unit_joins_its_batch() {
         let rig = rig(production());
-        let events = Arc::new(Dispatcher::new());
-        rig.lookout.listen(&events);
-        request("/posts/1", 500, || query("SELECT 1"));
-        // What the kernel does once `handle` has returned: no span around it.
-        events
-            .dispatch(ExceptionReported {
-                failure: HttpRequestFailed::new(
-                    Error::internal("boom"),
-                    "GET",
-                    "/posts/1",
-                    Some("/posts/{post}".to_string()),
-                )
-                .into(),
-            })
-            .await
-            .unwrap();
-        rig.lookout.flush().await;
+        request(&rig, "/posts/1", 500, || query("SELECT 1"));
+        // What the kernel may do once `handle` has returned: no unit around it.
+        rig.events.dispatch(boom()).await.unwrap();
+        rig.flush().await;
         let batches = rig.store.all();
         assert_eq!(batches.len(), 1, "{batches:#?}");
         let batch = &batches[0];
         assert_eq!(batch.kind, BatchKind::Request);
         assert!(batch.has_exception);
         assert_eq!(batch.entries.len(), 3, "request, query, exception");
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_reported_after_its_batch_was_parked_joins_it() {
+        let rig = rig(production());
+        request(&rig, "/posts/1", 500, || query("SELECT 1"));
+        // The batch has closed and is waiting: the report comes later still.
+        rig.events.settled().await;
+        assert_eq!(rig.lookout.inner.parked.lock().unwrap().len(), 1, "parked");
+        rig.events.dispatch(boom()).await.unwrap();
+        rig.flush().await;
+        let batches = rig.store.all();
+        assert_eq!(batches.len(), 1, "{batches:#?}");
+        assert!(batches[0].has_exception);
+        assert_eq!(batches[0].entries.len(), 3, "request, query, exception");
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_reported_inside_its_unit_is_not_parked() {
+        let rig = rig(production());
+        let unit = request_unit(&rig, "/posts/1");
+        let events = Arc::clone(&rig.events);
+        unit.scope(async {
+            served("/posts/1", Some(500), None, Duration::from_millis(1)).publish();
+            events.dispatch(boom()).await.unwrap();
+        })
+        .await;
+        drop(unit);
+        rig.events.settled().await;
+        assert!(rig.lookout.inner.parked.lock().unwrap().is_empty(), "nothing to wait for");
+        rig.lookout.flush().await;
+        assert_eq!(rig.store.all().len(), 1);
+        assert!(rig.store.all()[0].has_exception);
     }
 
     #[tokio::test]
@@ -2268,11 +2539,9 @@ mod tests {
         };
 
         let quiet = rig(local());
-        let events = Arc::new(Dispatcher::new());
-        quiet.lookout.listen(&events);
-        request("/posts/9", 404, || {});
-        events.dispatch(not_found()).await.unwrap();
-        quiet.lookout.flush().await;
+        request(&quiet, "/posts/9", 404, || {});
+        quiet.events.dispatch(not_found()).await.unwrap();
+        quiet.flush().await;
         let batches = quiet.store.all();
         assert_eq!(batches.len(), 1, "{batches:#?}");
         assert!(!batches[0].has_exception, "a 404 is not a failure");
@@ -2281,11 +2550,9 @@ mod tests {
         let mut config = local();
         config.capture.client_errors = true;
         let loud = rig(config);
-        let events = Arc::new(Dispatcher::new());
-        loud.lookout.listen(&events);
-        request("/posts/9", 404, || {});
-        events.dispatch(not_found()).await.unwrap();
-        loud.lookout.flush().await;
+        request(&loud, "/posts/9", 404, || {});
+        loud.events.dispatch(not_found()).await.unwrap();
+        loud.flush().await;
         let batches = loud.store.all();
         assert_eq!(batches.len(), 1, "{batches:#?}");
         assert!(batches[0].has_exception, "recorded when asked for");
@@ -2301,14 +2568,14 @@ mod tests {
 
         let quiet = rig(local());
         quiet.lookout.record_failure(&refused());
-        quiet.lookout.flush().await;
+        quiet.flush().await;
         assert!(quiet.store.all().is_empty(), "a refused client is not a failure");
 
         let mut config = local();
         config.capture.client_errors = true;
         let loud = rig(config);
         loud.lookout.record_failure(&refused());
-        loud.lookout.flush().await;
+        loud.flush().await;
         let batches = loud.store.all();
         assert_eq!(batches.len(), 1, "{batches:#?}");
         assert!(batches[0].has_exception, "recorded when asked for");
@@ -2318,14 +2585,15 @@ mod tests {
         let broken: rainier_events::report::Failure =
             WebSocketFailed::new(Error::internal("boom"), "2", "/socket", "message").into();
         rig.lookout.record_failure(&broken);
-        rig.lookout.flush().await;
+        rig.flush().await;
         assert_eq!(rig.store.all().len(), 1);
     }
 
     #[tokio::test]
     async fn a_parked_batch_nobody_claims_is_released_on_flush() {
         let rig = rig(local());
-        request("/posts/1", 500, || {});
+        request(&rig, "/posts/1", 500, || {});
+        rig.events.settled().await;
         assert!(rig.store.all().is_empty());
         rig.lookout.flush().await;
         assert_eq!(rig.store.all().len(), 1);
@@ -2339,12 +2607,12 @@ mod tests {
         });
         let rig = rig(config);
         let probe = rig.lookout.clone();
-        request("/posts/1", 200, || query("SELECT 1"));
-        request("/posts/2", 200, || {
+        request(&rig, "/posts/1", 200, || query("SELECT 1"));
+        request(&rig, "/posts/2", 200, || {
             assert!(probe.tag(None, "vip"));
             query("SELECT 2");
         });
-        rig.lookout.flush().await;
+        rig.flush().await;
         let batches = rig.store.all();
         assert_eq!(batches.len(), 1);
         assert!(batches[0].tags.contains(&"vip".to_string()));
@@ -2362,23 +2630,48 @@ mod tests {
         };
         let rig = rig(config);
         let probe = rig.lookout.clone();
-        request("/posts/1", 200, || query("SELECT 1"));
-        request("/posts/2", 200, || {
+        request(&rig, "/posts/1", 200, || query("SELECT 1"));
+        request(&rig, "/posts/2", 200, || {
             let id = probe.current_batch_id().expect("a batch");
             assert!(probe.tag(Some(&id), "vip"), "by its trace id");
             query("SELECT 2");
         });
-        rig.lookout.flush().await;
+        rig.flush().await;
         let batches = rig.store.all();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].entries.len(), 2, "with its query");
     }
 
     #[tokio::test]
+    async fn an_open_batch_is_found_by_its_id_from_anywhere() {
+        let config = production().scope(Scope {
+            monitored_tags: ["vip".to_string()].into(),
+            ..LookoutConfig::default().scope
+        });
+        let rig = rig(config);
+        let unit = Unit::on(&rig.events, UnitKind::Request, None, Some("/x".into()));
+        {
+            let _entered = unit.enter();
+            query("SELECT 1");
+        }
+        // Not from inside the unit: by its id alone, once the subscriber has
+        // opened the batch.
+        rig.events.settled().await;
+        assert!(rig.lookout.tag(Some(&unit.id_string()), "vip"));
+        {
+            let _entered = unit.enter();
+            served("/x", Some(200), None, Duration::from_millis(1)).publish();
+        }
+        drop(unit);
+        rig.flush().await;
+        assert_eq!(rig.store.all().len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_custom_keep_rule_replaces_the_default() {
         let rig = rig(production().keep_batch_if(|b| b.status == Some(200)));
-        request("/posts/1", 200, || {});
-        rig.lookout.flush().await;
+        request(&rig, "/posts/1", 200, || {});
+        rig.flush().await;
         assert_eq!(rig.store.all().len(), 1);
     }
 
@@ -2388,8 +2681,9 @@ mod tests {
         config.ingest.channel_capacity = 1;
         let rig = rig(config);
         for _ in 0..3 {
-            request("/posts/1", 200, || {});
+            request(&rig, "/posts/1", 200, || {});
         }
+        rig.events.settled().await;
         assert_eq!(rig.lookout.dropped(), 2);
         rig.lookout.flush().await;
         assert_eq!(rig.store.all().len(), 1);
@@ -2398,19 +2692,32 @@ mod tests {
     #[tokio::test]
     async fn log_lines_are_recorded_and_redacted() {
         let rig = rig(LookoutConfig { log_level: "warn".into(), ..local() });
-        request("/login", 200, || {
-            tracing::warn!(password = "hunter2", user = "ada", "login 3 failed");
-            tracing::info!("below the level");
+        request(&rig, "/login", 200, || {
+            Did::new("log")
+                .with("level", "WARN")
+                .with("target", "app::auth")
+                .with("message", "login 3 failed")
+                .with("password", "hunter2")
+                .with("user", "ada")
+                .publish();
+            Did::new("log")
+                .with("level", "INFO")
+                .with("target", "app::auth")
+                .with("message", "below the level")
+                .publish();
         });
-        rig.lookout.flush().await;
+        rig.flush().await;
         let batch = &rig.store.all()[0];
         let logs: Vec<&Entry> =
             batch.entries.iter().filter(|e| e.entry_type == EntryType::Log).collect();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].summary, "login 3 failed");
+        assert_eq!(logs[0].content["level"], "warn");
+        assert_eq!(logs[0].content["target"], "app::auth");
         assert_eq!(logs[0].content["password"], crate::redact::REDACTED);
         assert_eq!(logs[0].content["user"], "ada");
         assert_eq!(logs[0].family_hash.as_deref(), Some("warn login N failed"));
+        assert_eq!(logs[0].tags, vec!["warn".to_string()]);
     }
 
     #[tokio::test]
@@ -2422,7 +2729,7 @@ mod tests {
         assert!(writer.is_running());
         assert!(!rig.lookout.start_writer().is_running(), "only one writer");
 
-        request("/posts/1", 200, || query("SELECT 1"));
+        request(&rig, "/posts/1", 200, || query("SELECT 1"));
         for _ in 0..200 {
             if !rig.store.all().is_empty() {
                 break;
@@ -2431,14 +2738,24 @@ mod tests {
         }
         assert_eq!(rig.store.all().len(), 1, "flushed by the interval");
 
-        request("/posts/2", 200, || {});
+        request(&rig, "/posts/2", 200, || {});
+        rig.events.settled().await;
         writer.shutdown().await;
         assert_eq!(rig.store.all().len(), 2, "flushed on shutdown");
     }
 
-    /// A store whose writes record what spans are current — and run a query
-    /// of their own, as the database store does.
-    struct Noisy(MemoryStore);
+    /// A store whose writes run a query of their own, as the database store
+    /// does — published on the bus Lookout listens to.
+    struct Noisy(MemoryStore, Arc<Dispatcher>);
+
+    impl Noisy {
+        fn query(&self) {
+            self.1.publish_activity(
+                Did::new("db.query")
+                    .with("db.query.text", "INSERT INTO lookout_batches VALUES (?)"),
+            );
+        }
+    }
 
     impl Store for Noisy {
         fn name(&self) -> &'static str {
@@ -2448,7 +2765,7 @@ mod tests {
             &self,
             batches: Vec<Batch>,
         ) -> rainier_support::BoxFuture<'_, rainier_support::Result<()>> {
-            query("INSERT INTO lookout_batches VALUES (?)");
+            self.query();
             self.0.store(batches)
         }
         fn store_counting(
@@ -2456,7 +2773,7 @@ mod tests {
             batches: Vec<Batch>,
             counted: Vec<crate::entry::Aggregate>,
         ) -> rainier_support::BoxFuture<'_, rainier_support::Result<()>> {
-            query("INSERT INTO lookout_batches VALUES (?)");
+            self.query();
             self.0.store_counting(batches, counted)
         }
         fn batches(
@@ -2503,35 +2820,48 @@ mod tests {
 
     #[tokio::test]
     async fn lookouts_own_work_is_not_recorded() {
-        // The writer's span: a request-shaped span inside it opens no batch.
-        let rig = rig(local());
-        let internal = tracing::info_span!("lookout.write", rainier.lookout.internal = true);
-        internal.in_scope(|| request("/inside", 200, || query("SELECT 1")));
-        rig.lookout.flush().await;
-        assert!(rig.store.all().is_empty());
-
-        // And a store that queries while writing does not feed itself.
-        let store = Arc::new(Noisy(MemoryStore::new(10)));
+        let events = Arc::new(Dispatcher::new());
+        let store = Arc::new(Noisy(MemoryStore::new(10), Arc::clone(&events)));
         let lookout = Lookout::new(local(), store.clone());
-        let subscriber = tracing_subscriber::registry().with(lookout.layer());
-        let _guard = tracing::subscriber::set_default(subscriber);
-        request("/posts/1", 200, || {});
-        lookout.flush().await;
-        lookout.flush().await;
+        lookout.subscribe(&events);
+        let rig = Rig { lookout: lookout.clone(), store: Arc::new(MemoryStore::new(1)), events };
+
+        // A request, written by a store that queries while it writes — and
+        // written from inside a command, whose batch must not gain the
+        // store's query either.
+        request(&rig, "/posts/1", 200, || {});
+        rig.events.settled().await;
+        let command = Unit::on(&rig.events, UnitKind::Command, Some("deploy".into()), None);
+        let flushing = lookout.clone();
+        command
+            .scope(async move {
+                flushing.flush().await;
+                flushing.flush().await;
+            })
+            .await;
+        {
+            let _entered = command.enter();
+            Did::new("console.command").with("rainier.command.name", "deploy").publish();
+        }
+        drop(command);
+        rig.flush().await;
+        rig.flush().await;
+
         let all = store.0.all();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].entries.len(), 1, "just the request");
+        assert_eq!(all.len(), 2, "the request and the command: {all:#?}");
+        for batch in &all {
+            assert_eq!(batch.entries.len(), 1, "just the root: {batch:#?}");
+        }
     }
 
     #[tokio::test]
     async fn disabled_records_nothing() {
         let rig = rig(LookoutConfig::default().local(true));
-        let events = Arc::new(Dispatcher::new());
-        rig.lookout.listen(&events);
-        assert!(!events.has_listeners::<ExceptionReported>(), "no listeners registered");
-        request("/posts/1", 200, || query("SELECT 1"));
+        assert!(!rig.events.has_listeners::<ExceptionReported>(), "no subscriber registered");
+        assert_eq!(rig.events.subscriber_count(), 0);
+        request(&rig, "/posts/1", 200, || query("SELECT 1"));
         rig.lookout.record_failure(&ApplicationFailed::new(Error::internal("x")).into());
-        rig.lookout.flush().await;
+        rig.flush().await;
         assert!(!rig.lookout.start_writer().is_running());
         assert!(rig.store.all().is_empty());
     }
@@ -2540,31 +2870,45 @@ mod tests {
     async fn paused_opens_no_batches() {
         let rig = rig(local());
         rig.lookout.pause();
-        request("/posts/1", 200, || {});
+        request(&rig, "/posts/1", 200, || {});
+        rig.events.settled().await;
         rig.lookout.resume();
-        request("/posts/2", 200, || {});
-        rig.lookout.flush().await;
+        request(&rig, "/posts/2", 200, || {});
+        rig.flush().await;
         assert_eq!(rig.store.all().len(), 1);
+    }
+
+    /// One run of a job inside whatever unit is current — a worker command.
+    /// Inside a request it joins the request's unit, as the queue's `sync`
+    /// driver does; anywhere else it opens its own on the rig's bus.
+    fn job(rig: &Rig, outcome: &'static str, trace: Option<&str>) {
+        let _bus = rainier_events::set_default(Arc::clone(&rig.events));
+        let job = Unit::open_or_join(UnitKind::Job, Some("SendInvoice".into()), None);
+        let _entered = job.as_ref().map(|job| job.enter());
+        query("UPDATE invoices SET sent = 1");
+        // The trace is learned after the unit opened, from the job's
+        // stored `traceparent`.
+        if let Some(job) = &job {
+            job.set_trace(trace, None);
+        }
+        Did::new("queue.process")
+            .with("rainier.job.name", "SendInvoice")
+            .with("rainier.job.outcome", outcome)
+            .publish();
     }
 
     #[tokio::test]
     async fn a_job_inside_a_worker_command_is_its_own_batch_and_its_failure_keeps_it() {
         let rig = rig(production());
-        let command = tracing::info_span!("console.command", rainier.command.name = "queue:work");
-        command.in_scope(|| {
+        let command = Unit::on(&rig.events, UnitKind::Command, Some("queue:work".into()), None);
+        {
+            let _entered = command.enter();
             for outcome in ["processed", "failed"] {
-                let job = tracing::info_span!(
-                    "queue.process",
-                    rainier.job.name = "SendInvoice",
-                    rainier.job.outcome = Empty,
-                    otel.status_code = Empty,
-                );
-                job.in_scope(|| query("UPDATE invoices SET sent = 1"));
-                job.record("rainier.job.outcome", outcome);
+                job(&rig, outcome, None);
             }
-        });
+        }
         drop(command);
-        rig.lookout.flush().await;
+        rig.flush().await;
         let batches = rig.store.all();
         assert_eq!(batches.len(), 1, "only the failed job is interesting: {batches:#?}");
         let job = &batches[0];
@@ -2575,36 +2919,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_job_joins_the_trace_its_span_records_after_opening() {
+    async fn a_released_job_is_tagged_so() {
+        let rig = rig(local());
+        job(&rig, "released", None);
+        rig.flush().await;
+        let batches = rig.store.all();
+        assert!(batches[0].tags.contains(&"released".to_string()), "{:?}", batches[0].tags);
+        assert!(!batches[0].tags.contains(&"failed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_job_inside_a_request_is_part_of_it() {
+        let rig = rig(local());
+        request(&rig, "/posts", 200, || job(&rig, "processed", None));
+        rig.flush().await;
+        let batches = rig.store.all();
+        assert_eq!(batches.len(), 1);
+        let types: Vec<EntryType> = batches[0].entries.iter().map(|e| e.entry_type).collect();
+        assert_eq!(types, vec![EntryType::Request, EntryType::Query, EntryType::Job]);
+    }
+
+    #[tokio::test]
+    async fn a_job_joins_the_trace_its_unit_learns_after_opening() {
         for config in [local(), local().disable(EntryType::Job)] {
             let rig = rig(config);
-            let job = tracing::info_span!(
-                "queue.process",
-                rainier.job.name = "SendInvoice",
-                trace_id = Empty,
-            );
-            job.record("trace_id", "4bf92f3577b34da6a3ce929d0e0e4736");
-            job.in_scope(|| query("UPDATE invoices SET sent = 1"));
-            drop(job);
-            rig.lookout.flush().await;
+            job(&rig, "processed", Some(TRACE));
+            rig.flush().await;
             let batches = rig.store.all();
             assert_eq!(batches.len(), 1);
             assert_eq!(batches[0].kind, BatchKind::Job);
-            assert_eq!(batches[0].trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+            assert_eq!(batches[0].trace_id, TRACE);
         }
     }
 
     #[tokio::test]
     async fn jobs_and_commands_can_be_scoped_out() {
         let rig = rig(local().scope(Scope { jobs: false, ..LookoutConfig::default().scope }));
-        tracing::info_span!("queue.process", rainier.job.name = "J").in_scope(|| query("SELECT 1"));
-        tracing::info_span!("console.command", rainier.command.name = "lookout:prune")
-            .in_scope(|| query("DELETE"));
-        tracing::info_span!("console.command", rainier.command.name = "migrate")
-            .in_scope(|| query("CREATE"));
-        rig.lookout.flush().await;
+        let run = |kind: UnitKind, name: &str, root: Did, sql: &'static str| {
+            let unit = Unit::on(&rig.events, kind, Some(name.to_string()), None);
+            let _entered = unit.enter();
+            query(sql);
+            root.publish();
+        };
+        run(
+            UnitKind::Job,
+            "J",
+            Did::new("queue.process").with("rainier.job.name", "J"),
+            "SELECT 1",
+        );
+        run(
+            UnitKind::Command,
+            "lookout:prune",
+            Did::new("console.command").with("rainier.command.name", "lookout:prune"),
+            "DELETE",
+        );
+        run(
+            UnitKind::Command,
+            "migrate",
+            Did::new("console.command").with("rainier.command.name", "migrate"),
+            "CREATE",
+        );
+        rig.flush().await;
         let summaries: Vec<String> = rig.store.all().iter().map(|b| b.summary.clone()).collect();
         assert_eq!(summaries, vec!["command migrate"]);
+    }
+
+    #[tokio::test]
+    async fn a_unit_with_no_bus_is_closed_once_it_is_gone() {
+        // A unit opened without a bus never says it completed; its batch is
+        // closed when the unit is gone.
+        let rig = rig(local());
+        let unit = Unit::new(UnitKind::Request, None, Some("/quiet".into()));
+        {
+            let _bus = rainier_events::set_default(Arc::clone(&rig.events));
+            let _entered = unit.enter();
+            query("SELECT 1");
+            served("/quiet", Some(200), None, Duration::from_millis(1)).publish();
+        }
+        drop(unit);
+        rig.flush().await;
+        let batches = rig.store.all();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].entries.len(), 2);
     }
 
     #[derive(rainier_orm::Entity, Clone, Debug)]
@@ -2617,24 +3013,27 @@ mod tests {
 
     impl rainier_database::Model for Post {}
 
-    /// A request whose `work` runs inside its span, across awaits.
-    async fn request_async<F: std::future::Future>(path: &str, work: F) -> F::Output {
-        let span = request_span(path);
-        span.record("trace_id", "4bf92f3577b34da6a3ce929d0e0e4736");
-        let out = work.instrument_in(span.clone()).await;
-        span.record("http.response.status_code", 200);
-        drop(span);
+    /// A request whose `work` runs inside its unit, across awaits.
+    async fn request_async<F: std::future::Future>(rig: &Rig, path: &str, work: F) -> F::Output {
+        let unit = request_unit(rig, path);
+        let started = std::time::Instant::now();
+        let out = unit
+            .scope(async {
+                let out = work.await;
+                served(path, Some(200), None, started.elapsed()).publish();
+                out
+            })
+            .await;
+        drop(unit);
         out
     }
 
-    /// A fake database whose writes go to a dispatcher Lookout listens on —
+    /// A fake database whose writes go to the bus Lookout subscribed to —
     /// what boot wires for every connection.
     fn on_the_bus(rig: &Rig) -> rainier_database::Database {
         use rainier_database::testing::{fake_database, MemoryConnection};
-        let events = Arc::new(Dispatcher::new());
-        rig.lookout.listen(&events);
         let (db, _) = fake_database(MemoryConnection::new(rainier_orm::Dialect::Sqlite));
-        db.dispatch_changes_to(events);
+        db.dispatch_changes_to(Arc::clone(&rig.events));
         db
     }
 
@@ -2652,7 +3051,7 @@ mod tests {
         // write is on the bus as a `ModelChanged` all the same.
         let posts = EntityRepository::<Post>::new(db.clone());
 
-        request_async("/posts", async {
+        request_async(&rig, "/posts", async {
             posts.create(Post { id: 7, title: "Hello".into() }).await.expect("create");
             posts
                 .update_matching(
@@ -2664,10 +3063,10 @@ mod tests {
             posts.delete(7u64.into()).await.expect("delete");
         })
         .await;
-        // Outside every batch: Lookout's own store, a background task.
+        // Outside every unit: Lookout's own store, a background task.
         posts.delete(8u64.into()).await.expect("delete");
 
-        rig.lookout.flush().await;
+        rig.flush().await;
         let batches = rig.store.all();
         assert_eq!(batches.len(), 1);
         let batch = &batches[0];
@@ -2680,7 +3079,7 @@ mod tests {
         assert_eq!(created.content["keys"], serde_json::json!(["7"]));
         assert!(created.content["model_type"].as_str().is_some_and(|t| t.ends_with("::Post")));
         // Who made it, for a list of one model's changes.
-        assert_eq!(created.content["batch"]["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(created.content["batch"]["trace_id"], TRACE);
         assert_eq!(created.content["batch"]["kind"], "request");
         assert_eq!(created.content["batch"]["summary"], batch.summary);
         assert_eq!(models(batch)[1].content["keys"], serde_json::Value::Null);
@@ -2690,7 +3089,7 @@ mod tests {
     async fn model_changes_are_counted_when_their_batch_is_not_kept() {
         let rig = rig(production());
         let probe = rig.lookout.clone();
-        request("/posts", 200, || {
+        request(&rig, "/posts", 200, || {
             probe.record_model_change(&rainier_database::ModelChanged {
                 model: "Post".into(),
                 model_type: Some("shop::Post"),
@@ -2699,7 +3098,7 @@ mod tests {
                 keys: Some(vec!["7".into()]),
             });
         });
-        rig.lookout.flush().await;
+        rig.flush().await;
         assert!(rig.store.all().is_empty(), "an ordinary request is not kept in production");
         let counted = rig
             .store
@@ -2717,19 +3116,19 @@ mod tests {
         let rig = rig(local().disable(EntryType::Model));
         let db = on_the_bus(&rig);
         let posts = EntityRepository::<Post>::new(db);
-        request_async("/posts", async {
+        request_async(&rig, "/posts", async {
             posts.create(Post { id: 7, title: "Hello".into() }).await.expect("create");
         })
         .await;
-        rig.lookout.flush().await;
+        rig.flush().await;
         assert!(models(&rig.store.all()[0]).is_empty());
     }
 
     #[tokio::test]
     async fn a_disabled_watcher_drops_its_entries() {
         let rig = rig(local().disable(EntryType::Query));
-        request("/posts/1", 200, || query("SELECT 1"));
-        rig.lookout.flush().await;
+        request(&rig, "/posts/1", 200, || query("SELECT 1"));
+        rig.flush().await;
         let batch = &rig.store.all()[0];
         assert_eq!(batch.entries.len(), 1);
         assert_eq!(batch.entries[0].entry_type, EntryType::Request);
@@ -2742,7 +3141,7 @@ mod tests {
         let rig = rig(config);
         let probe = rig.lookout.clone();
         for user in ["7", "42"] {
-            request("/posts/1", 200, || {
+            request(&rig, "/posts/1", 200, || {
                 let cell = probe.inner.current_batch().unwrap();
                 let mut state = cell.lock();
                 let pending = state.as_mut().unwrap();
@@ -2750,18 +3149,10 @@ mod tests {
                 pending.user_id = Some(user.into());
             });
         }
-        rig.lookout.flush().await;
+        rig.flush().await;
         let batches = rig.store.all();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].guard.as_deref(), Some("session"));
         assert_eq!(batches[0].user_id, None, "ids are kept only with capture.user_id");
     }
-
-    /// `Instrument`, named so it does not read like the layer's own calls.
-    trait InstrumentIn: std::future::Future + Sized {
-        fn instrument_in(self, span: tracing::Span) -> tracing::instrument::Instrumented<Self> {
-            tracing::Instrument::instrument(self, span)
-        }
-    }
-    impl<F: std::future::Future> InstrumentIn for F {}
 }

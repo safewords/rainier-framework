@@ -208,10 +208,13 @@ pub struct Capture {
     #[serde(default)]
     pub client_errors: bool,
     /// Where in the application a slow query, cache call or outgoing request
-    /// came from: the application's own frames of the stack as its span
-    /// closes, as `code.trace`. Captured only for spans over their slow
-    /// threshold, so fast ones cost nothing. Function names need a binary
-    /// that is not stripped; files and lines need line tables
+    /// came from: the application's own frames of the stack, as `code.trace`.
+    /// Lookout asks publishers for a stack over the lowest slow threshold of
+    /// these watchers, and the publisher captures it on the thread that did
+    /// the work when it finishes — once per family per unit of work, so fast
+    /// work and repeats cost nothing. Lookout keeps it for an entry over its
+    /// own threshold and symbolises it on the writer. Function names need a
+    /// binary that is not stripped; files and lines need line tables
     /// (`debug = "line-tables-only"`). On by default.
     #[serde(default = "yes")]
     pub code_traces: bool,
@@ -544,11 +547,22 @@ pub struct Ingest {
     pub flush_interval_ms: u64,
     /// ...or once this many batches are waiting.
     pub flush_batch_size: usize,
+    /// How many threads Lookout's bus subscriber records on. Each unit of
+    /// work's events go to one of them, so they record in parallel; the
+    /// request thread's cost does not change with it. Default: a quarter of
+    /// the machine's cores, between one and four.
+    pub threads: usize,
 }
 
 impl Default for Ingest {
     fn default() -> Self {
-        Self { channel_capacity: 10_000, flush_interval_ms: 1000, flush_batch_size: 500 }
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        Self {
+            channel_capacity: 10_000,
+            flush_interval_ms: 1000,
+            flush_batch_size: 500,
+            threads: (cores / 4).clamp(1, 4),
+        }
     }
 }
 
@@ -1064,6 +1078,9 @@ impl LookoutConfig {
         }
         if self.ingest.channel_capacity == 0 {
             return Err(ConfigError::new("ingest.channel_capacity", "0", "a positive integer"));
+        }
+        if self.ingest.threads == 0 {
+            return Err(ConfigError::new("ingest.threads", "0", "a positive integer"));
         }
         if self.ingest.flush_batch_size == 0 {
             return Err(ConfigError::new("ingest.flush_batch_size", "0", "a positive integer"));

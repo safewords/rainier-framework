@@ -759,6 +759,28 @@ One driver is built from something no configuration file can hold: `kv` needs a
 `KvTransport`, which is a binding inside a Worker and an API client outside one.
 It arrives through `CacheResources` rather than through the config tree.
 
+## Events
+
+Every call on a store the `CacheManager` holds publishes a `CacheOperation`
+on the [event bus](events.md), whether or not the `telemetry` feature is on.
+Its kind is the span name — `cache.get`, `cache.put`, `cache.forget`,
+`cache.flush`, `cache.has`, `cache.increment`, `cache.touch`, `cache.add`,
+`cache.forget_if` — and it carries the span's fields under the same names:
+`otel.name` (`cache get`), `cache.operation`, `cache.store` (the driver),
+`cache.hit` where the call has one, and `otel.status_code`/`error.type` on a
+failure; plus its duration.
+
+Unlike the span it also carries `cache.key`, for a subscriber in the process
+to show. A key is often an identifier (`session:{id}`), so a subscriber that
+ships activities elsewhere should drop it; [Lookout](lookout.md) shows it only
+with `capture.cache_keys` on. The value is never carried. The health probe
+publishes nothing.
+
+The manager applies one wrapper to every store, and that wrapper is both the
+span and the event. Without the `telemetry` feature and with nothing
+subscribed, a call asks the bus once and runs the store's own future — no
+clock read, no allocation.
+
 ## Testing
 
 ```rust

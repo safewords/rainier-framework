@@ -32,10 +32,10 @@ type WildcardRegistration = (Arc<dyn WildcardListener>, i32, usize);
 
 /// One dispatched event, retained while the dispatcher is
 /// [faking](Dispatcher::fake).
-struct Recorded {
-    type_id: TypeId,
-    name: &'static str,
-    payload: Arc<dyn Any + Send + Sync>,
+pub(crate) struct Recorded {
+    pub(crate) type_id: TypeId,
+    pub(crate) name: &'static str,
+    pub(crate) payload: Arc<dyn Any + Send + Sync>,
 }
 
 /// Registers listeners and dispatches events to them.
@@ -69,7 +69,9 @@ pub struct Dispatcher {
     wildcards: RwLock<Vec<WildcardRegistration>>,
     sequence: AtomicUsize,
     /// `Some` while faking: events are recorded here and listeners are skipped.
-    recorder: Option<Mutex<Vec<Recorded>>>,
+    pub(crate) recorder: Option<Mutex<Vec<Recorded>>>,
+    /// What `publish` delivers to.
+    pub(crate) bus: crate::bus::BusState,
 }
 
 impl Dispatcher {
@@ -132,11 +134,17 @@ impl Dispatcher {
             }
         });
 
-        let registration = Registration {
-            handler,
-            priority,
-            sequence: self.sequence.fetch_add(1, Ordering::SeqCst),
-        };
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+        // The same listener, for `publish`: run later, on the delivery task.
+        let deferred = Arc::clone(&handler);
+        self.add_inline_typed(
+            TypeId::of::<E>(),
+            E::event_name(),
+            Arc::new(move |payload, _cx| {
+                crate::bus::Delivery::Pending(deferred(Arc::clone(payload)))
+            }),
+        );
+        let registration = Registration { handler, priority, sequence };
         self.listeners
             .write()
             .expect("listeners lock poisoned")
@@ -167,11 +175,15 @@ impl Dispatcher {
     /// [`listen_any`](Self::listen_any) at an explicit priority.
     pub fn listen_any_with_priority<L: WildcardListener>(&self, listener: L, priority: i32) {
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
-        self.wildcards.write().expect("wildcards lock poisoned").push((
-            Arc::new(listener),
-            priority,
-            sequence,
-        ));
+        let listener: Arc<dyn WildcardListener> = Arc::new(listener);
+        let deferred = Arc::clone(&listener);
+        self.add_inline_any(Arc::new(move |name, payload, _cx| {
+            crate::bus::Delivery::Pending(deferred.handle(name, Arc::clone(payload)))
+        }));
+        self.wildcards
+            .write()
+            .expect("wildcards lock poisoned")
+            .push((listener, priority, sequence));
     }
 
     /// Let a [`EventSubscriber`] register its listeners.
@@ -189,8 +201,7 @@ impl Dispatcher {
     /// [`has_typed_listeners`](Self::has_typed_listeners) to ask about `E`'s
     /// own.
     pub fn has_listeners<E: Event>(&self) -> bool {
-        self.has_typed_listeners::<E>()
-            || !self.wildcards.read().expect("wildcards lock poisoned").is_empty()
+        self.has_subscribers::<E>()
     }
 
     /// Whether a listener registered for `E` itself exists — wildcards not
@@ -206,12 +217,14 @@ impl Dispatcher {
     /// Drop every listener for `E`.
     pub fn forget<E: Event>(&self) {
         self.listeners.write().expect("listeners lock poisoned").remove(&TypeId::of::<E>());
+        self.forget_published::<E>();
     }
 
     /// Drop every listener, typed and wildcard.
     pub fn forget_all(&self) {
         self.listeners.write().expect("listeners lock poisoned").clear();
         self.wildcards.write().expect("wildcards lock poisoned").clear();
+        self.forget_all_published();
     }
 
     // --- dispatch ----------------------------------------------------------
@@ -241,6 +254,7 @@ impl Dispatcher {
             return Ok(());
         }
 
+        let payload = self.offer_to_subscribers::<E>(name, payload);
         let handlers = self.handlers_for::<E>();
         let wildcards = self.wildcard_handlers();
         #[cfg(feature = "telemetry")]
@@ -292,6 +306,7 @@ impl Dispatcher {
             return 0;
         }
 
+        let payload = self.offer_to_subscribers::<E>(name, payload);
         let handlers = self.handlers_for::<E>();
         let wildcards = self.wildcard_handlers();
         #[cfg(feature = "telemetry")]
@@ -342,6 +357,21 @@ impl Dispatcher {
         }
 
         deliver.await
+    }
+
+    /// Give a dispatched event to the subscriptions (`on`, `on_any`), which
+    /// never run inline: they get it as if it had been published.
+    fn offer_to_subscribers<E: Event>(
+        &self,
+        name: &'static str,
+        payload: Arc<dyn Any + Send + Sync>,
+    ) -> Arc<dyn Any + Send + Sync> {
+        if self.bus.hears(TypeId::of::<E>()) {
+            if let Ok(event) = Arc::clone(&payload).downcast::<E>() {
+                self.publish_built(name, crate::context::Context::current(), event, true);
+            }
+        }
+        payload
     }
 
     /// This event's handlers, highest priority first, snapshotted so the lock

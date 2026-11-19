@@ -73,6 +73,14 @@ impl Middleware for Trace {
         // service's own span in the trace, not the caller's.
         let outbound = crate::propagation::child_of(&context);
 
+        // On the request's unit of work, so every event published while it is
+        // handled carries the same trace id the log lines do. A trace the
+        // kernel already took from the caller's `traceparent` stands — it is
+        // this one.
+        if let Some(unit) = rainier_events::Context::current_unit() {
+            unit.set_trace(Some(&trace_id), Some(&header));
+        }
+
         // On the request, so a handler can propagate it to whatever it calls.
         request.extensions_mut().insert(context);
         if let Some(state) = state {
@@ -227,6 +235,24 @@ mod tests {
         assert_eq!(outbound.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736", "the same trace");
         assert_ne!(outbound.parent_id(), "00f067aa0ba902b7", "with this service as the parent");
         assert_eq!(crate::propagation::current(), None, "and only for the request");
+    }
+
+    #[tokio::test]
+    async fn the_trace_is_recorded_on_the_requests_unit_of_work() {
+        use rainier_events::{Unit, UnitKind};
+
+        let unit = Unit::new(UnitKind::Request, None, Some("/".into()));
+        unit.scope(through(Trace::new(), Request::builder().header(TRACEPARENT, EXAMPLE).build()))
+            .await;
+        assert_eq!(unit.trace_id(), Some("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(unit.traceparent(), Some(EXAMPLE));
+
+        // And one it starts, when nothing came in.
+        let fresh = Unit::new(UnitKind::Request, None, Some("/".into()));
+        let response = fresh.scope(through(Trace::new(), Request::builder().build())).await;
+        let header = response.header(TRACEPARENT).expect("a header").to_string();
+        assert_eq!(fresh.trace_id().map(str::len), Some(32));
+        assert!(header.contains(fresh.trace_id().unwrap_or("?")), "{header}");
     }
 
     #[tokio::test]

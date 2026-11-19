@@ -134,11 +134,7 @@ mod real {
 
     impl Transport for ReqwestTransport {
         fn send<'a>(&'a self, request: OutboundRequest) -> BoxFuture<'a, Result<RawResponse>> {
-            #[cfg(feature = "telemetry")]
-            return crate::telemetry::instrument(request, move |request| self.wire(request));
-
-            #[cfg(not(feature = "telemetry"))]
-            self.wire(request)
+            crate::telemetry::instrument(request, move |request| self.wire(request))
         }
 
         fn name(&self) -> &str {

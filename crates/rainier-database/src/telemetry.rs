@@ -1,8 +1,12 @@
-//! A `db.query` span per statement — behind the `telemetry` feature.
+//! A `db.query` span per statement — behind the `telemetry` feature — and
+//! what both it and the [`QueryExecuted`](crate::QueryExecuted) event say
+//! about a statement.
 //!
 //! Applied in [`Database`](crate::Database), the handle every query goes
 //! through — repositories, `Criteria`, raw SQL, the migrator — so nothing above
-//! it has to know.
+//! it has to know. The span needs the feature; the statement's description
+//! ([`sanitize`], the operation and table) does not, because the event is
+//! published whether or not it is on.
 //!
 //! # The statement, never its values
 //!
@@ -31,6 +35,7 @@ pub(crate) fn system(dialect: Dialect) -> &'static str {
 }
 
 /// Run `future` inside `span`, recording how it ended.
+#[cfg(feature = "telemetry")]
 ///
 /// `rows` reads a row count off a success, for `db.response.returned_rows`.
 pub(crate) async fn traced<T, E: std::fmt::Display, F>(
@@ -60,13 +65,10 @@ where
 }
 
 /// Open the span for one statement.
+#[cfg(feature = "telemetry")]
 pub(crate) fn span(dialect: Dialect, sql: &str) -> tracing::Span {
     let (operation, collection) = describe(sql);
-    let name = match (&operation, &collection) {
-        (Some(operation), Some(collection)) => format!("{operation} {collection}"),
-        (Some(operation), None) => operation.clone(),
-        _ => system(dialect).to_string(),
-    };
+    let name = otel_name(dialect, operation.as_deref(), collection.as_deref());
 
     rainier_support::span!(
         "db.query",
@@ -80,8 +82,22 @@ pub(crate) fn span(dialect: Dialect, sql: &str) -> tracing::Span {
     )
 }
 
+/// The span's `otel.name`: `SELECT users`, `SELECT`, or the system.
+#[cfg(feature = "telemetry")]
+pub(crate) fn otel_name(
+    dialect: Dialect,
+    operation: Option<&str>,
+    collection: Option<&str>,
+) -> String {
+    match (operation, collection) {
+        (Some(operation), Some(collection)) => format!("{operation} {collection}"),
+        (Some(operation), None) => operation.to_string(),
+        _ => system(dialect).to_string(),
+    }
+}
+
 /// The statement's operation and the table it names, when they can be read.
-fn describe(sql: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn describe(sql: &str) -> (Option<String>, Option<String>) {
     let mut words = sql.split_whitespace();
     let operation = words.next().map(|word| word.to_ascii_uppercase());
 

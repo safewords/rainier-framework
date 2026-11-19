@@ -2,10 +2,14 @@
 
 use std::sync::{Arc, Mutex};
 
-use rainier_events::Dispatcher;
+use std::time::Instant;
+
+use rainier_events::activity::{has_activity_subscribers, publish_activity_with};
+use rainier_events::{Dispatcher, Operation};
 use rainier_support::{Error, Result};
 use rainier_view::ViewEngine;
 
+use crate::events::{error_type, MailSent};
 use crate::mailable::Mailable;
 use crate::message::{Address, Message};
 use crate::transport::Transport;
@@ -18,7 +22,10 @@ pub struct MessageSending {
     pub message: Message,
 }
 
-/// Fired after a message is accepted by the transport.
+/// Published after a message is accepted by the transport.
+///
+/// Fire-and-forget: its listeners run after the send has returned, on the
+/// bus's subscriber threads, and nothing they do reaches the sender.
 #[derive(Debug, Clone)]
 pub struct MessageSent {
     /// The message that was sent.
@@ -136,7 +143,8 @@ impl Mailer {
         }
     }
 
-    /// Fire [`MessageSending`] and [`MessageSent`] through `events`.
+    /// Fire [`MessageSending`] (dispatched: a listener can veto the send) and
+    /// publish [`MessageSent`] (fire-and-forget) through `events`.
     pub fn with_events(mut self, events: Arc<Dispatcher>) -> Self {
         self.events = Some(events);
         self
@@ -169,13 +177,27 @@ impl Mailer {
     }
 
     /// Render and deliver a mailable.
+    ///
+    /// Runs as an [`Operation`] when somebody hears [`MailSent`], so the views
+    /// rendered for the message nest under the send.
     pub async fn send(&self, mailable: &dyn Mailable) -> Result<Message> {
-        // Resolved here, before the mailable is turned into a `Message` and
-        // its own preference is no longer reachable. An unknown name fails
-        // now, without a partial send.
-        let transport = Arc::clone(self.transport_for(mailable)?);
-        let message = self.prepare(mailable)?;
-        self.deliver_over(message, transport).await
+        let op = has_activity_subscribers::<MailSent>().then(Operation::new);
+        let mut attempt = None;
+        let send = async {
+            // Resolved here, before the mailable is turned into a `Message`
+            // and its own preference is no longer reachable. An unknown name
+            // fails now, without a partial send.
+            let transport = Arc::clone(self.transport_for(mailable)?);
+            let message = self.prepare(mailable)?;
+            attempt = Some(Attempt::of(&message, &transport));
+            self.deliver_traced(message, transport).await
+        };
+        let result = match &op {
+            Some(op) => op.scope(send).await,
+            None => send.await,
+        };
+        publish_sent(attempt, op.as_ref(), &result);
+        result
     }
 
     /// Render a mailable without sending it — for previewing, and for
@@ -238,11 +260,19 @@ impl Mailer {
         // `Message` has no mailable left to ask, which is why `send` resolves
         // the choice while it still can.
         let transport = Arc::clone(&self.transport);
-        self.deliver_over(message, transport).await
+        let op = has_activity_subscribers::<MailSent>().then(Operation::new);
+        let attempt = Attempt::of(&message, &transport);
+        let send = self.deliver_traced(message, transport);
+        let result = match &op {
+            Some(op) => op.scope(send).await,
+            None => send.await,
+        };
+        publish_sent(Some(attempt), op.as_ref(), &result);
+        result
     }
 
-    /// [`deliver`](Self::deliver), over a transport already chosen.
-    async fn deliver_over(
+    /// The send, in a `mail.send` span when `telemetry` is on.
+    async fn deliver_traced(
         &self,
         message: Message,
         transport: Arc<dyn Transport>,
@@ -303,9 +333,10 @@ impl Mailer {
         transport.send(&message).await?;
 
         if let Some(events) = &self.events {
-            // Sent is past tense: the message has gone, so a failing listener
-            // is logged rather than turned into a delivery failure.
-            events.dispatch_quietly(MessageSent { message: message.clone() }).await;
+            // Sent is past tense: the message has gone, so nothing a listener
+            // does — fails, stalls — reaches the send. Published, not
+            // dispatched: listeners run after `deliver` has returned.
+            events.publish_with(|| MessageSent { message: message.clone() });
         }
 
         Ok(message)
@@ -377,6 +408,41 @@ impl Mailer {
              nothing is recorded and the assertion is meaningless"
         );
     }
+}
+
+/// What [`MailSent`] reports about one delivery, taken as it starts.
+struct Attempt {
+    transport: Arc<dyn Transport>,
+    recipients: usize,
+    attachments: usize,
+    started: Instant,
+}
+
+impl Attempt {
+    fn of(message: &Message, transport: &Arc<dyn Transport>) -> Self {
+        Self {
+            transport: Arc::clone(transport),
+            recipients: message.envelope.to.len()
+                + message.envelope.cc.len()
+                + message.envelope.bcc.len(),
+            attachments: message.attachments.len(),
+            started: Instant::now(),
+        }
+    }
+}
+
+/// Publish [`MailSent`] for a delivery that was attempted — outside the
+/// send's own [`Operation`], whose parent it is.
+fn publish_sent(attempt: Option<Attempt>, op: Option<&Operation>, result: &Result<Message>) {
+    let Some(attempt) = attempt else { return };
+    publish_activity_with(|| MailSent {
+        transport: attempt.transport.name().to_string(),
+        recipients: attempt.recipients,
+        attachments: attempt.attachments,
+        duration: attempt.started.elapsed(),
+        error_type: result.as_ref().err().map(error_type),
+        operation: op.map(Operation::id),
+    });
 }
 
 impl std::fmt::Debug for Mailer {
@@ -637,6 +703,137 @@ mod tests {
 
         assert!(mailer.send(&Welcome::to("ada@example.com")).await.is_ok());
         assert_eq!(transport.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_sent_listener_hears_the_message_after_the_send_returns() {
+        let transport = Arc::new(MemoryTransport::new());
+        let events = Arc::new(Dispatcher::new());
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let h = Arc::clone(&heard);
+        events.on::<MessageSent>().run_sync(move |sent, _| {
+            h.lock().unwrap().push(sent.message.envelope.to[0].email.clone());
+            Ok(())
+        });
+
+        let mailer = mailer_with(Arc::clone(&transport)).with_events(Arc::clone(&events));
+        mailer.send(&Welcome::to("ada@example.com")).await.unwrap();
+        events.settled().await;
+
+        assert_eq!(*heard.lock().unwrap(), vec!["ada@example.com".to_string()]);
+    }
+
+    /// Records the context each view is rendered in.
+    struct Watching(Mutex<Vec<Option<u64>>>);
+
+    impl ViewEngine for Watching {
+        fn render(&self, _: &str, _: &serde_json::Value) -> Result<String> {
+            self.0.lock().unwrap().push(rainier_events::Context::current().parent());
+            Ok("<p>Hi</p>".into())
+        }
+        fn exists(&self, _: &str) -> bool {
+            true
+        }
+    }
+
+    struct Viewed;
+
+    impl Mailable for Viewed {
+        fn envelope(&self) -> Envelope {
+            Envelope::new("Viewed").to("ada@example.com").from("app@example.com")
+        }
+        fn content(&self) -> Result<Content> {
+            Content::view("mail.viewed", serde_json::json!({}))
+        }
+    }
+
+    /// Each `MailSent` heard, with the operation it was published inside.
+    type Heard = Arc<Mutex<Vec<(MailSent, Option<u64>)>>>;
+
+    fn activities(events: &Arc<Dispatcher>) -> Heard {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        events.on::<MailSent>().run_sync(move |sent, cx| {
+            s.lock().unwrap().push(((*sent).clone(), cx.parent()));
+            Ok(())
+        });
+        seen
+    }
+
+    #[tokio::test]
+    async fn a_send_publishes_mail_sent_with_the_spans_fields() {
+        use rainier_events::Activity;
+
+        let events = Arc::new(Dispatcher::new());
+        let _bus = rainier_events::set_default(Arc::clone(&events));
+        let seen = activities(&events);
+        let mailer = mailer_with(Arc::new(MemoryTransport::new()));
+
+        mailer.send(&Welcome::to("ada@example.com")).await.unwrap();
+        events.settled().await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (sent, parent) = &seen[0];
+        assert_eq!(*parent, None, "the send's own event is not inside its operation");
+        assert!(sent.operation.is_some());
+        assert!(!sent.failed());
+        assert_eq!(sent.kind(), "mail.send");
+        let fields = sent.collect_fields();
+        assert_eq!(fields.text("otel.name"), Some("mail memory"));
+        assert_eq!(fields.text("mail.transport"), Some("memory"));
+        assert_eq!(fields.get("mail.recipients"), Some(&rainier_events::Value::U64(1)));
+        assert_eq!(fields.get("mail.attachments"), Some(&rainier_events::Value::U64(0)));
+        assert!(fields.get("otel.status_code").is_none());
+        assert!(fields.get("mail.subject").is_none(), "never what the message said");
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_is_a_failed_mail_sent() {
+        use rainier_events::Activity;
+
+        let events = Arc::new(Dispatcher::new());
+        let _bus = rainier_events::set_default(Arc::clone(&events));
+        let seen = activities(&events);
+        let mailer = Mailer::fake(views());
+
+        assert!(mailer.send(&Welcome::without_sender("ada@example.com")).await.is_err());
+        events.settled().await;
+
+        let seen = seen.lock().unwrap();
+        let fields = seen[0].0.collect_fields();
+        assert!(seen[0].0.failed());
+        assert_eq!(fields.text("otel.status_code"), Some("ERROR"));
+        assert!(fields.text("error.type").is_some());
+    }
+
+    #[tokio::test]
+    async fn the_views_a_send_renders_run_inside_its_operation() {
+        let events = Arc::new(Dispatcher::new());
+        let _bus = rainier_events::set_default(Arc::clone(&events));
+        let seen = activities(&events);
+        let engine = Arc::new(Watching(Mutex::new(Vec::new())));
+        let mailer = Mailer::new(engine.clone(), Arc::new(MemoryTransport::new()));
+
+        mailer.send(&Viewed).await.unwrap();
+        events.settled().await;
+
+        let op = seen.lock().unwrap()[0].0.operation;
+        assert!(op.is_some());
+        assert_eq!(*engine.0.lock().unwrap(), vec![op]);
+    }
+
+    #[tokio::test]
+    async fn nobody_listening_means_no_operation_and_no_event() {
+        let events = Arc::new(Dispatcher::new());
+        let _bus = rainier_events::set_default(Arc::clone(&events));
+        let engine = Arc::new(Watching(Mutex::new(Vec::new())));
+        let mailer = Mailer::new(engine.clone(), Arc::new(MemoryTransport::new()));
+
+        assert!(!rainier_events::activity::has_activity_subscribers::<MailSent>());
+        mailer.send(&Viewed).await.unwrap();
+
+        assert_eq!(*engine.0.lock().unwrap(), vec![None], "no operation was opened");
     }
 
     #[tokio::test]

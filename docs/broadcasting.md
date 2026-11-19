@@ -327,6 +327,15 @@ notifications.
 
 ---
 
+## Events
+
+Every broadcast handed to the driver publishes `BroadcastSent` on the current
+[event bus](events.md) — with or without `telemetry` — an activity (kind
+`broadcast.publish`) with the span's fields: `rainier.broadcast.driver`,
+`rainier.broadcast.event`, `rainier.broadcast.channels` (a count — channel
+names carry ids), its duration, and `otel.status_code` / `error.type` on
+failure. Never the payload.
+
 ## Testing
 
 ```rust

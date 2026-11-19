@@ -68,6 +68,7 @@ pub mod concurrent;
 pub mod connection;
 pub mod criteria;
 pub mod databases;
+pub mod events;
 pub mod expression;
 pub mod factory;
 pub mod manager;
@@ -80,7 +81,6 @@ pub mod repository;
 pub mod row;
 pub mod statement;
 pub mod sticky;
-#[cfg(feature = "telemetry")]
 pub mod telemetry;
 pub mod testing;
 
@@ -94,6 +94,7 @@ pub use databases::{
     DatabaseConfig, DatabaseCredentials, DatabaseDriver, DatabaseRole, Databases, DsnDatabase,
     PoolSettings, ServerDatabase, SqliteDatabase,
 };
+pub use events::{ModelSubscription, OnModel, QueryExecuted};
 pub use expression::{Expression, Predicate, SubSelect};
 pub use factory::{Factory, HasFactory};
 pub use manager::DatabaseManager;

@@ -305,8 +305,9 @@ pub trait Filesystem: Send + Sync + 'static {
         })
     }
 
-    /// Whether this disk already opens a span per call — the `telemetry`
-    /// feature's wrapper — so wrapping it again would trace everything twice.
+    /// Whether this disk is already the observing wrapper
+    /// ([`TracedFilesystem`](crate::telemetry::TracedFilesystem)), so
+    /// wrapping it again would report everything twice.
     #[doc(hidden)]
     fn is_traced(&self) -> bool {
         false

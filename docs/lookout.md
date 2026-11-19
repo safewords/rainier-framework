@@ -13,11 +13,14 @@ by what it is: a **request** at `/_lookout/requests/<id>`, a **job** at
 from the browser at `/api-calls/<id>`. `/_lookout/batches/<id>` opens any of
 them, for a link that knows only the id.
 
-It is built from what the framework already emits. With the `lookout` feature
-every component opens the same spans the [`telemetry`](observability.md#passive-instrumentation)
-feature gives it; Lookout reads them in-process through a `tracing` layer, and
-listens on the event bus for what spans do not carry — failures, model changes,
-job outcomes. No application code opens anything for it.
+It is built from what the framework already emits. Every component publishes
+what it did — a query, a cache call, a job run, the request itself — on the
+[event bus](events.md) as an activity, in the unit of work (request, job,
+command, scheduled task) it did it in; failures, model changes and the end of
+each unit travel the same way. Lookout is one subscriber of that bus,
+`lookout`, on a thread of its own. Log lines reach the bus through
+`rainier_events::log_layer`, which boot adds to the tracing subscriber. No
+application code opens anything for it.
 
 Run the example to see it end to end, offline, from a checkout of this
 repository:
@@ -49,9 +52,9 @@ That is all a deployment needs. [`cargo rainier features`](deployment.md#sizing-
 for an environment that sets `LOOKOUT_ENABLED=true`, as it does `telemetry`
 for `TELEMETRY_ENABLED=true`.
 
-The feature compiles in the spans **without** the OTLP exporter. Lookout and
-`telemetry` are independent: turn both on to keep Lookout and export the same
-spans to a collector.
+The feature also compiles in the framework's spans, **without** the OTLP
+exporter. Lookout and `telemetry` are independent: turn both on to keep
+Lookout and export the same work to a collector as spans.
 
 ### The environment
 
@@ -215,15 +218,21 @@ frames — framework, runtime and standard-library frames left out — as
 `{"function", "file", "line"}`, innermost first.
 
 A slow query, cache call, outgoing request, mail, notification or view gets
-`code.trace` in the same shape: the stack **as its span closes**. `on_close`
-runs as the instrumented future is dropped, inside the poll of the code that
-awaited it, so those frames are where the call came from. Only spans over
-their slow threshold are traced, because a capture walks the stack; fast ones
-cost nothing. `LOOKOUT_CAPTURE_CODE_TRACES=false` turns it off.
+`code.trace` in the same shape: the stack **as the work finishes**. Lookout
+asks publishers (`rainier_events::code_trace::request_code_traces`) for a
+stack over the lowest slow threshold of those watchers, and the publisher —
+the database, the cache — captures it on the thread that did the work, inside
+the code that awaited it, so those frames are where the call came from. Only
+work over the threshold is traced, because a capture walks the stack; fast
+work costs nothing. `LOOKOUT_CAPTURE_CODE_TRACES=false` turns it off.
 
-The request pays only for the walk, once per family — a request running the
-same slow query five hundred times gets one trace, not five hundred walks —
-and for at most `MAX_CODE_TRACES_PER_BATCH` (16) families per batch. Turning the addresses into function names, which costs several times
+The request pays only for the walk, once per family per unit of work — a
+request running the same slow query five hundred times gets one trace, not
+five hundred walks — and Lookout keeps at most `MAX_CODE_TRACES_PER_BATCH`
+(16) families per batch. A watcher with a `slow_overrides` entry above its
+base threshold can miss a trace for the overridden family: the request goes
+out at the lowest threshold, but the publisher claims the family's one trace
+before Lookout sees whether the entry is slow. Turning the addresses into function names, which costs several times
 the walk, is the background writer's job, on a blocking thread, just before
 the batch is stored.
 
@@ -236,7 +245,7 @@ need line tables (`[profile.release] debug = "line-tables-only"`).
 `request`, `query`, `cache`, `http_client`, `job`, `mail`, `notification`,
 `event`, `scheduled_task`, `command`, `exception`, `log`, `model`, `view`,
 `broadcast`, `session`, `auth_attempt`, `n_plus_one`, `slow`, `custom`. The
-span each comes from is catalogued in `rainier_lookout::layer`.
+activity kind each comes from is catalogued in `rainier_lookout::subscriber`.
 
 ### Model changes
 
@@ -954,10 +963,12 @@ database store needs the prune.
 ## Overhead
 
 - **Off, it costs nothing at run time**: a disabled Lookout binds nothing,
-  mounts nothing and adds no layer or middleware. Without the feature none of
-  it is compiled.
-- **On, nothing waits on it.** The request path appends entries to an
-  in-memory buffer. When the request or job ends, its batch is handed, as it
+  mounts nothing, subscribes to nothing and adds no layer or middleware; with
+  nobody subscribed, a publisher asks the bus once and builds nothing.
+  Without the feature none of it is compiled.
+- **On, nothing waits on it.** The request thread publishes activities onto
+  the bus; Lookout's subscriber thread turns them into entries in an
+  in-memory buffer. When the unit of work ends, its batch is handed, as it
   is, to a **bounded channel**
   (`ingest.channel_capacity`, 10 000) with `try_send`; when the channel is
   full the batch is **dropped and counted** — `Lookout::dropped()` — and the
@@ -973,26 +984,29 @@ database store needs the prune.
   kept are added up in the writer and written every 2 seconds (or with a
   kept batch, or on flush and shutdown) — often enough for the dashboard's
   [live](#live) numbers to trail the traffic by about that much, and never
-  once per request; an interval in which nothing was counted writes nothing. Its
-  own store traffic runs inside a span marked `rainier.lookout.internal`, so
-  the database or cache store's queries are not recorded. A failing store is
+  once per request; an interval in which nothing was counted writes nothing. The
+  writer runs outside every unit of work, so the database or cache store's
+  queries are not recorded; its spans are still marked
+  `rainier.lookout.internal`, and log lines written inside them are not
+  published. A failing store is
   logged at most once per interval, never reported on the bus.
 - A batch holds at most 2000 entries; the rest are counted in a
   `truncated:<n>` tag.
 - **What a request pays** on its own thread, measured by the
   `hot_path_cost` test in `crates/rainier-lookout/tests` (release build, Apple
-  M-series, a request of twenty queries and three cache calls): about 17 µs
-  with Lookout on, kept or not — the span bookkeeping, under a microsecond a
-  span — and 1.4 µs with the feature built but `LOOKOUT_ENABLED=false`. A slow
-  query adds a stack walk for its code trace (above), about 10 µs, once per
-  query shape: twenty slow queries of five shapes cost about 73 µs.
-  `cache_store_cost` in the same directory measures what the cache store
-  costs the cache per write and per dashboard read.
-- **Spans below `RUST_LOG`.** Lookout needs `info` spans whatever the log
-  filter says, so with Lookout on the framework's `RUST_LOG` filter is a
-  per-layer filter on the log lines (and the exporter) rather than a global
-  one — see [below](#the-subscriber). Spans nobody else wants are then
-  created for Lookout alone. That is the cost of recording them.
+  M-series, 2026-11-19, a request of twenty queries and three cache calls
+  published on the bus): about 16 µs with Lookout on, kept or not — building
+  and publishing the activities — and under 1 µs with nothing subscribed or
+  `LOOKOUT_ENABLED=false`. A slow query adds a stack walk for its code trace
+  (above), once per query shape: twenty slow queries of five shapes cost
+  about 76 µs. The test also prints what the subscriber's thread and the
+  writer do afterwards. `cache_store_cost` in the same directory measures
+  what the cache store costs the cache per write and per dashboard read.
+- **Log lines below `RUST_LOG`.** Lookout records log lines at
+  `LOOKOUT_LOG_LEVEL` whatever the log filter says, so the framework's
+  `RUST_LOG` filter is a per-layer filter on the log lines (and the
+  exporter) rather than a global one — see [below](#the-subscriber). Spans
+  are not affected: the log layer's own filter passes events only.
 
 ### Process lifetime
 
@@ -1014,46 +1028,56 @@ anything.
 
 ## The subscriber
 
-At boot the framework builds Lookout **before** installing its tracing
-subscriber, and installs:
+Everything but log lines reaches Lookout on the event bus, whatever tracing
+subscriber is installed: boot calls `Lookout::subscribe` on the application's
+dispatcher, which registers one subscriber, `lookout`. The kernel opens each
+request's unit of work on that dispatcher and publishes the request's
+`http.server.request` activity, so there is one request entry per request;
+Lookout's middleware adds what only the request and response carry (route,
+status, user, the opt-in headers and bodies).
+
+Log lines come through the tracing subscriber. At boot the framework builds
+Lookout **before** installing it, and with Lookout on installs:
 
 ```text
 registry
   ├─ the log lines   .with_filter(EnvFilter(RUST_LOG))
   ├─ the exporter    .with_filter(EnvFilter(RUST_LOG))     (telemetry, with an endpoint)
-  └─ Lookout's layer                                       (unfiltered)
+  └─ rainier_events::log_layer::LogLayer                   (events only)
 ```
 
-A global `EnvFilter` decides for every layer at once: with `RUST_LOG=warn` the
-`info`-level request and `db.query` spans would never exist, and Lookout would
-record nothing. Per layer, the log lines and the exporter see exactly what
-they did before. `TelemetrySettings::subscriber` builds this without
-installing it.
+The log layer publishes each log event at or above the level a subscriber
+asked for — Lookout asks for `LOOKOUT_LOG_LEVEL` — as a `log` activity in the
+unit of work that wrote it. A global `EnvFilter` would decide for every layer
+at once: with `RUST_LOG=warn` an `info` line would never reach the layer.
+Per layer, the log lines and the exporter see exactly what they did before.
+`TelemetrySettings::subscriber` builds this without installing it.
 
 ### Lookout and OpenTelemetry
 
-They read the same spans and do not depend on each other. `telemetry` exports
-them to a collector for cross-service traces, sampling at the edge and
-long-term storage; Lookout keeps them in the application for a per-request
-view with queries, N+1s and failures side by side, with no collector to run.
+They do not depend on each other. `telemetry` exports the framework's spans
+to a collector for cross-service traces, sampling at the edge and long-term
+storage; Lookout records the same work from the bus in the application for a
+per-request view with queries, N+1s and failures side by side, with no
+collector to run.
 A batch carries the request's trace id (`trace_id`, and the API's `?trace=`
 filter), so a batch found in Lookout can be looked up in the tracing backend,
 and the other way round.
 
-### A subscriber of your own
+### A tracing subscriber of your own
 
 The framework never replaces a subscriber the application installed. If one
 was already set, or the application boots `without_tracing()`, boot logs a
-warning that Lookout's layer is not attached, and the application adds it:
+warning that the log layer is not attached. Everything else is still
+recorded; for log lines, the application adds the layer:
 
 ```rust
 use tracing_subscriber::prelude::*;
 
 let app = Rainier::new(".").without_tracing().boot().await?;
-let lookout = app.resolve::<rainier_framework::lookout::Lookout>()?;
 tracing_subscriber::registry()
     .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::from_default_env()))
-    .with(lookout.layer())
+    .with(rainier_events::log_layer::LogLayer::new())
     .init();
 ```
 
@@ -1061,15 +1085,20 @@ Keep the filter on your own layers, not on the registry, for the reason
 above. No request, job or command runs before `boot` returns, so installing
 the subscriber after it misses nothing worth recording.
 
-In a test, set it for the thread: `tracing::subscriber::set_default(
-tracing_subscriber::registry().with(lookout.layer()))`.
+In a test, nothing needs installing: publish on the application's
+dispatcher, and wait for it (`events.settled().await`) before
+`Lookout::flush`.
 
 ---
 
 ## Limitations
 
-- **Spans outside a unit of work are not recorded** — a query at boot, a
+- **Work outside a unit of work is not recorded** — a query at boot, a
   cache read in a background task. Only failures get a batch of their own.
+- **An excluded route is dropped when its route is known** — at the request
+  activity, or in the middleware after the response — rather than as the
+  router matches it. What it recorded until then is held in memory and then
+  discarded: never stored or counted.
 - **Middleware groups are not part of the scope.** Nothing on a request or
   response says which group its route was registered in.
 - **The memory store is per process.** On several replicas each has its

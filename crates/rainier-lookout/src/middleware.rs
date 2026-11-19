@@ -1,29 +1,35 @@
 //! [`LookoutMiddleware`]: what a request's batch learns from the request and
-//! the response rather than from spans.
+//! the response rather than from the bus.
 //!
-//! Global middleware runs inside the kernel's `http.server.request` span, so
-//! the batch is already open when it starts. Before the work it applies the
-//! request-side scope — the dashboard's own path is never recorded — and takes
-//! the opt-in captures (headers; the body, kept only if the batch ends up with
-//! a failure). After the response it reads:
+//! Global middleware runs inside the request's unit of work, which the server
+//! opens, so the batch is there when it starts. Before the work it applies
+//! the request-side scope — the dashboard's own path is never recorded — and
+//! takes the opt-in captures (headers; the body, kept only if the batch ends
+//! up with a failure). After the response it reads:
 //!
 //! - the matched route from the response's extensions
 //!   ([`MatchedRoute`](rainier_routing::MatchedRoute), which the router puts
-//!   there) — and runs the route stage of the scope, if the router's span
-//!   record had not already;
+//!   there) — and runs the route stage of the scope;
 //! - the status;
 //! - the guard and user, through [`Lookout::identify_with`].
 //!
 //! Guard and user scope are evaluated when the batch closes.
 //!
-//! **Without the server's `telemetry` feature** there is no server span, so
-//! the middleware opens an `http.server.request` span itself, with the same
-//! fields. Requests are then recorded from this middleware inward: whatever
+//! This runs on the request's own thread, and writes into the batch directly:
+//! the batch is the unit's, whichever thread gets to it first opens it.
+//!
+//! **With no unit of work around it** — a kernel that opens none — the
+//! middleware opens the request's unit itself, on the bus Lookout subscribed
+//! to, and publishes its `http.server.request` activity when the response is
+//! ready. Requests are then recorded from this middleware inward: whatever
 //! global middleware runs before it is outside the batch.
 //!
 //! **Middleware groups** are not part of the scope here: nothing on the
 //! request or response says which group a route was registered in.
 
+use std::time::{Duration, Instant};
+
+use rainier_events::{Activity, Context, Fields, Unit, UnitKind};
 use rainier_http::{Request, Response};
 use rainier_middleware::{Middleware, Next};
 
@@ -49,7 +55,7 @@ impl Middleware for LookoutMiddleware {
             return next.run(request).await;
         }
 
-        if inner.current_batch().is_some() {
+        if Context::current_unit().is_some() {
             inner.before_request(&request);
             let path = request.path().to_string();
             let response = next.run(request).await;
@@ -57,33 +63,86 @@ impl Middleware for LookoutMiddleware {
             return self.lookout.mark_for_rum(response, &path);
         }
 
-        // No server span around us: open one, so the request has a batch.
+        // No unit around us: open the request's, so it has a batch.
+        let Some(events) = inner.events() else { return next.run(request).await };
         let method = request.method().as_str().to_string();
-        let span = tracing::info_span!(
-            "http.server.request",
-            otel.name = %method,
-            http.request.method = %method,
-            url.path = %request.path(),
-            http.route = tracing::field::Empty,
-            rainier.route.name = tracing::field::Empty,
-            http.response.status_code = tracing::field::Empty,
-            trace_id = tracing::field::Empty,
-        );
+        let path = request.path().to_string();
+        let unit = Unit::on(&events, UnitKind::Request, None, Some(path.clone()));
         let lookout = self.lookout.clone();
+        let started = Instant::now();
         let work = async move {
             lookout.inner.before_request(&request);
-            let path = request.path().to_string();
             let response = next.run(request).await;
             lookout.inner.after_response(&response);
+            let matched = response.extensions().get::<rainier_routing::MatchedRoute>();
+            events.publish_activity(RequestHandled {
+                method,
+                path: path.clone(),
+                route: matched.map(|m| m.uri.clone()),
+                route_name: matched.and_then(|m| m.name.clone()),
+                status: response.status().as_u16(),
+                trace_id: Context::current_unit().and_then(|u| u.trace_id().map(str::to_string)),
+                duration: started.elapsed(),
+            });
             lookout.mark_for_rum(response, &path)
         };
-        let response = tracing::Instrument::instrument(work, span.clone()).await;
-        span.record("http.response.status_code", response.status().as_u16());
-        response
+        unit.scope(work).await
     }
 
     fn name(&self) -> &'static str {
         "Lookout"
+    }
+}
+
+/// The `http.server.request` activity the middleware publishes for a request
+/// whose unit it opened itself, with the fields the server's span carries.
+#[derive(Debug, Clone)]
+pub struct RequestHandled {
+    /// The request method.
+    pub method: String,
+    /// The request path.
+    pub path: String,
+    /// The matched route's pattern.
+    pub route: Option<String>,
+    /// The matched route's name.
+    pub route_name: Option<String>,
+    /// The response status.
+    pub status: u16,
+    /// The trace, when the unit knew one.
+    pub trace_id: Option<String>,
+    /// How long the middleware and everything inside it took.
+    pub duration: Duration,
+}
+
+impl Activity for RequestHandled {
+    fn kind(&self) -> &'static str {
+        "http.server.request"
+    }
+
+    fn fields(&self, fields: &mut Fields) {
+        let name = match &self.route {
+            Some(route) => format!("{} {route}", self.method),
+            None => self.method.clone(),
+        };
+        fields
+            .set("otel.name", name)
+            .set("http.request.method", self.method.clone())
+            .set("url.path", self.path.clone())
+            .maybe("http.route", self.route.clone())
+            .maybe("rainier.route.name", self.route_name.clone())
+            .set("http.response.status_code", self.status)
+            .maybe("trace_id", self.trace_id.clone());
+        if self.status >= 500 {
+            fields.set("otel.status_code", "ERROR").set("error.type", self.status.to_string());
+        }
+    }
+
+    fn duration(&self) -> Option<Duration> {
+        Some(self.duration)
+    }
+
+    fn failed(&self) -> bool {
+        self.status >= 500
     }
 }
 
@@ -127,7 +186,6 @@ mod tests {
     use rainier_http::{Method, Request, Response};
     use rainier_routing::Router;
     use rainier_server::Kernel;
-    use tracing_subscriber::layer::SubscriberExt;
 
     use crate::config::{Patterns, Scope};
     use crate::entry::{BatchKind, EntryType};
@@ -138,17 +196,26 @@ mod tests {
         Request::builder().method(Method::GET).uri(uri).build()
     }
 
-    /// A real kernel and router, with the server's `telemetry` spans on, and
-    /// Lookout's middleware in the global stack.
+    /// A bus with Lookout subscribed to it, and a real kernel and router
+    /// whose requests' units publish on it, with Lookout's middleware in the
+    /// global stack.
+    fn wired(lookout: &Lookout) -> (Kernel, Arc<Dispatcher>) {
+        let events = Arc::new(Dispatcher::new());
+        lookout.subscribe(&events);
+        (kernel(lookout, Arc::clone(&events)), events)
+    }
+
+    /// Everything published so far heard, then written.
+    async fn flushed(lookout: &Lookout, events: &Dispatcher) {
+        events.settled().await;
+        lookout.flush().await;
+    }
+
     fn kernel(lookout: &Lookout, events: Arc<Dispatcher>) -> Kernel {
         let mut router = Router::new();
         router
             .get("/posts/{post}", || async {
-                let span = tracing::info_span!(
-                    "db.query",
-                    db.query.text = "SELECT * FROM posts WHERE id = ?"
-                );
-                let _e = span.enter();
+                crate::testing::query("SELECT * FROM posts WHERE id = ?");
                 "post"
             })
             .name("posts.show");
@@ -202,6 +269,7 @@ mod tests {
         let compiled =
             router.compile(&rainier_container::Container::new()).expect("routes compile");
         Kernel::with_middleware(compiled, vec![Arc::new(lookout.middleware())])
+            .with_events(Arc::clone(&events))
             .with_reporter(Reporter::new(events))
     }
 
@@ -221,11 +289,7 @@ mod tests {
                 .get("x-user")
                 .map(|u| ("session".to_string(), u.to_str().ok().map(str::to_string)))
         });
-        let events = Arc::new(Dispatcher::new());
-        lookout.listen(&events);
-        let kernel = kernel(&lookout, Arc::clone(&events));
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+        let (kernel, events) = wired(&lookout);
 
         let ok = kernel
             .handle_request(
@@ -241,7 +305,7 @@ mod tests {
         kernel.handle_request(get("/health")).await;
         let failed = kernel.handle_request(get("/boom")).await;
         assert_eq!(failed.status().as_u16(), 500);
-        lookout.flush().await;
+        flushed(&lookout, &events).await;
 
         let batches = store.all();
         let summaries: Vec<&str> = batches.iter().map(|b| b.summary.as_str()).collect();
@@ -257,8 +321,8 @@ mod tests {
         assert_eq!(headers["authorization"], crate::redact::REDACTED);
         assert_eq!(headers["accept"], "text/html");
 
-        // The failure was reported after the server span closed, and joined
-        // its request's batch anyway.
+        // The failure was reported by the kernel after the middleware had
+        // seen the response, and joined its request's batch.
         let boom = &batches[1];
         assert!(boom.has_exception);
         assert_eq!(boom.route_pattern.as_deref(), Some("/boom"));
@@ -278,9 +342,7 @@ mod tests {
         config.rum.secret = b"test-key".to_vec();
         let store = Arc::new(MemoryStore::new(10));
         let lookout = Lookout::new(config.clone(), store.clone());
-        let kernel = kernel(&lookout, Arc::new(Dispatcher::new()));
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+        let (kernel, events) = wired(&lookout);
 
         let ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1";
         let mut request = Request::builder()
@@ -294,7 +356,7 @@ mod tests {
         request.extensions_mut().insert(rainier_http::ClientIp("203.0.113.77".parse().unwrap()));
         let answered = kernel.handle_request(request).await;
         assert_eq!(answered.status().as_u16(), 200);
-        lookout.flush().await;
+        flushed(&lookout, &events).await;
 
         // The response names its batch, signed, for the browser to report on.
         let timing = answered.header("server-timing").expect("a Server-Timing header").to_string();
@@ -401,9 +463,7 @@ mod tests {
         config.rum.secret = b"test-key".to_vec();
         let store = Arc::new(MemoryStore::new(10));
         let lookout = Lookout::new(config.clone(), store.clone());
-        let kernel = kernel(&lookout, Arc::new(Dispatcher::new()));
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+        let (kernel, events) = wired(&lookout);
 
         let answered = kernel
             .handle_request(
@@ -415,7 +475,7 @@ mod tests {
                     .build(),
             )
             .await;
-        lookout.flush().await;
+        flushed(&lookout, &events).await;
         assert!(store.all().is_empty(), "fast and fine: not kept");
 
         let timing = answered.header("server-timing").unwrap().to_string();
@@ -509,6 +569,8 @@ mod tests {
         let mut router = Router::new();
         router.get("/hello", || async { "hi" }).name("hello");
         let compiled = router.compile(&rainier_container::Container::new()).unwrap();
+        let events = Arc::new(Dispatcher::new());
+        lookout.subscribe(&events);
         // The order the framework builds: Lookout outermost, the
         // application's proxy trust, then Lookout's client hook innermost.
         let kernel = Kernel::with_middleware(
@@ -521,9 +583,8 @@ mod tests {
                 ),
                 Arc::new(lookout.client_middleware()),
             ],
-        );
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+        )
+        .with_events(Arc::clone(&events));
 
         let mut request = Request::builder()
             .method(Method::GET)
@@ -533,7 +594,7 @@ mod tests {
         // The socket's peer: the ingress, inside the cluster.
         request.extensions_mut().insert(rainier_http::ClientIp("10.42.2.7".parse().unwrap()));
         assert_eq!(kernel.handle_request(request).await.status().as_u16(), 200);
-        lookout.flush().await;
+        flushed(&lookout, &events).await;
 
         let batches = store.all();
         let client = &batches[0].entries[0].content["client"];
@@ -547,9 +608,7 @@ mod tests {
         config.capture.response_body = true;
         let store = Arc::new(MemoryStore::new(10));
         let lookout = Lookout::new(config, store.clone());
-        let kernel = kernel(&lookout, Arc::new(Dispatcher::new()));
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+        let (kernel, events) = wired(&lookout);
 
         let answered = kernel
             .handle_request(
@@ -563,7 +622,7 @@ mod tests {
             )
             .await;
         assert_eq!(answered.status().as_u16(), 200);
-        lookout.flush().await;
+        flushed(&lookout, &events).await;
 
         let batches = store.all();
         let root = &batches[0].entries[0].content;
@@ -585,9 +644,7 @@ mod tests {
         config.capture.bodies_except = vec!["sessions.*".into()];
         let store = Arc::new(MemoryStore::new(10));
         let lookout = Lookout::new(config, store.clone());
-        let kernel = kernel(&lookout, Arc::new(Dispatcher::new()));
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+        let (kernel, events) = wired(&lookout);
         kernel
             .handle_request(
                 Request::builder()
@@ -597,7 +654,7 @@ mod tests {
                     .build(),
             )
             .await;
-        lookout.flush().await;
+        flushed(&lookout, &events).await;
         let batch = &store.all()[0];
         assert_eq!(batch.route_name.as_deref(), Some("sessions.store"));
         let root = &batch.entries[0].content;
@@ -612,9 +669,7 @@ mod tests {
         let config = LookoutConfig::default().enabled(true).local(true);
         let store = Arc::new(MemoryStore::new(10));
         let lookout = Lookout::new(config, store.clone());
-        let kernel = kernel(&lookout, Arc::new(Dispatcher::new()));
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+        let (kernel, events) = wired(&lookout);
         kernel
             .handle_request(
                 Request::builder()
@@ -624,7 +679,7 @@ mod tests {
                     .build(),
             )
             .await;
-        lookout.flush().await;
+        flushed(&lookout, &events).await;
         let root = &store.all()[0].entries[0].content;
         assert!(
             root.get("request.body").is_none() && root.get("response.body").is_none(),
@@ -645,12 +700,10 @@ mod tests {
             let user = if response.status().as_u16() == 200 { "42" } else { "7" };
             Some(("session".to_string(), Some(user.to_string())))
         });
-        let kernel = kernel(&lookout, Arc::new(Dispatcher::new()));
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+        let (kernel, events) = wired(&lookout);
         kernel.handle_request(get("/posts/1")).await;
         kernel.handle_request(get("/missing")).await;
-        lookout.flush().await;
+        flushed(&lookout, &events).await;
         let batches = store.all();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].user_id.as_deref(), Some("42"));
@@ -659,14 +712,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_a_server_span_the_middleware_opens_one() {
+    async fn without_a_unit_the_middleware_opens_one() {
         use rainier_middleware::Pipeline;
 
         let store = Arc::new(MemoryStore::new(10));
         let lookout =
             Lookout::new(LookoutConfig::default().enabled(true).local(true), store.clone());
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(lookout.layer()));
+        let events = Arc::new(Dispatcher::new());
+        lookout.subscribe(&events);
         let pipeline = Pipeline::new().through(lookout.middleware()).then(|_request: Request| {
             Box::pin(async {
                 let mut response = Response::new(rainier_http::StatusCode::OK);
@@ -679,10 +732,12 @@ mod tests {
             }) as rainier_support::BoxedFuture<Response>
         });
         pipeline.run(get("/")).await;
-        lookout.flush().await;
+        flushed(&lookout, &events).await;
         let batches = store.all();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].summary, "GET / 200");
+        let roots = batches[0].entries.iter().filter(|e| e.entry_type == EntryType::Request);
+        assert_eq!(roots.count(), 1, "the middleware's own request entry, once");
         assert_eq!(batches[0].route_name.as_deref(), Some("home"));
     }
 }

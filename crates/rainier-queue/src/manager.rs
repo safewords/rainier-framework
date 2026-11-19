@@ -51,7 +51,7 @@ impl Queue for SyncQueue {
                 1,
             ));
 
-            self.registry.run(&job, context).await?;
+            crate::events::run_inline(&self.registry, &job, context, "sync").await?;
             Ok(id)
         })
     }
@@ -542,7 +542,7 @@ impl QueueManager {
         let queued = QueuedJob::from_job(&job)?;
         let context =
             Arc::new(JobContext::new(container, queued.id.clone(), queued.queue.clone(), 1, 1));
-        self.registry.run(&queued, context).await
+        crate::events::run_inline(&self.registry, &queued, context, "sync").await
     }
 
     /// Push `job` to an already-resolved backend.
@@ -553,6 +553,28 @@ impl QueueManager {
     /// dispatch that lands nowhere, which is the failure the name check exists
     /// for.
     async fn push_to(&self, queue: &Arc<dyn Queue>, job: QueuedJob) -> Result<String> {
+        let started = std::time::Instant::now();
+        // What the event names the job by, copied only for a listener.
+        let heard =
+            rainier_events::activity::has_activity_subscribers::<crate::events::JobQueued>()
+                .then(|| (job.name.clone(), job.queue.clone(), job.id.clone()));
+
+        let result = self.push_published(queue, job).await;
+
+        if let Some((name, on, id)) = heard {
+            rainier_events::activity::publish_activity_with(|| crate::events::JobQueued {
+                name,
+                queue: on,
+                id,
+                driver: queue.name().to_string(),
+                duration: started.elapsed(),
+                error: crate::events::error_of(&result),
+            });
+        }
+        result
+    }
+
+    async fn push_published(&self, queue: &Arc<dyn Queue>, job: QueuedJob) -> Result<String> {
         #[cfg(feature = "telemetry")]
         {
             let mut job = job;
@@ -570,8 +592,11 @@ impl QueueManager {
             // off the dispatch that caused it. A job that already carries one
             // — re-dispatched from a worker, forwarded from elsewhere — keeps
             // the trace it came with.
+            // Else the trace of the unit of work that queued it, which is
+            // known even where no `Trace` middleware put one in force.
             if job.traceparent.is_none() {
-                job.traceparent = rainier_telemetry::propagation::for_span(&span);
+                job.traceparent = rainier_telemetry::propagation::for_span(&span)
+                    .or_else(crate::events::current_traceparent);
             }
             let traced = span.clone();
             return tracing::Instrument::instrument(
@@ -586,8 +611,17 @@ impl QueueManager {
             .await;
         }
 
+        // Without spans the trace still crosses the queue: the job carries
+        // the trace of the unit of work that queued it, so the worker's unit
+        // joins it.
         #[cfg(not(feature = "telemetry"))]
-        self.push_untraced(queue, job).await
+        {
+            let mut job = job;
+            if job.traceparent.is_none() {
+                job.traceparent = crate::events::current_traceparent();
+            }
+            self.push_untraced(queue, job).await
+        }
     }
 
     async fn push_untraced(&self, queue: &Arc<dyn Queue>, job: QueuedJob) -> Result<String> {

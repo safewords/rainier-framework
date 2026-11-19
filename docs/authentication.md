@@ -549,6 +549,15 @@ let banner = impersonator_id(&request).map(|staff| format!("Viewing as {} (staff
 `is_impersonating(&request)` and `impersonator_id(&request)` let a layout show
 the "you are viewing as …" banner.
 
+## Events
+
+Every `SessionGuard::attempt` publishes `AuthAttempted` on the current
+[event bus](events.md) — with or without `telemetry` — an activity (kind
+`auth.attempt`) with the span's fields: `rainier.auth.guard`,
+`rainier.auth.outcome` (`success` / `failure`), its duration, and
+`otel.status_code` / `error.type` when the attempt errored rather than
+answering. Never the credentials, and never who.
+
 ## What is not here
 
 **Password reset, email verification and OAuth are add-ins, not this crate.**

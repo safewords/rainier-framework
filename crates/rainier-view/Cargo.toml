@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 rainier-support = { workspace = true }
+# `ViewRendered`, published for every template rendered.
+rainier-events = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

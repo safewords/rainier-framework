@@ -30,6 +30,21 @@
 //! | Sees | the event itself | what [`FromEvent`] copied out |
 //! | Right for | updating a counter, invalidating a cache | mail, webhooks, anything over a network |
 //!
+//! # `dispatch` or `publish`
+//!
+//! A queued listener is registered with `listen`, so it is an inline
+//! listener like any other, and **how the event is raised decides when the
+//! write happens**:
+//!
+//! - `dispatch(event).await` runs it inline: the job is on the queue when
+//!   `dispatch` returns, and a write the queue refuses is `dispatch`'s
+//!   error.
+//! - `publish(event)` runs it later, on its own thread: the write is fire and
+//!   forget, and a refused one is logged and reported as a failed listener,
+//!   never returned — `publish` has nothing to return it through.
+//!
+//! Dispatch an event whose queued work must not be lost silently.
+//!
 //! # The job is built at dispatch, not at handle
 //!
 //! [`FromEvent::from_event`] runs while the event is still in hand, and what
@@ -168,6 +183,115 @@ mod tests {
         assert_eq!(pushed.len(), 1);
         // The id, because that is what `from_event` copied out.
         assert_eq!(pushed[0].payload["user_id"], 7);
+    }
+
+    /// A queue whose every push is refused, the way a broker mid-failover
+    /// refuses one.
+    struct Refusing;
+
+    impl rainier_queue::Queue for Refusing {
+        fn name(&self) -> &str {
+            "refusing"
+        }
+        fn push<'a>(
+            &'a self,
+            _: rainier_queue::QueuedJob,
+        ) -> rainier_support::BoxFuture<'a, rainier_support::Result<String>> {
+            Box::pin(async { Err(Error::service_unavailable("the broker is failing over")) })
+        }
+        fn reserve<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> rainier_support::BoxFuture<'a, rainier_support::Result<Option<rainier_queue::QueuedJob>>>
+        {
+            Box::pin(async { Ok(None) })
+        }
+        fn acknowledge<'a>(
+            &'a self,
+            _: &'a rainier_queue::QueuedJob,
+        ) -> rainier_support::BoxFuture<'a, rainier_support::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn release<'a>(
+            &'a self,
+            _: &'a rainier_queue::QueuedJob,
+            _: std::time::Duration,
+        ) -> rainier_support::BoxFuture<'a, rainier_support::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn fail<'a>(
+            &'a self,
+            _: &'a rainier_queue::QueuedJob,
+            _: &'a str,
+        ) -> rainier_support::BoxFuture<'a, rainier_support::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn size<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> rainier_support::BoxFuture<'a, rainier_support::Result<u64>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn clear<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> rainier_support::BoxFuture<'a, rainier_support::Result<u64>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    fn refusing() -> Arc<QueueManager> {
+        Arc::new(QueueManager::new(
+            Arc::new(Refusing),
+            Arc::new(rainier_queue::JobRegistry::new().with::<SendWelcomeEmail>()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_dispatched_event_queues_inline_and_a_refused_write_fails_the_dispatch() {
+        // `listen_queued` is an ordinary `listen` listener: `dispatch` runs it
+        // inline, before it returns, and its queue write's error is the
+        // dispatch's error.
+        let events = Dispatcher::new();
+        events.listen_queued_on::<UserRegistered, SendWelcomeEmail>(refusing());
+
+        let failed =
+            events.dispatch(UserRegistered { user_id: 7, email: "ada@example.com".into() }).await;
+
+        let message =
+            failed.expect_err("the refused write fails the dispatch").message().to_string();
+        assert!(message.contains("failing over"), "{message}");
+        assert_eq!(events.subscriber_failures(), 0, "not also run deferred");
+    }
+
+    #[tokio::test]
+    async fn a_published_event_queues_after_the_publisher_has_moved_on() {
+        // The same listener, raised with `publish`: run later on its own
+        // thread, so the job is on the queue once the bus has settled, not
+        // when `publish` returns.
+        let queue = Arc::new(QueueManager::fake());
+        let events = Dispatcher::new();
+        events.listen_queued_on::<UserRegistered, SendWelcomeEmail>(Arc::clone(&queue));
+
+        events.publish(UserRegistered { user_id: 7, email: "ada@example.com".into() });
+        events.settled().await;
+
+        let pushed = queue.pushed::<SendWelcomeEmail>();
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].payload["user_id"], 7);
+    }
+
+    #[tokio::test]
+    async fn a_published_events_refused_write_is_reported_not_returned() {
+        // Fire and forget: `publish` has nothing to return an error through,
+        // so the refused write is logged and reported as a failed listener.
+        let events = Dispatcher::new();
+        events.listen_queued_on::<UserRegistered, SendWelcomeEmail>(refusing());
+
+        events.publish(UserRegistered { user_id: 7, email: "ada@example.com".into() });
+        events.settled().await;
+
+        assert_eq!(events.subscriber_failures(), 1);
     }
 
     #[tokio::test]

@@ -206,6 +206,22 @@ empty `Vec` rather than an error.
 `S3` covers Cloudflare R2, MinIO and anything else speaking the protocol — set
 `endpoint`, and `path_style` where the service wants it.
 
+## Events
+
+Every call on a disk the `Storage` holds publishes a `StorageOperation` on
+the [event bus](events.md), whether or not the `telemetry` feature is on. Its
+kind is the span name — `storage.get`, `storage.read`, `storage.put`,
+`storage.delete`, `storage.exists`, `storage.metadata`, `storage.list`,
+`storage.directories`, `storage.copy`, `storage.rename`, `storage.sign`,
+`storage.sign_upload` — and it carries the span's fields under the same
+names: `otel.name` (`storage put`), `storage.operation`, `storage.driver`,
+`storage.bytes` for a `get` or a `put`, and `otel.status_code`/`error.type` on
+a failure; plus its duration. Like the span, never the path and never the
+contents.
+
+Without the `telemetry` feature and with nothing subscribed, a call asks the
+bus once and runs the disk's own future — no clock read, no allocation.
+
 ## Testing
 
 ```rust

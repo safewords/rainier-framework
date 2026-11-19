@@ -707,10 +707,11 @@ See [Container: binding a trait object](container.md#binding-a-trait-object).
 
 ## Hooks
 
-A repository built `.with_events(dispatcher)` dispatches
-[lifecycle events](models.md#lifecycle-hooks) around every write, and a `-ing`
-listener returning `Err` vetoes it. Without a dispatcher, writes are silent —
-which is what you want in a seeder.
+A repository built `.with_events(dispatcher)` raises
+[lifecycle events](models.md#lifecycle-hooks) around every write: a `-ing`
+hook is dispatched and awaited, and a listener returning `Err` vetoes the
+write; a `-ed` hook is published, fire and forget, after it. Without a
+dispatcher, writes are silent — which is what you want in a seeder.
 
 ## Testing
 

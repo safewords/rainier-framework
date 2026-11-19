@@ -413,6 +413,15 @@ Three things it does on purpose:
   in seconds, in the error's details — so the queued job sending it can back
   off by exactly that much.
 
+## Events
+
+Every send publishes `NotificationSent` on the current [event bus](events.md) —
+with or without `telemetry` — an activity (kind `notification.send`) with the
+span's fields: `rainier.notification.name`, `rainier.notification.channels`,
+its duration, and `otel.status_code` / `error.type` on failure. Never the
+recipient, never what it said. The send runs as an operation, so the mail its
+mail channel sends (`MailSent`) names it as its parent.
+
 ## Testing
 
 ```rust

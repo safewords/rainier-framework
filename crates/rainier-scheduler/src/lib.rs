@@ -69,9 +69,11 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod cron;
+pub mod events;
 pub mod schedule;
 pub mod task;
 
 pub use cron::CronExpression;
+pub use events::ScheduledTaskRan;
 pub use schedule::{RunSummary, Schedule};
 pub use task::{ClosureTask, Outcome, ScheduledTask, Skipped, Task};

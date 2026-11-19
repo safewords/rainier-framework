@@ -10,6 +10,8 @@ repository.workspace = true
 [dependencies]
 rainier-support = { workspace = true }
 rainier-http = { workspace = true }
+# The activities the server publishes for a socket's work — see `events`.
+rainier-events = { workspace = true }
 
 async-trait = { workspace = true }
 serde = { workspace = true }

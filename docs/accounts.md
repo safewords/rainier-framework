@@ -272,8 +272,10 @@ factor, issuing a token — with `ConfirmPassword::recently()`.
 
 ## Events
 
-Dispatched with `dispatch_quietly`, so a failing welcome mail does not turn a
-written registration into a `500`.
+Published on the bus given to `.events(..)` — fire-and-forget, built only when
+somebody listens. Listeners run after the response is on its way, so a failing
+or slow welcome mail neither turns a written registration into a `500` nor
+holds the request up.
 
 | Event | When |
 |---|---|

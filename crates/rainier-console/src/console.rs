@@ -7,7 +7,7 @@ use std::panic::AssertUnwindSafe;
 use futures_util::FutureExt as _;
 use rainier_container::Application;
 use rainier_events::report::{self, CommandFailed};
-use rainier_events::{Exception, Reporter};
+use rainier_events::{Dispatcher, Exception, Reporter, UnitKind};
 use rainier_support::Result;
 
 use crate::arguments::Arguments;
@@ -142,6 +142,25 @@ impl Console {
             return self.print_help(command.name());
         }
 
+        // The command is a unit of work: what it publishes — and what the
+        // jobs and tasks a `queue:work` or `schedule:work` runs publish about
+        // themselves, each in a unit of its own — names it.
+        let events = app.resolve::<Dispatcher>().ok();
+        match crate::events::open_unit(events.as_ref(), UnitKind::Command, command.name()) {
+            Some(unit) => unit.scope(self.run_command(app, &command, &args)).await,
+            None => self.run_command(app, &command, &args).await,
+        }
+    }
+
+    /// Run `command`, inside its unit of work.
+    async fn run_command(
+        &self,
+        app: &Application,
+        command: &Arc<dyn Command>,
+        args: &Arguments,
+    ) -> i32 {
+        let started = std::time::Instant::now();
+
         // The command's name and its exit code — not its arguments, which is
         // where a console takes a password, a token or a customer's email.
         #[cfg(feature = "telemetry")]
@@ -151,7 +170,7 @@ impl Console {
             rainier.command.name = command.name(),
             process.exit.code = tracing::field::Empty,
         );
-        let handled = command.handle(&args, app);
+        let handled = command.handle(args, app);
         #[cfg(feature = "telemetry")]
         let handled = tracing::Instrument::instrument(handled, span.clone());
 
@@ -167,9 +186,20 @@ impl Console {
                     .map(|backtrace| backtrace.to_string());
                 let exception = Exception::panic(panic_message(payload.as_ref()), backtrace);
                 report_failure(app, CommandFailed::new(exception, command.name())).await;
+                publish_ran(command.name(), None, Some("panic"), started);
                 std::panic::resume_unwind(payload);
             }
         };
+
+        match &handled {
+            Ok(code) => publish_ran(command.name(), Some(*code), None, started),
+            Err(error) => publish_ran(
+                command.name(),
+                Some(exit::FAILURE),
+                Some(crate::events::error_type(error.kind())),
+                started,
+            ),
+        }
 
         #[cfg(feature = "telemetry")]
         match &handled {
@@ -273,6 +303,22 @@ impl Console {
             })
             .min_by_key(|candidate| candidate.len())
     }
+}
+
+/// Publish the command's [`CommandRan`](crate::events::CommandRan), inside
+/// its unit — built only when somebody listens.
+fn publish_ran(
+    name: &str,
+    exit_code: Option<i32>,
+    error: Option<&'static str>,
+    started: std::time::Instant,
+) {
+    rainier_events::activity::publish_activity_with(|| crate::events::CommandRan {
+        name: name.to_string(),
+        exit_code,
+        error,
+        duration: started.elapsed(),
+    });
 }
 
 /// Report a command's failure through the application's bound [`Reporter`],
@@ -497,6 +543,74 @@ mod tests {
         // The namespace case: a typo in `queue:` should still find something.
         assert_eq!(console.closest("queue").as_deref(), Some("queue:work"));
         assert_eq!(console.closest("zzz"), None);
+    }
+
+    #[tokio::test]
+    async fn a_command_runs_in_its_unit_and_publishes_command_ran_then_unit_completed() {
+        use rainier_events::{Activity, Context, Dispatcher, UnitCompleted, UnitKind};
+
+        let app = app();
+        app.instance(Dispatcher::new());
+        let events = app.resolve::<Dispatcher>().unwrap();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (a, b) = (Arc::clone(&seen), Arc::clone(&seen));
+        events
+            .subscriber("test")
+            .on(move |ran: &crate::CommandRan, cx: &Context| {
+                let unit = cx.unit().expect("published inside the command's unit");
+                assert_eq!(unit.kind(), UnitKind::Command);
+                assert_eq!(unit.name(), Some(ran.name.as_str()));
+                let fields = ran.collect_fields();
+                a.lock().unwrap().push(format!(
+                    "ran {} {} {}",
+                    fields.text("rainier.command.name").unwrap_or("?"),
+                    fields.get("process.exit.code").map(|v| v.render()).unwrap_or_default(),
+                    fields.text("error.type").unwrap_or("-"),
+                ));
+                Ok(())
+            })
+            .on(move |done: &UnitCompleted, _| {
+                b.lock()
+                    .unwrap()
+                    .push(format!("completed {}", done.name.as_deref().unwrap_or("?")));
+                Ok(())
+            })
+            .start();
+
+        assert_eq!(console().run_argv(&app, ["check"]).await, 3);
+        assert_eq!(console().run_argv(&app, ["queue:work"]).await, exit::FAILURE);
+        assert!(Context::current_unit().is_none());
+
+        for _ in 0..2000 {
+            events.settled().await;
+            if seen.lock().unwrap().len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let seen = seen.lock().unwrap().clone();
+        let at = |line: &str| {
+            seen.iter().position(|s| s == line).unwrap_or_else(|| panic!("{line}: {seen:?}"))
+        };
+        assert_eq!(seen.len(), 4, "{seen:?}");
+        // Each unit completes after its own CommandRan was delivered.
+        assert!(at("ran check 3 -") < at("completed check"));
+        assert!(at("ran queue:work 1 internal") < at("completed queue:work"));
+    }
+
+    #[tokio::test]
+    async fn with_nobody_listening_no_command_ran_is_built() {
+        use rainier_events::Dispatcher;
+
+        let app = app();
+        app.instance(Dispatcher::fake());
+        assert_eq!(console().run_argv(&app, ["check"]).await, 3);
+        let events = app.resolve::<Dispatcher>().unwrap();
+        // The fake records what was published: exactly one.
+        events.assert_dispatched_times::<crate::CommandRan>(1);
+
+        let quiet = Dispatcher::new();
+        assert!(!quiet.has_activity_subscribers::<crate::CommandRan>());
     }
 
     #[test]

@@ -122,6 +122,7 @@
 
 pub mod cache;
 pub mod driver;
+pub mod events;
 #[cfg(feature = "cloudflare-kv")]
 pub mod kv;
 pub mod lock;
@@ -129,7 +130,6 @@ pub mod memory;
 pub mod prefixed;
 pub mod rate_limit;
 pub mod stores;
-#[cfg(feature = "telemetry")]
 pub mod telemetry;
 
 #[cfg(feature = "dynamodb")]
@@ -141,6 +141,7 @@ pub mod redis;
 
 pub use cache::{Cache, CacheExt};
 pub use driver::CacheDriver;
+pub use events::CacheOperation;
 #[cfg(feature = "cloudflare-kv")]
 pub use kv::{KvCache, KvTransport, MIN_TTL as KV_MIN_TTL};
 pub use lock::{Lock, LockGuard, LockManager};
@@ -184,10 +185,10 @@ pub struct CacheManager {
 impl CacheManager {
     /// Wrap a cache.
     ///
-    /// With the `telemetry` feature the store is traced — see
-    /// `rainier_cache::telemetry`.
+    /// The store is observed: a [`CacheOperation`] per call on the event
+    /// bus, and with the `telemetry` feature a `cache.*` span — see
+    /// [`telemetry`].
     pub fn new(store: Arc<dyn Cache>) -> Self {
-        #[cfg(feature = "telemetry")]
         let store = crate::telemetry::TracedCache::wrap(store);
 
         Self { store, stores: std::collections::BTreeMap::new() }
@@ -204,7 +205,6 @@ impl CacheManager {
     /// does both, from one declaration, so the two are the same backend rather
     /// than two built from the same settings.
     pub fn with_store(mut self, name: impl Into<String>, store: Arc<dyn Cache>) -> Self {
-        #[cfg(feature = "telemetry")]
         let store = crate::telemetry::TracedCache::wrap(store);
 
         self.stores.insert(name.into(), store);

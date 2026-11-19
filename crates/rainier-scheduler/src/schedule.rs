@@ -147,11 +147,18 @@ impl Schedule {
     ) -> RunSummary {
         let mut summary = RunSummary::default();
 
+        // The application's bus, for each task's unit of work.
+        let events = app.resolve::<rainier_events::Dispatcher>().ok();
+
         for task in self.due(at) {
             let name = task.name();
             let started = std::time::Instant::now();
 
-            let run = task.run(app, locks, at);
+            // Each due task is a unit of work of its own — `schedule:work` is
+            // a command that runs forever, and a task inside it is not part
+            // of it — whose root activity is its `ScheduledTaskRan`.
+            let unit = crate::events::open_unit(events.as_ref(), &name);
+            let run = crate::events::published(&name, started, task.run(app, locks, at));
 
             // One span per due task, with how it ended — including the runs
             // that were skipped, since "the backup did not run because the
@@ -167,7 +174,10 @@ impl Schedule {
             #[cfg(feature = "telemetry")]
             let run = tracing::Instrument::instrument(run, span.clone());
 
-            let outcome = run.await;
+            let outcome = match unit {
+                Some(unit) => unit.scope(run).await,
+                None => run.await,
+            };
             summary.durations.push((name.clone(), started.elapsed()));
 
             #[cfg(feature = "telemetry")]
@@ -344,6 +354,67 @@ mod tests {
         assert_eq!(summary.ran, vec!["fine"]);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert!(summary.has_failures());
+    }
+
+    #[tokio::test]
+    async fn each_due_task_is_a_unit_with_its_scheduled_task_ran() {
+        use crate::ScheduledTaskRan;
+        use rainier_events::{Activity, Context, Dispatcher, UnitCompleted, UnitKind};
+        use std::sync::Mutex;
+
+        let app = Application::new(".");
+        app.instance(Dispatcher::new());
+        let events = app.resolve::<Dispatcher>().unwrap();
+        let seen: StdArc<Mutex<Vec<String>>> = StdArc::default();
+        let (a, b) = (StdArc::clone(&seen), StdArc::clone(&seen));
+        events
+            .subscriber("test")
+            .on(move |ran: &ScheduledTaskRan, cx: &Context| {
+                let unit = cx.unit().expect("inside the task's unit");
+                assert_eq!(unit.kind(), UnitKind::ScheduledTask);
+                assert_eq!(unit.name(), Some(ran.name.as_str()));
+                let fields = ran.collect_fields();
+                a.lock().unwrap().push(format!(
+                    "{} {} {}",
+                    ran.name,
+                    fields.text("rainier.task.outcome").unwrap_or("?"),
+                    fields
+                        .text("error.type")
+                        .or(fields.text("rainier.task.skipped"))
+                        .unwrap_or("-"),
+                ));
+                Ok(())
+            })
+            .on(move |done: &UnitCompleted, _| {
+                b.lock()
+                    .unwrap()
+                    .push(format!("completed {}", done.name.as_deref().unwrap_or("?")));
+                Ok(())
+            })
+            .start();
+
+        let mut schedule = Schedule::new();
+        schedule
+            .call("broken", |_| Box::pin(async { Err(rainier_support::Error::internal("boom")) }));
+        schedule.call("fine", |_| Box::pin(futures_stub::Ready));
+        schedule.call("never", |_| Box::pin(futures_stub::Ready)).when(|| false);
+        schedule.run_due(&app, &locks(), at(0, 0)).await;
+
+        for _ in 0..2000 {
+            events.settled().await;
+            if seen.lock().unwrap().len() >= 6 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let seen = seen.lock().unwrap().clone();
+        let at = |line: &str| {
+            seen.iter().position(|s| s == line).unwrap_or_else(|| panic!("{line}: {seen:?}"))
+        };
+        assert_eq!(seen.len(), 6, "{seen:?}");
+        assert!(at("broken failed internal") < at("completed broken"));
+        assert!(at("fine ran -") < at("completed fine"));
+        assert!(at("never skipped condition_false") < at("completed never"));
     }
 
     #[tokio::test]

@@ -1,5 +1,7 @@
 //! An `http.client.request` span per attempt, and `traceparent` on the wire —
-//! behind the `telemetry` feature.
+//! behind the `telemetry` feature — and an
+//! [`HttpClientRequestSent`](crate::HttpClientRequestSent) event per attempt,
+//! always.
 //!
 //! Applied inside the **transports**, not the [`PendingRequest`](crate::PendingRequest)
 //! builder, because the builder is not the only way out: the mail APIs, the
@@ -19,16 +21,81 @@
 //! definition. `http.response.status_code`, and `error.type` for a 4xx or 5xx
 //! (the status) or a transport failure (the error's kind). One span per
 //! attempt, as the OpenTelemetry conventions ask, so three retries are three
-//! spans and the backoff between them is the gap you can see.
+//! spans and the backoff between them is the gap you can see. The event
+//! carries the same, under the same names.
+//!
+//! # With nobody listening
+//!
+//! Without the `telemetry` feature and with nothing subscribed, a send asks
+//! the bus once and returns the transport's own future: no copy of the URL,
+//! no clock read, no extra future.
 
+use std::sync::Arc;
+use std::time::Instant;
+
+use rainier_events::Dispatcher;
 use rainier_support::{BoxFuture, Result};
 
 use crate::transport::{OutboundRequest, RawResponse};
 
-/// Wrap one send in a client span, writing `traceparent` onto the request.
+/// What an attempt's event needs, taken before the request is handed over —
+/// only when something will hear it.
+struct Sending {
+    events: Arc<Dispatcher>,
+    method: String,
+    url: String,
+    started: Instant,
+}
+
+impl Sending {
+    fn start(request: &OutboundRequest) -> Option<Self> {
+        let events = crate::events::listening()?;
+        Some(Self {
+            events,
+            method: request.method.clone(),
+            url: request.url.clone(),
+            started: Instant::now(),
+        })
+    }
+
+    fn finish(self, result: &Result<RawResponse>) {
+        let duration = self.started.elapsed();
+        let Self { events, method, url, .. } = self;
+        events.publish_activity_with(|| {
+            crate::events::HttpClientRequestSent::new(&method, &url, result, duration)
+        });
+    }
+}
+
+/// Observe one send: its event, and with `telemetry` its client span and the
+/// `traceparent` it writes onto the request.
 pub(crate) fn instrument<'a>(
+    request: OutboundRequest,
+    send: impl FnOnce(OutboundRequest) -> BoxFuture<'a, Result<RawResponse>> + Send + 'a,
+) -> BoxFuture<'a, Result<RawResponse>> {
+    let sending = Sending::start(&request);
+
+    #[cfg(feature = "telemetry")]
+    return traced(request, send, sending);
+
+    #[cfg(not(feature = "telemetry"))]
+    match sending {
+        // Nobody to tell: the transport's own future, as is.
+        None => send(request),
+        Some(sending) => Box::pin(async move {
+            let result = send(request).await;
+            sending.finish(&result);
+            result
+        }),
+    }
+}
+
+/// Wrap one send in a client span, writing `traceparent` onto the request.
+#[cfg(feature = "telemetry")]
+fn traced<'a>(
     mut request: OutboundRequest,
     send: impl FnOnce(OutboundRequest) -> BoxFuture<'a, Result<RawResponse>> + Send + 'a,
+    sending: Option<Sending>,
 ) -> BoxFuture<'a, Result<RawResponse>> {
     use tracing::field::Empty;
 
@@ -68,6 +135,9 @@ pub(crate) fn instrument<'a>(
                 }
                 Err(error) => rainier_support::telemetry::record_error(&traced, error),
             }
+            if let Some(sending) = sending {
+                sending.finish(&result);
+            }
             result
         },
         span,
@@ -76,18 +146,18 @@ pub(crate) fn instrument<'a>(
 
 /// The parts of a URL a span may carry.
 #[derive(Debug, PartialEq, Eq)]
-struct Target {
-    scheme: String,
-    host: String,
-    port: u16,
+pub(crate) struct Target {
+    pub(crate) scheme: String,
+    pub(crate) host: String,
+    pub(crate) port: u16,
     /// `scheme://host[:port]/path` — no query, no fragment, no userinfo.
-    redacted: String,
+    pub(crate) redacted: String,
 }
 
 impl Target {
     /// A forgiving parse: a URL this cannot make sense of becomes an empty
     /// host rather than a failed request — the span is not worth the call.
-    fn parse(url: &str) -> Self {
+    pub(crate) fn parse(url: &str) -> Self {
         let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
         let rest = rest.split(['?', '#']).next().unwrap_or_default();
         let (authority, path) = match rest.find('/') {
@@ -116,11 +186,13 @@ impl Target {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
+    #[cfg(feature = "telemetry")]
     use crate::{FakeTransport, Http};
+    #[cfg(feature = "telemetry")]
     use rainier_support::telemetry::testing::Recorder;
+    #[cfg(feature = "telemetry")]
+    use std::sync::Arc;
 
     #[test]
     fn a_url_loses_its_query_and_its_credentials() {
@@ -136,6 +208,7 @@ mod tests {
         assert_eq!(Target::parse("https://example.com").redacted, "https://example.com");
     }
 
+    #[cfg(feature = "telemetry")]
     #[tokio::test]
     async fn every_attempt_is_a_client_span_and_the_trace_goes_on_the_wire() {
         let recorder = Recorder::new();
@@ -171,6 +244,7 @@ mod tests {
         assert!(!recorder.everything().contains("secret"));
     }
 
+    #[cfg(feature = "telemetry")]
     #[tokio::test]
     async fn a_traceparent_the_caller_set_is_left_alone() {
         let fake = Arc::new(FakeTransport::new());
@@ -187,6 +261,7 @@ mod tests {
         assert_eq!(fake.recorded()[0].header("traceparent"), Some("00-theirs"));
     }
 
+    #[cfg(feature = "telemetry")]
     #[tokio::test]
     async fn outside_a_trace_nothing_is_added() {
         let fake = Arc::new(FakeTransport::new());

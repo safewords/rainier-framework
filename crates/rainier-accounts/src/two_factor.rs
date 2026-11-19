@@ -133,7 +133,7 @@ impl<U: AccountUser> Accounts<U> {
         let expires_at = now() + self.enabled().two_factor_timeout.as_secs();
         session.put(PENDING, Pending { id: user.auth_identifier(), expires_at })?;
 
-        self.announce(TwoFactorChallenged { user_id: user.auth_identifier() }).await;
+        self.announce(|| TwoFactorChallenged { user_id: user.auth_identifier() });
         Ok(Some(self.respond(
             request,
             StatusCode::OK,
@@ -191,11 +191,10 @@ impl<U: AccountUser> Accounts<U> {
         } else if !recovery_code.is_empty() {
             let spent = recovery::consume(&mut record.recovery_codes, &recovery_code);
             if spent {
-                self.announce(RecoveryCodeUsed {
+                self.announce(|| RecoveryCodeUsed {
                     user_id: pending.id.clone(),
                     remaining: record.recovery_codes.len(),
-                })
-                .await;
+                });
             }
             spent
         } else {
@@ -204,7 +203,7 @@ impl<U: AccountUser> Accounts<U> {
 
         if !accepted {
             limiter.hit(&key, self.enabled().login_decay).await?;
-            self.announce(TwoFactorFailed { user: Arc::new(user) }).await;
+            self.announce(|| TwoFactorFailed { user: Arc::new(user) });
             return Err(Error::validation(json!({
                 "code": ["The two-factor code was not valid."],
             })));
@@ -271,7 +270,7 @@ impl<U: AccountUser> Accounts<U> {
 
         record.confirmed = true;
         tf.users.save_two_factor(&user, Some(&record)).await?;
-        self.announce(TwoFactorEnabled { user: Arc::new(user) }).await;
+        self.announce(|| TwoFactorEnabled { user: Arc::new(user) });
 
         Ok(self.respond(
             request,
@@ -289,7 +288,7 @@ impl<U: AccountUser> Accounts<U> {
         let tf = self.two_factor()?;
         if tf.users.find_two_factor(&user).await?.is_some() {
             tf.users.save_two_factor(&user, None).await?;
-            self.announce(TwoFactorDisabled { user: Arc::new(user) }).await;
+            self.announce(|| TwoFactorDisabled { user: Arc::new(user) });
         }
 
         Ok(self.respond(

@@ -84,10 +84,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod events;
 pub mod handler;
 pub mod message;
 pub mod socket;
 
+pub use events::{WebSocketConnected, WebSocketMessageHandled};
 pub use handler::{Matched, Rooms, WebSocketHandler, WebSocketRoutes};
 pub use message::Message;
 pub use socket::{instance_id, is_disconnect, socket_from_identity, Outbound, Socket, SocketId};

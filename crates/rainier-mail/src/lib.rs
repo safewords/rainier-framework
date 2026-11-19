@@ -79,6 +79,7 @@ mod api;
 #[cfg(feature = "smtp")]
 pub mod cloudflare;
 pub mod driver;
+pub mod events;
 pub mod mailable;
 pub mod mailer;
 #[cfg(feature = "mailgun")]
@@ -97,6 +98,7 @@ pub mod smtp;
 pub mod transport;
 
 pub use driver::{MailDriver, MailEncryption};
+pub use events::MailSent;
 pub use mailable::Mailable;
 pub use mailer::{Mailer, MessageSending, MessageSent, ORIGINAL_TO};
 #[cfg(feature = "mailgun")]

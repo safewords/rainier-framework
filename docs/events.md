@@ -1,59 +1,142 @@
 # Events
 
-The dispatcher is Rainier's **event bus** — the seam where something happens and
-something else reacts without either knowing about the other. [The bus](#the-bus)
-below is how it works and what travels on it; the rest of the page is the API.
-
-Raising one works anywhere. Reacting is done on `events`, the `Dispatcher`
-handed to your listener registration at boot — see
-[Where listeners are registered](#where-listeners-are-registered):
+The dispatcher is the seam where something happens and something else reacts
+without either knowing about the other. It carries two kinds of message:
+**hooks**, which ask and wait for an answer, and **events**, which tell and
+never wait. Everything the framework does is published on it as an event, and
+your code subscribes to whatever it wants.
 
 ```rust
-// Raise
-Event::instance().dispatch(PostPublished { post }).await?;
+// Tell: an event. Returns at once; subscribers run later on their own threads.
+Event::instance().publish(PostPublished { post_id: post.id });
 
-// React
-events.listen(|event: Arc<PostPublished>| async move {
-    Queue::instance().dispatch(NotifyAuthor { post_id: event.post.id }).await?;
+// React to it.
+events.on::<PostPublished>().run(|event, _cx| async move {
+    Queue::instance().dispatch(NotifyAuthor { post_id: event.post_id }).await?;
     Ok(())
 });
 ```
 
+Reacting is set up on `events`, the `Dispatcher` handed to your listener
+registration at boot. See
+[Where listeners are registered](#where-listeners-are-registered).
+
+## Hooks and events: the two ideas
+
+Everything on this page is one of two ideas. The method names come from
+history rather than design, so learn the ideas first and then map the names
+onto them.
+
+**A hook asks "may I?"** Code stops at a point, asks whoever is registered,
+and **waits** for every answer. Any of them can say no:
+
+```rust
+// The repository, before inserting a Post:
+events.dispatch(Creating { model: post.clone() }).await?;   // waits; an Err cancels the insert
+
+// Your code, registered at boot:
+events.listen(|e: Arc<Creating<Post>>| async move {
+    if e.model.title.is_empty() {
+        return Err(Error::validation("A post needs a title."));
+    }
+    Ok(())
+});
+```
+
+A hook runs **inline**, on the request's own task, so it costs the request
+exactly as long as the listener takes. That is the point: the caller needs
+the answer before it can go on. The framework has four:
+
+| Hook | Can cancel |
+|---|---|
+| `Creating<M>`, `Updating<M>`, `Deleting<M>` | the database write |
+| `MessageSending` | the mail |
+
+**An event says "this happened."** Code announces a fact and carries on
+without waiting. Whoever subscribed hears it later, on their own thread, and
+cannot affect the code that announced it:
+
+```rust
+// The framework, after a query:
+publish(QueryExecuted { .. });                        // returns at once
+
+// Your code:
+events.on::<QueryExecuted>()
+    .when(|q| q.duration > Duration::from_millis(500))
+    .run_sync(|q, cx| { slow_queries::record(q, cx.trace_id()); Ok(()) });
+```
+
+Everything else the framework raises is an event: requests, queries, cache
+calls, jobs, mail sent, `Created<M>`, `ModelChanged` and the rest.
+
+**The tense tells you which.** A present-participle name — `Creating`,
+`Sending` — has not happened yet, so it can still be stopped: a hook. A past
+tense — `Created`, `Sent`, `Executed`, `Handled` — is done and cannot be
+undone: an event.
+
+### Which name is which
+
+| Name | Idea | What it does |
+|---|---|---|
+| `dispatch(e).await` | hook | ask, wait for every listener; the first `Err` comes back |
+| `dispatch_quietly(e).await` | hook, errors ignored | wait for every listener; failures are logged and counted, not returned |
+| `listen(..)`, `listen_any(..)` | hook listener | runs **inline** when its event is dispatched — and, if the same event is published instead, on its own thread like a subscriber |
+| `publish(e)`, `publish_with(..)` | event | announce; never waits |
+| `on::<E>()`, `on_any()`, `subscriber(..)`, `on_activity` | event subscriber | always on its own thread; never inline |
+| `Dispatcher` | both | the one registry that holds both |
+| `Queue::dispatch(job)` | neither | puts a job on the [queue](queues.md); same word, unrelated |
+
+Rules that follow from it:
+
+- **Raising your own:** `publish` it, unless the code raising it needs the
+  listeners' answer. If it needs the answer, `dispatch` it and keep the
+  listeners fast. A listener that sends mail or calls an API belongs on an
+  event, or behind [a queued listener](#queued-listeners).
+- **Reacting:** register a hook listener with `listen` only to veto or check
+  before something happens. To react to something that happened, use `on`.
+  It never runs on the request's path.
+- **A dispatched event still reaches subscribers.** `on` subscribers hear
+  dispatched events too, on their own threads, and the dispatch does not wait
+  for them. So Lookout sees hooks without slowing them down.
+
 ## The bus
 
-An application has **one** `Dispatcher`. Everything raised in it — by your
-code or by the framework — goes through that one object, and everything that
-reacts registers on it. That is what makes it a bus rather than a set of
-callbacks: a producer never names its consumers, a consumer never names its
-producer, and either side can be added or removed without touching the other.
+Everything the framework does is announced on this dispatcher: every request,
+query, cache call, outgoing HTTP call, mail, notification, view, session,
+login attempt, broadcast, scheduled task, console command, job, log line and
+model write is a typed event. Your code subscribes to the ones it wants.
+[Lookout](lookout.md) is one subscriber among them. It has no special access,
+and other subscribers neither know nor care that it is there.
+
+An application has **one** `Dispatcher`. Everything raised in it, by your
+code or by the framework, goes through that one object, and everything that
+reacts subscribes on it. That is what makes it a bus rather than a set of
+callbacks. A producer never names its consumers, a consumer never names its
+producer, and either side can be added or removed without touching the other:
 
 ```mermaid
 flowchart LR
-    subgraph producers["Producers — raise facts"]
+    subgraph producers["Producers — publish facts"]
         direction TB
         app["Your code<br/>PostPublished, OrderPlaced, …"]
-        db["Every committed write<br/>ModelChanged"]
-        repo["Repositories built with_events<br/>Creating&lt;M&gt; … Deleted&lt;M&gt;"]
-        mail["The mailer<br/>MessageSending, MessageSent"]
-        worker["The queue worker<br/>JobProcessing … JobFailed"]
+        work["The framework's work<br/>RequestHandled, QueryExecuted,<br/>CacheOperation, JobRan, MailSent, …"]
+        db["Every committed write<br/>ModelChanged, Created&lt;M&gt; …"]
         reporter["The reporter<br/>ExceptionReported, HttpRequestFailed, …"]
     end
 
     bus(("Dispatcher<br/>one per application"))
 
-    subgraph consumers["Consumers — react"]
+    subgraph consumers["Subscribers — each on its own thread"]
         direction TB
-        yours["Your listeners<br/>listen / listen_sync / subscribe"]
+        yours["Your subscribers<br/>on::&lt;E&gt;(), on_model, subscriber(..)"]
         queued["Queued listeners<br/>listen_queued → a job"]
-        wild["Wildcard listeners<br/>listen_any: every event, by name"]
+        wild["Wildcards and activity subscribers<br/>on_any, on_activity"]
         lookout["Lookout<br/>one subscriber among the others"]
     end
 
     app --> bus
+    work --> bus
     db --> bus
-    repo --> bus
-    mail --> bus
-    worker --> bus
     reporter --> bus
     bus --> yours
     bus --> queued
@@ -61,158 +144,220 @@ flowchart LR
     bus --> lookout
 ```
 
-Three properties follow from the design, and the rest of this page leans on
-them.
+The framework publishes whatever is or isn't subscribed, and whether or not
+optional features such as Lookout or OpenTelemetry are compiled in. Nothing
+about one subscriber changes what another hears, and none depends on another
+being there. Your `ModelChanged` subscriber works in an application without
+Lookout, and Lookout registers the same way yours does.
 
-### A dispatch runs where it was raised
+There are two ways to raise an event, and the raiser picks:
 
-There is no background thread and no channel in the middle. `dispatch` calls
-each listener in turn, on the task that raised the event, and returns when the
-last one has finished. The typed listeners for the event run first, highest
-`priority` first and then in the order they registered; the wildcard listeners
-run after them, in the same order.
-
-```mermaid
-sequenceDiagram
-    participant C as Code raising the event<br/>(a request, a job)
-    participant D as Dispatcher
-    participant T as Listeners for E<br/>by priority
-    participant W as Wildcard listeners
-    C->>D: dispatch(event)
-    Note over D: built once, shared as an Arc
-    D->>T: listener 1, listener 2, …
-    T-->>D: Ok / Err
-    D->>W: (name, payload)
-    W-->>D: Ok / Err
-    D-->>C: Ok(()) — or the first Err
-```
-
-Because it runs inline, a listener is **inside the unit of work that raised
-the event**: the request's span, its trace id, its scoped bindings. A log line
-a listener writes carries the request's trace id; Lookout files what a
-listener hears under the request that raised it. It also means a slow listener
-slows the request down — which is what [queued listeners](#queued-listeners)
-are for.
-
-### Producers and consumers are independent
-
-The framework offers its events to the bus whatever is or is not listening,
-and whether or not optional features such as Lookout are compiled in. Nothing
-about a listener changes what is offered, and no listener depends on another
-being there:
-
-- Your listener for `ModelChanged` works in an application without Lookout.
-- Lookout registers its own listeners the same way yours are registered — it
-  is one consumer among the others, not part of the bus.
-- One listener failing does not stop the others when the event is raised with
-  [`dispatch_quietly`](#dispatching), which is how the framework raises the
-  events it only announces (`ModelChanged`, the failure reports).
-
-What *is* shared is the cost of building an event. A producer asks
-[`has_listeners`](#introspection) first and skips building an event nobody
-would hear — and a wildcard listener hears everything, so registering one
-(Lookout does) means every event is built.
-
-```mermaid
-flowchart TD
-    raise["A producer has something to say"] --> ask{"has_listeners::&lt;E&gt;()<br/>typed or wildcard?"}
-    ask -->|no| skip["Nothing is built<br/>— the common case with no listeners"]
-    ask -->|yes| build["Build E once"] --> deliver["Deliver to every listener"]
-```
-
-### Facts, not requests
-
-An event says that something **happened**. It has no recipient and no return
-value. If the code raising it needs an answer — did the card charge? — that is
-a function call, not an event; see [when to reach for an event](#when-to-reach-for-an-event).
-
-## What travels on the bus
-
-Not everything the framework does is an event. There are two channels, and
-knowing which carries what tells you where to hook in.
-
-| | **The bus** — `Dispatcher` | **Spans** — `tracing` |
+| | `publish(event)` | `dispatch(event).await` |
 |---|---|---|
-| What it carries | facts with a typed payload | the timing and shape of work |
-| Who reads it | listeners: your code, queued jobs, Lookout | the tracing subscriber: logs, an OTLP exporter, Lookout's layer |
-| You hook in with | `events.listen(…)` | a `tracing` layer |
-| Model writes | `ModelChanged`, and the typed hooks | `db.query` |
-| Failures | `ExceptionReported` and one event per kind | `otel.status_code` on the span |
-| Jobs | `JobProcessing`, `JobProcessed`, `JobReleased`, `JobFailed` | `queue.process`, `queue.handle`, … |
-| Mail | `MessageSending`, `MessageSent` | `mail.send` |
-| Requests, queries, cache calls, outgoing HTTP, views, sessions | — | `http.server.request`, `db.query`, `cache.*`, `http.client.request`, … |
+| Returns | at once — not `async`, nothing to await | after every listener has run |
+| Listeners run | later, each subscriber on its own thread | inline, in order, on the raiser's task |
+| A listener's `Err` | logged and reported; the raiser never sees it | returned to the raiser (`dispatch_quietly`: logged) |
+| Used for | facts: something happened | questions: may this happen? |
 
-The last row is the gap: a request or a query is a span and nothing more, so
-there is no event to listen for. Read those through
-[observability](observability.md), or through Lookout.
-
-Lookout reads both channels and joins them into one batch per unit of work —
-the spans through its tracing layer, the facts through its listeners:
+The framework publishes everything except the four hooks whose answer it
+needs: `Creating<M>`, `Updating<M>`, `Deleting<M>` and `MessageSending`, which
+can veto a write or a mail. Those are dispatched.
 
 ```mermaid
 flowchart LR
-    work["A request or a job"] -->|opens spans| spans["tracing"]
-    work -->|raises events| bus(("Dispatcher"))
-    spans --> layer["Lookout's layer<br/>requests, queries, cache, …"]
-    bus --> listeners["Lookout's listeners<br/>ModelChanged, ExceptionReported,<br/>job outcomes"]
-    bus --> yours["Your listeners"]
-    layer --> batch["One batch per unit of work,<br/>in the trace it belongs to"]
-    listeners --> batch
+    P["business code<br/>publish(QueryExecuted)"] -->|"one atomic load;<br/>a lock-free push per subscriber"| I1[(inbox)]
+    P --> I2[(inbox)]
+    P --> I3[(inbox)]
+    P -.->|returns at once| C[carries on]
+    I1 --> S1["thread: Lookout"]
+    I2 --> S2["thread: your audit log"]
+    I3 --> S3["thread: on::&lt;ModelChanged&gt;"]
 ```
+
+### A repeater, not a store
+
+`publish` keeps nothing and waits for nothing:
+
+- **With nobody subscribed**, it costs one atomic load. The event is not even
+  built if you use `publish_with(|| …)`.
+- **With subscribers**, it does one lock-free push onto each subscriber's
+  inbox. There is no lock, no `await` and no syscall. The inbox has no
+  capacity limit, so nothing is ever dropped and the publisher never waits for
+  room.
+- **Every subscriber runs on its own OS thread**, started with the first event
+  it is sent. One that is slow, stuck or panicking affects only itself. A
+  subscriber with more work than one thread keeps up with takes several —
+  `subscriber(..).threads(4)` — and each unit of work's events stay together
+  on one of them, in order, its `UnitCompleted` last.
+- **The publisher never wakes a subscriber's thread**, because waking a
+  sleeping thread is a syscall. The subscriber thread checks its inbox itself:
+  continuously while events arrive, and about every millisecond once idle. So
+  after a quiet spell an event can reach a subscriber up to a millisecond late.
+  That delay falls on the subscriber, never on your request.
+
+Measured on an Apple-silicon laptop, release build, on the publishing thread
+(`cargo test -p rainier-events --release --test publish_cost -- --ignored --nocapture`):
+
+| | per publish, in a request | a request of 20 queries + 3 cache calls | per publish, a million back to back |
+|---|---|---|---|
+| nobody subscribed | 5 ns | 0.1 µs | 5 ns |
+| one subscriber | 120–170 ns | 2.8–3.9 µs | ~210 ns |
+| three async subscribers and a wildcard | ~180 ns | ~4.3 µs | ~490 ns |
+
+With Lookout subscribed, recording that same request costs its thread about
+5 µs (`cargo test -p rainier-lookout --release --test hot_path_cost --
+--ignored --nocapture`); Lookout does the rest on its own threads.
+Lookout's old `tracing` layer cost the request's thread about 59 µs.
+
+### Subscribing
+
+```rust
+// One event, one handler, its own thread.
+events.on::<OrderShipped>()
+    .when(|e| e.total_cents > 10_000)          // runs on the subscriber's thread
+    .run(|e: Arc<OrderShipped>, cx: Context| async move {
+        audit::record("big order", e.order_id, cx.trace_id()).await
+    });
+
+// A component watching many events: one thread for all its handlers.
+events.subscriber("metrics")
+    .on(|q: &QueryExecuted, _cx| { metrics::histogram("db", q.duration); Ok(()) })
+    .on(|c: &CacheOperation, _cx| { metrics::increment(c.kind()); Ok(()) })
+    .start();
+
+// One model, one row: the declarative form of "tell me when user 42 changes".
+events.on_model::<User>().key(42).actions(&[ModelAction::Updated])
+    .run(|change, _cx| async move { refresh_profile_card(change).await });
+```
+
+`.run` takes an async handler, which runs on the subscriber's own runtime.
+`.run_sync` and `subscriber(..).on(..)` take a plain closure, which runs on
+the subscriber's thread. Use them for quick work such as counting or
+recording into memory. An ordinary `listen` listener works on both paths: it
+runs inline when its event is dispatched, and on its own thread when it is
+published.
+
+### Context: which request is this?
+
+A subscriber runs later and on another thread, so it can't learn which
+request or job an event came from by looking around. The publisher records
+that at publish time, and it travels with the event as a `Context`:
+
+- **`cx.unit()`** is the unit of work: an HTTP request, one attempt of a job,
+  a console command or a scheduled task. It carries the unit's id, kind, name,
+  path, trace id and `traceparent`. A job queued from a request continues the
+  request's trace, so a request, the job it queued and the job that job
+  queued share one trace id.
+- **`cx.parent()`** is the operation the event ran inside. For example, a view
+  rendered while a mail is sent names the mail.
+- **`UnitCompleted`** is published once a unit is over **and** every event
+  raised in it has been handled by every subscriber. A subscriber that
+  gathers a unit's events closes on it, and never sees a straggler after it.
+
+The framework opens units itself. If your code `tokio::spawn`s work that
+belongs to the current request, carry the context with it:
+`tokio::spawn(Context::current().scope(work))`.
+
+### Activities: everything at once
+
+Each framework event also describes itself as an `Activity`. It has a
+`kind()` (`db.query`, `cache.get`, `http.server.request`, … — the names of the
+framework's `tracing` spans), its `fields()` under the same OpenTelemetry
+names, a `duration()` and `failed()`. A subscriber that wants everything the
+framework does without naming every type, as Lookout does, uses
+`subscriber(..).on_activity(..)`. Publish your own activities with
+`publish_activity` and they appear there too.
+
+`tracing` spans are unchanged. They still feed OpenTelemetry exporters and
+logs. The bus and the spans are two outputs of the same instrumentation, and
+neither depends on the other.
+
+### The bus, broadcasting, notifications and the queue
+
+Four mechanisms that all mean "tell someone", and they don't overlap:
+
+| | Reaches | Leaves the process? | Durable? | Use it for |
+|---|---|---|---|---|
+| **Event bus** (`publish`, `on`) | code in this process that subscribed | no | no — a repeater; gone once delivered | reacting to what happened: metrics, audit, cache invalidation, Lookout |
+| **Hooks** (`dispatch`, `listen`) | listeners in this process, inline | no | no | a decision the raiser waits for: veto a write |
+| [**Broadcast**](broadcasting.md) | browsers subscribed to a channel | yes, over WebSockets | no — best-effort | "the page should update" |
+| [**Notification**](notifications.md) | one named person | yes — mail, SMS, a row | per channel | "tell Ada her order shipped" |
+| [**Queue**](queues.md) | a worker, later | via the queue's store | yes — retried, recorded | work that must happen: send the mail, call the webhook |
+
+They compose. A subscriber on the bus can queue a job, the job sends a
+notification, and the notification broadcasts so the bell moves. Each step is
+also an event on the bus.
+
+## What travels on the bus
+
+Everything the framework does. The `tracing` spans it also opens carry the same
+work for OpenTelemetry exporters and log lines, and nothing else reads them:
+
+| | **The bus** (`Dispatcher`) | **Spans** (`tracing`) |
+|---|---|---|
+| Carries | typed facts, with the unit of work they belong to | the timing and shape of work |
+| Read by | subscribers: your code, queued jobs, Lookout | the tracing subscriber: logs, an OTLP exporter |
+| Needs | nothing; always on | each crate's `telemetry` feature |
+| Requests | `RequestHandled` | `http.server.request` |
+| Queries, model writes | `QueryExecuted`, `ModelChanged`, `Created<M>` … | `db.query` |
+| Cache, storage, sessions | `CacheOperation`, `StorageOperation`, `SessionOperation` | `cache.*`, `storage.*`, `session.*` |
+| Outgoing HTTP | `HttpClientRequestSent` | `http.client.request` |
+| Jobs | `JobQueued`, `JobRan`, `JobProcessing` … `JobFailed` | `queue.publish`, `queue.process`, … |
+| Mail, notifications, views | `MailSent`, `NotificationSent`, `ViewRendered` | `mail.send`, `notification.send`, `view.render` |
+| Auth, broadcasts, WebSockets | `AuthAttempted`, `BroadcastSent`, `WebSocket…` | `auth.attempt`, `broadcast.publish`, `websocket.*` |
+| Commands, scheduled tasks | `CommandRan`, `ScheduledTaskRan` | `console.command`, `schedule.task` |
+| Log lines | `LogWritten` (the `log-layer` feature) | the log event itself |
+| Failures | `ExceptionReported` and one event per kind | `otel.status_code` on the span |
+
+An activity's `kind()` is its span's name and its fields are the span's
+attributes. So a subscriber that knows spans already knows the events.
 
 ## A model change, end to end
 
 Every write a statement builder or repository makes reports the rows it
 touched to the connection's change feed once it has succeeded. Boot connects
-each of the application's connections to the bus, so each write becomes one
-`ModelChanged` — for every model, from a repository with or without
-`with_events`, a bulk update or none:
+each of the application's connections to the bus, so every write becomes one
+published `ModelChanged`, for every model. That covers a repository with or
+without `with_events`, a bulk update, or no repository at all:
 
 ```mermaid
 sequenceDiagram
     participant R as Request handler
     participant Repo as Post repository
     participant DB as Database
-    participant Feed as Change feed
     participant D as Dispatcher
-    participant A as Your audit listener
-    participant L as Lookout
+    participant A as Your audit subscriber<br/>(its own thread)
+    participant L as Lookout<br/>(its own threads)
     R->>Repo: create(post)
+    Repo->>D: dispatch(Creating&lt;Post&gt;) — a hook: awaited, can veto
     Repo->>DB: INSERT INTO posts …
     DB-->>Repo: ok
-    Repo->>Feed: RowChange { posts, insert, [7] }
-    Note over Feed: inside a transaction: held until COMMIT,<br/>dropped on ROLLBACK
-    Feed->>D: dispatch_quietly(ModelChanged { Post, Created, [7] })
-    D->>A: the shared ModelChanged
-    D->>L: the shared ModelChanged
-    Note over L: recorded in the request's batch
-    D-->>Repo: done
+    Note over Repo,D: inside a transaction: held until COMMIT,<br/>dropped on ROLLBACK
+    Repo->>D: publish(ModelChanged { Post, Created, [7] }), publish(Created&lt;Post&gt;)
+    D-->>Repo: returned at once
     Repo-->>R: Post
+    D-)A: ModelChanged, in the request's context
+    D-)L: ModelChanged, in the request's context
+    Note over L: recorded in the request's batch
 ```
-
-The typed `Created<Post>` is a separate, older path: it fires only from a
-repository built `with_events`, carries the model itself, and a `Creating`
-listener can veto the write. See [models](models.md#lifecycle-hooks) for both.
 
 ## Across the queue
 
-A dispatch inside a job runs inside that job, as anywhere else. What links a
-job to the request that queued it is the trace: the dispatch writes the
-request's `traceparent` onto the job, the worker's span records it, and so
-every event raised in the job — and in any job that job queues — is heard in
-the same trace.
+What links a job to the request that queued it is the trace. The dispatch
+writes the request's `traceparent` onto the job, and the worker opens the job's
+unit of work in that trace. Every event raised in the job, and in any job that
+job queues, carries the same trace id:
 
 ```mermaid
 flowchart LR
-    req["POST /orders<br/>raises OrderPlaced"] -->|queues| j1["SendReceipt<br/>raises MessageSent"]
-    j1 -->|queues| j2["SyncInvoice<br/>raises ModelChanged"]
+    req["POST /orders<br/>publishes OrderPlaced"] -->|queues| j1["SendReceipt<br/>publishes MailSent"]
+    j1 -->|queues| j2["SyncInvoice<br/>publishes ModelChanged"]
     req -.->|trace 4bf9…| t["one trace"]
     j1 -.-> t
     j2 -.-> t
 ```
 
-A listener in either job runs in that job's span; Lookout shows the three
-batches together on any one of them. See
+Lookout shows the three batches together from any one of them. See
 [observability](observability.md#the-trace-crosses-every-boundary).
 
 ## Any type is an event
@@ -317,6 +462,20 @@ quietly stopped queueing is a feature that quietly stopped working.
 `listen_queued_on::<E, J>(queue)` takes the queue explicitly, for a test or an
 application that does not install the facades.
 
+**How the event is raised decides when the queue write happens.** A queued
+listener is registered with `listen`, so it is an inline listener like any
+other:
+
+- **`dispatch(event).await`** runs it inline. The job is on the queue when
+  `dispatch` returns, and a write the queue refuses is `dispatch`'s error.
+- **`publish(event)`** runs it later, on its own thread. The queue write is
+  fire and forget: a refused write is logged and reported as a failed listener
+  (`ListenerFailed`), never returned, because `publish` has nothing to return
+  it through.
+
+Dispatch an event whose queued work must not be lost without the caller
+knowing.
+
 ## Where listeners are registered
 
 ```rust
@@ -339,7 +498,7 @@ Through the **builder**, not a provider's `register`. The dispatcher is bound
 into the container after listeners are added, so `with_events` runs at the
 right moment.
 
-### Subscribers
+### Grouping listeners: `EventSubscriber`
 
 For a group of related listeners:
 
@@ -365,10 +524,16 @@ map in the middle.
 ## Dispatching
 
 ```rust
+events.publish(event);                      // fire and forget — see "The bus"
 events.dispatch(event).await?;              // Err from any listener propagates
-events.dispatch_quietly(event).await;       // returns how many ran; errors logged
+events.dispatch_quietly(event).await;       // returns how many failed; errors logged
 events.dispatch_as("legacy.name", event).await?;
 ```
+
+`publish` is the default for anything that has *happened*. The two
+`dispatch` forms are for the rarer event whose raiser waits on its listeners.
+A dispatched event still reaches the bus's subscribers (`on`, `subscriber`) —
+on their own threads, without the raiser waiting for them.
 
 The difference between the first two is the whole design question, and Rainier
 gives you both because the right answer depends on the event:
@@ -398,8 +563,11 @@ take down the request that raised the event.
 ## Introspection
 
 ```rust
-events.has_listeners::<PostPublished>();        // typed or wildcard: would anything hear it?
-events.has_typed_listeners::<PostPublished>();  // a listener for this type itself
+events.has_listeners::<PostPublished>();        // would anything hear it, published?
+events.has_typed_listeners::<PostPublished>();  // a hook listener for this type itself
+events.has_subscribers::<PostPublished>();      // the same as has_listeners: one atomic load
+events.subscriber_count();                      // subscribers registered (threads, once they hear)
+events.subscriber_failures();                   // subscriber runs that returned Err
 events.forget::<PostPublished>();
 events.forget_all();
 ```
@@ -419,6 +587,11 @@ Event::instance().assert_not_dispatched::<PostDeleted>();
 let dispatched: Vec<Arc<PostPublished>> = Event::instance().dispatched::<PostPublished>();
 let names = Event::instance().dispatched_names();
 ```
+
+The fake records published events as well as dispatched ones. With a real
+dispatcher, `events.settled().await` waits until every published event has
+been handled by every subscriber — for tests only; production code never waits
+on the bus.
 
 The fake **records instead of calling listeners**. Every assertion panics if
 you call it on a real dispatcher, rather than passing vacuously — a test that
@@ -444,8 +617,12 @@ You can listen to these without raising them:
 | `Updating<M>`, `Updated<M>` | |
 | `Deleting<M>`, `Deleted<M>` | |
 | `MessageSending`, `MessageSent` | [the mailer](mail.md) |
-| `JobProcessing`, `JobProcessed` | [the worker](queues.md#worker-events) |
+| `JobProcessing`, `JobProcessed` | [the worker](queues.md#worker-events) — published, so their listeners run after the worker has moved on |
 | `JobReleased`, `JobFailed` | |
+| `RequestHandled` (`http.server.request`) | the HTTP kernel, once per request — the root activity of the request's unit |
+| `JobQueued` (`queue.publish`), `JobRan` (`queue.process`) | every dispatch; every job attempt — the root of the attempt's unit, or an operation in the request it ran inside |
+| `CommandRan` (`console.command`) | the console, once per command — the root of the command's unit |
+| `ScheduledTaskRan` (`schedule.task`) | the scheduler, once per due task, skipped ones included — the root of the task's unit |
 | `HttpRequestFailed`, `JobAttemptFailed`, `CommandFailed`, … | [the reporter](errors.md#reporting) — one event per kind of failure; the full catalogue is there |
 | `ExceptionReported` | the reporter — every failure once, whatever its kind |
 

@@ -37,11 +37,11 @@ rainier-routing = { workspace = true }
 # container only because `Command::handle` is given the `Application`.
 rainier-console = { workspace = true }
 rainier-container = { workspace = true }
-# The recorder: a `tracing` layer over the framework's spans, a bounded channel
-# to a background writer, listeners on the event bus, and a global middleware.
-tracing-subscriber = { workspace = true }
+# The recorder: a subscriber on the event bus, a bounded channel to a
+# background writer, and a global middleware.
 tokio = { workspace = true }
-rainier-events = { workspace = true }
+# `log-layer`: Lookout asks `log_layer` for log lines at its `log_level`.
+rainier-events = { workspace = true, features = ["log-layer"] }
 rainier-middleware = { workspace = true }
 async-trait = { workspace = true }
 # Real user monitoring: a report names the request it describes by a token
@@ -55,8 +55,9 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-# The middleware test runs a real kernel and router, with their spans on.
-rainier-server = { workspace = true, features = ["telemetry"] }
+# The middleware test runs a real kernel and router. No `telemetry`: Lookout
+# hears the bus, not spans.
+rainier-server = { workspace = true }
 # The executor the database store's tests connect with. Its SQL support comes
 # from the `sea-orm-executor` feature below, not from here: a feature named on
 # a dev-dependency is unified into every crate's tests in `cargo test

@@ -11,6 +11,8 @@ description = "A cron scheduler for Rainier, with atomic locks for withoutOverla
 rainier-cache = { workspace = true }
 rainier-container = { workspace = true }
 rainier-support = { workspace = true }
+# Each due task is a unit of work on the bus, with a `ScheduledTaskRan`.
+rainier-events = { workspace = true }
 
 chrono = { workspace = true }
 tracing = { workspace = true }

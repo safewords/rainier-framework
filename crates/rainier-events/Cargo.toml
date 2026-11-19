@@ -11,13 +11,20 @@ repository.workspace = true
 rainier-support = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["rt"] }
+arc-swap = "1"
+crossbeam-queue = "0.3"
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
+# Only for `log_layer`, behind `log-layer`.
+tracing-subscriber = { workspace = true, optional = true }
 
 [features]
 default = []
 # An `event.dispatch` span per event somebody listens for.
 telemetry = ["rainier-support/telemetry"]
+# `log_layer`: a `tracing_subscriber::Layer` that publishes log events at or
+# above a requested level as `LogWritten` activities.
+log-layer = ["dep:tracing-subscriber"]
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -86,7 +86,7 @@ pub use broadcaster::{Broadcaster, LogBroadcaster, MemoryBroadcaster};
 pub use broadcasters::{BroadcasterConfig, KafkaBroadcast, RedisBroadcast};
 pub use channel::Channel;
 pub use event::{Broadcast, Broadcastable};
-pub use manager::Broadcasting;
+pub use manager::{BroadcastSent, Broadcasting};
 pub use pusher::PusherAuth;
 pub use sessions::{SessionChannels, SessionRoster};
 

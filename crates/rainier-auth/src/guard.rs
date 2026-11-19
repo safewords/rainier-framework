@@ -19,6 +19,7 @@ use rainier_session::SessionRequestExt;
 use rainier_support::{BoxFuture, Error, Result};
 
 use crate::abilities::Abilities;
+use crate::events::AuthAttempted;
 use crate::session::AUTH_KEY;
 use crate::user::{Authenticatable, Credentials, UserProvider};
 
@@ -202,7 +203,7 @@ impl<U: Authenticatable> StatefulGuard<U> for SessionGuard<U> {
         request: &'a Request,
         credentials: &'a Credentials,
     ) -> BoxFuture<'a, Result<Option<U>>> {
-        let attempt = self.attempt_untraced(request, credentials);
+        let attempt = self.attempt_published(request, credentials);
 
         // The guard and whether it worked — never the credentials, and never
         // who: a failed attempt's username is somebody else's, as often as not.
@@ -246,6 +247,29 @@ impl<U: Authenticatable> StatefulGuard<U> for SessionGuard<U> {
 }
 
 impl<U: Authenticatable> SessionGuard<U> {
+    /// The attempt, publishing [`AuthAttempted`] when it has an answer.
+    fn attempt_published<'a>(
+        &'a self,
+        request: &'a Request,
+        credentials: &'a Credentials,
+    ) -> BoxFuture<'a, Result<Option<U>>> {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let result = self.attempt_untraced(request, credentials).await;
+            rainier_events::activity::publish_activity_with(|| AuthAttempted {
+                guard: self.name.clone(),
+                outcome: match &result {
+                    Ok(Some(_)) => Some("success"),
+                    Ok(None) => Some("failure"),
+                    Err(_) => None,
+                },
+                duration: started.elapsed(),
+                error_type: result.as_ref().err().map(crate::events::error_type),
+            });
+            result
+        })
+    }
+
     fn attempt_untraced<'a>(
         &'a self,
         request: &'a Request,
@@ -571,6 +595,47 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(guard.guest(&request).await.unwrap(), "a failed attempt must not log anyone in");
+    }
+
+    #[tokio::test]
+    async fn an_attempt_publishes_auth_attempted_with_the_guard_and_outcome() {
+        use rainier_events::{Activity, Dispatcher};
+
+        let events = Arc::new(Dispatcher::new());
+        let _bus = rainier_events::set_default(Arc::clone(&events));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        events.on::<AuthAttempted>().run_sync(move |attempt, _| {
+            s.lock().unwrap().push((*attempt).clone());
+            Ok(())
+        });
+        let guard = session_guard();
+        let request = with_session();
+
+        guard
+            .attempt(&request, &Credentials::password("ada@example.com", "hunter2"))
+            .await
+            .unwrap();
+        guard.attempt(&request, &Credentials::password("ada@example.com", "secret")).await.unwrap();
+        let broken = SessionGuard::new("web", FakeProvider::broken());
+        assert!(broken.attempt(&request, &Credentials::password("a@b.c", "x")).await.is_err());
+        events.settled().await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].kind(), "auth.attempt");
+        let fields = seen[0].collect_fields();
+        assert_eq!(fields.text("otel.name"), Some("auth attempt"));
+        assert_eq!(fields.text("rainier.auth.guard"), Some("web"));
+        assert_eq!(fields.text("rainier.auth.outcome"), Some("failure"));
+        let everything = format!("{fields:?}");
+        assert!(!everything.contains("hunter2") && !everything.contains("ada@"), "never who");
+        assert_eq!(seen[1].collect_fields().text("rainier.auth.outcome"), Some("success"));
+        assert!(seen[2].failed());
+        let failed = seen[2].collect_fields();
+        assert_eq!(failed.text("otel.status_code"), Some("ERROR"));
+        assert_eq!(failed.text("error.type"), Some("internal"));
+        assert!(failed.get("rainier.auth.outcome").is_none());
     }
 
     #[tokio::test]

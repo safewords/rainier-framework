@@ -41,9 +41,11 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod engine;
+pub mod events;
 pub mod template;
 pub mod vite;
 
 pub use engine::{escape_html, MemoryEngine, TemplateEngine, View, ViewEngine};
+pub use events::ViewRendered;
 pub use template::{CompareOp, Condition, Expr, Literal, Node, Template};
 pub use vite::Vite;

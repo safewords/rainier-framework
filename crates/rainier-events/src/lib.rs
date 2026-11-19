@@ -47,10 +47,22 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod activity;
+pub mod bus;
+pub mod context;
 pub mod dispatcher;
 pub mod event;
+#[cfg(feature = "log-layer")]
+pub mod log_layer;
 pub mod report;
 
+pub use activity::{code_trace, Activity, Fields, Value};
+pub use bus::Subscriber;
+pub use bus::{
+    bus, has_subscribers, install, installed, publish, publish_with, set_default, AnySubscription,
+    Subscription,
+};
+pub use context::{Context, Operation, Unit, UnitCompleted, UnitKind};
 pub use dispatcher::Dispatcher;
 pub use event::{Event, EventSubscriber, Listener, WildcardListener};
 pub use report::{

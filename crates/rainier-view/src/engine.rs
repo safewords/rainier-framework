@@ -9,6 +9,7 @@ use rainier_support::{Error, Result};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::events::ViewRendered;
 use crate::template::{parse, CompareOp, Condition, Expr, Literal, Node, Template};
 use crate::vite::Vite;
 
@@ -196,12 +197,18 @@ impl ViewEngine for TemplateEngine {
         #[cfg(feature = "telemetry")]
         let _entered = span.enter();
 
+        let started = std::time::Instant::now();
         let mut renderer = Renderer { engine: self, depth: 0 };
         let rendered = renderer.render_named(name, data);
 
         #[cfg(feature = "telemetry")]
         let rendered = rainier_support::telemetry::record_result(&span, rendered);
 
+        rainier_events::activity::publish_activity_with(|| ViewRendered {
+            name: name.to_string(),
+            duration: started.elapsed(),
+            error_type: rendered.as_ref().err().map(crate::events::error_type),
+        });
         rendered
     }
 
@@ -749,6 +756,49 @@ mod tests {
 
         assert_eq!(recorder.span("view.render").field("rainier.view.name"), Some("greeting"));
         assert!(!recorder.everything().contains("Ada Lovelace"));
+    }
+
+    #[tokio::test]
+    async fn a_render_publishes_view_rendered_named_by_its_template() {
+        use rainier_events::{Activity, Dispatcher};
+        use std::sync::{Arc, Mutex};
+
+        let root = temp_root("published");
+        write(&root, "greeting", "Hi {{ name }}");
+        let engine = TemplateEngine::new(&root);
+        let events = Arc::new(Dispatcher::new());
+        let _bus = rainier_events::set_default(Arc::clone(&events));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        events.on::<ViewRendered>().run_sync(move |view, _| {
+            s.lock().unwrap().push((*view).clone());
+            Ok(())
+        });
+
+        engine.render("greeting", &json!({ "name": "Ada Lovelace" })).unwrap();
+        assert!(engine.render("nope", &json!({})).is_err());
+        events.settled().await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].kind(), "view.render");
+        let fields = seen[0].collect_fields();
+        assert_eq!(fields.text("otel.name"), Some("render greeting"));
+        assert_eq!(fields.text("rainier.view.name"), Some("greeting"));
+        assert!(fields.get("otel.status_code").is_none());
+        assert!(!format!("{fields:?}").contains("Ada Lovelace"), "never the data");
+        assert!(seen[1].failed());
+        assert_eq!(seen[1].collect_fields().text("error.type"), Some("internal"));
+    }
+
+    #[test]
+    fn with_nobody_listening_a_render_builds_no_event() {
+        let root = temp_root("unheard");
+        write(&root, "greeting", "Hi");
+        let events = std::sync::Arc::new(rainier_events::Dispatcher::new());
+        let _bus = rainier_events::set_default(events);
+        assert!(!rainier_events::activity::has_activity_subscribers::<ViewRendered>());
+        assert_eq!(TemplateEngine::new(&root).render("greeting", &json!({})).unwrap(), "Hi");
     }
 
     #[test]

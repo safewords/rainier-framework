@@ -62,14 +62,15 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod events;
 pub mod fake;
 pub mod request;
 pub mod response;
 pub mod retry;
-#[cfg(feature = "telemetry")]
 pub mod telemetry;
 pub mod transport;
 
+pub use events::HttpClientRequestSent;
 pub use fake::{FakeTransport, RecordedRequest};
 pub use request::{Http, MultipartField, PendingRequest};
 pub use response::HttpResponse;
