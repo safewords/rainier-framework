@@ -56,6 +56,7 @@ use std::time::Duration;
 use crossbeam_queue::SegQueue;
 use rainier_support::{BoxedFuture, Result};
 
+use crate::activity::{Activity, AsActivity};
 use crate::context::Context;
 use crate::event::Event;
 use crate::Dispatcher;
@@ -77,6 +78,8 @@ pub(crate) type TypedHandler = Arc<dyn Fn(&Payload, &Context) -> Delivery + Send
 /// A handler of every event.
 pub(crate) type AnyHandler =
     Arc<dyn Fn(&'static str, &Payload, &Context) -> Delivery + Send + Sync>;
+/// A handler of every [`Activity`].
+pub(crate) type ActivityHandler = Arc<dyn Fn(&dyn Activity, &Context) -> Result<()> + Send + Sync>;
 
 /// One event on its way to one subscriber.
 struct Item {
@@ -84,6 +87,8 @@ struct Item {
     type_id: TypeId,
     payload: Payload,
     cx: Context,
+    /// Set when the event is an [`Activity`].
+    activity: Option<AsActivity>,
 }
 
 /// A subscriber: its handlers, its inbox, and the thread that drains it.
@@ -91,6 +96,7 @@ pub(crate) struct Core {
     name: String,
     typed: HashMap<TypeId, Vec<TypedHandler>>,
     any: Vec<AnyHandler>,
+    activities: Vec<ActivityHandler>,
     /// Registered with `listen`/`listen_any`: `dispatch` runs it inline, so
     /// a dispatched event is not also sent here.
     inline: bool,
@@ -110,6 +116,7 @@ impl Core {
             name,
             typed: HashMap::new(),
             any: Vec::new(),
+            activities: Vec::new(),
             inline,
             inbox: SegQueue::new(),
             started: Once::new(),
@@ -195,6 +202,15 @@ impl Core {
         for handler in &self.any {
             sort(handler(item.name, &item.payload, &item.cx), &mut pending, &mut failures);
         }
+        if !self.activities.is_empty() {
+            if let Some(activity) = item.activity.and_then(|cast| cast(item.payload.as_ref())) {
+                for handler in &self.activities {
+                    if let Err(e) = handler(activity, &item.cx) {
+                        failures.push(e);
+                    }
+                }
+            }
+        }
         if pending.is_empty() {
             self.finish(item, failures);
             return;
@@ -213,7 +229,7 @@ impl Core {
     }
 
     fn finish(self: &Arc<Self>, item: Item, failures: Vec<rainier_support::Error>) {
-        let Item { name, type_id, payload, cx } = item;
+        let Item { name, type_id, payload, cx, .. } = item;
         if !failures.is_empty() {
             self.failed.fetch_add(failures.len() as u64, Ordering::Relaxed);
             let reportable = !crate::report::is_failure_event(type_id);
@@ -257,6 +273,9 @@ pub(crate) struct Snapshot {
     typed: HashMap<TypeId, Arc<[Arc<Core>]>>,
     /// Subscribers with a wildcard handler: they get every event.
     any: Arc<[Arc<Core>]>,
+    /// Subscribers with an activity handler and no wildcard: they get every
+    /// activity, and their typed handlers' events besides.
+    activity: Arc<[Arc<Core>]>,
 }
 
 impl Snapshot {
@@ -267,6 +286,7 @@ impl Snapshot {
 
     fn all(&self) -> Vec<Arc<Core>> {
         let mut all: Vec<Arc<Core>> = self.any.to_vec();
+        all.extend(self.activity.iter().cloned());
         for list in self.typed.values() {
             for core in list.iter() {
                 if !all.iter().any(|c| Arc::ptr_eq(c, core)) {
@@ -324,6 +344,17 @@ impl Dispatcher {
         AnySubscription { events: self, filter: None, name: None }
     }
 
+    /// Subscribe to every [`Activity`] — everything the framework publishes
+    /// about its own work — with one synchronous handler, on a thread named
+    /// `name`.
+    pub fn on_activity(
+        &self,
+        name: impl Into<String>,
+        handler: impl Fn(&dyn Activity, &Context) -> Result<()> + Send + Sync + 'static,
+    ) {
+        self.subscriber(name).on_activity(handler).start();
+    }
+
     /// Declare a subscriber with several handlers that share one thread —
     /// what a component that watches many events (Lookout, an audit log)
     /// registers as. See [`Subscriber`].
@@ -337,17 +368,25 @@ impl Dispatcher {
         let current = self.bus.snapshot.load();
         let mut typed = current.typed.clone();
         let mut any = current.any.to_vec();
+        let mut activity = current.activity.to_vec();
         if core.any.is_empty() {
             for type_id in core.typed.keys() {
                 let mut list: Vec<_> = typed.get(type_id).map(|l| l.to_vec()).unwrap_or_default();
                 list.push(Arc::clone(&core));
                 typed.insert(*type_id, list.into());
             }
+            if !core.activities.is_empty() {
+                activity.push(Arc::clone(&core));
+            }
         } else {
             any.push(Arc::clone(&core));
         }
         self.bus.subscribers.fetch_add(1, Ordering::Relaxed);
-        self.bus.snapshot.store(Arc::new(Snapshot { typed, any: any.into() }));
+        self.bus.snapshot.store(Arc::new(Snapshot {
+            typed,
+            any: any.into(),
+            activity: activity.into(),
+        }));
     }
 
     pub(crate) fn forget_published<E: Event>(&self) {
@@ -359,7 +398,11 @@ impl Dispatcher {
                 core.retired.store(true, Ordering::Release);
             }
         }
-        self.bus.snapshot.store(Arc::new(Snapshot { typed, any: Arc::clone(&current.any) }));
+        self.bus.snapshot.store(Arc::new(Snapshot {
+            typed,
+            any: Arc::clone(&current.any),
+            activity: Arc::clone(&current.activity),
+        }));
     }
 
     pub(crate) fn forget_all_published(&self) {
@@ -435,7 +478,50 @@ impl Dispatcher {
             if from_dispatch && core.inline {
                 continue;
             }
-            core.send(Item { name, type_id, payload: Arc::clone(&payload), cx: cx.clone() });
+            core.send(Item {
+                name,
+                type_id,
+                payload: Arc::clone(&payload),
+                cx: cx.clone(),
+                activity: None,
+            });
+        }
+    }
+
+    /// Whether any subscriber hears every activity.
+    #[inline]
+    pub(crate) fn hears_activities(&self) -> bool {
+        let snapshot = self.bus.snapshot.load();
+        !snapshot.activity.is_empty() || !snapshot.any.is_empty()
+    }
+
+    /// Send a built [`Activity`] to its type's subscribers, the wildcards and
+    /// the activity subscribers — each subscriber once.
+    pub(crate) fn publish_activity_built<E: Activity>(&self, cx: Context, payload: Arc<E>) {
+        let name = E::event_name();
+        if let Some(recorder) = &self.recorder {
+            recorder.lock().expect("recorder lock poisoned").push(crate::dispatcher::Recorded {
+                type_id: TypeId::of::<E>(),
+                name,
+                payload,
+            });
+            return;
+        }
+        let type_id = TypeId::of::<E>();
+        let payload: Payload = payload;
+        let cast: AsActivity = crate::activity::as_activity::<E>;
+        let snapshot = self.bus.snapshot.load();
+        let typed = snapshot.typed.get(&type_id);
+        let typed_only =
+            typed.into_iter().flat_map(|l| l.iter()).filter(|c| c.activities.is_empty());
+        for core in typed_only.chain(snapshot.any.iter()).chain(snapshot.activity.iter()) {
+            core.send(Item {
+                name,
+                type_id,
+                payload: Arc::clone(&payload),
+                cx: cx.clone(),
+                activity: Some(cast),
+            });
         }
     }
 
@@ -533,6 +619,16 @@ impl Subscriber<'_> {
                 Err(_) => Delivery::Skip,
             });
         self.core.typed.entry(TypeId::of::<E>()).or_default().push(handler);
+        self
+    }
+
+    /// Handle every [`Activity`] — everything the framework publishes about
+    /// its own work — synchronously, whatever its type.
+    pub fn on_activity(
+        mut self,
+        handler: impl Fn(&dyn Activity, &Context) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.core.activities.push(Arc::new(handler));
         self
     }
 

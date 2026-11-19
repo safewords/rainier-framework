@@ -206,3 +206,63 @@ async fn the_bus_resolves_to_the_current_units_dispatcher() {
     assert!(found.is_some_and(|b| Arc::ptr_eq(&b, &events)));
     let _ = Context::none();
 }
+
+struct QueryRan {
+    sql: &'static str,
+}
+
+impl rainier_events::Activity for QueryRan {
+    fn kind(&self) -> &'static str {
+        "db.query"
+    }
+    fn fields(&self, fields: &mut rainier_events::Fields) {
+        fields.set("db.query.text", self.sql);
+    }
+}
+
+#[tokio::test]
+async fn an_activity_reaches_its_typed_and_its_activity_subscribers_once_each() {
+    let events = Arc::new(Dispatcher::new());
+    let typed = Arc::new(AtomicUsize::new(0));
+    let activities = Arc::new(Mutex::new(Vec::new()));
+    let t = Arc::clone(&typed);
+    events.on::<QueryRan>().run_sync(move |_, _| {
+        t.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    let a = Arc::clone(&activities);
+    events
+        .subscriber("watcher")
+        .on(|_: &QueryRan, _| Ok(()))
+        .on_activity(move |act, _| {
+            a.lock().unwrap().push(format!(
+                "{} {}",
+                act.kind(),
+                act.collect_fields().text("db.query.text").unwrap_or("")
+            ));
+            Ok(())
+        })
+        .start();
+    events.publish_activity(QueryRan { sql: "SELECT 1" });
+    events.settled().await;
+    assert_eq!(typed.load(Ordering::SeqCst), 1);
+    assert_eq!(*activities.lock().unwrap(), vec!["db.query SELECT 1"]);
+}
+
+#[tokio::test]
+async fn each_subscriber_runs_on_a_thread_of_its_own() {
+    let events = Arc::new(Dispatcher::new());
+    let names = Arc::new(Mutex::new(Vec::new()));
+    for label in ["audit", "metrics"] {
+        let names = Arc::clone(&names);
+        events.on::<UserChanged>().named(label).run_sync(move |_, _| {
+            names.lock().unwrap().push(std::thread::current().name().unwrap_or("").to_string());
+            Ok(())
+        });
+    }
+    events.publish(UserChanged { id: 1 });
+    events.settled().await;
+    let mut names = names.lock().unwrap().clone();
+    names.sort();
+    assert_eq!(names, vec!["rainier-sub-audit", "rainier-sub-metrics"]);
+}

@@ -85,6 +85,8 @@ pub struct Unit {
     /// The bus to publish [`UnitCompleted`] on, and to resolve
     /// [`bus`](crate::bus) to while this unit is current.
     events: OnceLock<Weak<Dispatcher>>,
+    /// Families a code trace has been taken for in this unit.
+    traced: std::sync::Mutex<Vec<u64>>,
 }
 
 impl Unit {
@@ -101,6 +103,7 @@ impl Unit {
             started: Instant::now(),
             started_at: SystemTime::now(),
             events: OnceLock::new(),
+            traced: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -209,6 +212,21 @@ impl Unit {
     /// How long since the unit opened.
     pub fn elapsed(&self) -> std::time::Duration {
         self.started.elapsed()
+    }
+
+    /// Claim the one code trace this unit takes for `family` (a statement, a
+    /// URL): `true` the first time, `false` after.
+    pub fn claim_trace(&self, family: &str) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        family.hash(&mut hasher);
+        let key = hasher.finish();
+        let Ok(mut traced) = self.traced.lock() else { return false };
+        if traced.contains(&key) {
+            return false;
+        }
+        traced.push(key);
+        true
     }
 
     /// The bus this unit publishes on, if it was opened with one.
