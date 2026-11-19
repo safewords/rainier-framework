@@ -600,3 +600,24 @@ fn describing_a_session(lookout: &rainier_framework::lookout::Lookout) {
     rainier_framework::lookout::describe_session("profile", "ada");
     lookout.describe_session(None, "profile", "ada");
 }
+
+/// `docs/deferred.md`.
+#[allow(dead_code, reason = "compiling is the point")]
+async fn deferring(app: &Application) {
+    use rainier_framework::deferred::{self, Deferral, Deferrer, Drained};
+
+    let spawned: Deferral = defer("posts.count_view", async { Ok::<_, Error>(()) });
+    let _ = spawned.is_spawned();
+    rainier_framework::defer("posts.count_view", async {});
+
+    app.instance(Deferrer::new().max_in_flight(64).timeout(Duration::from_secs(5)));
+
+    deferred::settle().await;
+    let drained: Drained = deferred::drain_on_shutdown(app).await;
+    let _ = drained.abandoned;
+
+    let deferrer = deferred::current();
+    let _ = deferrer.in_flight();
+    deferrer.settle().await;
+    deferrer.drain(Duration::from_secs(1)).await;
+}

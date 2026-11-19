@@ -1214,6 +1214,11 @@ impl Rainier {
 
         app.boot().await?;
 
+        // After `boot`, so a `Metrics` registry a provider bound is there to
+        // observe it. Anything deferred before this ran on the process-wide
+        // deferrer, which shutdown drains as well.
+        crate::deferred::install(&app);
+
         // Last, because a provider's `boot` can still add scheduled tasks. A
         // task declaring `on_one_server` over an in-process lock is a
         // guarantee that is not one, and every process gets told — but only
@@ -1281,6 +1286,17 @@ fn default_config(env: &Env, base_path: &std::path::Path) -> Result<Config> {
         env.int("SERVER_REQUEST_TIMEOUT", 0).max(0) as u64,
     )?;
     config.set(keys::SERVER_COMPRESSION, env.bool("SERVER_COMPRESSION", false))?;
+
+    config.set(
+        keys::DEFER_MAX_IN_FLIGHT,
+        env.int("DEFER_MAX_IN_FLIGHT", crate::deferred::DEFAULT_MAX_IN_FLIGHT as i64).max(0) as u64,
+    )?;
+    config.set(keys::DEFER_TIMEOUT_SECS, env.int("DEFER_TIMEOUT", 0).max(0) as u64)?;
+    config.set(
+        keys::DEFER_SHUTDOWN_TIMEOUT_SECS,
+        env.int("DEFER_SHUTDOWN_TIMEOUT", crate::deferred::DEFAULT_SHUTDOWN_TIMEOUT_SECS as i64)
+            .max(0) as u64,
+    )?;
 
     config.set(keys::DATABASE_URL, env.string("DATABASE_URL", "sqlite::memory:"))?;
 

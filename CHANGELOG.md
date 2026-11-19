@@ -12,6 +12,18 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **`defer`** (`rainier-framework`): run work in the background of a request
+  without the response waiting on it, like Laravel's `defer()`. The task
+  carries the request's span (and so its trace id) and facade application;
+  an `Err` is logged at `warn` and a panic at `error`, by name; and
+  `deferred_tasks_total` / `deferred_task_duration_seconds` are recorded per
+  name and outcome when a `Metrics` registry is bound. `serve` and
+  `queue:work` wait for in-flight deferred work on shutdown, up to
+  `DEFER_SHUTDOWN_TIMEOUT` (10 s). Past `DEFER_MAX_IN_FLIGHT` (1024) new work
+  is shed and counted rather than piling up behind a slow dependency;
+  `DEFER_TIMEOUT` cancels a task that runs too long. Works without an
+  application, and `deferred::settle()` waits for it in tests. See
+  [deferred work](docs/deferred.md).
 - **`QueryCache`** (`rainier-framework`): a process-local cache of computed
   results — a lookup table, an aggregate, a small set of ids — invalidated by
   writes to the tables they were read from, on every replica. Entries are

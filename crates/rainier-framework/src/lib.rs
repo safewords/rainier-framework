@@ -117,6 +117,7 @@ pub mod broadcasting;
 pub mod captcha;
 pub mod commands;
 pub mod cors;
+pub mod deferred;
 pub mod facades;
 pub mod groups;
 pub mod health;
@@ -153,6 +154,7 @@ pub use commands::{
     console, KeyGenerateCommand, MigrateCommand, MigrateRollbackCommand, QueueWorkCommand,
     RouteListCommand, ServeCommand,
 };
+pub use deferred::{defer, Deferral, Deferrer};
 pub use facades::Views;
 pub use health::{Health, Report as HealthReport};
 pub use limits::RateLimits;
@@ -242,6 +244,7 @@ pub mod prelude {
     pub use rainier_telemetry::LogFormat;
 
     pub use crate::binding::{Bound, BoundAs};
+    pub use crate::deferred::defer;
     pub use rainier_http::extract::{Bearer, Form, Json, Path, Query, RawBody};
     pub use rainier_http::{
         Cookie, FromRequest, Html, IntoResponse, Method, Redirect, Request, Response, StatusCode,

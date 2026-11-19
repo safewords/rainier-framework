@@ -145,6 +145,22 @@ config_keys! {
     /// will not compress.
     pub SERVER_COMPRESSION: bool = "server.compression";
 
+    // --- deferred work ------------------------------------------------------
+
+    /// How many [deferred](crate::deferred) tasks may run at once before new
+    /// ones are shed. `0` means no ceiling. Defaults to
+    /// [`DEFAULT_MAX_IN_FLIGHT`](crate::deferred::DEFAULT_MAX_IN_FLIGHT).
+    pub DEFER_MAX_IN_FLIGHT: u64 = "defer.max_in_flight";
+
+    /// How long one deferred task may run before it is cancelled, in seconds.
+    /// `0` turns it off, which is the default.
+    pub DEFER_TIMEOUT_SECS: u64 = "defer.timeout_secs";
+
+    /// How long `serve` and `queue:work` wait for deferred work after they
+    /// stop, in seconds. Defaults to
+    /// [`DEFAULT_SHUTDOWN_TIMEOUT_SECS`](crate::deferred::DEFAULT_SHUTDOWN_TIMEOUT_SECS).
+    pub DEFER_SHUTDOWN_TIMEOUT_SECS: u64 = "defer.shutdown_timeout_secs";
+
     // --- observability ------------------------------------------------------
     //
     // All three are off by default. Each costs something a request pays for —
@@ -656,6 +672,9 @@ mod tests {
             ("SERVER", SERVER_MAX_BODY_BYTES.path()),
             ("SERVER", SERVER_REQUEST_TIMEOUT_SECS.path()),
             ("SERVER", SERVER_COMPRESSION.path()),
+            ("DEFER", DEFER_MAX_IN_FLIGHT.path()),
+            ("DEFER", DEFER_TIMEOUT_SECS.path()),
+            ("DEFER", DEFER_SHUTDOWN_TIMEOUT_SECS.path()),
             ("DATABASE", DATABASE_URL.path()),
             ("DATABASES", DATABASE_DEFAULT.path()),
             ("FILESYSTEMS", FILESYSTEM_DEFAULT.path()),
@@ -716,6 +735,9 @@ mod tests {
             SERVER_MAX_BODY_BYTES.path(),
             SERVER_REQUEST_TIMEOUT_SECS.path(),
             SERVER_COMPRESSION.path(),
+            DEFER_MAX_IN_FLIGHT.path(),
+            DEFER_TIMEOUT_SECS.path(),
+            DEFER_SHUTDOWN_TIMEOUT_SECS.path(),
             DATABASE_URL.path(),
             DATABASES.path(),
             DATABASE_DEFAULT.path(),

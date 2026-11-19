@@ -268,6 +268,11 @@ tokio::spawn(async move {
 Server::from_arc(kernel).run_until(rx).await?;
 ```
 
+Before it exits, `serve` also waits — up to `DEFER_SHUTDOWN_TIMEOUT`, ten
+seconds by default — for [deferred work](deferred.md#shutdown) the last
+requests started. A `main` of your own calls
+`rainier_framework::deferred::drain_on_shutdown(&app)` after `run_until`.
+
 For the worker, `worker.stop()` asks it to finish the current job and exit —
 which is what makes a deploy not lose work in flight. `queue:work` calls it for
 you on `SIGTERM`.

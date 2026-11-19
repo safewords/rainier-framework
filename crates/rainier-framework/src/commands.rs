@@ -138,6 +138,9 @@ impl Command for ServeCommand {
         println!("Rainier is serving http://{host}:{port} — press Ctrl-C to stop");
         server.run().await?;
 
+        // Work requests deferred, before anything it might use is torn down.
+        crate::deferred::drain_on_shutdown(app).await;
+
         // Terminating hooks run once the server has stopped accepting, which
         // is where an application flushes whatever it deferred.
         app.terminate();
@@ -743,6 +746,9 @@ impl Command for QueueWorkCommand {
                 Err(e) => failure = failure.or(Some(e)),
             }
         }
+
+        // Work the jobs deferred.
+        crate::deferred::drain_on_shutdown(app).await;
 
         // Whatever the batch exporter is still holding: the last jobs of a
         // worker being shut down are the ones somebody will want to see.

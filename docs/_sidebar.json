@@ -12,7 +12,7 @@
     "database", "models", "repositories", "relationships", "migrations", "pagination"
   ] },
   { "group": "Digging Deeper", "items": [
-    "console", "events", "queues", "scheduling", "mail", "notifications",
+    "console", "events", "queues", "deferred", "scheduling", "mail", "notifications",
     "broadcasting", "websockets", "kafka", "cache", "filesystem",
     "http-client", "helpers", "scenarios"
   ] },

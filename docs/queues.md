@@ -3,6 +3,9 @@
 Deferred work: a `Job` contract, a `Queue` port with three drivers, and a
 `Worker` that runs them.
 
+For work that should run after the response but is cheap to lose — and not
+worth a round trip to a queue backend — see [`defer`](deferred.md).
+
 A job is a struct, conventionally one file per job under `src/app/jobs/`.
 `PostRepository` and the `PostLive` [mailable](mail.md) here are the
 application's own:
