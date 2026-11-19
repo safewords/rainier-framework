@@ -31,6 +31,11 @@ the release as a whole and names the crate it landed in.
   opt in through `Connection::begin` (`bind_executor!(T, begin = f)`); the
   sea-orm executor does, through `SeaOrmExecutor::begin` and
   `SeaOrmTransaction`. See [database](docs/database.md#transactions).
+- **`vec_distance_euclidean`** (`rainier-database`): Euclidean distance —
+  `VEC_DISTANCE_EUCLIDEAN` on MariaDB, `<->` on pgvector, `vec_distance_l2` on
+  sqlite-vec — the distance a MariaDB vector index uses unless declared
+  otherwise. A cosine query against such an index scans every row without
+  saying so; the docs now say which to use.
 - **`words(columns, terms)`** (`rainier-database`): a word search a `FULLTEXT`
   index answers — `MATCH … AGAINST (… IN BOOLEAN MODE)` on MySQL and MariaDB,
   each term required and prefix-matched, operators stripped from what was typed;

@@ -450,6 +450,16 @@ dot, never interpolated. `contains`/`starts_with`/`ends_with` escape the term's
 own `%` and `_`, so a search for `50%` does not match everything starting with
 `50`.
 
+**A vector search uses the index only with the index's distance.**
+`vec_distance_cosine` and `vec_distance_euclidean` order rows by similarity, and
+MariaDB answers `ORDER BY` such a distance `LIMIT k` from its HNSW vector index —
+but only when the function is the one the index was built for. An index
+declared without `DISTANCE=cosine` is Euclidean (MariaDB's default), and a
+cosine query against it reads every row, silently; check with `EXPLAIN`. Over
+unit vectors the two orderings are identical and cosine similarity is
+`1 - d² / 2`, so normalise and use `vec_distance_euclidean` against a default
+index.
+
 **A word search uses the index, not a scan.** `words(columns, terms)` holds
 when every term occurs as a word, or the start of one, in at least one of the
 columns. On MySQL and MariaDB it is

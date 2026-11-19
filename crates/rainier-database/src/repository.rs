@@ -781,7 +781,7 @@ fn expression_type<E: rainier_orm::Entity>(
             | Function::NullIf
             | Function::Greatest
             | Function::Least => args.first().map_or(ColumnType::Text, of),
-            Function::VecDistanceCosine => ColumnType::Double,
+            Function::VecDistanceCosine | Function::VecDistanceEuclidean => ColumnType::Double,
             Function::VecFromText => ColumnType::Binary,
         },
         Expression::Arithmetic(left, _, right) => match (of(left), of(right)) {

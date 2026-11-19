@@ -153,6 +153,10 @@ pub enum Function {
     /// spells it differently and is not supported. Each needs its extension or
     /// version; nothing emulates it.
     VecDistanceCosine,
+    /// Euclidean (L2) distance between two vectors: `VEC_DISTANCE_EUCLIDEAN(a,
+    /// b)` on MariaDB, pgvector's `a <-> b` on Postgres, sqlite-vec's
+    /// `vec_distance_l2(a, b)` on SQLite.
+    VecDistanceEuclidean,
     /// A vector from its text form, `'[0.1, 0.2, …]'`: `VEC_FromText` on
     /// MariaDB, `CAST(… AS vector)` on Postgres, `vec_f32` on SQLite.
     VecFromText,
@@ -633,6 +637,9 @@ pub fn concat(args: impl IntoIterator<Item = Expression>) -> Expression {
 
 /// Cosine distance between two vectors — see [`Function::VecDistanceCosine`].
 ///
+/// Uses a MariaDB vector index only if the index was built with
+/// `DISTANCE=cosine`; see [`vec_distance_euclidean`] for the default.
+///
 /// To let MariaDB answer from its vector index, select it under a name and
 /// order by that name, with a limit:
 /// `.select_as(vec_distance_cosine(col("embedding"), vec_from_text(q)), "d")
@@ -640,6 +647,22 @@ pub fn concat(args: impl IntoIterator<Item = Expression>) -> Expression {
 /// not use the index.
 pub fn vec_distance_cosine(a: impl Into<Expression>, b: impl Into<Expression>) -> Expression {
     function(Function::VecDistanceCosine, [a.into(), b.into()])
+}
+
+/// Euclidean distance between two vectors — see
+/// [`Function::VecDistanceEuclidean`].
+///
+/// **The distance must be the index's.** A MariaDB vector index is built for
+/// one distance — `DISTANCE=euclidean` unless the index says otherwise, and
+/// `mhnsw_default_distance` is `euclidean` out of the box — and a query
+/// ordering by the other one is answered by reading every row, with no error
+/// and no warning; only `EXPLAIN` shows it. For unit vectors the two orders are
+/// the same and the scores convert exactly: cosine similarity is
+/// `1 - d² / 2`. So an index built without `DISTANCE=cosine` is used by
+/// `vec_distance_euclidean` over normalised vectors, and not by
+/// [`vec_distance_cosine`].
+pub fn vec_distance_euclidean(a: impl Into<Expression>, b: impl Into<Expression>) -> Expression {
+    function(Function::VecDistanceEuclidean, [a.into(), b.into()])
 }
 
 /// A vector from its bound text form — see [`Function::VecFromText`].
@@ -1205,6 +1228,15 @@ fn render_function(
             }
             Dialect::Sqlite => call("vec_distance_cosine", args),
         },
+        Function::VecDistanceEuclidean => match dialect {
+            Dialect::MySql => call("VEC_DISTANCE_EUCLIDEAN", args),
+            Dialect::Postgres => {
+                let mut args = args.into_iter();
+                let (a, b) = (args.next().expect("two arguments"), args.next().expect("two"));
+                a.binary(BinOper::Custom("<->"), b)
+            }
+            Dialect::Sqlite => call("vec_distance_l2", args),
+        },
         Function::VecFromText => match dialect {
             Dialect::MySql => call("VEC_FromText", args),
             Dialect::Postgres => {
@@ -1611,6 +1643,20 @@ mod tests {
         assert!(sql(Dialect::Postgres, &e)
             .0
             .contains(r#"GREATEST(CAST("posts"."n" AS BIGINT) - $1, $2)"#));
+    }
+
+    #[test]
+    fn euclidean_distance_is_spelled_by_each_vector_extension() {
+        let d = vec_distance_euclidean(col("embedding"), vec_from_text("[1,0]")).lt(0.5_f64);
+        assert!(sql(Dialect::MySql, &d)
+            .0
+            .contains("VEC_DISTANCE_EUCLIDEAN(`posts`.`embedding`, VEC_FromText(?)) < ?"));
+        assert!(sql(Dialect::Postgres, &d)
+            .0
+            .contains(r#""posts"."embedding" <-> CAST($1 AS vector)"#));
+        assert!(sql(Dialect::Sqlite, &d)
+            .0
+            .contains(r#"vec_distance_l2("posts"."embedding", vec_f32(?)) < ?"#));
     }
 
     #[test]
