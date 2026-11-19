@@ -12,7 +12,7 @@ use rainier_events::Operation;
 use rainier_support::{Error, ErrorKind, Result};
 
 use crate::channel::Channel;
-use crate::events::{error_type, NotificationSent};
+use crate::events::NotificationSent;
 use crate::notification::{Delivery, Notifiable, Notification, Receipt, Sent};
 
 /// Holds the configured channels and fans a notification out across them.
@@ -122,7 +122,7 @@ impl Notifier {
             notification: notification.notification_name(),
             channels: result.as_ref().ok().map(|receipt| receipt.outcomes.len()),
             duration: started.elapsed(),
-            error_type: result.as_ref().err().map(error_type),
+            error_type: result.as_ref().err().map(|e| e.kind().name()),
             operation: op.as_ref().map(Operation::id),
         });
         result

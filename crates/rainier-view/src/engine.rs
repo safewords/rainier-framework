@@ -207,7 +207,7 @@ impl ViewEngine for TemplateEngine {
         rainier_events::activity::publish_activity_with(|| ViewRendered {
             name: name.to_string(),
             duration: started.elapsed(),
-            error_type: rendered.as_ref().err().map(crate::events::error_type),
+            error_type: rendered.as_ref().err().map(|e| e.kind().name()),
         });
         rendered
     }

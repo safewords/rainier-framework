@@ -9,7 +9,7 @@ use rainier_events::{Dispatcher, Operation};
 use rainier_support::{Error, Result};
 use rainier_view::ViewEngine;
 
-use crate::events::{error_type, MailSent};
+use crate::events::MailSent;
 use crate::mailable::Mailable;
 use crate::message::{Address, Message};
 use crate::transport::Transport;
@@ -440,7 +440,7 @@ fn publish_sent(attempt: Option<Attempt>, op: Option<&Operation>, result: &Resul
         recipients: attempt.recipients,
         attachments: attempt.attachments,
         duration: attempt.started.elapsed(),
-        error_type: result.as_ref().err().map(error_type),
+        error_type: result.as_ref().err().map(|e| e.kind().name()),
         operation: op.map(Operation::id),
     });
 }

@@ -12,6 +12,11 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **`ErrorKind::name`** (`rainier-support`): the stable `error.type` string
+  for a kind — `"not_found"`, `"internal"`, … — always available, where
+  `telemetry::kind_name` needed the `telemetry` feature (it now calls this).
+  The thirteen private copies of that table across the event crates are gone.
+
 - **The event bus** (`rainier-events`): everything the framework does is now
   published as a typed event, and anything — your code, Lookout — subscribes
   to what it wants. `Dispatcher::publish` / `publish_with` are fire and
@@ -215,6 +220,10 @@ the release as a whole and names the crate it landed in.
   replays the session reports are tagged too. A browser cannot label itself.
 
 ### Fixed
+
+- **`rainier-mfa` with only `passkeys`** compiles: it asked for `rsa` without
+  the `pkcs1v15` feature its RS256 check uses, and built only when another
+  crate in the graph happened to turn that on.
 
 - **Session replay** (`rainier-lookout`): each recorded piece starts at the
   page's size, not one event later — the recorder split a snapshot's two
