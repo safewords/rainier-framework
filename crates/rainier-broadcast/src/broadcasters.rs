@@ -23,7 +23,7 @@
 //! # use rainier_broadcast::{BroadcasterConfig, RedisBroadcast};
 //! let declared = BroadcasterConfig::Redis(RedisBroadcast {
 //!     url: "redis://cache:6379".into(),
-//!     prefix: Some("lewd-production".into()),
+//!     prefix: Some("app-production".into()),
 //!     key: Some("app-key".into()),
 //!     secret: Some("app-secret".into()),
 //! });
@@ -55,7 +55,7 @@
 //! let declared: BroadcasterConfig = serde_json::from_value(json!({
 //!     "driver": "redis",
 //!     "url": "redis://cache:6379",
-//!     "prefix": "lewd-production",
+//!     "prefix": "app-production",
 //!     "key": "app-key",
 //!     "secret": "app-secret",
 //! })).unwrap();

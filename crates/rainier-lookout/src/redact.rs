@@ -71,7 +71,7 @@ const SECRET_PREFIX: usize = 4;
 /// assert_eq!(mask_secret(key), mask_secret(key), "deterministic");
 /// assert!(mask_secret("550e8400-e29b-41d4-a716-446655440000").is_none(), "a UUID");
 /// assert!(mask_secret("profile_picture_upload_status").is_none(), "an identifier");
-/// assert!(mask_secret("https://lewd.net/posts/123456789012345").is_none(), "a URL");
+/// assert!(mask_secret("https://app.example.com/posts/123456789012345").is_none(), "a URL");
 /// ```
 pub fn mask_secret(value: &str) -> Option<String> {
     let len = value.chars().count();

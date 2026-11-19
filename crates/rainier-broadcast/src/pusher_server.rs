@@ -93,7 +93,7 @@ const KEEPALIVE_SECONDS: u64 = 15;
 ///
 /// // The fan-in: everything published by any replica, delivered to ours.
 /// tokio::spawn(async move {
-///     let mut events = connector.subscribe("lewd-production:*").await?;
+///     let mut events = connector.subscribe("app-production:*").await?;
 ///     while let Some(message) = events.next_message().await {
 ///         server.deliver_published(&message.channel, message.text().unwrap_or_default());
 ///     }
@@ -160,7 +160,7 @@ impl PusherServer {
     ///
     /// Must be the same prefix [`RedisBroadcaster`](crate::RedisBroadcaster)
     /// publishes under, or nothing matches: the publisher writes to
-    /// `lewd-production:private-chat.7` and the browser subscribed to
+    /// `app-production:private-chat.7` and the browser subscribed to
     /// `private-chat.7`.
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
@@ -657,13 +657,13 @@ mod tests {
 
     #[test]
     fn the_prefix_comes_off_a_published_channel_name() {
-        // The publisher writes `lewd-production:private-chat.7`; the browser
+        // The publisher writes `app-production:private-chat.7`; the browser
         // subscribed to `private-chat.7`. Without stripping, nothing matches
         // and every event is delivered to nobody — silently, because zero
         // recipients is also what an idle channel looks like.
-        let server = PusherServer::new(auth()).with_prefix("lewd-production:");
+        let server = PusherServer::new(auth()).with_prefix("app-production:");
         let delivered = server.deliver_published(
-            "lewd-production:private-chat.7",
+            "app-production:private-chat.7",
             &json!({ "event": "chat.sent", "data": { "id": 1 } }).to_string(),
         );
         // Nobody is connected in a unit test; what matters is that it did not

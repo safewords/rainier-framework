@@ -964,7 +964,7 @@ the release as a whole and names the crate it landed in.
   `CrashLoopBackOff` is not being drained at all, and stays that way for minutes
   after the broker itself is healthy. That is the failure mode rather than a
   theoretical one: a Redis Cluster shard lost its master, and both
-  `lewd-backend-worker-interactive` replicas spent three hours restarting instead
+  replicas of an application's interactive worker spent three hours restarting instead
   of consuming the four queues they serve, one of which carries feed generation.
 
   A reserve failure is now logged, waited out and retried. The wait doubles from

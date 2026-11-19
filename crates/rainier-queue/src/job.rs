@@ -156,7 +156,7 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     /// `None` defers to the worker's own limit, which is where every job's
     /// timeout used to come from. That default is chosen for the shortest
     /// work in the application, so a job whose honest duration is minutes had
-    /// no way to say so and was killed partway through — the transcoder's
+    /// no way to say so and was killed partway through — a video transcode's
     /// ladder published its smallest rendition and lost the rest, reported
     /// only as "the job exceeded its 60s timeout" on the worker.
     ///

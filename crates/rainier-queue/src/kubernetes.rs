@@ -1373,7 +1373,7 @@ mod tests {
         let spec = KubernetesJobSpec::new("2Gi", "4Gi", "500m", "1")
             .with_image("ghcr.io/example/svc:1.2.3")
             .with_service_account("csam-uploader")
-            .with_namespace("lewd-prod")
+            .with_namespace("app-production")
             .with_node_selector("role", "sensitive-content")
             .with_ttl_seconds_after_finished(0)
             .with_tmpfs_scratch();

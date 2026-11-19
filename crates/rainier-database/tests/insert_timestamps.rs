@@ -1,7 +1,7 @@
 //! `created_at` / `updated_at` stamped on insert, against a real database.
 //!
 //! Applications build rows with `..Default::default()`, which leaves both
-//! `None`. Before `rainier_orm::timestamps` that wrote NULL, silently: lewd.net
+//! `None`. Before `rainier_orm::timestamps` that wrote NULL, silently: one application
 //! had 21 tables of rows that did not know when they were made. These read the
 //! row back, because a test of the SQL could not tell "stamped" from "bound a
 //! value the database then ignored".

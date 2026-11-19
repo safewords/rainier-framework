@@ -348,7 +348,7 @@ pub struct WorkerOptions {
     ///
     /// So the distinction is *who is asking*, and the answer is: only an
     /// explicit `--timeout`. A chart that passes one by habit turns every
-    /// declaration into a decoy again — which is exactly why lewd's stopped.
+    /// declaration into a decoy again — which is exactly why one application's stopped.
     ///
     /// `Some(None)` is `--timeout=0`: run with no limit at all. The nesting is
     /// load-bearing, because "no override given" and "overridden to

@@ -301,7 +301,7 @@ impl Column {
         //     errno 150 "Foreign key constraint is incorrectly formed"
         //
         // which names neither column and reads as a malformed constraint
-        // rather than a type mismatch. Caught by lewd.net's
+        // rather than a type mismatch. Caught by an application's
         // `0001_create_help_questions` refusing to apply to a fresh MySQL
         // database — the pairing was correct in the PHP schema it was
         // transcribed from, because `$table->increments()` is UNSIGNED there.

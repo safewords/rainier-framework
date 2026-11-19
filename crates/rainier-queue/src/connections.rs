@@ -2693,7 +2693,7 @@ mod tests {
         // slot lived elsewhere: nothing drained, nothing failed, and no job was
         // marked failed, because none of them ran.
         let declared = ConnectionConfig::Redis(
-            RedisConnection::cluster(["redis://lewd-redis-leader:6379/"]).expect("declares"),
+            RedisConnection::cluster(["redis://app-redis-leader:6379/"]).expect("declares"),
         );
 
         let json = serde_json::to_value(declared).expect("serialises");

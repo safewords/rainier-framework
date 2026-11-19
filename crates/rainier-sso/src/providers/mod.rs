@@ -8,7 +8,7 @@
 //! | [`x`] | [`X`] | `GET /2/users/me` |
 //! | [`google`] | [`Oidc`] | the verified ID token |
 //! | [`microsoft`] | [`Oidc`] | the verified ID token |
-//! | [`oidc`] | [`Oidc`] | the verified ID token — Okta, Auth0, Keycloak, Authentik, safewords identity, anything with a discovery document |
+//! | [`oidc`] | [`Oidc`] | the verified ID token — Okta, Auth0, Keycloak, Authentik, a self-hosted identity provider, anything with a discovery document |
 //!
 //! # Which emails count as verified
 //!

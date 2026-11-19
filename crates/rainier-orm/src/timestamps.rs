@@ -6,7 +6,7 @@
 //!
 //! Applications build rows with `..Default::default()`, and `Default` leaves an
 //! `Option<DateTime<Utc>>` as `None`. Without this, every such insert wrote a
-//! NULL `created_at`: in lewd.net that was 21 tables, including chats, uploads,
+//! NULL `created_at`: in one application that was 21 tables, including chats, uploads,
 //! media assets, reports and payment events, found on 2026-11-06 when a growth
 //! chart could not be rebuilt because no upload knew when it was made. A rule
 //! that every call site must remember is a rule that most call sites forgot.

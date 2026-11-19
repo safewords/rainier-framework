@@ -3,10 +3,9 @@
 //! [`rainier_crypt::jwt::Jwt`] verifies a token against a key ring you
 //! already hold, and [`JwtKeyRing::from_jwks`](rainier_crypt::jwt::JwtKeyRing::from_jwks)
 //! builds a ring from a JWKS document. What was missing — and what every
-//! relying party ended up hand-rolling (see the copy in `maps-api`'s
-//! `attest.rs`) — is the layer between: **fetch** the issuer's JWKS over HTTP,
-//! **cache** it, **re-fetch** when a token names a key the cache does not hold,
-//! and verify against the right audience.
+//! relying party ended up hand-rolling — is the layer between: **fetch** the
+//! issuer's JWKS over HTTP, **cache** it, **re-fetch** when a token names a key
+//! the cache does not hold, and verify against the right audience.
 //!
 //! [`Jwks`] is that layer, once. Point it at an issuer and its JWKS URL, hold
 //! one in the container, and verify:
