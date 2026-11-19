@@ -193,12 +193,9 @@ impl Console {
 
         match &handled {
             Ok(code) => publish_ran(command.name(), Some(*code), None, started),
-            Err(error) => publish_ran(
-                command.name(),
-                Some(exit::FAILURE),
-                Some(crate::events::error_type(error.kind())),
-                started,
-            ),
+            Err(error) => {
+                publish_ran(command.name(), Some(exit::FAILURE), Some(error.kind().name()), started)
+            }
         }
 
         #[cfg(feature = "telemetry")]

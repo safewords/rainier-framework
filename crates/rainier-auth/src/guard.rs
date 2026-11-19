@@ -264,7 +264,7 @@ impl<U: Authenticatable> SessionGuard<U> {
                     Err(_) => None,
                 },
                 duration: started.elapsed(),
-                error_type: result.as_ref().err().map(crate::events::error_type),
+                error_type: result.as_ref().err().map(|e| e.kind().name()),
             });
             result
         })

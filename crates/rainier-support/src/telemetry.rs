@@ -67,25 +67,9 @@ pub fn record_result<T>(span: &tracing::Span, result: crate::Result<T>) -> crate
     result
 }
 
-/// The `error.type` an [`ErrorKind`] records as.
-///
-/// Stable, low-cardinality strings — `error.type` is a dimension a backend
-/// groups by, so it must not carry anything that varies per request.
+/// The `error.type` an [`ErrorKind`] records as: [`ErrorKind::name`].
 pub fn kind_name(kind: ErrorKind) -> &'static str {
-    match kind {
-        ErrorKind::BadRequest => "bad_request",
-        ErrorKind::Unauthenticated => "unauthenticated",
-        ErrorKind::Unauthorized => "unauthorized",
-        ErrorKind::NotFound => "not_found",
-        ErrorKind::MethodNotAllowed => "method_not_allowed",
-        ErrorKind::Conflict => "conflict",
-        ErrorKind::PayloadTooLarge => "payload_too_large",
-        ErrorKind::Validation => "validation",
-        ErrorKind::TooManyRequests => "too_many_requests",
-        ErrorKind::Internal => "internal",
-        ErrorKind::ServiceUnavailable => "service_unavailable",
-        ErrorKind::Status(_) => "status",
-    }
+    kind.name()
 }
 
 /// A subscriber that records spans, for tests — [`Recorder`](testing::Recorder).

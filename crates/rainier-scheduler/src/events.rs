@@ -46,7 +46,7 @@ impl Activity for ScheduledTaskRan {
             .set("rainier.task.outcome", self.outcome)
             .maybe("rainier.task.skipped", self.skipped);
         if let Some(kind) = self.error {
-            fields.set("otel.status_code", "ERROR").set("error.type", error_type(kind));
+            fields.set("otel.status_code", "ERROR").set("error.type", kind.name());
         }
     }
 
@@ -100,25 +100,6 @@ pub(crate) async fn published(
         duration: started.elapsed(),
     });
     outcome
-}
-
-/// The `error.type` an [`ErrorKind`] records as — the strings the span's
-/// `record_error` uses.
-fn error_type(kind: ErrorKind) -> &'static str {
-    match kind {
-        ErrorKind::BadRequest => "bad_request",
-        ErrorKind::Unauthenticated => "unauthenticated",
-        ErrorKind::Unauthorized => "unauthorized",
-        ErrorKind::NotFound => "not_found",
-        ErrorKind::MethodNotAllowed => "method_not_allowed",
-        ErrorKind::Conflict => "conflict",
-        ErrorKind::PayloadTooLarge => "payload_too_large",
-        ErrorKind::Validation => "validation",
-        ErrorKind::TooManyRequests => "too_many_requests",
-        ErrorKind::Internal => "internal",
-        ErrorKind::ServiceUnavailable => "service_unavailable",
-        ErrorKind::Status(_) => "status",
-    }
 }
 
 #[cfg(test)]

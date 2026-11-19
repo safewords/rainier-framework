@@ -62,7 +62,7 @@ impl Activity for JobQueued {
             .set("messaging.message.id", self.id.clone())
             .set("rainier.job.name", self.name.clone());
         if let Some(kind) = self.error {
-            fields.set("otel.status_code", "ERROR").set("error.type", error_type(kind));
+            fields.set("otel.status_code", "ERROR").set("error.type", kind.name());
         }
     }
 
@@ -150,7 +150,7 @@ impl Activity for JobRan {
             ("error", kind) => {
                 fields
                     .set("otel.status_code", "ERROR")
-                    .set("error.type", kind.map_or("internal", error_type));
+                    .set("error.type", kind.map_or("internal", ErrorKind::name));
             }
             (outcome, _) => {
                 fields.set("otel.status_code", "ERROR").set(
@@ -177,25 +177,6 @@ impl Activity for JobRan {
 /// Whole milliseconds, as the span records them.
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-/// The `error.type` an [`ErrorKind`] records as — the same strings the
-/// span's `record_error` uses.
-pub(crate) fn error_type(kind: ErrorKind) -> &'static str {
-    match kind {
-        ErrorKind::BadRequest => "bad_request",
-        ErrorKind::Unauthenticated => "unauthenticated",
-        ErrorKind::Unauthorized => "unauthorized",
-        ErrorKind::NotFound => "not_found",
-        ErrorKind::MethodNotAllowed => "method_not_allowed",
-        ErrorKind::Conflict => "conflict",
-        ErrorKind::PayloadTooLarge => "payload_too_large",
-        ErrorKind::Validation => "validation",
-        ErrorKind::TooManyRequests => "too_many_requests",
-        ErrorKind::Internal => "internal",
-        ErrorKind::ServiceUnavailable => "service_unavailable",
-        ErrorKind::Status(_) => "status",
-    }
 }
 
 /// The error kind of a result, for an activity's `error.type`.

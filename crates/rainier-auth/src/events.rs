@@ -8,7 +8,6 @@
 use std::time::Duration;
 
 use rainier_events::{Activity, Fields};
-use rainier_support::{Error, ErrorKind};
 
 /// A guard tried a set of credentials.
 ///
@@ -50,23 +49,5 @@ impl Activity for AuthAttempted {
 
     fn failed(&self) -> bool {
         self.error_type.is_some()
-    }
-}
-
-/// An error's kind as a span's `error.type` records it.
-pub(crate) fn error_type(error: &Error) -> &'static str {
-    match error.kind() {
-        ErrorKind::BadRequest => "bad_request",
-        ErrorKind::Unauthenticated => "unauthenticated",
-        ErrorKind::Unauthorized => "unauthorized",
-        ErrorKind::NotFound => "not_found",
-        ErrorKind::MethodNotAllowed => "method_not_allowed",
-        ErrorKind::Conflict => "conflict",
-        ErrorKind::PayloadTooLarge => "payload_too_large",
-        ErrorKind::Validation => "validation",
-        ErrorKind::TooManyRequests => "too_many_requests",
-        ErrorKind::Internal => "internal",
-        ErrorKind::ServiceUnavailable => "service_unavailable",
-        ErrorKind::Status(_) => "status",
     }
 }

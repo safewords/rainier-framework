@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rainier_events::{Activity, Dispatcher, Fields, Unit, UnitKind};
-use rainier_support::ErrorKind;
 
 /// A console command ran: the `console.command` activity.
 ///
@@ -69,25 +68,6 @@ pub(crate) fn open_unit(
     }
 }
 
-/// The `error.type` an [`ErrorKind`] records as — the strings the span's
-/// `record_error` uses.
-pub(crate) fn error_type(kind: ErrorKind) -> &'static str {
-    match kind {
-        ErrorKind::BadRequest => "bad_request",
-        ErrorKind::Unauthenticated => "unauthenticated",
-        ErrorKind::Unauthorized => "unauthorized",
-        ErrorKind::NotFound => "not_found",
-        ErrorKind::MethodNotAllowed => "method_not_allowed",
-        ErrorKind::Conflict => "conflict",
-        ErrorKind::PayloadTooLarge => "payload_too_large",
-        ErrorKind::Validation => "validation",
-        ErrorKind::TooManyRequests => "too_many_requests",
-        ErrorKind::Internal => "internal",
-        ErrorKind::ServiceUnavailable => "service_unavailable",
-        ErrorKind::Status(_) => "status",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,7 +95,7 @@ mod tests {
         let ran = CommandRan {
             name: "queue:work".into(),
             exit_code: Some(1),
-            error: Some(error_type(ErrorKind::Internal)),
+            error: Some(rainier_support::ErrorKind::Internal.name()),
             duration: Duration::ZERO,
         };
         let fields = ran.collect_fields();

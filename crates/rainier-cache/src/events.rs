@@ -58,7 +58,7 @@ impl Activity for CacheOperation {
             .maybe("cache.key", self.key.clone())
             .maybe("cache.hit", self.hit);
         if let Some(kind) = self.error {
-            fields.set("otel.status_code", "ERROR").set("error.type", error_type(kind));
+            fields.set("otel.status_code", "ERROR").set("error.type", kind.name());
         }
     }
 
@@ -80,26 +80,6 @@ pub(crate) fn listening() -> Option<Arc<Dispatcher>> {
         return None;
     }
     rainier_events::bus()
-}
-
-/// The `error.type` an [`ErrorKind`] records as — the same strings as
-/// `rainier_support::telemetry::kind_name`, which exists only with the
-/// `telemetry` feature.
-pub(crate) fn error_type(kind: ErrorKind) -> &'static str {
-    match kind {
-        ErrorKind::BadRequest => "bad_request",
-        ErrorKind::Unauthenticated => "unauthenticated",
-        ErrorKind::Unauthorized => "unauthorized",
-        ErrorKind::NotFound => "not_found",
-        ErrorKind::MethodNotAllowed => "method_not_allowed",
-        ErrorKind::Conflict => "conflict",
-        ErrorKind::PayloadTooLarge => "payload_too_large",
-        ErrorKind::Validation => "validation",
-        ErrorKind::TooManyRequests => "too_many_requests",
-        ErrorKind::Internal => "internal",
-        ErrorKind::ServiceUnavailable => "service_unavailable",
-        ErrorKind::Status(_) => "status",
-    }
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use rainier_events::activity::publish_activity_with;
 use rainier_events::{Activity, Fields};
-use rainier_support::{Error, ErrorKind, Result};
+use rainier_support::Result;
 
 use crate::broadcaster::{Broadcaster, LogBroadcaster};
 use crate::channel::Channel;
@@ -101,7 +101,7 @@ impl Broadcasting {
             event: broadcast.event.clone(),
             channels: broadcast.channels.len(),
             duration: started.elapsed(),
-            error_type: result.as_ref().err().map(error_type),
+            error_type: result.as_ref().err().map(|e| e.kind().name()),
         });
         result
     }
@@ -181,24 +181,6 @@ impl Activity for BroadcastSent {
 
     fn failed(&self) -> bool {
         self.error_type.is_some()
-    }
-}
-
-/// An error's kind as a span's `error.type` records it.
-fn error_type(error: &Error) -> &'static str {
-    match error.kind() {
-        ErrorKind::BadRequest => "bad_request",
-        ErrorKind::Unauthenticated => "unauthenticated",
-        ErrorKind::Unauthorized => "unauthorized",
-        ErrorKind::NotFound => "not_found",
-        ErrorKind::MethodNotAllowed => "method_not_allowed",
-        ErrorKind::Conflict => "conflict",
-        ErrorKind::PayloadTooLarge => "payload_too_large",
-        ErrorKind::Validation => "validation",
-        ErrorKind::TooManyRequests => "too_many_requests",
-        ErrorKind::Internal => "internal",
-        ErrorKind::ServiceUnavailable => "service_unavailable",
-        ErrorKind::Status(_) => "status",
     }
 }
 
