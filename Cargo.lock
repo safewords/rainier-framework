@@ -3891,6 +3891,8 @@ name = "rainier-events"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
+ "crossbeam-queue",
  "rainier-support",
  "serde",
  "serde_json",
