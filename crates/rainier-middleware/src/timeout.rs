@@ -15,10 +15,25 @@
 //!
 //! # What cancelling actually does
 //!
-//! At the deadline the handler's future is **dropped**. Everything it holds is
-//! released and the response becomes `408`. But dropping a future only stops
-//! the part that had not run yet — work already handed to someone else keeps
-//! going:
+//! At the deadline the client gets `408`, and the request is marked
+//! [abandoned](rainier_http::Abandonment) with
+//! [`TimedOut`](rainier_http::AbandonReason::TimedOut). What happens to the
+//! handler's work is its route's [`AbandonPolicy`]:
+//!
+//! - **Cancel**, the default: the handler's future is **dropped**. Everything
+//!   it holds is released.
+//! - **Finish**: the work runs on in its own task to the end, and its response
+//!   is discarded. For a route whose work must not stop halfway and cannot be
+//!   made one transaction.
+//!
+//! ```ignore
+//! router.post("/import", import)
+//!     .middleware(Timeout::seconds(60))
+//!     .when_abandoned(AbandonPolicy::new().on_timeout(OnAbandon::Finish));
+//! ```
+//!
+//! Cancelling only stops the part that had not run yet — work already handed
+//! to someone else keeps going:
 //!
 //! - A query in flight was already sent. The database will run it to
 //!   completion and the row will be written; only the *answer* is discarded.
@@ -40,7 +55,12 @@
 
 use std::time::Duration;
 
-use rainier_http::{IntoResponse, Request, Response};
+use std::future::Future;
+use std::task::Poll;
+
+use rainier_http::{
+    AbandonPolicy, AbandonReason, Abandonment, IntoResponse, OnAbandon, Request, Response,
+};
 use rainier_support::Error;
 
 use crate::pipeline::{Middleware, Next};
@@ -75,15 +95,40 @@ impl Timeout {
 
 #[async_trait::async_trait]
 impl Middleware for Timeout {
-    async fn handle(&self, request: Request, next: Next) -> Response {
+    async fn handle(&self, mut request: Request, next: Next) -> Response {
         // Kept for the log line: `request` is moved into the future, and the
         // whole point is that the future may not come back.
         let method = request.method().to_string();
         let uri = request.uri().path().to_string();
 
-        match tokio::time::timeout(self.limit, next.run(request)).await {
-            Ok(response) => response,
-            Err(_) => {
+        // The server gives every request one; a request built in a test or
+        // run through a bare pipeline gets one here, so the route can still
+        // read it.
+        let abandonment = match request.extensions().get::<Abandonment>() {
+            Some(abandonment) => abandonment.clone(),
+            None => {
+                let abandonment = Abandonment::new();
+                request.extensions_mut().insert(abandonment.clone());
+                abandonment
+            }
+        };
+
+        // Known here only when this timeout is the route's own: the router
+        // records the route's policy before the route's middleware runs. A
+        // global timeout runs before routing, and the router itself keeps a
+        // finishing route's work alive when this drops it.
+        let policy = request.extensions().get::<AbandonPolicy>().copied();
+        let outcome = match policy {
+            Some(policy) if policy.for_reason(AbandonReason::TimedOut) == OnAbandon::Finish => {
+                let work = crate::run_detachable(next.run(request), abandonment.clone(), policy);
+                within(self.limit, work, &abandonment).await
+            }
+            _ => within(self.limit, next.run(request), &abandonment).await,
+        };
+
+        match outcome {
+            Some(response) => response,
+            None => {
                 // At `warn`, not `error`: one slow request is a fact about the
                 // request. It is worth seeing, and it is not a fault of the
                 // process.
@@ -119,6 +164,32 @@ impl Middleware for Timeout {
     fn name(&self) -> &'static str {
         "Timeout"
     }
+}
+
+/// `work`'s response, or `None` at `limit` — with the request marked abandoned
+/// **before** `work` is dropped, so whatever owns the work underneath can tell
+/// a timeout from any other reason it was let go of.
+async fn within<F>(limit: Duration, work: F, abandonment: &Abandonment) -> Option<Response>
+where
+    F: Future<Output = Response>,
+{
+    let mut work = std::pin::pin!(work);
+    let mut deadline = std::pin::pin!(tokio::time::sleep(limit));
+    let finished = std::future::poll_fn(|cx| {
+        if let Poll::Ready(response) = work.as_mut().poll(cx) {
+            return Poll::Ready(Some(response));
+        }
+        if deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await;
+    if finished.is_none() {
+        abandonment.abandon(AbandonReason::TimedOut);
+    }
+    finished
+    // `work` is dropped here, after the mark.
 }
 
 #[cfg(test)]
@@ -213,6 +284,46 @@ mod tests {
         // Long enough that it would have finished had it survived.
         tokio::time::sleep(Duration::from_millis(700)).await;
         assert!(!finished.load(Ordering::SeqCst), "the handler kept running past its timeout");
+    }
+
+    #[tokio::test]
+    async fn a_route_that_finishes_on_timeout_runs_on_after_the_408() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&finished);
+
+        // What the router records for a route declared to finish on timeout.
+        let request = request().with_extension(AbandonPolicy::new().on_timeout(OnAbandon::Finish));
+        let response = Pipeline::new()
+            .through(Timeout::millis(10))
+            .then(move |_| {
+                let flag = Arc::clone(&flag);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    flag.store(true, Ordering::SeqCst);
+                    Response::ok("discarded")
+                }
+            })
+            .run(request)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(finished.load(Ordering::SeqCst), "the work was cancelled despite its policy");
+    }
+
+    #[tokio::test]
+    async fn a_timeout_marks_the_request_abandoned() {
+        let abandonment = Abandonment::new();
+        let response = Pipeline::new()
+            .through(Timeout::millis(10))
+            .then(|_| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Response::ok("no")
+            })
+            .run(request().with_extension(abandonment.clone()))
+            .await;
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(abandonment.reason(), Some(AbandonReason::TimedOut));
     }
 
     #[tokio::test]

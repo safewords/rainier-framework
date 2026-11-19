@@ -267,6 +267,21 @@ stops it being public.
 Controller middleware runs **inside** the route's group and outside the action,
 so a group's session still wraps the controller's authorisation check.
 
+### When a request is abandoned
+
+A resource controller can choose, per action, what happens to the work when the
+client hangs up or a timeout gives up. Leave it unset and the route's group
+decides; see [Abandoned requests](abandoned-requests.md).
+
+```rust
+fn when_abandoned(&self, action: ResourceAction) -> AbandonPolicy {
+    match action {
+        ResourceAction::Store | ResourceAction::Destroy => AbandonPolicy::finish(),
+        _ => AbandonPolicy::new(),
+    }
+}
+```
+
 ## Testing an action
 
 Because an action is a function, you can call it:

@@ -453,6 +453,17 @@ impl Request {
     pub fn ip(&self) -> Option<std::net::IpAddr> {
         self.extensions.get::<ClientIp>().map(|ip| ip.0)
     }
+
+    /// Whether, and why, this request has been abandoned — its client hung up,
+    /// or a timeout gave up on it.
+    ///
+    /// For a long handler that wants to stop early on its own terms, whatever
+    /// its route's [`AbandonPolicy`](crate::AbandonPolicy) says. A request the
+    /// server did not give one (built in a test, say) gets a signal that never
+    /// fires.
+    pub fn abandonment(&self) -> crate::Abandonment {
+        self.extensions.get::<crate::Abandonment>().cloned().unwrap_or_default()
+    }
 }
 
 /// A fluent [`Request`] builder.

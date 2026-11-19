@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use rainier_http::{IntoResponse, Method, Request, Response};
+use rainier_http::{AbandonPolicy, IntoResponse, Method, Request, Response};
 use rainier_middleware::{IntoMiddlewareStack, MiddlewareStack};
 use rainier_support::{str, BoxedFuture, Error, ErrorKind};
 
@@ -351,6 +351,25 @@ pub trait ResourceController: Send + Sync + 'static {
     fn middleware(&self) -> ControllerMiddleware {
         ControllerMiddleware::new()
     }
+
+    /// What `action` does with its work when its request is abandoned — the
+    /// client hangs up, or a `Timeout` gives up. See
+    /// [`Route::when_abandoned`](crate::Route::when_abandoned).
+    ///
+    /// Unset by default, so the route's group decides, and then
+    /// [`AbandonPolicy::DEFAULT`].
+    ///
+    /// ```ignore
+    /// fn when_abandoned(&self, action: ResourceAction) -> AbandonPolicy {
+    ///     match action {
+    ///         ResourceAction::Store | ResourceAction::Destroy => AbandonPolicy::finish(),
+    ///         _ => AbandonPolicy::new(),
+    ///     }
+    /// }
+    /// ```
+    fn when_abandoned(&self, _action: ResourceAction) -> AbandonPolicy {
+        AbandonPolicy::new()
+    }
 }
 
 fn unsupported(request: Request, action: &str) -> Response {
@@ -441,6 +460,7 @@ impl Router {
             if !for_action.is_empty() {
                 route.middleware(for_action);
             }
+            route.when_abandoned(controller.when_abandoned(action));
         }
     }
 }

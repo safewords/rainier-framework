@@ -35,6 +35,7 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod abandon;
 pub mod body;
 pub mod coerce;
 pub mod cookie;
@@ -44,6 +45,7 @@ pub mod request;
 pub mod response;
 pub mod upload;
 
+pub use abandon::{AbandonPolicy, AbandonReason, Abandoned, Abandonment, OnAbandon};
 pub use body::Body;
 pub use cookie::{Cookie, SameSite};
 pub use extract::FromRequest;
