@@ -57,6 +57,10 @@ the release as a whole and names the crate it landed in.
 
 ### Changed
 
+- **Idle WebSocket connections use less memory** (`rainier-server`): an
+  upgraded connection starts with a 4 KiB read buffer instead of tungstenite's
+  128 KiB, and the buffer grows when a larger frame arrives. See
+  [websockets](docs/websockets.md#memory-per-connection).
 - **sqlx no longer logs every statement at INFO** (`rainier-drivers`): the
   sea-orm executor sets sqlx's statement logging to `DEBUG`. At
   `RUST_LOG=info` an application wrote a log line per SQL statement under

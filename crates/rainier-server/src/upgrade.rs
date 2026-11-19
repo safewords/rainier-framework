@@ -33,7 +33,9 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
-use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame, Role};
+use tokio_tungstenite::tungstenite::protocol::{
+    frame::coding::CloseCode, CloseFrame, Role, WebSocketConfig,
+};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::WebSocketStream;
 
@@ -73,6 +75,23 @@ impl Default for Liveness {
     fn default() -> Self {
         Self { ping_every: Duration::from_secs(25), give_up_after: Duration::from_secs(70) }
     }
+}
+
+/// The bytes each connection reserves for reading before any frame arrives.
+///
+/// tungstenite allocates its read buffer up front at this size and grows it
+/// only when a frame needs more. Its default is 128 KiB, so a server holding
+/// idle connections spent 128 KiB on each one before reading a byte. Most
+/// socket traffic is small JSON frames, so this starts at 4 KiB. A larger
+/// message still arrives whole: the buffer grows to fit it.
+pub const INITIAL_READ_BUFFER: usize = 4 * 1024;
+
+/// The transport settings every upgraded connection runs with.
+///
+/// Only the initial read buffer differs from tungstenite's defaults. The
+/// message and frame size limits are unchanged.
+pub fn socket_config() -> WebSocketConfig {
+    WebSocketConfig::default().read_buffer_size(INITIAL_READ_BUFFER)
 }
 
 /// Whether this request is asking to become a WebSocket.
@@ -169,7 +188,7 @@ pub async fn handle_upgrade(
         let stream = WebSocketStream::from_raw_socket(
             hyper_util::rt::TokioIo::new(upgraded),
             Role::Server,
-            None,
+            Some(socket_config()),
         )
         .await;
 
@@ -660,5 +679,58 @@ mod tests {
         assert!(is_routine_disconnect(&WsError::Io(IoError::from(Io::BrokenPipe))));
         assert!(!is_routine_disconnect(&WsError::Utf8(String::new())));
         assert!(!is_routine_disconnect(&WsError::Io(IoError::from(Io::PermissionDenied))));
+    }
+
+    /// Remembers the size of every text message it is handed.
+    #[derive(Default)]
+    struct Measures {
+        sizes: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WebSocketHandler for Measures {
+        async fn on_message(&self, _: &Socket, message: Message) -> rainier_support::Result<()> {
+            if let Message::Text(text) = message {
+                self.sizes.lock().unwrap().push(text.len());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_larger_than_the_initial_read_buffer_arrives_whole() {
+        // The read buffer starts small so idle connections cost little. A
+        // message bigger than it must still be read in one piece.
+        let big = INITIAL_READ_BUFFER * 50;
+        let (server, client) = tokio::io::duplex(4096);
+        let server =
+            WebSocketStream::from_raw_socket(server, Role::Server, Some(socket_config())).await;
+        let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+
+        let handler = Arc::new(Measures::default());
+        let running = tokio::spawn(run(
+            handler.clone(),
+            server,
+            "/ws/large".into(),
+            Vec::new(),
+            Liveness::default(),
+        ));
+        client.send(WsMessage::Text("x".repeat(big).into())).await.unwrap();
+        client.send(WsMessage::Text("small".into())).await.unwrap();
+        client.close(None).await.unwrap();
+        running.await.unwrap();
+
+        assert_eq!(*handler.sizes.lock().unwrap(), vec![big, 5]);
+    }
+
+    #[test]
+    fn upgraded_connections_reserve_a_small_read_buffer() {
+        let config = socket_config();
+        assert_eq!(config.read_buffer_size, INITIAL_READ_BUFFER);
+        // Everything else stays at tungstenite's defaults.
+        let defaults = WebSocketConfig::default();
+        assert_eq!(config.max_message_size, defaults.max_message_size);
+        assert_eq!(config.max_frame_size, defaults.max_frame_size);
+        assert_eq!(config.write_buffer_size, defaults.write_buffer_size);
     }
 }

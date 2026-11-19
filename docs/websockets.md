@@ -95,6 +95,14 @@ its own — for **70 s**. A write that cannot finish in that time ends the
 connection too. `on_close` runs as it does for any other ending. The ping keeps
 the connection under the 60 s idle timeout most proxies apply.
 
+## Memory per connection
+
+Each upgraded connection starts with a **4 KiB** read buffer
+(`INITIAL_READ_BUFFER` in `rainier-server`), which grows when a frame needs more
+and keeps that size afterwards. tungstenite's default is 128 KiB, allocated
+before the first byte is read, so an idle connection used to cost at least
+that much. The message and frame size limits are tungstenite's defaults.
+
 ## The socket handle
 
 ```rust
