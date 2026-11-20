@@ -78,6 +78,48 @@ impl CacheRateLimiter {
     }
 }
 
+impl CacheRateLimiter {
+    /// A counter with no deadline beside it: give it a window from now.
+    ///
+    /// Both keys are written with the same TTL, so a counter whose deadline is
+    /// gone is one that outlived its window — and the way that happens is the
+    /// gap between `add` and `increment`. When the window ends in that gap,
+    /// `add` has already answered `false` and `INCR` then *creates* the counter,
+    /// with no expiry at all. Left alone it never resets: the caller is refused
+    /// forever with `retry-after` equal to the whole window, which is what
+    /// identity did to one bento replica's service-token mint (2026-11-20).
+    ///
+    /// Moving its expiry to a full window from now bounds that to one window.
+    /// The count is kept rather than cleared, so a caller cannot reset its own
+    /// limit by racing the window's end; and an evicted deadline beside a live
+    /// counter costs at most one extra window, the safe direction.
+    async fn reopen_orphan(
+        &self,
+        key: &str,
+        counter: &str,
+        deadline: &str,
+        window: Duration,
+    ) -> u64 {
+        let ends_at = now_millis() + window.as_millis() as u64;
+        if let Err(e) = self.cache.touch(counter, Some(window)).await {
+            tracing::warn!(key, error = %e, "could not give an orphaned rate limit counter an expiry");
+            report(CacheFailed::new(e, "rate_limiter", Some(counter.to_string()), "touch_orphan"))
+                .await;
+        }
+        // `add`, so two replicas healing the same key at once agree on one end.
+        match self.cache.add(deadline, ends_at.to_string().as_bytes(), Some(window)).await {
+            Ok(true) => ends_at,
+            Ok(false) => {
+                read_millis(self.cache.get(deadline).await.ok().flatten()).unwrap_or(ends_at)
+            }
+            Err(e) => {
+                tracing::warn!(key, error = %e, "could not record a rate limit window's end");
+                ends_at
+            }
+        }
+    }
+}
+
 impl RateLimitStore for CacheRateLimiter {
     fn hit<'a>(&'a self, key: &'a str, window: Duration) -> BoxFuture<'a, Result<Hit>> {
         Box::pin(async move {
@@ -105,7 +147,10 @@ impl RateLimitStore for CacheRateLimiter {
                 }
                 Some(ends_at)
             } else {
-                read_millis(self.cache.get(&deadline).await?)
+                match read_millis(self.cache.get(&deadline).await?) {
+                    Some(ends_at) => Some(ends_at),
+                    None => Some(self.reopen_orphan(key, &counter, &deadline, window).await),
+                }
             };
 
             let count = self.cache.increment(&counter, 1).await?;
@@ -225,6 +270,25 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         assert!(limiter.peek("ada").await.unwrap().is_none());
+        assert_eq!(limiter.hit("ada", window).await.unwrap().count, 1);
+    }
+
+    #[tokio::test]
+    async fn a_counter_left_without_an_expiry_resets_after_one_window() {
+        // What `INCR` leaves when the window ends between `add` and
+        // `increment`: a counter with no TTL and no deadline. It used to
+        // refuse its caller forever.
+        let cache: Arc<dyn Cache> = Arc::new(MemoryCache::new());
+        let limiter = CacheRateLimiter::new(Arc::clone(&cache));
+        let window = Duration::from_millis(60);
+        cache.put("rate:ada", b"500", None).await.unwrap();
+
+        let hit = limiter.hit("ada", window).await.unwrap();
+        assert_eq!(hit.count, 501, "the count is kept, not forgiven");
+        assert!(hit.resets_in <= window, "{:?}", hit.resets_in);
+
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
         assert_eq!(limiter.hit("ada", window).await.unwrap().count, 1);
     }
 
