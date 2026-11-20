@@ -590,7 +590,26 @@ let post = db.transaction(|tx| async move {
   certification conflict a multi-primary cluster such as Galera reports as a
   deadlock at `COMMIT`. Its closure is `Fn`, because it may run more than once,
   and must do nothing outside the transaction that it cannot safely repeat. Any
-  other error is returned at once.
+  other error is returned at once. MariaDB's `1020 Record has changed since
+  last read` — a locking read that found its row changed since the
+  transaction's snapshot, under `innodb_snapshot_isolation` (on by default
+  since 11.6) — is a conflict too.
+- **A transaction can be lost under its connection on multi-primary Galera.**
+  A transaction that conflicts with another node's writeset is aborted by the
+  node while the client is between statements, and the abort is meant to be
+  reported on the next statement. Measured on MariaDB 12.3.3 through this
+  crate's driver, it was not always reported: the statements after it then ran
+  and committed one by one in autocommit, and `COMMIT` succeeded with nothing
+  to commit — half of the work landed, and the rest silently did not.
+  `Database::guarding_lost_transactions(true)` guards against it at the cost
+  of three statements per transaction: `SET SESSION TRANSACTION READ ONLY`
+  after `BEGIN` (a write after a loss is refused, `1792`, instead of
+  committing alone), `@@in_transaction` before `COMMIT` (a loss followed only
+  by reads is caught), and `READ WRITE` again before the `COMMIT` or
+  `ROLLBACK`. Every loss is reported as a conflict, so `transaction_retrying`
+  runs the work again. MariaDB only, and off by default: it is not needed
+  while every write goes through one node, because the abort needs a
+  conflicting writeset from another node to happen.
 - On a split connection the transaction runs on the writer. A backend that
   cannot hold one connection across statements — an HTTP-fronted database, a
   sharded fleet — refuses before the closure runs.
