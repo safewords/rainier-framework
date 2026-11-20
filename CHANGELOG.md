@@ -12,6 +12,16 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **`Database::guarding_lost_transactions`** (`rainier-database`): on
+  multi-primary Galera, a transaction aborted by a conflicting writeset from
+  another node was not always reported to the client, and the rest of its work
+  committed statement by statement in autocommit. The guard (MariaDB only, off
+  by default) refuses those writes and reports the loss as a conflict, so
+  `transaction_retrying` runs the work again. See `docs/database.md`.
+- **MariaDB `1020` is a conflict** (`rainier-database`): `Record has changed
+  since last read`, raised under `innodb_snapshot_isolation`, is now retried by
+  `transaction_retrying` like a deadlock.
+
 - **Abandoned requests** (`rainier-http`, `rainier-routing`,
   `rainier-middleware`, `rainier-server`): each route declares what happens to
   its work when the client hangs up or a `Timeout` gives up on it.

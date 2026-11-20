@@ -245,3 +245,140 @@ async fn on_a_real_server_other_connections_do_not_see_uncommitted_writes() {
     assert_eq!(entries(&db).all().await.unwrap().len(), 1, "rolled back on the server");
     db.statement("DROP TABLE ledger_entries").await.unwrap();
 }
+
+/// A MariaDB handle on a fresh `guard_entries` table, or `None` (skipped).
+async fn mariadb(table: &str) -> Option<Database> {
+    let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+        eprintln!("no TEST_DATABASE_URL — skipping");
+        return None;
+    };
+    if !url.starts_with("mysql://") && !url.starts_with("mariadb://") {
+        eprintln!("TEST_DATABASE_URL is not MariaDB or MySQL — skipping");
+        return None;
+    }
+    // One connection, so the test sees the same session the transaction ran on.
+    let pool = PoolConfig { max_connections: 1, ..PoolConfig::default() };
+    let db = Database::new(SeaOrmExecutor::connect(&url, &pool).await.expect("connect"));
+    db.statement(&format!("DROP TABLE IF EXISTS {table}")).await.unwrap();
+    db.statement(&format!("CREATE TABLE {table} (id BIGINT PRIMARY KEY, amount BIGINT NOT NULL)"))
+        .await
+        .unwrap();
+    Some(db)
+}
+
+async fn ids(db: &Database, table: &str) -> Vec<String> {
+    db.query(format!("SELECT CAST(id AS CHAR) AS id FROM {table} ORDER BY id"))
+        .column("id")
+        .await
+        .unwrap()
+}
+
+/// What a Galera brute-force abort does to the client: the server rolls the
+/// transaction back between statements, and the work goes on. Simulated with a
+/// `ROLLBACK` sent through the transaction's own connection.
+async fn lose(tx: &Database) {
+    tx.statement("ROLLBACK").await.unwrap();
+}
+
+#[tokio::test]
+async fn unguarded_a_write_after_a_lost_transaction_commits_on_its_own() {
+    let Some(db) = mariadb("lost_unguarded").await else { return };
+    let _ = db
+        .transaction(|tx| async move {
+            tx.statement("INSERT INTO lost_unguarded VALUES (1, 1)").await?;
+            lose(&tx).await;
+            tx.statement("INSERT INTO lost_unguarded VALUES (2, 2)").await?;
+            Ok(())
+        })
+        .await;
+    assert_eq!(ids(&db, "lost_unguarded").await, vec!["2"], "the failure being guarded against");
+    db.statement("DROP TABLE lost_unguarded").await.unwrap();
+}
+
+#[tokio::test]
+async fn guarded_a_write_after_a_lost_transaction_is_refused_as_a_conflict() {
+    let Some(db) = mariadb("lost_write").await else { return };
+    let db = db.guarding_lost_transactions(true);
+    let result: Result<(), Error> = db
+        .transaction(|tx| async move {
+            tx.statement("INSERT INTO lost_write VALUES (1, 1)").await?;
+            lose(&tx).await;
+            tx.statement("INSERT INTO lost_write VALUES (2, 2)").await?;
+            Ok(())
+        })
+        .await;
+    let error = result.expect_err("the write after the loss is refused");
+    assert!(error.message().contains("1792"), "{}", error.message());
+    assert!(ids(&db, "lost_write").await.is_empty(), "nothing of it landed");
+    db.statement("INSERT INTO lost_write VALUES (3, 3)")
+        .await
+        .expect("and the connection writes again");
+    db.statement("DROP TABLE lost_write").await.unwrap();
+}
+
+#[tokio::test]
+async fn guarded_a_transaction_lost_before_reads_only_is_caught_at_commit() {
+    let Some(db) = mariadb("lost_read").await else { return };
+    let db = db.guarding_lost_transactions(true);
+    let result: Result<(), Error> = db
+        .transaction(|tx| async move {
+            tx.statement("INSERT INTO lost_read VALUES (1, 1)").await?;
+            lose(&tx).await;
+            let _ = ids(&tx, "lost_read").await;
+            Ok(())
+        })
+        .await;
+    let error = result.expect_err("reported, not a silent success");
+    assert!(error.message().contains("deadlock found"), "{}", error.message());
+    db.statement("DROP TABLE lost_read").await.unwrap();
+}
+
+#[tokio::test]
+async fn guarded_a_lost_attempt_is_retried_and_lands_once() {
+    let Some(db) = mariadb("lost_retry").await else { return };
+    let db = db.guarding_lost_transactions(true);
+    let attempts = Arc::new(Mutex::new(0));
+    let counted = Arc::clone(&attempts);
+    db.transaction_retrying(3, move |tx| {
+        let counted = Arc::clone(&counted);
+        async move {
+            let first = {
+                let mut n = counted.lock().unwrap();
+                *n += 1;
+                *n == 1
+            };
+            tx.statement("INSERT INTO lost_retry VALUES (1, 1)").await?;
+            if first {
+                lose(&tx).await;
+            }
+            tx.statement("INSERT INTO lost_retry VALUES (2, 2)").await?;
+            Ok(())
+        }
+    })
+    .await
+    .expect("the second attempt commits");
+    assert_eq!(*attempts.lock().unwrap(), 2);
+    assert_eq!(ids(&db, "lost_retry").await, vec!["1", "2"]);
+    db.statement("DROP TABLE lost_retry").await.unwrap();
+}
+
+#[tokio::test]
+async fn guarded_an_ordinary_transaction_commits_and_leaves_the_connection_writable() {
+    let Some(db) = mariadb("guard_plain").await else { return };
+    let db = db.guarding_lost_transactions(true);
+    db.transaction(|tx| async move {
+        tx.statement("INSERT INTO guard_plain VALUES (1, 1)").await?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let _: Result<(), Error> = db
+        .transaction(|tx| async move {
+            tx.statement("INSERT INTO guard_plain VALUES (2, 2)").await?;
+            Err(Error::internal("undo"))
+        })
+        .await;
+    db.statement("INSERT INTO guard_plain VALUES (3, 3)").await.expect("writable after both");
+    assert_eq!(ids(&db, "guard_plain").await, vec!["1", "3"]);
+    db.statement("DROP TABLE guard_plain").await.unwrap();
+}

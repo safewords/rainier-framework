@@ -349,6 +349,10 @@ pub struct Database {
     /// not drop its copy for a write that may yet be rolled back, nor keep it
     /// for one that commits. `None` outside a transaction.
     pending: Option<Arc<std::sync::Mutex<Vec<RowChange>>>>,
+
+    /// Whether [`transaction`](Self::transaction) guards against a transaction
+    /// lost under it — see [`guarding_lost_transactions`](Self::guarding_lost_transactions).
+    guard_lost: bool,
 }
 
 /// A subscriber to row changes. See [`Database::on_change`].
@@ -377,6 +381,7 @@ impl Database {
             to_the_writer: false,
             subscribers: Arc::default(),
             pending: None,
+            guard_lost: false,
         }
     }
 
@@ -433,6 +438,7 @@ impl Database {
             to_the_writer: false,
             subscribers: Arc::default(),
             pending: None,
+            guard_lost: false,
         })
     }
 
@@ -697,10 +703,44 @@ impl Database {
             to_the_writer: false,
             subscribers: Arc::clone(&self.subscribers),
             pending: Some(Arc::clone(&pending)),
+            guard_lost: self.guard_lost,
         };
 
-        match work(handle).await {
+        let guarded = self.guard_lost && self.dialect() == Dialect::MySql;
+        if guarded {
+            transaction
+                .execute(ShardRoute::Global, "SET SESSION TRANSACTION READ ONLY", Vec::new())
+                .await?;
+        }
+
+        match work(handle.clone()).await {
             Ok(value) => {
+                if guarded {
+                    let still_in = handle
+                        .query("SELECT CAST(@@in_transaction AS CHAR) AS t")
+                        .scalar_string("t")
+                        .await;
+                    let (aborted, restored) = restore_read_write(&*transaction).await;
+                    let lost = !matches!(still_in.as_ref().map(|t| t.as_deref()), Ok(Some("1")));
+                    if lost || aborted.is_some() || restored.is_err() {
+                        if let Err(rollback) = transaction.rollback().await {
+                            tracing::warn!(error = %rollback.message(), "could not roll a lost transaction back");
+                        }
+                        pending.lock().unwrap_or_else(|p| p.into_inner()).clear();
+                        still_in?;
+                        if let Some(error) = aborted {
+                            // The abort, reported on the restore. Worded as
+                            // the conflict it is if the driver's words were not.
+                            return Err(if is_conflict(&error) {
+                                error
+                            } else {
+                                Error::internal(format!("{LOST_TRANSACTION}: {}", error.message()))
+                            });
+                        }
+                        restored?;
+                        return Err(Error::internal(LOST_TRANSACTION));
+                    }
+                }
                 let committed = transaction.commit().await;
                 let changes =
                     std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner()));
@@ -710,6 +750,11 @@ impl Database {
                 committed.map(|()| value)
             }
             Err(error) => {
+                if guarded {
+                    if let (_, Err(restore)) = restore_read_write(&*transaction).await {
+                        tracing::warn!(error = %restore.message(), "could not restore READ WRITE after a guarded transaction");
+                    }
+                }
                 if let Err(rollback) = transaction.rollback().await {
                     // The connection goes back to the pool either way, and a
                     // transaction that was neither committed nor rolled back
@@ -750,6 +795,50 @@ impl Database {
                 result => return result,
             }
         }
+    }
+
+    /// Guard every [`transaction`](Self::transaction) on this handle against
+    /// being lost under it. MariaDB only; elsewhere it changes nothing.
+    ///
+    /// # What it guards against
+    ///
+    /// On a multi-primary Galera cluster, a transaction that conflicts with a
+    /// writeset from another node is *brute-force aborted*: the node rolls it
+    /// back while the client is between statements. MariaDB is meant to report
+    /// that as a deadlock on the client's next statement. Measured against
+    /// MariaDB 12.3.3 through this crate's driver (2026-11-19), that report
+    /// did not always arrive. The connection was then out of the transaction
+    /// with nothing said, and every statement after it ran — and committed —
+    /// on its own in autocommit, and the `COMMIT` at the end succeeded with
+    /// nothing to commit. Half of the work landed, unguarded by anything the
+    /// transaction promised: a claim taken twice, a counter incremented twice.
+    ///
+    /// # How
+    ///
+    /// Three statements more per transaction:
+    ///
+    /// 1. After `BEGIN`, `SET SESSION TRANSACTION READ ONLY`. That governs the
+    ///    *next* transaction, not this one, which stays writable. If this one
+    ///    is lost, each statement after it is such a next transaction, so a
+    ///    write fails loudly (`1792 … READ ONLY transaction`) instead of
+    ///    committing alone. That failure counts as a conflict, so
+    ///    [`transaction_retrying`](Self::transaction_retrying) runs the work
+    ///    again.
+    /// 2. Before `COMMIT`, `@@in_transaction`. A transaction lost while the
+    ///    work went on to read only — its writes undone, nothing failing — is
+    ///    caught here and reported as a conflict too.
+    /// 3. `SET SESSION TRANSACTION READ WRITE`, before the `COMMIT` or the
+    ///    `ROLLBACK`, so the connection goes back to the pool as it came.
+    ///
+    /// A `work` that panics skips step 3, and its connection keeps refusing
+    /// writes outside a transaction until it is recycled — loud, where the
+    /// failure this exists for is silent.
+    ///
+    /// Not needed while every write goes through one node: the abort needs a
+    /// conflicting writeset from another node to happen at all.
+    pub fn guarding_lost_transactions(mut self, on: bool) -> Self {
+        self.guard_lost = on;
+        self
     }
 
     /// Whether this handle is inside a [transaction](Self::transaction).
@@ -963,14 +1052,64 @@ impl Executor for Database {
 
 /// Whether `error` is the database undoing a transaction for a conflict with
 /// another — the kind [`Database::transaction_retrying`] runs again.
+/// Step 3 of [`Database::guarding_lost_transactions`]: the connection back to
+/// `READ WRITE` before it returns to the pool.
+///
+/// Tried up to three times. A transaction lost under the connection reports
+/// the abort on the *next* statement, whichever it is — and when that is this
+/// one, the `SET` does not run, and a connection that refuses every write
+/// outside a transaction would go back to the pool. The abort is reported
+/// once; the next attempt runs.
+///
+/// Answers the first error, if there was one, even when a later attempt
+/// restored the connection: that error is the abort, and the transaction it
+/// reports is gone. Treating the restore as clean and going on to `COMMIT`
+/// commits nothing and calls it success, which is the failure this guard
+/// exists for.
+async fn restore_read_write(transaction: &dyn Transaction) -> (Option<Error>, Result<()>) {
+    let mut first = None;
+    for _ in 0..3 {
+        match transaction
+            .execute(ShardRoute::Global, "SET SESSION TRANSACTION READ WRITE", Vec::new())
+            .await
+        {
+            Ok(_) => return (first, Ok(())),
+            Err(error) => {
+                if first.is_none() {
+                    first = Some(Error::internal(error.message().to_string()));
+                }
+            }
+        }
+    }
+    let failed = Error::internal("could not restore READ WRITE after a guarded transaction");
+    (first, Err(failed))
+}
+
+/// What a guarded transaction reports when the server was no longer in it at
+/// `COMMIT` — worded as the deadlock it was, so it counts as a conflict.
+const LOST_TRANSACTION: &str = "deadlock found: the transaction was aborted under this connection \
+     (WSREP detected deadlock/conflict, not reported to the client); guarded by \
+     Database::guarding_lost_transactions";
+
 fn is_conflict(error: &Error) -> bool {
     let message = error.message().to_ascii_lowercase();
     [
+        // A guarded transaction lost under its connection: a write after the
+        // loss is refused as read-only (1792), and that is the conflict too.
+        // See `Database::guarding_lost_transactions`.
+        "1792",
+        "read only transaction",
         // MySQL / MariaDB: ER_LOCK_DEADLOCK, which Galera also raises for a
         // certification failure ("WSREP detected deadlock/conflict").
         "deadlock found",
         "1213",
         "wsrep detected deadlock",
+        // MariaDB with `innodb_snapshot_isolation` (on by default since
+        // 11.6): ER_CHECKREAD, a locking read that found its row changed
+        // since the transaction's snapshot. The server's own advice is "try
+        // restarting transaction".
+        "1020",
+        "record has changed since last read",
         // Postgres: serialization_failure, deadlock_detected.
         "40001",
         "40p01",
@@ -990,6 +1129,21 @@ fn into_anyhow(error: Error) -> rainier_orm::Error {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_snapshot_conflict_and_a_guarded_loss_are_conflicts() {
+        for message in [
+            "error returned from database: 1020 (HY000): Record has changed since last read in \
+             table 't'; try restarting transaction",
+            "error returned from database: 1792 (25006): Cannot execute statement in a READ ONLY \
+             transaction",
+            super::LOST_TRANSACTION,
+        ] {
+            assert!(super::is_conflict(&Error::internal(message)), "{message}");
+        }
+        assert!(!super::is_conflict(&Error::internal("1062 Duplicate entry")));
+    }
+
     use super::*;
     use crate::statement;
     use crate::sticky::with_sticky_scope;
