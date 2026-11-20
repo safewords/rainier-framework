@@ -67,8 +67,30 @@
 //! cheap without guessing a `max-age` on the application's behalf — set
 //! `cache_control` when the answer is known (a content-hashed filename can be
 //! cached for a year; `index.html` cannot be cached at all).
+//!
+//! # Large files stream
+//!
+//! A file up to [`IN_MEMORY_LIMIT`] is read whole, which is what lets the
+//! compression middleware compress it — it only compresses a body already in
+//! memory. Anything bigger is streamed from disk in fixed-size chunks with its
+//! `Content-Length` still declared, so serving a gigabyte disk image costs a
+//! chunk of memory per download rather than a gigabyte. Big files are rarely
+//! worth compressing anyway: they are images, video and archives.
+//!
+//! # Ranges
+//!
+//! A single `Range: bytes=…` is answered `206 Partial Content`, which is what
+//! lets a client resume a download or seek in a video. `If-Range` is honoured:
+//! a range asked against an older version of the file gets the whole new one.
+//! A request for several ranges at once is answered with the whole file, which
+//! the specification allows and no common client depends on otherwise; a range
+//! that starts past the end is `416`.
 
 use std::path::{Component, Path, PathBuf};
+
+use bytes::{Bytes, BytesMut};
+use rainier_http::Body;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use percent_encoding::percent_decode_str;
 use rainier_events::report::FailureEvent as _;
@@ -224,30 +246,59 @@ impl PublicFiles {
             return self.headers(Response::new(StatusCode::NOT_MODIFIED), &resolved, &tag);
         }
 
-        let Ok(bytes) = tokio::fs::read(&resolved).await else {
-            return not_found();
+        let len = metadata.len();
+
+        // `If-Range` says "only if it is still the version I have"; a range of
+        // some other version spliced into this one would be a corrupt file.
+        let still_current = request.header("if-range").is_none_or(|given| given.trim() == tag);
+        let range = match request.header("range").filter(|_| still_current) {
+            None => None,
+            Some(header) => match parse_range(header, len) {
+                RangeAsked::None => None,
+                RangeAsked::One(start, end) => Some((start, end)),
+                RangeAsked::Unsatisfiable => {
+                    return self
+                        .headers(Response::new(StatusCode::RANGE_NOT_SATISFIABLE), &resolved, &tag)
+                        .with_header("content-range", &format!("bytes */{len}"))
+                        .with_header("content-length", "0");
+                }
+            },
+        };
+
+        let (status, start, body_len) = match range {
+            Some((start, end)) => (StatusCode::PARTIAL_CONTENT, start, end - start + 1),
+            None => (StatusCode::OK, 0, len),
         };
 
         // A HEAD is a GET whose body is dropped — the headers, including
         // length, must be the ones a GET would have produced.
-        let body_len = bytes.len();
         let response = if request.method().as_str() == "HEAD" {
-            Response::new(StatusCode::OK)
+            Response::new(status)
         } else {
-            Response::new(StatusCode::OK).with_body(bytes)
+            match body(&resolved, start, body_len).await {
+                Some(body) => Response::new(status).with_body(body),
+                None => return not_found(),
+            }
         };
 
-        self.headers(response, &resolved, &tag).with_header("content-length", &body_len.to_string())
+        let mut response = self
+            .headers(response, &resolved, &tag)
+            .with_header("content-length", &body_len.to_string());
+        if range.is_some() {
+            response = response.with_header(
+                "content-range",
+                &format!("bytes {start}-{}/{len}", start + body_len - 1),
+            );
+        }
+        response
     }
 
     fn headers(&self, response: Response, path: &Path, tag: &str) -> Response {
         let mut response = response
             .with_header("content-type", content_type(path))
             .with_header("etag", tag)
-            // Says the range unit is understood even though ranges are not
-            // served, so a client asks rather than assuming — see the module
-            // docs. `none` is the honest answer.
-            .with_header("accept-ranges", "none");
+            // See the module docs on ranges.
+            .with_header("accept-ranges", "bytes");
 
         if let Some(cache_control) = &self.cache_control {
             response = response.with_header("cache-control", cache_control);
@@ -259,6 +310,109 @@ impl PublicFiles {
 
 fn not_found() -> Response {
     Error::not_found("Not Found").into_response()
+}
+
+/// The biggest file read whole into memory; anything larger streams. See the
+/// module docs on why there is a line at all.
+pub const IN_MEMORY_LIMIT: u64 = 1024 * 1024;
+
+/// How much of a streamed file is read at a time.
+const CHUNK: usize = 64 * 1024;
+
+/// `len` bytes of the file from `start`: in memory when small, streamed when
+/// not. `None` when the file cannot be opened, which the caller answers as a
+/// 404 the same as a file that is not there.
+async fn body(path: &Path, start: u64, len: u64) -> Option<Body> {
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    if start > 0 {
+        file.seek(std::io::SeekFrom::Start(start)).await.ok()?;
+    }
+
+    if len <= IN_MEMORY_LIMIT {
+        let mut bytes = Vec::with_capacity(len as usize);
+        (&mut file).take(len).read_to_end(&mut bytes).await.ok()?;
+        return Some(Body::from_bytes(bytes));
+    }
+
+    Some(Body::from_stream(futures_util::stream::unfold(
+        (file, len),
+        |(mut file, remaining)| async move {
+            if remaining == 0 {
+                return None;
+            }
+            let want = CHUNK.min(remaining as usize);
+            let mut buf = BytesMut::zeroed(want);
+            match file.read(&mut buf).await {
+                // Shorter than its declared length: the file was truncated
+                // under the download. An error rather than a quiet end, so the
+                // connection is dropped and the client knows the copy is bad.
+                Ok(0) => Some((
+                    Err(Error::internal("a public file got shorter while it was being sent")),
+                    (file, 0),
+                )),
+                Ok(read) => {
+                    buf.truncate(read);
+                    let chunk: Bytes = buf.freeze();
+                    Some((Ok(chunk), (file, remaining - read as u64)))
+                }
+                Err(e) => {
+                    Some((Err(Error::internal(format!("reading a public file: {e}"))), (file, 0)))
+                }
+            }
+        },
+    )))
+}
+
+/// What a `Range` header asks for, against a file of `len` bytes.
+#[derive(Debug, PartialEq, Eq)]
+enum RangeAsked {
+    /// Nothing this serves as a range — a unit other than bytes, several
+    /// ranges, or a header that does not parse. Answered with the whole file.
+    None,
+    /// One range, inclusive at both ends, already clamped to the file.
+    One(u64, u64),
+    /// A range that starts past the end. `416`.
+    Unsatisfiable,
+}
+
+fn parse_range(header: &str, len: u64) -> RangeAsked {
+    let Some(spec) = header.trim().strip_prefix("bytes=") else {
+        return RangeAsked::None;
+    };
+    if spec.contains(',') {
+        return RangeAsked::None;
+    }
+    let Some((first, last)) = spec.trim().split_once('-') else {
+        return RangeAsked::None;
+    };
+    let (first, last) = (first.trim(), last.trim());
+
+    if first.is_empty() {
+        // `bytes=-500`: the last 500 bytes.
+        let Ok(suffix) = last.parse::<u64>() else {
+            return RangeAsked::None;
+        };
+        if suffix == 0 || len == 0 {
+            return RangeAsked::Unsatisfiable;
+        }
+        return RangeAsked::One(len.saturating_sub(suffix), len - 1);
+    }
+
+    let Ok(start) = first.parse::<u64>() else {
+        return RangeAsked::None;
+    };
+    let end = if last.is_empty() {
+        len.saturating_sub(1)
+    } else {
+        match last.parse::<u64>() {
+            Ok(end) if end >= start => end.min(len.saturating_sub(1)),
+            _ => return RangeAsked::None,
+        }
+    };
+    if start >= len {
+        return RangeAsked::Unsatisfiable;
+    }
+    RangeAsked::One(start, end)
 }
 
 /// A tag from what the filesystem knows without reading the file.
@@ -321,6 +475,23 @@ mod tests {
 
     fn files() -> PublicFiles {
         PublicFiles::at("public")
+    }
+
+    #[test]
+    fn a_range_is_read_the_way_the_specification_reads_it() {
+        assert_eq!(parse_range("bytes=0-99", 1000), RangeAsked::One(0, 99));
+        assert_eq!(parse_range("bytes=900-", 1000), RangeAsked::One(900, 999));
+        assert_eq!(parse_range("bytes=-100", 1000), RangeAsked::One(900, 999));
+        // Past the end clamps; a suffix bigger than the file is all of it.
+        assert_eq!(parse_range("bytes=990-5000", 1000), RangeAsked::One(990, 999));
+        assert_eq!(parse_range("bytes=-5000", 1000), RangeAsked::One(0, 999));
+        assert_eq!(parse_range("bytes=1000-", 1000), RangeAsked::Unsatisfiable);
+        assert_eq!(parse_range("bytes=-0", 1000), RangeAsked::Unsatisfiable);
+        // Served whole rather than refused.
+        assert_eq!(parse_range("bytes=0-1,5-6", 1000), RangeAsked::None);
+        assert_eq!(parse_range("items=0-1", 1000), RangeAsked::None);
+        assert_eq!(parse_range("bytes=9-3", 1000), RangeAsked::None);
+        assert_eq!(parse_range("bytes=x-3", 1000), RangeAsked::None);
     }
 
     #[test]

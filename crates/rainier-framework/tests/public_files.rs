@@ -9,7 +9,7 @@
 use std::fs;
 
 use rainier_framework::public::PublicFiles;
-use rainier_http::{Method, Request, StatusCode};
+use rainier_http::{Body, Method, Request, StatusCode};
 
 /// A fresh tree per test.
 ///
@@ -146,4 +146,119 @@ async fn none_is_sent_when_none_is_configured() {
     let files = PublicFiles::at(root("none_is_sent_when_none_is_configured"));
 
     assert_eq!(files.serve(&get("/robots.txt")).await.header("cache-control"), None);
+}
+
+/// A file over the in-memory limit, with every byte different from its
+/// neighbours' so an off-by-one in a range or a chunk boundary shows.
+fn big(dir: &std::path::Path) -> Vec<u8> {
+    let len = rainier_framework::public::IN_MEMORY_LIMIT as usize * 3 + 12_345;
+    let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    fs::write(dir.join("disk.img"), &bytes).unwrap();
+    bytes
+}
+
+fn with(path: &str, headers: &[(&str, &str)]) -> Request {
+    let mut builder = Request::builder().method(Method::GET).uri(path);
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    builder.build()
+}
+
+#[tokio::test]
+async fn a_big_file_streams_rather_than_being_read_whole() {
+    // A disk image read whole is a process holding a gigabyte per download.
+    let dir = root("a_big_file_streams_rather_than_being_read_whole");
+    let expected = big(&dir);
+    let files = PublicFiles::at(&dir);
+
+    let mut response = files.serve(&get("/disk.img")).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(matches!(response.body(), Body::Stream(_)), "{:?}", response.body());
+    assert_eq!(response.header("content-length"), Some(expected.len().to_string().as_str()));
+    let body = response.take_body().collect().await.unwrap();
+    assert!(body[..] == expected[..], "the streamed bytes are not the file");
+}
+
+#[tokio::test]
+async fn a_small_file_stays_in_memory_so_it_can_be_compressed() {
+    let files = PublicFiles::at(root("a_small_file_stays_in_memory_so_it_can_be_compressed"));
+
+    let response = files.serve(&get("/robots.txt")).await;
+
+    assert!(matches!(response.body(), Body::Bytes(_)), "{:?}", response.body());
+    assert_eq!(response.header("accept-ranges"), Some("bytes"));
+}
+
+#[tokio::test]
+async fn a_range_is_answered_206_with_exactly_those_bytes() {
+    let dir = root("a_range_is_answered_206_with_exactly_those_bytes");
+    let expected = big(&dir);
+    let len = expected.len();
+    let files = PublicFiles::at(&dir);
+
+    // One small range from the middle, and one big enough to stream.
+    for (asked, start, end) in [
+        ("bytes=1000-1999".to_string(), 1000, 1999),
+        (format!("bytes={}-", 100), 100, len - 1),
+        ("bytes=-10".to_string(), len - 10, len - 1),
+    ] {
+        let mut response = files.serve(&with("/disk.img", &[("range", &asked)])).await;
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{asked}");
+        assert_eq!(
+            response.header("content-range"),
+            Some(format!("bytes {start}-{end}/{len}").as_str()),
+            "{asked}"
+        );
+        assert_eq!(
+            response.header("content-length"),
+            Some((end - start + 1).to_string().as_str()),
+            "{asked}"
+        );
+        let body = response.take_body().collect().await.unwrap();
+        assert!(body[..] == expected[start..=end], "{asked}: wrong bytes");
+    }
+}
+
+#[tokio::test]
+async fn a_range_of_an_older_version_gets_the_whole_file() {
+    // `If-Range` naming another etag: splicing a range of this version into a
+    // copy of that one would be a corrupt file.
+    let dir = root("a_range_of_an_older_version_gets_the_whole_file");
+    let files = PublicFiles::at(&dir);
+    let tag = files.serve(&get("/robots.txt")).await.header("etag").unwrap().to_string();
+
+    let stale =
+        files.serve(&with("/robots.txt", &[("range", "bytes=0-3"), ("if-range", "\"0-0\"")])).await;
+    assert_eq!(stale.status(), StatusCode::OK);
+
+    let current =
+        files.serve(&with("/robots.txt", &[("range", "bytes=0-3"), ("if-range", &tag)])).await;
+    assert_eq!(current.status(), StatusCode::PARTIAL_CONTENT);
+}
+
+#[tokio::test]
+async fn a_range_past_the_end_is_416() {
+    let files = PublicFiles::at(root("a_range_past_the_end_is_416"));
+
+    let response = files.serve(&with("/robots.txt", &[("range", "bytes=5000-")])).await;
+
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(response.header("content-range"), Some("bytes */14"));
+}
+
+#[tokio::test]
+async fn a_head_of_a_big_file_has_its_length_and_no_body() {
+    let dir = root("a_head_of_a_big_file_has_its_length_and_no_body");
+    let expected = big(&dir);
+    let files = PublicFiles::at(&dir);
+
+    let head = Request::builder().method(Method::HEAD).uri("/disk.img").build();
+    let response = files.serve(&head).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.header("content-length"), Some(expected.len().to_string().as_str()));
+    assert!(response.body().is_empty());
 }

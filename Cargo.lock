@@ -3937,6 +3937,7 @@ version = "2.0.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "bytes",
  "chrono",
  "futures-util",
  "percent-encoding",

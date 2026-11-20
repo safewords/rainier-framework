@@ -56,6 +56,8 @@ rainier-scheduler = { workspace = true }
 rainier-session = { workspace = true }
 rainier-orm = { workspace = true }
 async-trait = { workspace = true }
+# Streamed `public/` files are read into `BytesMut` chunks — see `public`.
+bytes = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }

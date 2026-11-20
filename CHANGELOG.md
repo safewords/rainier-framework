@@ -12,6 +12,13 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **`public/` files stream, and answer ranges** (`rainier-framework`):
+  `PublicFiles` read every file whole into memory before sending it, so a
+  process serving a large download held all of it at once, per request. Files
+  over `public::IN_MEMORY_LIMIT` (1 MiB) now stream from disk with their
+  `Content-Length`; smaller ones stay in memory so compression still applies. A
+  single `Range: bytes=…` is answered `206` (`416` past the end, `If-Range`
+  honoured), and `Accept-Ranges` says `bytes` rather than `none`.
 - **`Database::guarding_lost_transactions`** (`rainier-database`): on
   multi-primary Galera, a transaction aborted by a conflicting writeset from
   another node was not always reported to the client, and the rest of its work

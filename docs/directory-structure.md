@@ -96,6 +96,13 @@ route always wins over a file of the same name, and dotfiles and anything
 outside the directory are refused. A proxy or CDN in front can still serve them
 instead, if you have one.
 
+A file up to 1 MiB is sent from memory, which lets
+[compression](middleware.md#compress) shrink a stylesheet or a script; anything larger is
+streamed from disk with its `Content-Length` declared, so a video or a disk
+image costs a 64 KiB buffer per download rather than its own size. A single
+`Range: bytes=…` is answered `206 Partial Content` (and `If-Range` respected),
+so downloads resume and media seeks.
+
 ### `config/` is Rust, not data files
 
 `src/config/` is a Rust module with one `configure` function per concern, all
