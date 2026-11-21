@@ -93,6 +93,7 @@ fn render(state: &Shared) -> String {
         "version": version(),
         "insights": state.config.insights,
         "stream": state.config.dashboard.stream,
+        "mcp": state.config.dashboard.mcp,
     });
     let assets = attribute(&format!("{}/assets", state.base));
     let version = version();

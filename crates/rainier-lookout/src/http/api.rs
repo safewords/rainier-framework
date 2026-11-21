@@ -36,19 +36,26 @@ fn page<T: serde::Serialize>(
 
 /// `GET /api/batches`.
 pub(crate) async fn batches(state: Arc<Shared>, request: Req) -> Result<Response> {
-    let mut params = Params::new(request.query());
+    Ok(Response::json(&batches_value(&state, request.query()).await?))
+}
+
+pub(crate) async fn batches_value(state: &Shared, query: &Value) -> Result<Value> {
+    let mut params = Params::new(query);
     let query = params::batch_query(&mut params);
     params.finish()?;
     let limit = query.limit.unwrap_or(params::DEFAULT_LIMIT);
     let found = state.store.batches(query).await?;
-    Ok(Response::json(&page(&found, limit, |b| b.started_at)))
+    Ok(page(&found, limit, |b| b.started_at))
 }
 
 /// `GET /api/batches/{id}`.
 pub(crate) async fn batch(state: Arc<Shared>, request: Req) -> Result<Response> {
-    let id = request.route_param("id").unwrap_or_default();
+    Ok(Response::json(&batch_value(&state, request.route_param("id").unwrap_or_default()).await?))
+}
+
+pub(crate) async fn batch_value(state: &Shared, id: &str) -> Result<Value> {
     match state.store.batch(id).await? {
-        Some(batch) => Ok(Response::json(&json!({ "data": batch }))),
+        Some(batch) => Ok(json!({ "data": batch })),
         None => Err(Error::not_found("No such batch.")),
     }
 }
@@ -56,15 +63,24 @@ pub(crate) async fn batch(state: Arc<Shared>, request: Req) -> Result<Response> 
 /// `GET /api/entries/{type}`: newest first; `family` (or `key`) narrows to
 /// one family, `q` to entries whose summary or family key contains the text.
 pub(crate) async fn entries(state: Arc<Shared>, request: Req) -> Result<Response> {
-    let mut params = Params::new(request.query());
-    let entry_type = params.parse_type("type", request.route_param("type").unwrap_or_default());
+    let entry_type = request.route_param("type").unwrap_or_default();
+    Ok(Response::json(&entries_value(&state, entry_type, request.query()).await?))
+}
+
+pub(crate) async fn entries_value(
+    state: &Shared,
+    entry_type: &str,
+    query: &Value,
+) -> Result<Value> {
+    let mut params = Params::new(query);
+    let entry_type = params.parse_type("type", entry_type);
     let mut query = params::entries_query(&mut params);
     params.finish()?;
     let Some(entry_type) = entry_type else {
         return Err(Error::internal("validated entry type missing"));
     };
     if let Some(id) = query.family.clone() {
-        query.key = Some(require_family(&state, entry_type, &id).await?);
+        query.key = Some(require_family(state, entry_type, &id).await?);
     }
     let limit = query.limit;
     let Some(search) = query.search.map(|q| q.to_lowercase()) else {
@@ -72,7 +88,7 @@ pub(crate) async fn entries(state: Arc<Shared>, request: Req) -> Result<Response
             Some(key) => state.store.family_entries(entry_type, key, query.before, limit).await?,
             None => state.store.entries(entry_type, query.before, limit).await?,
         };
-        return Ok(Response::json(&page(&found, limit, |e| e.occurred_at)));
+        return Ok(page(&found, limit, |e| e.occurred_at));
     };
 
     // A text search reads at most this many pages, so it is bounded however
@@ -105,7 +121,7 @@ pub(crate) async fn entries(state: Arc<Shared>, request: Req) -> Result<Response
         (false, false, _, Some(cursor)) => json!({ "before": cursor.to_rfc3339() }),
         _ => Value::Null,
     };
-    Ok(Response::json(&json!({ "data": found, "next": next })))
+    Ok(json!({ "data": found, "next": next }))
 }
 
 /// `GET /api/models`: every model written since `since` (24 hours by
@@ -113,7 +129,11 @@ pub(crate) async fn entries(state: Arc<Shared>, request: Req) -> Result<Response
 /// aggregates, so every write is counted, in kept batches or not. `period`
 /// picks the buckets read (600 by default; 3600 for a window past a day).
 pub(crate) async fn models(state: Arc<Shared>, request: Req) -> Result<Response> {
-    let mut params = Params::new(request.query());
+    Ok(Response::json(&models_value(&state, request.query()).await?))
+}
+
+pub(crate) async fn models_value(state: &Shared, query: &Value) -> Result<Value> {
+    let mut params = Params::new(query);
     let now = Utc::now();
     let since = params.time("since").unwrap_or(now - chrono::Duration::hours(24));
     let period = params::period(&mut params);
@@ -122,20 +142,24 @@ pub(crate) async fn models(state: Arc<Shared>, request: Req) -> Result<Response>
         period.unwrap_or(if now - since > chrono::Duration::hours(24) { 3600 } else { 600 });
     let rows = state.store.aggregate_rows(EntryType::Model, period, since).await?;
     let models = crate::watchers::models::summarize(&rows);
-    Ok(Response::json(&json!({ "data": models, "since": since.to_rfc3339(), "period_s": period })))
+    Ok(json!({ "data": models, "since": since.to_rfc3339(), "period_s": period }))
 }
 
 /// `GET /api/models/{model}`: one model's recorded changes, every action,
 /// newest first; `before` pages. Each entry's `content.batch` says what made
 /// it — its kind, summary and trace id — and `batch_id` links to the batch.
 pub(crate) async fn model(state: Arc<Shared>, request: Req) -> Result<Response> {
-    let mut params = Params::new(request.query());
+    let model = request.route_param("model").unwrap_or_default();
+    Ok(Response::json(&model_value(&state, model, request.query()).await?))
+}
+
+pub(crate) async fn model_value(state: &Shared, model: &str, query: &Value) -> Result<Value> {
+    let mut params = Params::new(query);
     let before = params.time("before");
     let limit = params.limit(params::MAX_LIMIT, params::DEFAULT_LIMIT);
     params.finish()?;
-    let model = request.route_param("model").unwrap_or_default();
     let found = state.store.model_changes(model, before, limit).await?;
-    Ok(Response::json(&page(&found, limit, |e| e.occurred_at)))
+    Ok(page(&found, limit, |e| e.occurred_at))
 }
 
 /// One aggregate row as the API shows it: the stored fields plus the average
@@ -155,15 +179,22 @@ fn aggregate_json(row: &Aggregate) -> Value {
 
 /// `GET /api/families/{type}/{id}`: the key a [`family_id`] names.
 pub(crate) async fn family(state: Arc<Shared>, request: Req) -> Result<Response> {
-    let mut params = Params::new(request.query());
-    let entry_type = params.parse_type("type", request.route_param("type").unwrap_or_default());
+    let entry_type = request.route_param("type").unwrap_or_default();
+    let id = request.route_param("id").unwrap_or_default();
+    Ok(Response::json(&family_value(&state, entry_type, id).await?))
+}
+
+pub(crate) async fn family_value(state: &Shared, entry_type: &str, id: &str) -> Result<Value> {
+    let empty = Value::Object(Map::new());
+    let mut params = Params::new(&empty);
+    let entry_type = params.parse_type("type", entry_type);
     params.finish()?;
     let Some(entry_type) = entry_type else {
         return Err(Error::internal("validated entry type missing"));
     };
-    let id = request.route_param("id").unwrap_or_default().to_ascii_lowercase();
-    let key = require_family(&state, entry_type, &id).await?;
-    Ok(Response::json(&json!({ "data": { "id": id, "key": key } })))
+    let id = id.to_ascii_lowercase();
+    let key = require_family(state, entry_type, &id).await?;
+    Ok(json!({ "data": { "id": id, "key": key } }))
 }
 
 /// The key a [`family_id`] names, or 404.
@@ -190,8 +221,17 @@ async fn require_family(state: &Shared, entry_type: EntryType, id: &str) -> Resu
 
 /// `GET /api/aggregates/{type}`.
 pub(crate) async fn aggregates(state: Arc<Shared>, request: Req) -> Result<Response> {
-    let mut params = Params::new(request.query());
-    let entry_type = params.parse_type("type", request.route_param("type").unwrap_or_default());
+    let entry_type = request.route_param("type").unwrap_or_default();
+    Ok(Response::json(&aggregates_value(&state, entry_type, request.query()).await?))
+}
+
+pub(crate) async fn aggregates_value(
+    state: &Shared,
+    entry_type: &str,
+    query: &Value,
+) -> Result<Value> {
+    let mut params = Params::new(query);
+    let entry_type = params.parse_type("type", entry_type);
     let query = params::aggregate_query(&mut params, entry_type, Utc::now());
     params.finish()?;
     let Some(query) = query else {
@@ -199,15 +239,20 @@ pub(crate) async fn aggregates(state: Arc<Shared>, request: Req) -> Result<Respo
     };
     let rows = state.store.aggregates(query).await?;
     let data: Vec<Value> = rows.iter().map(aggregate_json).collect();
-    Ok(Response::json(&json!({ "data": data })))
+    Ok(json!({ "data": data }))
 }
 
 /// `GET /api/series/{type}`: one zero-filled point per bucket from `since`
 /// to now, the projection past it, and with `keys=N` a series for each of the
 /// N busiest keys.
 pub(crate) async fn series(state: Arc<Shared>, request: Req) -> Result<Response> {
-    let mut params = Params::new(request.query());
-    let entry_type = params.parse_type("type", request.route_param("type").unwrap_or_default());
+    let entry_type = request.route_param("type").unwrap_or_default();
+    Ok(Response::json(&series_value(&state, entry_type, request.query()).await?))
+}
+
+pub(crate) async fn series_value(state: &Shared, entry_type: &str, query: &Value) -> Result<Value> {
+    let mut params = Params::new(query);
+    let entry_type = params.parse_type("type", entry_type);
     let now = Utc::now();
     let forecast_default =
         if state.config.insights.enabled { state.config.insights.forecast_buckets } else { 0 };
@@ -219,7 +264,7 @@ pub(crate) async fn series(state: Arc<Shared>, request: Req) -> Result<Response>
     let mut rows =
         state.store.aggregate_rows(query.entry_type, query.period_s, query.since).await?;
     let key = if let Some(id) = &query.family {
-        Some(require_family(&state, query.entry_type, id).await?)
+        Some(require_family(state, query.entry_type, id).await?)
     } else {
         query.key.clone()
     };
@@ -270,7 +315,7 @@ pub(crate) async fn series(state: Arc<Shared>, request: Req) -> Result<Response>
             );
         }
     }
-    Ok(Response::json(&json!({
+    Ok(json!({
         "data": points,
         "forecast": forecast,
         "period": query.period_s,
@@ -279,17 +324,21 @@ pub(crate) async fn series(state: Arc<Shared>, request: Req) -> Result<Response>
         // `{ slot: count }` — what an issue page draws its distribution from.
         "histogram": histogram,
         "keys": keys,
-    })))
+    }))
 }
 
 /// `GET /api/insights`: what changed between the last window and the one
 /// before, by the configured thresholds or the ones in the query.
 pub(crate) async fn insights(state: Arc<Shared>, request: Req) -> Result<Response> {
-    let mut params = Params::new(request.query());
+    Ok(Response::json(&insights_value(&state, request.query()).await?))
+}
+
+pub(crate) async fn insights_value(state: &Shared, query: &Value) -> Result<Value> {
+    let mut params = Params::new(query);
     let (config, limit) = params::insights_query(&mut params, state.config.insights);
     params.finish()?;
     if !state.config.insights.enabled {
-        return Ok(Response::json(&json!({ "data": [], "config": config, "enabled": false })));
+        return Ok(json!({ "data": [], "config": config, "enabled": false }));
     }
     let now = Utc::now();
     let period = config.period_s();
@@ -304,34 +353,41 @@ pub(crate) async fn insights(state: Arc<Shared>, request: Req) -> Result<Respons
     .flatten()
     .collect();
     let found = trends::insights(&rows, &config, now, limit);
-    Ok(Response::json(&json!({ "data": found, "config": config, "enabled": true })))
+    Ok(json!({ "data": found, "config": config, "enabled": true }))
 }
 
 /// `GET /api/cases`.
 pub(crate) async fn cases(state: Arc<Shared>, request: Req) -> Result<Response> {
-    let mut params = Params::new(request.query());
+    Ok(Response::json(&cases_value(&state, request.query()).await?))
+}
+
+pub(crate) async fn cases_value(state: &Shared, query: &Value) -> Result<Value> {
+    let mut params = Params::new(query);
     let query = params::case_query(&mut params);
     params.finish()?;
     let found = state.store.cases(query).await?;
-    Ok(Response::json(&json!({ "data": found })))
+    Ok(json!({ "data": found }))
 }
 
 /// `GET /api/cases/{id}`.
 pub(crate) async fn case(state: Arc<Shared>, request: Req) -> Result<Response> {
-    let id = request.route_param("id").unwrap_or_default();
+    Ok(Response::json(&case_value(&state, request.route_param("id").unwrap_or_default()).await?))
+}
+
+pub(crate) async fn case_value(state: &Shared, id: &str) -> Result<Value> {
     match state.store.case(id).await? {
-        Some(case) => Ok(Response::json(&json!({ "data": case }))),
+        Some(case) => Ok(json!({ "data": case })),
         None => Err(Error::not_found("No such case.")),
     }
 }
 
 #[derive(serde::Deserialize)]
-struct CaseActionBody {
-    action: String,
+pub(crate) struct CaseActionBody {
+    pub(crate) action: String,
     #[serde(default)]
-    severity: Option<String>,
+    pub(crate) severity: Option<String>,
     #[serde(default)]
-    note: Option<String>,
+    pub(crate) note: Option<String>,
 }
 
 /// `POST /api/cases/{id}`: resolve, reopen, ignore, or set the severity.
@@ -344,6 +400,16 @@ pub(crate) async fn act_on_case(state: Arc<Shared>, request: Req) -> Result<Resp
         )));
     }
     let body: CaseActionBody = request.json()?;
+    let id = request.route_param("id").unwrap_or_default();
+    Ok(Response::json(&act_on_case_value(&state, id, body).await?))
+}
+
+/// Resolve, reopen, ignore, or set the severity of case `id`.
+pub(crate) async fn act_on_case_value(
+    state: &Shared,
+    id: &str,
+    body: CaseActionBody,
+) -> Result<Value> {
     let mut errors = Map::new();
     let action = match body.action.as_str() {
         "resolve" => Some(CaseAction::Resolve),
@@ -374,13 +440,12 @@ pub(crate) async fn act_on_case(state: Arc<Shared>, request: Req) -> Result<Resp
     let Some(action) = action.filter(|_| errors.is_empty()) else {
         return Err(Error::validation(Value::Object(errors)));
     };
-    let id = request.route_param("id").unwrap_or_default();
     let Some(case) = state.store.case(id).await? else {
         return Err(Error::not_found("No such case."));
     };
     let case = cases::act(case, &action, note, Utc::now());
     state.store.save_case(case.clone()).await?;
-    Ok(Response::json(&json!({ "data": case })))
+    Ok(json!({ "data": case }))
 }
 
 /// `GET /api/status`.

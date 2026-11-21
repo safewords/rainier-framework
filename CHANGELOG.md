@@ -12,6 +12,20 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **MCP** (`rainier-mcp`, `rainier-framework`): a Model Context Protocol
+  server served from the application's own router — tools, resources and
+  prompts declared with `Rainier::with_mcp`, over stateless Streamable HTTP at
+  `MCP_PATH` (`/_mcp`). Behind the `mcp` feature and `MCP_ENABLED`; open in the
+  local environment, otherwise a bearer token from `MCP_TOKENS` or the
+  application's `with_mcp_access` check, and the router's own 404 for anyone
+  else. See `docs/mcp.md`.
+- **Lookout over MCP** (`rainier-lookout`): with both on, Lookout's tools
+  (`lookout_batches`, `lookout_batch`, `lookout_aggregates`, `lookout_cases`
+  and the rest) and four prompts (`lookout_health`, `lookout_triage`,
+  `lookout_slow_route`, `lookout_investigate_case`) join the server, running
+  the JSON API's own code. The dashboard has an **MCP** page saying how to
+  connect, and an assistant's reads are not recorded.
+
 - **`public/` files stream, and answer ranges** (`rainier-framework`):
   `PublicFiles` read every file whole into memory before sending it, so a
   process serving a large download held all of it at once, per request. Files

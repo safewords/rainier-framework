@@ -83,6 +83,7 @@ hyper.
 | `rainier-websocket` | **socket** handlers, rooms, the socket handle | http |
 | `rainier-metrics` | the **Prometheus** registry and request timing | middleware |
 | `rainier-openapi` | the **OpenAPI** document, and rules-to-schema | routing, validation |
+| `rainier-mcp` | a **Model Context Protocol** server: tools, resources, prompts | routing |
 | `rainier-telemetry` | **trace context**, and OTLP behind a feature | middleware |
 | `rainier-server` | the HTTP kernel and the hyper server | routing, middleware |
 | `rainier-console` | the console kernel and its commands | container |

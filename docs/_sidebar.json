@@ -14,7 +14,7 @@
   { "group": "Digging Deeper", "items": [
     "console", "events", "queues", "deferred", "scheduling", "mail", "notifications",
     "broadcasting", "websockets", "kafka", "cache", "filesystem",
-    "http-client", "helpers", "scenarios"
+    "http-client", "mcp", "helpers", "scenarios"
   ] },
   { "group": "Security", "items": [
     "authentication", "authorization", "hashing", "encryption", "sessions", "captcha"

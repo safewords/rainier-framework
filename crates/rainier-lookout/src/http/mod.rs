@@ -72,7 +72,7 @@ use rainier_support::{BoxFuture, Error};
 use crate::config::{Dashboard, LookoutConfig};
 use crate::store::Store;
 
-mod api;
+pub(crate) mod api;
 mod params;
 mod rum;
 mod shell;

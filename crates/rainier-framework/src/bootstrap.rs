@@ -99,6 +99,15 @@ pub struct Rainier {
     /// its user type.
     #[cfg(feature = "lookout")]
     lookout_viewers: Option<crate::lookout::Viewers>,
+    /// Additions to the MCP server, applied in order at boot.
+    #[cfg(feature = "mcp")]
+    mcp: Vec<crate::mcp::Adjustment>,
+    /// The application's own say on who may use the MCP server.
+    #[cfg(feature = "mcp")]
+    mcp_access: Option<crate::mcp::AccessCheck>,
+    /// Adjustments to the `MCP_*` settings, applied over the environment.
+    #[cfg(feature = "mcp")]
+    mcp_settings: Vec<Box<dyn FnOnce(crate::mcp::McpSettings) -> crate::mcp::McpSettings>>,
 }
 
 impl Rainier {
@@ -149,6 +158,12 @@ impl Rainier {
             lookout: Vec::new(),
             #[cfg(feature = "lookout")]
             lookout_viewers: None,
+            #[cfg(feature = "mcp")]
+            mcp: Vec::new(),
+            #[cfg(feature = "mcp")]
+            mcp_access: None,
+            #[cfg(feature = "mcp")]
+            mcp_settings: Vec::new(),
         }
     }
 
@@ -736,6 +751,69 @@ impl Rainier {
         self
     }
 
+    /// Add to the MCP server: tools, resources, prompts, instructions.
+    ///
+    /// Each closure is handed the server and returns it, in order. Nothing
+    /// is served unless `MCP_ENABLED` is true; see `docs/mcp.md`.
+    ///
+    /// ```no_run
+    /// # use rainier_framework::Rainier;
+    /// use rainier_framework::mcp::{Tool, ToolResult};
+    /// # fn wire(app: Rainier) -> Rainier {
+    /// app.with_mcp(|server| {
+    ///     server.tool(
+    ///         Tool::new("ping", "Answer pong.", |_| async { Ok(ToolResult::text("pong")) })
+    ///             .read_only(),
+    ///     )
+    /// })
+    /// # }
+    /// ```
+    #[cfg(feature = "mcp")]
+    pub fn with_mcp(
+        mut self,
+        configure: impl FnOnce(crate::mcp::McpServer) -> crate::mcp::McpServer + 'static,
+    ) -> Self {
+        self.mcp.push(Box::new(configure));
+        self
+    }
+
+    /// Adjust the MCP server's settings over what `MCP_*` says — to turn it
+    /// on in code, or move it.
+    ///
+    /// ```no_run
+    /// # use rainier_framework::Rainier;
+    /// # fn wire(app: Rainier) -> Rainier {
+    /// app.with_mcp_settings(|settings| rainier_framework::mcp::McpSettings {
+    ///     enabled: true,
+    ///     ..settings
+    /// })
+    /// # }
+    /// ```
+    #[cfg(feature = "mcp")]
+    pub fn with_mcp_settings(
+        mut self,
+        adjust: impl FnOnce(crate::mcp::McpSettings) -> crate::mcp::McpSettings + 'static,
+    ) -> Self {
+        self.mcp_settings.push(Box::new(adjust));
+        self
+    }
+
+    /// Who else may use the MCP server, besides the local environment and a
+    /// request bearing one of `MCP_TOKENS`: whoever `allow` says yes to.
+    ///
+    /// The future is `'static`; take what it needs from the request first.
+    #[cfg(feature = "mcp")]
+    pub fn with_mcp_access(
+        mut self,
+        allow: impl Fn(&rainier_http::Request) -> rainier_support::BoxFuture<'static, bool>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.mcp_access = Some(Arc::new(allow));
+        self
+    }
+
     /// Build and boot the application.
     ///
     /// Compiling the router here is what makes an unknown middleware alias or
@@ -748,16 +826,40 @@ impl Rainier {
             return Err(error);
         }
 
+        // The MCP server's settings and identity, read while the environment
+        // and configuration are still in hand. A bad `MCP_*` fails the boot.
+        #[cfg(feature = "mcp")]
+        let mcp_settings = {
+            let mut settings = crate::mcp::McpSettings::from_env(&self.env)?;
+            for adjust in std::mem::take(&mut self.mcp_settings) {
+                settings = adjust(settings);
+            }
+            let name = self.config.get(keys::APP_NAME).unwrap_or_else(|| "Rainier".into());
+            let version = self
+                .env
+                .get("APP_VERSION")
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+            (settings, name, version)
+        };
+
         // Lookout is built before the subscriber, which carries its log
         // lines. Its store needs databases and caches that do not exist yet,
         // so it starts on a deferred one that is filled in below.
         #[cfg(feature = "lookout")]
         let lookout = {
-            let config = crate::lookout::configure(
+            #[allow(unused_mut, reason = "only the `mcp` feature changes it")]
+            let mut config = crate::lookout::configure(
                 &self.env,
                 &self.config,
                 std::mem::take(&mut self.lookout),
             )?;
+            // An assistant reading Lookout over MCP is not the application's
+            // work, any more than browsing the dashboard is: its calls are
+            // not recorded. Failures in them still are.
+            #[cfg(feature = "mcp")]
+            if mcp_settings.0.enabled && mcp_settings.0.lookout {
+                config.scope.routes.exclude.push("mcp".to_string());
+            }
             config.enabled.then(|| {
                 let deferred = Arc::new(crate::lookout::DeferredStore::default());
                 let store: Arc<dyn crate::lookout::Store> = deferred.clone();
@@ -1082,6 +1184,64 @@ impl Rainier {
             });
         }
 
+        // The MCP server, outside every middleware group for the same reason
+        // as Lookout's dashboard: a refused request's 404 must be the
+        // router's own. Lookout's tools join it when both are on.
+        #[cfg(feature = "mcp")]
+        #[allow(unused_variables, reason = "only the `lookout` feature reads the link")]
+        let mcp_link: Option<crate::mcp::DashboardLink> = {
+            let (settings, name, version) = mcp_settings;
+            if settings.enabled {
+                #[allow(unused_mut, reason = "only the `lookout` feature adds to it here")]
+                let mut server = crate::mcp::McpServer::new(name, version);
+                for adjust in std::mem::take(&mut self.mcp) {
+                    server = adjust(server);
+                }
+                #[cfg(feature = "lookout")]
+                if let Some((lookout, _)) = lookout.as_ref().filter(|_| settings.lookout) {
+                    server = rainier_lookout::mcp::register(
+                        server,
+                        Arc::clone(&*app.resolve::<Arc<dyn crate::lookout::Store>>()?),
+                        Arc::new(lookout.config().clone()),
+                        &environment,
+                    );
+                }
+                // What Lookout's MCP page says: where, whether a token is
+                // needed here, and what the server offers.
+                #[cfg(not(feature = "lookout"))]
+                let link = ();
+                #[cfg(feature = "lookout")]
+                let link = crate::lookout::config::McpLink {
+                    path: rainier_routing::route::normalise_uri(&settings.path),
+                    name: server.name().to_string(),
+                    open: settings.open_locally && environment.eq_ignore_ascii_case("local"),
+                    tokens: !settings.tokens.is_empty(),
+                    tools: server.tools().iter().map(|t| t.name().to_string()).collect(),
+                    prompts: server.prompts().iter().map(|p| p.name().to_string()).collect(),
+                };
+                let server = Arc::new(server);
+                app.instance(Arc::clone(&server));
+                let mut gate = match self.mcp_access.take() {
+                    Some(check) => crate::mcp::McpGate::from_check(check),
+                    None => crate::mcp::McpGate::deny_all(),
+                };
+                for token in &settings.tokens {
+                    gate = gate.token(token.clone());
+                }
+                let mut endpoint = crate::mcp::McpEndpoint::new(server)
+                    .path(settings.path.clone())
+                    .gate(gate.open_locally(settings.open_locally))
+                    .environment(environment.clone());
+                for origin in &settings.allowed_origins {
+                    endpoint = endpoint.allow_origin(origin.clone());
+                }
+                self.router.merge(endpoint.routes());
+                Some(link)
+            } else {
+                None
+            }
+        };
+
         // Lookout's dashboard, outside every middleware group: its clearing
         // endpoint is a DELETE that the gate and a custom header protect, and
         // a group's middleware — a session cookie, a CSRF check — would make a
@@ -1089,6 +1249,12 @@ impl Rainier {
         #[cfg(feature = "lookout")]
         if let Some((lookout, _)) = &lookout {
             let config = lookout.config();
+            #[allow(unused_mut, reason = "only the `mcp` feature adds the link")]
+            let mut dashboard_config = config.clone();
+            #[cfg(feature = "mcp")]
+            {
+                dashboard_config.dashboard.mcp = mcp_link.clone();
+            }
             let gate = match &self.lookout_viewers {
                 Some(viewers) => crate::lookout::LookoutGate::from_check(viewers(
                     Arc::downgrade(&app),
@@ -1098,7 +1264,7 @@ impl Rainier {
             };
             self.router.merge(crate::lookout::routes(
                 Arc::clone(&*app.resolve::<Arc<dyn crate::lookout::Store>>()?),
-                Arc::new(config.clone()),
+                Arc::new(dashboard_config),
                 gate,
                 &crate::lookout::gate_environment(config.local, &environment),
             ));

@@ -10,6 +10,7 @@ import Batches from './views/Batches.vue'
 import BatchDetail from './views/BatchDetail.vue'
 import Entries from './views/Entries.vue'
 import Status from './views/Status.vue'
+import Mcp from './views/Mcp.vue'
 import Models from './views/Models.vue'
 import Issue from './views/Issue.vue'
 import Timing from './views/Timing.vue'
@@ -28,6 +29,8 @@ const router = createRouter({
     { path: '/batches/:id', name: 'batch', component: BatchDetail, props: true },
     { path: '/entries/:type', name: 'entries', component: Entries, props: true },
     { path: '/status', name: 'status', component: Status },
+    // How to connect an AI client to the application's MCP server.
+    { path: '/mcp', name: 'mcp', component: Mcp },
     // Every model written, and one model's changes: what made each, and its trace.
     { path: '/models', name: 'models', component: Models },
     { path: '/models/:model', name: 'model', component: Models, props: true },

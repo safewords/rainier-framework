@@ -133,6 +133,8 @@ pub mod limits;
 pub mod lookout;
 pub mod mail;
 pub mod mailers;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod model_cache;
 pub mod notifications;
 pub mod observability;

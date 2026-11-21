@@ -507,6 +507,31 @@ pub struct Dashboard {
     /// falls back to polling, for a proxy that buffers responses.
     #[serde(default = "yes")]
     pub stream: bool,
+    /// The application's MCP server, for the dashboard's MCP page — where it
+    /// is and how to connect. `None` when there is none; set by whoever
+    /// mounts both, never from the environment.
+    #[serde(default)]
+    pub mcp: Option<McpLink>,
+}
+
+/// The application's MCP server, as the dashboard's MCP page describes it.
+///
+/// Nothing secret: whether tokens exist, never what they are.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpLink {
+    /// Where it answers, from the site's root: `/_mcp`.
+    pub path: String,
+    /// The name it reports, and a sensible name for the client to give it.
+    pub name: String,
+    /// Whether anyone may connect here without a token: the local
+    /// environment, with the server open locally.
+    pub open: bool,
+    /// Whether any bearer token is configured.
+    pub tokens: bool,
+    /// The tools it offers, by name.
+    pub tools: Vec<String>,
+    /// The prompts it offers, by name.
+    pub prompts: Vec<String>,
 }
 
 impl Default for Dashboard {
@@ -518,6 +543,7 @@ impl Default for Dashboard {
             ability: "viewLookout".to_string(),
             open_locally: true,
             stream: true,
+            mcp: None,
         }
     }
 }

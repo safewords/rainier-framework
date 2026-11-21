@@ -43,6 +43,7 @@ members = [
     "crates/rainier-mfa",
     "crates/cargo-rainier",
     "crates/rainier-lookout",
+    "crates/rainier-mcp",
 ]
 
 # A local checkout of an upstream dependency (see `.cargo/config.toml`) is its
@@ -65,6 +66,7 @@ rainier-container = { path = "crates/rainier-container", version = "2.0.0" }
 rainier-config = { path = "crates/rainier-config", version = "2.0.0" }
 rainier-debug = { path = "crates/rainier-debug", version = "2.0.0" }
 rainier-lookout = { path = "crates/rainier-lookout", version = "2.0.0" }
+rainier-mcp = { path = "crates/rainier-mcp", version = "2.0.0" }
 rainier-events = { path = "crates/rainier-events", version = "2.0.0" }
 rainier-http = { path = "crates/rainier-http", version = "2.0.0" }
 rainier-http-client = { path = "crates/rainier-http-client", version = "2.0.0" }

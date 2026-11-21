@@ -3960,6 +3960,7 @@ dependencies = [
  "rainier-http-client",
  "rainier-lookout",
  "rainier-mail",
+ "rainier-mcp",
  "rainier-metrics",
  "rainier-mfa",
  "rainier-middleware",
@@ -4036,6 +4037,7 @@ dependencies = [
  "rainier-drivers",
  "rainier-events",
  "rainier-http",
+ "rainier-mcp",
  "rainier-middleware",
  "rainier-orm",
  "rainier-routing",
@@ -4068,6 +4070,21 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rainier-mcp"
+version = "2.0.0"
+dependencies = [
+ "rainier-container",
+ "rainier-http",
+ "rainier-routing",
+ "rainier-support",
+ "serde",
+ "serde_json",
+ "subtle",
  "tokio",
  "tracing",
 ]

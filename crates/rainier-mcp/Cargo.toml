@@ -1,0 +1,25 @@
+[package]
+name = "rainier-mcp"
+description = "A Model Context Protocol server for Rainier: tools, resources and prompts an application declares, served over Streamable HTTP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-http = { workspace = true }
+rainier-routing = { workspace = true }
+rainier-support = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The bearer token is compared in constant time.
+subtle = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+rainier-container = { workspace = true }
+
+[lints]
+workspace = true

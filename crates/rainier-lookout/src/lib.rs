@@ -32,6 +32,8 @@ pub mod commands;
 pub mod config;
 pub mod entry;
 pub mod http;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod middleware;
 pub mod recorder;
 pub mod redact;

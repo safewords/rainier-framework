@@ -22,6 +22,21 @@ export const config = {
   insights: insights(raw.insights),
   // Whether "Live" may stream (LOOKOUT_STREAM); otherwise it polls.
   stream: raw.stream !== false,
+  // The application's MCP server, for the MCP page: `null` when there is none.
+  mcp: mcp(raw.mcp),
+}
+
+function mcp(value) {
+  if (!value || typeof value !== 'object' || typeof value.path !== 'string') return null
+  const names = (list) => (Array.isArray(list) ? list.filter((n) => typeof n === 'string') : [])
+  return {
+    path: value.path,
+    name: typeof value.name === 'string' ? value.name : '',
+    open: value.open === true,
+    tokens: value.tokens === true,
+    tools: names(value.tools),
+    prompts: names(value.prompts),
+  }
 }
 
 function insights(value) {

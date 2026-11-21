@@ -42,6 +42,8 @@ rainier-compat = { workspace = true, optional = true }
 rainier-mfa = { workspace = true, optional = true }
 # Lookout, the diagnostics suite: see the `lookout` feature.
 rainier-lookout = { workspace = true, optional = true }
+# A Model Context Protocol server: see the `mcp` feature.
+rainier-mcp = { workspace = true, optional = true }
 rainier-cache = { workspace = true }
 rainier-crypt = { workspace = true }
 rainier-drivers = { workspace = true }
@@ -173,6 +175,10 @@ telemetry = [
 # layer. It needs no `telemetry`: that feature is OpenTelemetry — spans and
 # the OTLP exporter — and is independent of Lookout. See `docs/lookout.md`.
 lookout = ["dep:rainier-lookout", "rainier-events/log-layer"]
+# A Model Context Protocol server at `/_mcp`: the application's own tools,
+# resources and prompts for an AI client, and Lookout's when Lookout is on too.
+# Off unless `MCP_ENABLED=true`. See `docs/mcp.md`.
+mcp = ["dep:rainier-mcp", "rainier-lookout?/mcp"]
 # Stripe: customers, Checkout, the billing portal, subscriptions, payment
 # intents and refunds over the framework's outbound client, plus verified,
 # deduplicated webhooks dispatched onto the event bus. See `rainier_billing`.

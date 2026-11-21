@@ -52,6 +52,8 @@ subtle = { workspace = true }
 rand = { workspace = true }
 # A session replay's upload is checked to be a gzip before it is stored.
 base64 = { workspace = true }
+# Lookout's tools and prompts on an MCP server (`mcp`).
+rainier-mcp = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -71,6 +73,9 @@ default = []
 # in-memory SQLite, and on the servers `LOOKOUT_TEST_DATABASE_URLS` names. The
 # store itself needs no feature; this is what its tests connect with.
 sea-orm-executor = ["rainier-database/sea-orm-executor"]
+# Lookout's tools and prompts, for an MCP server the application mounts. See
+# `mcp` and `docs/mcp.md`.
+mcp = ["dep:rainier-mcp"]
 
 [lints]
 workspace = true

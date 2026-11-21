@@ -173,6 +173,7 @@ in drivers; the port crates are adapters over it.**
 | `rainier-websocket` | the socket handler contract, the socket handle, rooms |
 | `rainier-metrics` | the Prometheus registry, its text format, request timing |
 | `rainier-openapi` | the OpenAPI document, and rules-to-schema |
+| `rainier-mcp` | a Model Context Protocol server: tools, resources and prompts over HTTP |
 | `rainier-telemetry` | W3C trace context, and OTLP behind a feature |
 | `rainier-server` | the HTTP kernel and the hyper server |
 | `rainier-console` | the console: commands, arguments, the kernel |

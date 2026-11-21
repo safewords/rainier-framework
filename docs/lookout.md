@@ -929,6 +929,21 @@ shape.
 | `POST` | `/api/cases/{id}` | `{"action": "resolve" \| "reopen" \| "ignore" \| "severity", "severity"?, "note"?}` — needs `X-Lookout: 1` |
 | `GET` | `/api/status` | the store, watchers, sample rates, retention and insight thresholds |
 
+### Over MCP
+
+With the framework's `mcp` feature and `MCP_ENABLED=true`, an AI assistant
+can read all of this too: Lookout's tools — batches, a batch's waterfall,
+aggregates, series, insights, cases, models — and prompts for a health check,
+triage, a slow route and one case join the application's
+[MCP server](mcp.md#lookout), running the same code as the API above.
+`MCP_LOOKOUT=false` leaves them out.
+
+The dashboard's **MCP** page (`{path}/mcp`) says how to connect from where
+you are: the server's address, whether this environment needs a token, the
+Claude Code command, a `.mcp.json` for a repository, and a `curl` to check.
+Lookout learns of the server through `Dashboard::mcp`, which boot fills in; an
+application that mounts both itself sets it.
+
 The page itself is a prebuilt Vue app served from the binary, with a strict
 Content-Security-Policy, `X-Frame-Options: DENY` and `Cache-Control:
 no-store`.

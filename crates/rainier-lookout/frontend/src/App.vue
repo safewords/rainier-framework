@@ -102,7 +102,10 @@ const sections = [
   },
   {
     title: 'Lookout',
-    items: [{ label: 'Status', to: { name: 'status' }, match: (r) => r.name === 'status' }],
+    items: [
+      { label: 'Status', to: { name: 'status' }, match: (r) => r.name === 'status' },
+      { label: 'MCP', to: { name: 'mcp' }, match: (r) => r.name === 'mcp' },
+    ],
   },
 ]
 
