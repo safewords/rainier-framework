@@ -281,3 +281,90 @@ fn an_empty_token_never_matches() {
     let gate = McpGate::deny_all().token("  ");
     assert!(format!("{gate:?}").contains("tokens: 0"));
 }
+
+const READER: &str = "a-read-only-client-token-of-32-chars";
+
+fn with_reader() -> CompiledRouter {
+    router(McpGate::deny_all().token("let-me-in").read_only_client("reader", READER), "production")
+}
+
+async fn as_reader(router: &CompiledRouter, method: &str, params: Value) -> Answer {
+    let body = json!({ "jsonrpc": "2.0", "id": 9, "method": method, "params": params });
+    send(router, Method::POST, &body.to_string(), &[("authorization", &format!("Bearer {READER}"))])
+        .await
+}
+
+#[tokio::test]
+async fn a_read_only_client_sees_and_calls_only_read_only_tools() {
+    let router = with_reader();
+    let list = as_reader(&router, "tools/list", json!({})).await;
+    assert_eq!(list.status, StatusCode::OK);
+    let names: Vec<String> = list.json()["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["echo".to_string()]);
+
+    let echoed =
+        as_reader(&router, "tools/call", json!({ "name": "echo", "arguments": { "text": "hi" } }))
+            .await;
+    assert_eq!(echoed.json()["result"]["content"][0]["text"], "hi");
+
+    for tool in ["who", "broken", "invalid"] {
+        let refused = as_reader(&router, "tools/call", json!({ "name": tool })).await;
+        assert_eq!(refused.json()["error"]["code"], -32602, "{tool}: {}", refused.text);
+        assert!(refused.text.contains("may only read"), "{}", refused.text);
+    }
+
+    // Resources and prompts read, so a read-only client keeps them.
+    let read = as_reader(&router, "resources/read", json!({ "uri": "app://readme" })).await;
+    assert_eq!(read.json()["result"]["contents"][0]["text"], "# Hello");
+}
+
+#[tokio::test]
+async fn a_full_token_beside_a_read_only_client_keeps_everything() {
+    let router = with_reader();
+    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+    let answer =
+        send(&router, Method::POST, &body.to_string(), &[("authorization", "Bearer let-me-in")])
+            .await;
+    assert_eq!(answer.json()["result"]["tools"].as_array().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn the_gate_names_the_read_only_client_it_let_in() {
+    let gate = McpGate::deny_all().token("let-me-in").read_only_client("reader", READER);
+    let request = |token: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/_mcp")
+            .header("authorization", &format!("Bearer {token}"))
+            .body(String::new())
+            .build()
+    };
+    assert_eq!(
+        gate.admit(&request(READER), "production").await,
+        Some(Access::ReadOnly { client: "reader".into() })
+    );
+    assert_eq!(gate.admit(&request("let-me-in"), "production").await, Some(Access::Full));
+    assert_eq!(gate.admit(&request("nope"), "production").await, None);
+    assert!(!format!("{gate:?}").contains(READER), "the Debug output must not hold a token");
+}
+
+#[tokio::test]
+async fn a_tool_is_told_which_client_called_it() {
+    let tool = Tool::new("actor", "Who called.", |call| async move {
+        Ok(ToolResult::text(call.client().unwrap_or("full").to_string()))
+    })
+    .read_only();
+    let server = McpServer::new("t", "1").tool(tool);
+    let body =
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "actor" } });
+    let access = Access::ReadOnly { client: "reader".into() };
+    let answer = server.handle_as(body.clone(), None, &access).await.unwrap();
+    assert_eq!(answer["result"]["content"][0]["text"], "reader");
+    let answer = server.handle(body, None).await.unwrap();
+    assert_eq!(answer["result"]["content"][0]["text"], "full");
+}

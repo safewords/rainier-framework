@@ -12,6 +12,17 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **MCP read-only clients** (`rainier-mcp`, `rainier-framework`):
+  `MCP_READ_ONLY_CLIENTS=name=token,...` lets in named clients that are shown,
+  and may call, only the tools marked `read_only()` — with Lookout, everything
+  but `lookout_update_case` — and are logged by name on every call
+  (`rainier_mcp::access`). Each has its own token, so one is taken away
+  without touching the others. Handlers see the caller through
+  `Call::client()` / `Call::access()`; `McpGate::read_only_client`,
+  `McpGate::admit` and `McpServer::handle_as` are the same in code. A name or
+  token given twice, or a read-only token that is also in `MCP_TOKENS`, fails
+  the boot. See `docs/mcp.md#read-only-clients`.
+
 - **MCP** (`rainier-mcp`, `rainier-framework`): a Model Context Protocol
   server served from the application's own router — tools, resources and
   prompts declared with `Rainier::with_mcp`, over stateless Streamable HTTP at

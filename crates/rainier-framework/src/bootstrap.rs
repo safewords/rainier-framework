@@ -1215,7 +1215,7 @@ impl Rainier {
                     path: rainier_routing::route::normalise_uri(&settings.path),
                     name: server.name().to_string(),
                     open: settings.open_locally && environment.eq_ignore_ascii_case("local"),
-                    tokens: !settings.tokens.is_empty(),
+                    tokens: !settings.tokens.is_empty() || !settings.read_only_clients.is_empty(),
                     tools: server.tools().iter().map(|t| t.name().to_string()).collect(),
                     prompts: server.prompts().iter().map(|p| p.name().to_string()).collect(),
                 };
@@ -1227,6 +1227,9 @@ impl Rainier {
                 };
                 for token in &settings.tokens {
                     gate = gate.token(token.clone());
+                }
+                for (name, token) in &settings.read_only_clients {
+                    gate = gate.read_only_client(name.clone(), token.clone());
                 }
                 let mut endpoint = crate::mcp::McpEndpoint::new(server)
                     .path(settings.path.clone())

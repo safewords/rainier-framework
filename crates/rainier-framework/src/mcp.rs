@@ -18,8 +18,8 @@
 //! 4. binds the server in the container as `Arc<McpServer>`;
 //! 5. mounts it at `MCP_PATH` (`/_mcp`), outside every middleware group,
 //!    behind an [`McpGate`]: everyone in the local environment (unless
-//!    `MCP_OPEN_LOCALLY=false`), a request bearing one of `MCP_TOKENS`, or
-//!    whoever [`Rainier::with_mcp_access`](crate::Rainier::with_mcp_access)
+//!    `MCP_OPEN_LOCALLY=false`), a request bearing one of `MCP_TOKENS`, a
+//!    named read-only client from `MCP_READ_ONLY_CLIENTS`, or whoever [`Rainier::with_mcp_access`](crate::Rainier::with_mcp_access)
 //!    lets through. Anybody else gets the router's own 404.
 //!
 //! Off, it binds nothing and mounts nothing.
@@ -51,6 +51,10 @@ pub struct McpSettings {
     /// `MCP_TOKENS`: bearer tokens that are let in, comma-separated. Two at
     /// once so one can be rotated without a gap.
     pub tokens: Vec<String>,
+    /// `MCP_READ_ONLY_CLIENTS`: named clients that may only read, as
+    /// `name=token` pairs, comma-separated. Each is shown, and may call, only
+    /// the read-only tools, and is logged by name on every call.
+    pub read_only_clients: Vec<(String, String)>,
     /// `MCP_ALLOWED_ORIGINS`: browser origins allowed besides the server's
     /// own host, comma-separated.
     pub allowed_origins: Vec<String>,
@@ -68,6 +72,7 @@ impl Default for McpSettings {
             enabled: false,
             path: "/_mcp".into(),
             tokens: Vec::new(),
+            read_only_clients: Vec::new(),
             allowed_origins: Vec::new(),
             open_locally: true,
             lookout: true,
@@ -79,7 +84,11 @@ impl McpSettings {
     /// Read the `MCP_*` variables.
     ///
     /// A token shorter than 32 characters fails: it is the only thing
-    /// between the internet and every tool, Lookout's included.
+    /// between the internet and every tool, Lookout's included. So does a
+    /// read-only client that is not `name=token`, a name that is not
+    /// letters, digits, `.`, `_` or `-`, a name given twice, and a token used
+    /// twice — two clients on one token could not be told apart, and a
+    /// client on a full token would not be read-only.
     pub fn from_env(env: &Env) -> Result<Self> {
         let list = |name: &str| -> Vec<String> {
             env.get(name)
@@ -90,10 +99,29 @@ impl McpSettings {
                 .map(str::to_string)
                 .collect()
         };
+        let mut read_only_clients = Vec::new();
+        for entry in list("MCP_READ_ONLY_CLIENTS") {
+            let Some((name, token)) = entry.split_once('=') else {
+                return Err(Error::internal(
+                    "mcp: every MCP_READ_ONLY_CLIENTS entry must be name=token",
+                ));
+            };
+            let (name, token) = (name.trim(), token.trim());
+            let valid_name = !name.is_empty()
+                && name.len() <= 64
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+            if !valid_name {
+                return Err(Error::internal(
+                    "mcp: an MCP_READ_ONLY_CLIENTS name must be 1-64 letters, digits, `.`, `_` or `-`",
+                ));
+            }
+            read_only_clients.push((name.to_string(), token.to_string()));
+        }
         let settings = Self {
             enabled: env.bool("MCP_ENABLED", false),
             path: env.string("MCP_PATH", "/_mcp"),
             tokens: list("MCP_TOKENS"),
+            read_only_clients,
             allowed_origins: list("MCP_ALLOWED_ORIGINS"),
             open_locally: env.bool("MCP_OPEN_LOCALLY", true),
             lookout: env.bool("MCP_LOOKOUT", true),
@@ -103,6 +131,29 @@ impl McpSettings {
                 "mcp: every MCP_TOKENS entry must be at least 32 characters; one is {}",
                 short.chars().count()
             )));
+        }
+        if let Some((name, token)) =
+            settings.read_only_clients.iter().find(|(_, t)| t.chars().count() < 32)
+        {
+            return Err(Error::internal(format!(
+                "mcp: the MCP_READ_ONLY_CLIENTS token of `{name}` must be at least 32 characters; it is {}",
+                token.chars().count()
+            )));
+        }
+        let mut names = std::collections::HashSet::new();
+        let mut tokens: std::collections::HashSet<&str> =
+            settings.tokens.iter().map(String::as_str).collect();
+        for (name, token) in &settings.read_only_clients {
+            if !names.insert(name.as_str()) {
+                return Err(Error::internal(format!(
+                    "mcp: MCP_READ_ONLY_CLIENTS names `{name}` twice"
+                )));
+            }
+            if !tokens.insert(token.as_str()) {
+                return Err(Error::internal(format!(
+                    "mcp: the MCP_READ_ONLY_CLIENTS token of `{name}` is also another token"
+                )));
+            }
         }
         if !settings.path.starts_with('/') {
             return Err(Error::internal("mcp: MCP_PATH must start with `/`"));
@@ -146,6 +197,37 @@ mod tests {
         let env = Env::from_map([("MCP_TOKENS", "short")]).isolated();
         assert!(McpSettings::from_env(&env).is_err());
     }
+
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn clients(value: &str) -> Result<McpSettings> {
+        McpSettings::from_env(
+            &Env::from_map([("MCP_TOKENS", A), ("MCP_READ_ONLY_CLIENTS", value)]).isolated(),
+        )
+    }
+
+    #[test]
+    fn read_only_clients_are_name_token_pairs() {
+        let settings = clients(&format!(" reader-1 = {B} , ")).unwrap();
+        assert_eq!(settings.read_only_clients, vec![("reader-1".to_string(), B.to_string())]);
+    }
+
+    #[test]
+    fn a_malformed_read_only_client_fails() {
+        assert!(clients(B).is_err(), "no name");
+        assert!(clients(&format!("={B}")).is_err(), "empty name");
+        assert!(clients(&format!("two words={B}")).is_err(), "bad name");
+        assert!(clients("reader=short").is_err(), "short token");
+    }
+
+    #[test]
+    fn a_read_only_client_must_be_told_apart() {
+        let c = "cccccccccccccccccccccccccccccccc";
+        assert!(clients(&format!("x={B},x={c}")).is_err(), "a name twice");
+        assert!(clients(&format!("x={B},y={B}")).is_err(), "a token twice");
+        assert!(clients(&format!("x={A}")).is_err(), "a full token as a read-only one");
+    }
 }
 
 #[cfg(test)]
@@ -159,10 +241,13 @@ mod boot_tests {
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
+    const READER: &str = "fedcba9876543210fedcba9876543210";
+
     fn on(local: bool) -> impl FnOnce(McpSettings) -> McpSettings {
         move |settings| McpSettings {
             enabled: true,
             tokens: vec![TOKEN.into()],
+            read_only_clients: vec![("reader".into(), READER.into())],
             open_locally: local,
             ..settings
         }
@@ -176,12 +261,20 @@ mod boot_tests {
 
     fn builder() -> Rainier {
         Rainier::new(".").without_facades().without_tracing().with_mcp(|server| {
-            server.tool(
-                super::Tool::new("ping", "Answer pong.", |_| async {
-                    Ok(super::ToolResult::text("pong"))
-                })
-                .read_only(),
-            )
+            server
+                .tool(
+                    super::Tool::new("ping", "Answer pong.", |_| async {
+                        Ok(super::ToolResult::text("pong"))
+                    })
+                    .read_only(),
+                )
+                .tool(super::Tool::new(
+                    "poke",
+                    "Change something; answer who did.",
+                    |call| async move {
+                        Ok(super::ToolResult::text(call.client().unwrap_or("full").to_string()))
+                    },
+                ))
         })
     }
 
@@ -233,6 +326,58 @@ mod boot_tests {
 
         let called = app.send(rpc("tools/call", json!({ "name": "ping" }), Some(TOKEN))).await;
         called.assert_json_path("result.content.0.text", "pong");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_client_is_shown_and_may_call_only_read_only_tools() {
+        let app =
+            TestApp::new(builder().with_mcp_settings(on(false)).boot().await.unwrap()).unwrap();
+
+        let full = tool_names(&app.send(rpc("tools/list", json!({}), Some(TOKEN))).await.json());
+        assert!(full.contains(&"poke".to_string()), "{full:?}");
+        let poked = app.send(rpc("tools/call", json!({ "name": "poke" }), Some(TOKEN))).await;
+        poked.assert_json_path("result.content.0.text", "full");
+
+        let read = tool_names(&app.send(rpc("tools/list", json!({}), Some(READER))).await.json());
+        assert_eq!(read, vec!["ping".to_string()]);
+        let pinged = app.send(rpc("tools/call", json!({ "name": "ping" }), Some(READER))).await;
+        pinged.assert_json_path("result.content.0.text", "pong");
+        let refused = app.send(rpc("tools/call", json!({ "name": "poke" }), Some(READER))).await;
+        refused.assert_ok();
+        assert_eq!(refused.json()["error"]["code"], -32602, "{}", refused.json());
+    }
+
+    #[tokio::test]
+    async fn taking_a_read_only_client_out_of_the_settings_shuts_it_out() {
+        let without =
+            |settings| McpSettings { read_only_clients: Vec::new(), ..on(false)(settings) };
+        let app = TestApp::new(builder().with_mcp_settings(without).boot().await.unwrap()).unwrap();
+        app.send(rpc("tools/list", json!({}), Some(READER))).await.assert_not_found();
+        app.send(rpc("tools/list", json!({}), Some(TOKEN))).await.assert_ok();
+    }
+
+    #[cfg(feature = "lookout")]
+    #[tokio::test]
+    async fn a_read_only_client_cannot_change_lookout_cases() {
+        let app = local(builder())
+            .with_mcp_settings(on(false))
+            .with_lookout(|config| config.enabled(true).local(true))
+            .boot()
+            .await
+            .unwrap();
+        let app = TestApp::new(app).unwrap();
+
+        let names = tool_names(&app.send(rpc("tools/list", json!({}), Some(READER))).await.json());
+        assert!(names.contains(&"lookout_status".to_string()), "{names:?}");
+        assert!(!names.contains(&"lookout_update_case".to_string()), "{names:?}");
+        let refused = app
+            .send(rpc(
+                "tools/call",
+                json!({ "name": "lookout_update_case", "arguments": { "id": "x", "action": "resolve" } }),
+                Some(READER),
+            ))
+            .await;
+        assert_eq!(refused.json()["error"]["code"], -32602, "{}", refused.json());
     }
 
     #[cfg(feature = "lookout")]

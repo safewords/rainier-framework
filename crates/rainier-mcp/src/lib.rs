@@ -29,8 +29,9 @@
 //!   `tools/*`, `resources/*` and `prompts/*`, one message or a batch.
 //! - [`McpEndpoint`] serves it at one path. It is stateless — no session id,
 //!   no server-initiated stream — so any replica answers any request.
-//! - [`McpGate`] decides who may: everyone locally, a bearer token, or the
-//!   application's own check. A refused request gets the router's own 404.
+//! - [`McpGate`] decides who may: everyone locally, a bearer token, a named
+//!   read-only client's token, or the application's own check. A refused
+//!   request gets the router's own 404.
 //!
 //! See `docs/mcp.md`.
 
@@ -43,8 +44,8 @@ mod server;
 
 pub use http::{AccessCheck, McpEndpoint, McpGate};
 pub use server::{
-    Call, Content, McpServer, Prompt, PromptArgument, Resource, Tool, ToolAnnotations, ToolResult,
-    LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+    Access, Call, Content, McpServer, Prompt, PromptArgument, Resource, Tool, ToolAnnotations,
+    ToolResult, LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 
 #[cfg(test)]

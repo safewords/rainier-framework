@@ -14,7 +14,7 @@ use rainier_routing::{Req, Router};
 use rainier_support::{BoxFuture, Error};
 use subtle::ConstantTimeEq;
 
-use crate::server::{McpServer, SUPPORTED_PROTOCOL_VERSIONS};
+use crate::server::{Access, McpServer, SUPPORTED_PROTOCOL_VERSIONS};
 
 /// The application's answer to "may this request use the MCP server?".
 pub type AccessCheck = Arc<dyn Fn(&Request) -> BoxFuture<'static, bool> + Send + Sync>;
@@ -27,7 +27,9 @@ pub type AccessCheck = Arc<dyn Fn(&Request) -> BoxFuture<'static, bool> + Send +
 ///    on (the default);
 /// 2. it carries `Authorization: Bearer <token>` with one of the
 ///    [`token`](Self::token)s, compared in constant time;
-/// 3. the application's check says yes.
+/// 3. it carries the token of a [`read_only_client`](Self::read_only_client),
+///    and is let in as that client, with [`Access::ReadOnly`];
+/// 4. the application's check says yes.
 ///
 /// Anything else is answered with the router's own 404, as if nothing were
 /// there.
@@ -35,6 +37,7 @@ pub type AccessCheck = Arc<dyn Fn(&Request) -> BoxFuture<'static, bool> + Send +
 pub struct McpGate {
     check: AccessCheck,
     tokens: Vec<String>,
+    read_only_clients: Vec<(String, String)>,
     open_locally: bool,
 }
 
@@ -42,6 +45,10 @@ impl std::fmt::Debug for McpGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpGate")
             .field("tokens", &self.tokens.len())
+            .field(
+                "read_only_clients",
+                &self.read_only_clients.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            )
             .field("open_locally", &self.open_locally)
             .finish_non_exhaustive()
     }
@@ -57,7 +64,7 @@ impl McpGate {
 
     /// A gate from an already-shared check.
     pub fn from_check(check: AccessCheck) -> Self {
-        Self { check, tokens: Vec::new(), open_locally: true }
+        Self { check, tokens: Vec::new(), read_only_clients: Vec::new(), open_locally: true }
     }
 
     /// Nobody, but for a token or the local environment. The default.
@@ -81,6 +88,20 @@ impl McpGate {
         self
     }
 
+    /// Also let in a request bearing `token`, as the client `name`, to read
+    /// only: it is shown and may call only the tools marked
+    /// [`read_only`](crate::Tool::read_only), and every method it calls is
+    /// logged with its name. One token per client, so each can be told apart
+    /// and taken away on its own. An empty token is ignored.
+    #[must_use]
+    pub fn read_only_client(mut self, name: impl Into<String>, token: impl Into<String>) -> Self {
+        let token = token.into();
+        if !token.trim().is_empty() {
+            self.read_only_clients.push((name.into(), token));
+        }
+        self
+    }
+
     /// Whether everybody is let in when the environment is `local`.
     #[must_use]
     pub fn open_locally(mut self, open: bool) -> Self {
@@ -90,18 +111,37 @@ impl McpGate {
 
     /// Whether `request` may use the server in `environment`.
     pub async fn allows(&self, request: &Request, environment: &str) -> bool {
+        self.admit(request, environment).await.is_some()
+    }
+
+    /// How much of the server `request` may use in `environment` — `None`
+    /// when it may not use it at all.
+    pub async fn admit(&self, request: &Request, environment: &str) -> Option<Access> {
         if self.open_locally && environment.eq_ignore_ascii_case("local") {
-            return true;
+            return Some(Access::Full);
         }
         if let Some(given) = request.bearer_token() {
-            let matched = self.tokens.iter().fold(false, |found, token| {
-                found | bool::from(token.as_bytes().ct_eq(given.as_bytes()))
-            });
-            if matched {
-                return true;
+            let given = given.as_bytes();
+            // Every token is compared, matched or not, so the time taken says
+            // nothing about which one — or whether any — was close.
+            let full = self
+                .tokens
+                .iter()
+                .fold(false, |found, token| found | bool::from(token.as_bytes().ct_eq(given)));
+            let mut client = None;
+            for (name, token) in &self.read_only_clients {
+                if bool::from(token.as_bytes().ct_eq(given)) && client.is_none() {
+                    client = Some(name);
+                }
+            }
+            if full {
+                return Some(Access::Full);
+            }
+            if let Some(name) = client {
+                return Some(Access::ReadOnly { client: name.clone() });
             }
         }
-        (self.check)(request).await
+        (self.check)(request).await.then_some(Access::Full)
     }
 }
 
@@ -183,7 +223,7 @@ impl McpEndpoint {
         router.add(
             vec![Method::GET, Method::PUT, Method::PATCH, Method::DELETE, Method::OPTIONS],
             base.as_str(),
-            guarded(&state, |_: Arc<McpEndpoint>, _: Req| async {
+            guarded(&state, |_: Arc<McpEndpoint>, _: Req, _: Access| async {
                 Response::new(StatusCode::METHOD_NOT_ALLOWED).with_header("allow", "POST")
             }),
         );
@@ -192,7 +232,7 @@ impl McpEndpoint {
 }
 
 /// `POST {path}`: one message or a batch in, the answer out.
-async fn post(state: Arc<McpEndpoint>, request: Req) -> Response {
+async fn post(state: Arc<McpEndpoint>, request: Req, access: Access) -> Response {
     if let Some(origin) = request.header("origin") {
         if !origin_allowed(origin, request.header("host"), &state.allowed_origins) {
             return error_response(StatusCode::FORBIDDEN, "This origin may not use the server.");
@@ -207,7 +247,7 @@ async fn post(state: Arc<McpEndpoint>, request: Req) -> Response {
         }
     }
     let body = String::from_utf8_lossy(request.body()).into_owned();
-    match state.server.handle_str(&body, Some(Arc::clone(&request))).await {
+    match state.server.handle_str_as(&body, Some(Arc::clone(&request)), &access).await {
         Some(answer) => Response::json(&answer),
         None => Response::new(StatusCode::ACCEPTED),
     }
@@ -239,7 +279,7 @@ fn guarded<F, Fut, R>(
     handler: F,
 ) -> impl Fn(Req) -> BoxFuture<'static, Response> + Clone + Send + Sync + 'static
 where
-    F: Fn(Arc<McpEndpoint>, Req) -> Fut + Clone + Send + Sync + 'static,
+    F: Fn(Arc<McpEndpoint>, Req, Access) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = R> + Send + 'static,
     R: IntoResponse,
 {
@@ -248,12 +288,12 @@ where
         let state = Arc::clone(&state);
         let handler = handler.clone();
         Box::pin(async move {
-            if !state.gate.allows(&request, &state.environment).await {
+            let Some(access) = state.gate.admit(&request, &state.environment).await else {
                 tracing::info!(target: "rainier_mcp::gate", "mcp: request refused");
                 return Error::not_found(format!("No route matches {}", request.path()))
                     .into_response();
-            }
-            handler(state, request)
+            };
+            handler(state, request, access)
                 .await
                 .into_response()
                 .with_header("cache-control", "no-store")

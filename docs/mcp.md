@@ -35,6 +35,7 @@ MCP_TOKENS=a-random-string-of-at-least-32-characters
 | `MCP_ENABLED` | `false` | Serve it at all |
 | `MCP_PATH` | `/_mcp` | Where |
 | `MCP_TOKENS` | — | Bearer tokens that are let in, comma-separated, each at least 32 characters — two at once to rotate one without a gap |
+| `MCP_READ_ONLY_CLIENTS` | — | [Named clients that may only read](#read-only-clients), as `name=token` pairs, comma-separated |
 | `MCP_OPEN_LOCALLY` | `true` | Let everyone in when `APP_ENV=local` |
 | `MCP_ALLOWED_ORIGINS` | — | Browser origins allowed besides the server's own host, comma-separated |
 | `MCP_LOOKOUT` | `true` | Offer [Lookout's tools](#lookout) when Lookout is on |
@@ -123,7 +124,8 @@ Rainier::new(".").with_mcp(|server| {
 
 The server is bound in the container as `Arc<McpServer>`. It is the protocol
 without the transport: `McpServer::handle` answers one JSON-RPC message or a
-batch, which is also how to test a tool without HTTP.
+batch, which is also how to test a tool without HTTP; `handle_as` does the
+same for a caller with a given `Access`, such as a read-only client.
 
 ---
 
@@ -133,6 +135,7 @@ batch, which is also how to test a tool without HTTP.
 |---|---|
 | `APP_ENV=local` (with `MCP_OPEN_LOCALLY`, the default) | everyone |
 | anywhere | a request with `Authorization: Bearer <one of MCP_TOKENS>`, compared in constant time |
+| anywhere | a [read-only client](#read-only-clients), with its own token from `MCP_READ_ONLY_CLIENTS` |
 | anywhere | whoever the application's own check lets in |
 
 The application's check sees the request's headers:
@@ -157,6 +160,44 @@ send no `Origin`.
 
 Treat a token as you would a database password: with Lookout on, it reads
 everything Lookout recorded.
+
+### Read-only clients
+
+A token in `MCP_TOKENS` can do everything the server offers, and every holder
+of it looks the same. When an assistant — or anything you would rather not
+trust with writes — needs the server, give it a **read-only client** instead:
+a name and a token of its own.
+
+```env
+MCP_READ_ONLY_CLIENTS=reviewer=a-random-string-of-at-least-32-characters,triage-bot=another-random-string-of-32-or-more
+```
+
+A read-only client:
+
+- is shown, by `tools/list`, only the tools marked
+  [`read_only()`](#tools-resources-and-prompts), and is refused the rest by
+  `tools/call` with an `invalid params` error naming the tool. With Lookout,
+  that leaves out `lookout_update_case`. Resources and prompts read, so it
+  keeps them;
+- is **logged by name** on every method it calls, at `info` on the
+  `rainier_mcp::access` target, with the tool, prompt or resource it named —
+  so what one client read can be told from what another did;
+- is handed to every handler: `call.client()` is its name (`None` for full
+  access), and `call.access()` says how it got in. A tool that should let such
+  a client change something is better as its own endpoint that records the
+  name as the actor than as a write tool it can call;
+- is taken away on its own: remove its entry and restart. Nobody else's token
+  changes.
+
+Each entry is `name=token`. The name is 1–64 letters, digits, `.`, `_` or `-`;
+the token at least 32 characters. A name given twice, a token given twice, or
+a token that is also in `MCP_TOKENS` fails the boot — two clients on one token
+could not be told apart, and a read-only client on a full token would not be
+read-only. In code, `McpGate::read_only_client(name, token)` does the same.
+
+"Read-only" is the tool's own `read_only()` claim. A tool marked read-only
+that writes anyway is a bug in the tool, and this cannot catch it: mark a tool
+read-only only when it is.
 
 ---
 

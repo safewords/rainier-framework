@@ -19,18 +19,74 @@ pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
-/// What a tool, a prompt or a resource reader is handed: the arguments, and
-/// the HTTP request that carried the call when there was one.
+/// How much of the server a caller may use, as the [gate](crate::McpGate)
+/// decided when it let the request in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Access {
+    /// Everything: the local environment, a token from `MCP_TOKENS`, or the
+    /// application's own check.
+    #[default]
+    Full,
+    /// A named client that may only read: it is shown, and may call, only
+    /// the tools marked [`read_only`](Tool::read_only). Its name is on every
+    /// call it makes, so what it did can be told apart from what anyone
+    /// else did.
+    ReadOnly {
+        /// The client's name, as the deployment configured it.
+        client: String,
+    },
+}
+
+impl Access {
+    /// The client's name, when it is a named one.
+    pub fn client(&self) -> Option<&str> {
+        match self {
+            Access::Full => None,
+            Access::ReadOnly { client } => Some(client),
+        }
+    }
+
+    /// Whether this caller may use `tool`.
+    pub fn may_call(&self, tool: &Tool) -> bool {
+        match self {
+            Access::Full => true,
+            Access::ReadOnly { .. } => tool.is_read_only(),
+        }
+    }
+}
+
+/// What a tool, a prompt or a resource reader is handed: the arguments, the
+/// HTTP request that carried the call when there was one, and who was let in.
 #[derive(Debug, Clone, Default)]
 pub struct Call {
     arguments: Map<String, Value>,
     request: Option<Arc<Request>>,
+    access: Access,
 }
 
 impl Call {
-    /// A call with `arguments`, carried by `request`.
+    /// A call with `arguments`, carried by `request`, with full access.
     pub fn new(arguments: Map<String, Value>, request: Option<Arc<Request>>) -> Self {
-        Self { arguments, request }
+        Self { arguments, request, access: Access::Full }
+    }
+
+    /// The same call, made with `access`.
+    #[must_use]
+    pub fn with_access(mut self, access: Access) -> Self {
+        self.access = access;
+        self
+    }
+
+    /// What the caller was let in with.
+    pub fn access(&self) -> &Access {
+        &self.access
+    }
+
+    /// The named client making the call, if it is one — what a tool that
+    /// writes records as the actor.
+    pub fn client(&self) -> Option<&str> {
+        self.access.client()
     }
 
     /// Every argument, as the client sent them.
@@ -268,6 +324,12 @@ impl Tool {
     /// Its description.
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Whether it is marked [`read_only`](Self::read_only) — the only tools a
+    /// read-only client is shown or may call.
+    pub fn is_read_only(&self) -> bool {
+        self.annotations.read_only == Some(true)
     }
 
     /// Run it, as `tools/call` does — for tests.
@@ -626,14 +688,36 @@ impl McpServer {
     /// `None` when there is nothing to answer — the body held only
     /// notifications or responses.
     pub async fn handle_str(&self, body: &str, request: Option<Arc<Request>>) -> Option<Value> {
+        self.handle_str_as(body, request, &Access::Full).await
+    }
+
+    /// [`handle_str`](Self::handle_str) for a caller let in with `access`.
+    pub async fn handle_str_as(
+        &self,
+        body: &str,
+        request: Option<Arc<Request>>,
+        access: &Access,
+    ) -> Option<Value> {
         match serde_json::from_str::<Value>(body) {
-            Ok(message) => self.handle(message, request).await,
+            Ok(message) => self.handle_as(message, request, access).await,
             Err(e) => Some(protocol::error(Value::Null, codes::PARSE_ERROR, format!("{e}"))),
         }
     }
 
     /// Answer one JSON-RPC message, or a batch of them.
     pub async fn handle(&self, message: Value, request: Option<Arc<Request>>) -> Option<Value> {
+        self.handle_as(message, request, &Access::Full).await
+    }
+
+    /// [`handle`](Self::handle) for a caller let in with `access`: a
+    /// read-only client is shown only read-only tools, is refused the rest,
+    /// and has each method it calls logged with its name.
+    pub async fn handle_as(
+        &self,
+        message: Value,
+        request: Option<Arc<Request>>,
+        access: &Access,
+    ) -> Option<Value> {
         match message {
             Value::Array(batch) if batch.is_empty() => {
                 Some(protocol::error(Value::Null, codes::INVALID_REQUEST, "An empty batch."))
@@ -641,17 +725,22 @@ impl McpServer {
             Value::Array(batch) => {
                 let mut answers = Vec::new();
                 for message in batch {
-                    if let Some(answer) = self.handle_one(message, request.clone()).await {
+                    if let Some(answer) = self.handle_one(message, request.clone(), access).await {
                         answers.push(answer);
                     }
                 }
                 (!answers.is_empty()).then_some(Value::Array(answers))
             }
-            message => self.handle_one(message, request).await,
+            message => self.handle_one(message, request, access).await,
         }
     }
 
-    async fn handle_one(&self, message: Value, request: Option<Arc<Request>>) -> Option<Value> {
+    async fn handle_one(
+        &self,
+        message: Value,
+        request: Option<Arc<Request>>,
+        access: &Access,
+    ) -> Option<Value> {
         let Value::Object(message) = message else {
             return Some(protocol::error(
                 Value::Null,
@@ -686,7 +775,22 @@ impl McpServer {
                 ))
             }
         };
-        Some(match self.method(method, params, request).await {
+        if let Some(client) = access.client() {
+            // Every method a named client calls, with the tool, prompt or
+            // resource it named — the record of what that client read.
+            let target = ["name", "uri"]
+                .iter()
+                .find_map(|key| params.get(*key).and_then(Value::as_str))
+                .unwrap_or("");
+            tracing::info!(
+                target: "rainier_mcp::access",
+                client = %client,
+                method = %method,
+                target = %target,
+                "mcp: read-only client call"
+            );
+        }
+        Some(match self.method(method, params, request, access).await {
             Ok(result) => protocol::result(id, result),
             Err((code, message)) => protocol::error(id, code, message),
         })
@@ -697,20 +801,39 @@ impl McpServer {
         method: &str,
         params: Map<String, Value>,
         request: Option<Arc<Request>>,
+        access: &Access,
     ) -> std::result::Result<Value, (i64, String)> {
+        let call = |arguments, request| Call::new(arguments, request).with_access(access.clone());
         match method {
             "initialize" => Ok(self.initialize(&params)),
             "ping" => Ok(json!({})),
-            "tools/list" => {
-                Ok(json!({ "tools": self.tools.iter().map(Tool::describe).collect::<Vec<_>>() }))
-            }
+            "tools/list" => Ok(json!({
+                "tools": self
+                    .tools
+                    .iter()
+                    .filter(|tool| access.may_call(tool))
+                    .map(Tool::describe)
+                    .collect::<Vec<_>>(),
+            })),
             "tools/call" => {
                 let name = string_param(&params, "name")?;
                 let Some(tool) = self.find_tool(name) else {
                     return Err((codes::INVALID_PARAMS, format!("Unknown tool: {name}")));
                 };
+                if !access.may_call(tool) {
+                    tracing::warn!(
+                        target: "rainier_mcp::access",
+                        client = access.client().unwrap_or(""),
+                        tool = %name,
+                        "mcp: a read-only client called a tool that is not read-only"
+                    );
+                    return Err((
+                        codes::INVALID_PARAMS,
+                        format!("{name} is not read-only, and this client may only read."),
+                    ));
+                }
                 let arguments = object_param(&params, "arguments")?;
-                Ok(tool.call(Call::new(arguments, request)).await.to_value())
+                Ok(tool.call(call(arguments, request)).await.to_value())
             }
             "resources/list" => Ok(json!({
                 "resources": self.resources.iter().map(Resource::describe).collect::<Vec<_>>(),
@@ -723,7 +846,7 @@ impl McpServer {
                 };
                 let mut arguments = Map::new();
                 arguments.insert("uri".into(), json!(uri));
-                let text = (resource.reader)(Call::new(arguments, request))
+                let text = (resource.reader)(call(arguments, request))
                     .await
                     .map_err(|e| (codes::INTERNAL_ERROR, e.message().to_string()))?;
                 Ok(json!({
@@ -739,7 +862,7 @@ impl McpServer {
                     return Err((codes::INVALID_PARAMS, format!("Unknown prompt: {name}")));
                 };
                 let arguments = object_param(&params, "arguments")?;
-                let text = prompt.render(Call::new(arguments, request)).await.map_err(|e| {
+                let text = prompt.render(call(arguments, request)).await.map_err(|e| {
                     let code = if e.kind().is_server_error() {
                         codes::INTERNAL_ERROR
                     } else {
