@@ -20,12 +20,15 @@ env:
   # A backtrace on a failing test is the difference between a re-run and a fix.
   RUST_BACKTRACE: 1
   # The fleet's runners build in a 12 GiB RAM-backed scratch volume that also
-  # holds Docker's storage for the service containers, and `--all-features`
-  # with full debug info overflowed it ("mold: Disk full?", 2026-11-23).
-  # Line tables keep file:line in every backtrace at a fraction of the size;
-  # incremental state is never reused on an ephemeral runner anyway.
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # holds Docker's storage for the five service containers. `cargo test
+  # --workspace` links 100+ test binaries (43 crates, 61 integration-test
+  # files), each with its own copy of the dependencies' debug info, and that
+  # overflowed it even at line-tables-only ("mold: Disk full?", 2026-11-23).
+  # No debug info: a panic still prints its message and the backtrace still
+  # names every function, only without file:line. Incremental state is
+  # never reused on an ephemeral runner anyway.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
   CARGO_INCREMENTAL: 0
 
 concurrency:
@@ -236,6 +239,14 @@ jobs:
           # Lookout's database store, against both servers. Its own variable,
           # so `TEST_DATABASE_URL`'s MySQL-only checks are not turned on here.
           LOOKOUT_TEST_DATABASE_URLS: mysql://root:ci@127.0.0.1:3306/lookout,postgres://postgres:ci@127.0.0.1:5432/lookout
+      # Where the scratch volume went, pass or fail, so the next overflow is a
+      # number rather than a guess.
+      - name: scratch usage
+        if: always()
+        run: |
+          df -h /home/runner/_work || true
+          du -sh target target/debug/deps target/debug/build 2>/dev/null || true
+          docker system df || true
 
   msrv:
     name: minimum supported Rust (1.100, default features)
