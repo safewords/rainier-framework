@@ -7,7 +7,14 @@
 # never run. Summing what the run reports is the number that means something.
 set -euo pipefail
 
-output=$(cargo test --workspace --all-features 2>&1)
+# A failing test must say which one: under `set -e` a bare $(...) exits
+# with 101 and no output at all.
+if ! output=$(cargo test --workspace --all-features 2>&1); then
+    echo "cargo test failed; refusing to write a badge" >&2
+    printf '%s\n' "$output" | grep -E '^(test .* FAILED|---- |failures:|error)|panicked' >&2 || true
+    printf '%s\n' "$output" | tail -60 >&2
+    exit 1
+fi
 count=$(printf '%s' "$output" | grep -oE '[0-9]+ passed' | awk '{s+=$1} END {print s+0}')
 
 if [ "$count" -eq 0 ]; then
