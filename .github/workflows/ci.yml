@@ -19,6 +19,14 @@ env:
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C linker-features=-lld -C link-arg=-fuse-ld=mold"
   # A backtrace on a failing test is the difference between a re-run and a fix.
   RUST_BACKTRACE: 1
+  # The fleet's runners build in a 12 GiB RAM-backed scratch volume that also
+  # holds Docker's storage for the service containers, and `--all-features`
+  # with full debug info overflowed it ("mold: Disk full?", 2026-11-23).
+  # Line tables keep file:line in every backtrace at a fraction of the size;
+  # incremental state is never reused on an ephemeral runner anyway.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: 0
 
 concurrency:
   # A new push supersedes the run in flight for the same branch.
@@ -26,11 +34,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # This repo is public, and GitHub-hosted standard runners are free with
-  # unlimited minutes for public repos — so everything runs there. That is
-  # also the security boundary: outside code never executes inside the
-  # cluster, whose fleet serves only the private repos. The system-deps
-  # shim stays and no-ops on the hosted image.
+  # Public repository, on the safewords-runners fleet since 2026-11-23. Outside
+  # code cannot reach the fleet: pull requests are collaborators-only and a fork's
+  # runs need approval for every external contributor (both repository settings).
+  # The system-deps shim stays and no-ops on the fleet's image.
   # --- the fast ones, so a typo does not wait on a full test run -------------
 
   fmt:

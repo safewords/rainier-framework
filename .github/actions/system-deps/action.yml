@@ -1,7 +1,7 @@
 name: system dependencies
 description: >
-  The ARC runner image is a bare Ubuntu: no C toolchain, no cmake, no
-  pkg-config. Everything a `cargo build` of this workspace links against is
+  The upstream ARC runner image is a bare Ubuntu: no C toolchain, no cmake,
+  no pkg-config (safewords' own runner image has them, and this no-ops). Everything a `cargo build` of this workspace links against is
   installed here, once, so every compiling job starts with this step instead
   of growing its own apt lines. The list is deliberately short — the lockfile
   has no openssl-sys and Kafka is rskafka (pure Rust), so the only native code
