@@ -1,7 +1,7 @@
 //! Lookout over the Model Context Protocol — the `mcp` feature.
 //!
 //! [`register`] adds Lookout's tools and prompts to an
-//! [`McpServer`](rainier_mcp::McpServer), so an AI client connected to the
+//! [`McpServer`], so an AI client connected to the
 //! application can read what the dashboard shows: recent requests and jobs
 //! with their waterfalls, the slowest and busiest routes and queries, what
 //! changed, and the cases — and resolve or ignore a case.

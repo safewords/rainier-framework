@@ -123,9 +123,127 @@ impl Broadcaster for RedisBroadcaster {
     }
 }
 
+/// Reads broadcasts back off Redis pub/sub, so a process holding sockets can
+/// deliver them — the Redis twin of [`KafkaRelay`](crate::kafka::KafkaRelay).
+///
+/// Every replica publishes through [`RedisBroadcaster`] and every replica
+/// runs one of these, so a broadcast reaches a browser whichever replica it
+/// is connected to:
+///
+/// ```text
+///  request on replica A ──▶ Broadcasting ──PUBLISH──▶ redis
+///                                                       │
+///                              ┌────────────────────────┴───────────┐
+///                              ▼                                    ▼
+///                     relay on replica A                   relay on replica B
+///                              │                                    │
+///                         its sockets                          its sockets
+/// ```
+///
+/// It hands each message on whole — the channel's wire name, with the
+/// prefix taken off, and the body as published — and leaves delivery to the
+/// caller: `rainier_framework::relay::SocketFanOut::deliver_published` for a
+/// `rainier-websocket` `Rooms`, or `PusherServer::deliver_published` for
+/// Pusher-protocol sockets.
+///
+/// # One node, not a cluster
+///
+/// Point publishers and relays at **the same single node**. Plain `PUBLISH`
+/// is meant to reach a whole cluster, but in practice a sharded deployment can
+/// keep it to the node it was sent to, and then a broadcast reaches only the
+/// relays that happen to share that node — the symptom is an event that
+/// arrives "sometimes, after a refresh". A comma-separated seed list is
+/// trimmed to its first entry for that reason.
+///
+/// # Pub/sub keeps nothing
+///
+/// A message published while a relay is reconnecting is gone. That is right
+/// for pushing to a browser and wrong for anything that must not be missed —
+/// that wants [a job](https://rainierframework.io/docs/queues).
+#[derive(Clone, Debug)]
+pub struct RedisRelay {
+    url: String,
+    prefix: String,
+}
+
+impl RedisRelay {
+    /// Relay from the Redis at `url` (`redis://…`, or a comma-separated
+    /// seed list, of which the first entry is used).
+    pub fn new(url: impl Into<String>) -> Self {
+        let url = url.into();
+        let seed = url.split(',').next().unwrap_or(&url).trim().to_string();
+        Self { url: seed, prefix: String::new() }
+    }
+
+    /// Only channels published under this prefix — the same prefix the
+    /// [`RedisBroadcaster`] was given. Taken off the channel name before it
+    /// is handed on.
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = prefix.into();
+        self
+    }
+
+    /// The pattern subscribed to: the prefix, then everything.
+    pub fn pattern(&self) -> String {
+        format!("{}*", self.prefix)
+    }
+
+    /// Subscribe. Each [`RedisRelayStream::next`] is one published message.
+    pub async fn subscribe(&self) -> Result<RedisRelayStream> {
+        let connector = RedisConnector::open(&self.url)?;
+        let subscription = connector.subscribe(&self.pattern()).await?;
+        Ok(RedisRelayStream { subscription, prefix: self.prefix.clone() })
+    }
+
+    /// The channel's wire name a published one stands for, the prefix off;
+    /// `None` for a channel outside it.
+    pub fn channel_of<'a>(&self, published: &'a str) -> Option<&'a str> {
+        published.strip_prefix(self.prefix.as_str())
+    }
+}
+
+/// A live relay subscription.
+pub struct RedisRelayStream {
+    subscription: rainier_drivers::redis::RedisSubscription,
+    prefix: String,
+}
+
+impl RedisRelayStream {
+    /// The next message as `(channel, body)` — the channel's wire name with
+    /// the prefix off, the body as published. `None` when the connection has
+    /// ended, which is the signal to subscribe again. A message that is not
+    /// text, or outside the prefix, is skipped.
+    pub async fn next(&mut self) -> Option<(String, String)> {
+        loop {
+            let message = self.subscription.next_message().await?;
+            let Some(channel) = message.channel.strip_prefix(self.prefix.as_str()) else {
+                continue;
+            };
+            let Some(body) = message.text() else { continue };
+            return Some((channel.to_string(), body.to_string()));
+        }
+    }
+}
+
+impl std::fmt::Debug for RedisRelayStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisRelayStream").field("prefix", &self.prefix).finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relay_subscribes_under_the_prefix_and_takes_it_off() {
+        let relay = RedisRelay::new("redis://a:6379, redis://b:6379").with_prefix("app_");
+        assert_eq!(relay.pattern(), "app_*");
+        assert_eq!(relay.url, "redis://a:6379", "one node: the first seed");
+        assert_eq!(relay.channel_of("app_private-orders.7"), Some("private-orders.7"));
+        assert_eq!(relay.channel_of("other_news"), None);
+        assert_eq!(RedisRelay::new("redis://a").pattern(), "*");
+    }
 
     #[test]
     fn the_prefix_goes_before_the_wire_name_not_after_it() {

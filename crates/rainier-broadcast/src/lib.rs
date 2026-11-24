@@ -93,4 +93,4 @@ pub use sessions::{SessionChannels, SessionRoster};
 #[cfg(feature = "kafka")]
 pub use kafka::{KafkaBroadcaster, KafkaRelay, RelayCursor, RelayedBroadcast};
 #[cfg(feature = "redis")]
-pub use redis::RedisBroadcaster;
+pub use redis::{RedisBroadcaster, RedisRelay, RedisRelayStream};
