@@ -244,6 +244,53 @@ browser is also one the business cares about — an order shipping, a payment
 clearing — and the audit consumer, the analytics job and next quarter's service
 should all be able to read it without anybody coordinating.
 
+### Sockets across replicas, over Redis
+
+Two kinds of server hold browsers' sockets in your own process: the
+`pusher-server` feature's `PusherServer`, and a [`rainier-websocket`](websockets.md)
+`Rooms` registry. Either way, two replicas hold two sets of sockets, and a
+broadcast published on one has to reach the browsers held by the other. A
+`RedisRelay` in every replica reads what `RedisBroadcaster` publishes and
+hands it to that replica's sockets — the Redis twin of the
+[Kafka relay](kafka.md#sockets-across-replicas):
+
+```mermaid
+flowchart TD
+    REQ[request on replica A] --> B[Broadcasting] --> R[(one Redis node)]
+    R --> RA[relay on replica A] --> SA[its sockets]
+    R --> RB[relay on replica B] --> SB[its sockets]
+```
+
+```rust
+use rainier_framework::broadcast::redis::RedisRelay;
+use rainier_framework::relay::{self, SocketFanOut};
+
+// Into a `Rooms` registry, in the shape your client reads:
+relay::spawn_redis_into(
+    RedisRelay::new(&url).with_prefix("app_"),
+    SocketFanOut::new(Arc::clone(&rooms))
+        .shaping(|event, data| json!({ "type": event, "data": data }).to_string()),
+);
+
+// Or into Pusher-protocol sockets:
+relay::spawn_redis(RedisRelay::new(&url), move |channel, body| {
+    server.deliver_published(channel, body);
+});
+```
+
+Every replica publishes and every replica reads, including the one that
+published, so a broadcast reaches a browser whichever replica it is on. The
+relay subscribes to the prefix and everything under it, takes the prefix off,
+and hands on the channel's wire name and the body as published; `SocketFanOut`
+honours `to_others` there, at delivery.
+
+**Publishers and relays on one node.** A plain `PUBLISH` is meant to reach a
+whole cluster, but a sharded deployment can keep it to the node it was sent
+to, and then a broadcast reaches only the relays that share that node — an
+event that arrives "sometimes, after a refresh", because a refresh is a new
+socket on another replica. Give both halves the address of one node.
+`RedisRelay::new` keeps only the first entry of a comma-separated seed list.
+
 ### Writing one
 
 ```rust

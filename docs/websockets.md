@@ -192,12 +192,12 @@ socket is in — that would be a second copy of this map, and it would drift.
 load balancer have two sets of rooms and a message sent on one reaches half
 your users.
 
-That is the ceiling on this approach *by itself*. A [Kafka
-relay](kafka.md#sockets-across-replicas) lifts it without a second deployment:
-every replica publishes to a topic and every replica reads it back into its own
-rooms, so a message sent on one reaches the sockets held by all of them. The
-alternative is [broadcasting](broadcasting.md) through Redis to a server that
-holds every socket instead.
+That is the ceiling on this approach *by itself*. A relay lifts it without a
+second deployment — [over Redis](broadcasting.md#sockets-across-replicas-over-redis)
+or [over Kafka](kafka.md#sockets-across-replicas): every replica publishes and
+every replica reads it back into its own rooms, so a message sent on one
+reaches the sockets held by all of them. The alternative is
+[broadcasting](broadcasting.md) to a server that holds every socket instead.
 
 ## Which one
 
@@ -205,7 +205,7 @@ holds every socket instead.
 |---|---|---|
 | Who holds the socket | your process | a separate one — soketi, Pusher |
 | Direction | both ways | out only |
-| Across instances | one process's memory, unless [relayed](kafka.md#sockets-across-replicas) | yes, through Redis |
+| Across instances | one process's memory, unless relayed ([Redis](broadcasting.md#sockets-across-replicas-over-redis), [Kafka](kafka.md#sockets-across-replicas)) | yes, through Redis |
 | Client | anything that speaks WebSocket | a Pusher-protocol client |
 | Extra infrastructure | none | a relay, and Redis |
 

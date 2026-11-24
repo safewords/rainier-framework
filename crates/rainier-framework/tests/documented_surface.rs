@@ -510,6 +510,25 @@ async fn the_kafka_client() -> Result<()> {
     Ok(())
 }
 
+/// `docs/broadcasting.md` — relaying Redis broadcasts back into sockets.
+#[cfg(feature = "redis")]
+#[allow(dead_code, reason = "compiling is the point")]
+fn redis_relaying(url: &str, rooms: Arc<rainier_websocket::Rooms>) {
+    use rainier_broadcast::redis::RedisRelay;
+    use rainier_framework::relay::{self, SocketFanOut};
+
+    let relay = RedisRelay::new(url).with_prefix("app_");
+    let _ = (relay.pattern(), relay.channel_of("app_news"));
+    let fan_out = SocketFanOut::new(rooms)
+        .shaping(|event, data| serde_json::json!({ "type": event, "data": data }).to_string());
+    let _ = fan_out.deliver_published("news", r#"{"event":"E","data":{}}"#);
+    relay::spawn_redis_into(relay.clone(), fan_out).abort();
+    relay::spawn_redis(relay, |channel, body| {
+        let _ = (channel, body);
+    })
+    .abort();
+}
+
 /// `docs/kafka.md` — broadcasting over a topic, and relaying it back.
 #[cfg(feature = "kafka")]
 #[allow(dead_code, reason = "compiling is the point")]

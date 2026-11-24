@@ -23,18 +23,34 @@
 //!
 //! # Two processes or one
 //!
-//! Nothing here needs a second deployment. [`spawn`] starts the relay inside
-//! the web process, next to the sockets it feeds, so the whole of "broadcasting
-//! that works behind a load balancer" is a Kafka topic and one line in a
+//! Nothing here needs a second deployment. [`spawn`] (Kafka) and
+//! [`spawn_redis`] (Redis pub/sub) start the relay inside the web process,
+//! next to the sockets it feeds, so the whole of "broadcasting that works
+//! behind a load balancer" is a topic or a Redis node and one line in a
 //! provider.
+//!
+//! # Redis
+//!
+//! ```ignore
+//! // Publish as usual: `Broadcasting` with a `RedisBroadcaster`.
+//! relay::spawn_redis_into(RedisRelay::new(url), SocketFanOut::new(Arc::clone(&rooms)));
+//! ```
+//!
+//! Publishers and relays on **one Redis node** — see
+//! [`RedisRelay`](rainier_broadcast::redis::RedisRelay). [`spawn_redis`]
+//! takes any sink, so a process holding Pusher-protocol sockets hands each
+//! message to `PusherServer::deliver_published` instead.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "kafka")]
 use rainier_broadcast::kafka::{KafkaRelay, RelayedBroadcast};
 use rainier_events::report::{BroadcastFailed, FailureEvent as _};
+#[cfg(feature = "kafka")]
 use rainier_support::Result;
 use rainier_websocket::{socket_from_identity, Rooms};
+use serde_json::Value;
 
 /// How long to wait before reconnecting after the relay falls over.
 ///
@@ -46,6 +62,14 @@ const RECONNECT_AFTER: Duration = Duration::from_secs(5);
 /// Decides the room a channel's broadcasts belong in, or that they belong
 /// nowhere here.
 type RoomNamer = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Turns an event and its data into the text a socket is sent.
+type Shaper = Arc<dyn Fn(&str, &Value) -> String + Send + Sync>;
+
+/// The default text: `{"event": …, "data": …}`, as a Pusher client reads it.
+fn event_and_data(event: &str, data: &Value) -> String {
+    serde_json::json!({ "event": event, "data": data }).to_string()
+}
 
 /// Delivers relayed broadcasts to the sockets in a [`Rooms`] registry.
 ///
@@ -66,12 +90,54 @@ type RoomNamer = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 pub struct SocketFanOut {
     rooms: Arc<Rooms>,
     room_for: RoomNamer,
+    shape: Shaper,
 }
 
 impl SocketFanOut {
     /// Deliver to `rooms`, with the room named exactly as the channel is.
     pub fn new(rooms: Arc<Rooms>) -> Self {
-        Self { rooms, room_for: Arc::new(|channel: &str| Some(channel.to_string())) }
+        Self {
+            rooms,
+            room_for: Arc::new(|channel: &str| Some(channel.to_string())),
+            shape: Arc::new(event_and_data),
+        }
+    }
+
+    /// Decide the text each socket is sent, from the event and its data —
+    /// for a client that reads its own shape rather than
+    /// `{"event": …, "data": …}`:
+    ///
+    /// ```ignore
+    /// fan_out.shaping(|event, data| json!({ "type": event, "data": data }).to_string())
+    /// ```
+    pub fn shaping<F>(mut self, shape: F) -> Self
+    where
+        F: Fn(&str, &Value) -> String + Send + Sync + 'static,
+    {
+        self.shape = Arc::new(shape);
+        self
+    }
+
+    /// Deliver one message as published — the channel's wire name and the
+    /// body `Broadcasting` wrote (`{"event", "data", "socket"?}`) — which is
+    /// what a [`RedisRelay`](rainier_broadcast::redis::RedisRelay) hands on.
+    /// Returns how many sockets got it; a body that is not a broadcast is
+    /// dropped.
+    pub fn deliver_published(&self, channel: &str, body: &str) -> usize {
+        let Some(room) = (self.room_for)(channel) else {
+            return 0;
+        };
+        let Ok(body) = serde_json::from_str::<Value>(body) else {
+            tracing::debug!(channel, "a relayed message was not a broadcast");
+            return 0;
+        };
+        let event = body.get("event").and_then(Value::as_str).unwrap_or_default();
+        let data = body.get("data").cloned().unwrap_or(Value::Null);
+        let text = (self.shape)(event, &data);
+        match body.get("socket").and_then(Value::as_str).and_then(socket_from_identity) {
+            Some(socket) => self.rooms.send_except(&room, socket, text),
+            None => self.rooms.send(&room, text),
+        }
     }
 
     /// Decide the room a channel's broadcasts belong in.
@@ -94,12 +160,13 @@ impl SocketFanOut {
     /// minted by another replica names no socket in this process, so nothing is
     /// skipped and everyone here is told — which is the correct answer, not a
     /// fallback.
+    #[cfg(feature = "kafka")]
     pub fn deliver(&self, broadcast: &RelayedBroadcast) -> usize {
         let Some(room) = (self.room_for)(&broadcast.channel) else {
             return 0;
         };
 
-        let body = broadcast.wire_payload().to_string();
+        let body = (self.shape)(&broadcast.event, &broadcast.payload);
 
         match broadcast.except.as_deref().and_then(socket_from_identity) {
             Some(socket) => self.rooms.send_except(&room, socket, body),
@@ -114,6 +181,7 @@ impl SocketFanOut {
 }
 
 /// Read the topic and deliver, until something goes wrong.
+#[cfg(feature = "kafka")]
 ///
 /// Returns on the first failure rather than swallowing it — [`spawn`] is what
 /// adds the retry, and a caller running this directly usually wants to know.
@@ -143,6 +211,7 @@ pub async fn run(relay: &KafkaRelay, fan_out: &SocketFanOut) -> Result<()> {
 /// Run the relay in the background, reconnecting when it falls over.
 ///
 /// Call it from a provider's `boot`, in the process that serves WebSockets:
+#[cfg(feature = "kafka")]
 ///
 /// ```ignore
 /// let relay = KafkaRelay::new(Arc::clone(&kafka), "broadcasts");
@@ -179,7 +248,169 @@ pub fn spawn(relay: KafkaRelay, fan_out: SocketFanOut) -> tokio::task::JoinHandl
     })
 }
 
+/// Run a Redis relay in the background, handing each message — the
+/// channel's wire name and the body as published — to `sink`, and
+/// subscribing again when the connection drops.
+///
+/// ```ignore
+/// // Pusher-protocol sockets in this process:
+/// relay::spawn_redis(RedisRelay::new(url), move |channel, body| {
+///     server.deliver_published(channel, body);
+/// });
+/// ```
+///
+/// Each time it falls over it is reported as a [`BroadcastFailed`]
+/// (operation `relay`, `meta.extra["pattern"]`), then retried.
+#[cfg(feature = "redis")]
+pub fn spawn_redis<F>(
+    relay: rainier_broadcast::redis::RedisRelay,
+    sink: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn(&str, &str) + Send + Sync + 'static,
+{
+    rainier_container::spawn_with_facades(async move {
+        loop {
+            match relay.subscribe().await {
+                Ok(mut stream) => {
+                    tracing::info!(pattern = relay.pattern(), "relaying broadcasts from Redis");
+                    let mut read: u64 = 0;
+                    while let Some((channel, body)) = stream.next().await {
+                        read += 1;
+                        sink(&channel, &body);
+                    }
+                    // Say how much it carried: one that ends having read
+                    // nothing is a different failure from one that stopped.
+                    tracing::warn!(read, "the Redis relay's subscription ended; subscribing again");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "the Redis relay could not subscribe");
+                    rainier_events::report::report(
+                        BroadcastFailed::new(e, None::<String>, "relay")
+                            .with_extra("pattern", relay.pattern()),
+                    )
+                    .await;
+                }
+            }
+            tokio::time::sleep(RECONNECT_AFTER).await;
+        }
+    })
+}
+
+/// [`spawn_redis`] into a `Rooms` registry through a [`SocketFanOut`].
+#[cfg(feature = "redis")]
+pub fn spawn_redis_into(
+    relay: rainier_broadcast::redis::RedisRelay,
+    fan_out: SocketFanOut,
+) -> tokio::task::JoinHandle<()> {
+    spawn_redis(relay, move |channel, body| {
+        let reached = fan_out.deliver_published(channel, body);
+        tracing::debug!(channel, sockets = reached, "relayed");
+    })
+}
+
 #[cfg(test)]
+mod published_tests {
+    use super::*;
+    use rainier_websocket::{Socket, SocketId};
+    use tokio::sync::mpsc;
+
+    fn socket() -> (Socket, mpsc::UnboundedReceiver<rainier_websocket::Outbound>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Socket::new(SocketId::next(), "/ws", vec![], tx), rx)
+    }
+
+    fn text(rx: &mut mpsc::UnboundedReceiver<rainier_websocket::Outbound>) -> String {
+        match rx.try_recv().unwrap() {
+            rainier_websocket::Outbound::Send(m) => m.as_text().unwrap().to_string(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_published_body_reaches_the_room_in_its_own_shape_or_the_default() {
+        let rooms = Arc::new(Rooms::new());
+        let (socket, mut rx) = socket();
+        rooms.join("posts.7", socket);
+        let body = r#"{"event":"PostLiked","data":{"id":7}}"#;
+
+        assert_eq!(SocketFanOut::new(Arc::clone(&rooms)).deliver_published("posts.7", body), 1);
+        let sent: Value = serde_json::from_str(&text(&mut rx)).unwrap();
+        assert_eq!(sent["event"], "PostLiked");
+
+        let shaped = SocketFanOut::new(rooms)
+            .shaping(|event, data| serde_json::json!({ "type": event, "data": data }).to_string());
+        assert_eq!(shaped.deliver_published("posts.7", body), 1);
+        let sent: Value = serde_json::from_str(&text(&mut rx)).unwrap();
+        assert_eq!(sent["type"], "PostLiked");
+        assert_eq!(sent["data"]["id"], 7);
+    }
+
+    #[test]
+    fn a_published_body_skips_its_own_socket_and_drops_what_is_not_a_broadcast() {
+        let rooms = Arc::new(Rooms::new());
+        let (mine, mut mine_rx) = socket();
+        let (theirs, mut theirs_rx) = socket();
+        let identity = mine.identity();
+        rooms.join("news", mine);
+        rooms.join("news", theirs);
+        let fan_out = SocketFanOut::new(rooms);
+
+        let body = serde_json::json!({ "event": "E", "data": {}, "socket": identity }).to_string();
+        assert_eq!(fan_out.deliver_published("news", &body), 1);
+        assert!(mine_rx.try_recv().is_err());
+        assert!(theirs_rx.try_recv().is_ok());
+
+        assert_eq!(fan_out.deliver_published("news", "not json"), 0);
+    }
+
+    /// Two relays over a real Redis. Skipped unless `RAINIER_REDIS_TEST_URL`
+    /// names a server; `redis-server --port 6390` and
+    /// `RAINIER_REDIS_TEST_URL=redis://127.0.0.1:6390` runs it.
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn a_broadcast_reaches_both_replicas_rooms_over_redis() {
+        use rainier_broadcast::redis::RedisRelay;
+        use rainier_broadcast::{Broadcast, Broadcaster, Channel, RedisBroadcaster};
+        use rainier_drivers::redis::{RedisClient, RedisConnector};
+
+        let Ok(url) = std::env::var("RAINIER_REDIS_TEST_URL") else { return };
+        let (rooms_a, rooms_b) = (Arc::new(Rooms::new()), Arc::new(Rooms::new()));
+        let (a, mut a_rx) = socket();
+        let (b, mut b_rx) = socket();
+        rooms_a.join("news", a);
+        rooms_b.join("news", b);
+        spawn_redis_into(
+            RedisRelay::new(url.clone()).with_prefix("t_"),
+            SocketFanOut::new(rooms_a),
+        );
+        spawn_redis_into(
+            RedisRelay::new(url.clone()).with_prefix("t_"),
+            SocketFanOut::new(rooms_b),
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let client = RedisClient::connect(&RedisConnector::open(&url).unwrap()).await.unwrap();
+        let publisher = RedisBroadcaster::new(client).with_prefix("t_");
+        publisher
+            .publish(&Broadcast::new(
+                "Hello",
+                vec![Channel::public("news")],
+                serde_json::json!({ "n": 1 }),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        for rx in [&mut a_rx, &mut b_rx] {
+            let sent: Value = serde_json::from_str(&text(rx)).unwrap();
+            assert_eq!(sent["event"], "Hello");
+            assert_eq!(sent["data"]["n"], 1);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "kafka"))]
 mod tests {
     use super::*;
     use rainier_drivers::kafka::KafkaPosition;

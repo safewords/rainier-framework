@@ -141,7 +141,7 @@ pub mod observability;
 pub mod public;
 pub mod query_cache;
 pub mod queued_listeners;
-#[cfg(feature = "kafka")]
+#[cfg(any(feature = "kafka", feature = "redis"))]
 pub mod relay;
 pub mod reporting;
 pub mod scheduling;

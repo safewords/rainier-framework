@@ -12,6 +12,17 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **A Redis relay** (`rainier-broadcast`, `rainier-framework`): `RedisRelay`
+  reads back what `RedisBroadcaster` publishes, and `relay::spawn_redis`
+  hands each message to any sink — `relay::spawn_redis_into` with a
+  `SocketFanOut` for a `rainier-websocket` `Rooms`, or
+  `PusherServer::deliver_published`. Every replica publishes and every
+  replica relays into its own sockets, so `Rooms` work behind a load
+  balancer with Redis as well as Kafka. `SocketFanOut::deliver_published`
+  takes a message as published; `SocketFanOut::shaping` sets the text a
+  socket is sent. The relay module is now built with `redis` as well as
+  `kafka`. Publishers and relays belong on one Redis node.
+
 - **MCP read-only clients** (`rainier-mcp`, `rainier-framework`):
   `MCP_READ_ONLY_CLIENTS=name=token,...` lets in named clients that are shown,
   and may call, only the tools marked `read_only()` — with Lookout, everything
