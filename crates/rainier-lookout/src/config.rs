@@ -285,6 +285,12 @@ pub struct Rum {
     /// and keep it. `0` holds nothing. See `docs/lookout.md`, "Pairing".
     #[serde(default = "default_rum_hold_seconds")]
     pub hold_seconds: u64,
+    /// The request header a proxy in front puts the visitor's country in —
+    /// `cf-ipcountry` behind Cloudflare — for the RUM rollups' `country`.
+    /// `None`, the default, files every report under `unknown`. Only a
+    /// two-character code is taken; anything else is `unknown` too.
+    #[serde(default)]
+    pub country_header: Option<String>,
 }
 
 fn default_rum_hold_seconds() -> u64 {
@@ -365,6 +371,7 @@ impl std::fmt::Debug for Rum {
             .field("sample_rate", &self.sample_rate)
             .field("slow_ms", &self.slow_ms)
             .field("secret", &if self.secret.is_empty() { "unset" } else { "set" })
+            .field("country_header", &self.country_header)
             .finish()
     }
 }
@@ -836,6 +843,7 @@ impl LookoutConfig {
     /// | `LOOKOUT_RUM_SLOW_MS` | [`Rum::slow_ms`] | an integer |
     /// | `LOOKOUT_RUM_SECRET` | [`Rum::secret`] (default: from `APP_KEY`) | a string |
     /// | `LOOKOUT_RUM_HOLD_SECONDS` | [`Rum::hold_seconds`] | an integer |
+    /// | `LOOKOUT_RUM_COUNTRY_HEADER` | [`Rum::country_header`] | a header name (`cf-ipcountry`) |
     /// | `LOOKOUT_RUM_REPLAY` | [`Replay::enabled`] | a boolean |
     /// | `LOOKOUT_RUM_REPLAY_EXCEPT` | [`Replay::except`] | comma-separated globs over page paths |
     /// | `LOOKOUT_RUM_REPLAY_CONSENT` | [`Replay::consent`] | `required` or `implied` |
@@ -991,6 +999,19 @@ impl LookoutConfig {
         }
         if let Some(v) = get("LOOKOUT_RUM_SLOW_MS") {
             config.rum.slow_ms = parse_u64("LOOKOUT_RUM_SLOW_MS", &v)?;
+        }
+        if let Some(v) = get("LOOKOUT_RUM_COUNTRY_HEADER") {
+            let name = v.trim().to_ascii_lowercase();
+            if name.is_empty()
+                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Err(ConfigError::new(
+                    "LOOKOUT_RUM_COUNTRY_HEADER",
+                    v,
+                    "a header name, like cf-ipcountry",
+                ));
+            }
+            config.rum.country_header = Some(name);
         }
         if let Some(v) = get("LOOKOUT_RUM_REPLAY_EXCEPT") {
             config.rum.replay.except =

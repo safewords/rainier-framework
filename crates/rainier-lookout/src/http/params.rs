@@ -236,6 +236,131 @@ pub(crate) fn period(params: &mut Params<'_>) -> Option<u32> {
     }
 }
 
+/// A time: RFC 3339, or relative to `now` — `30m`, `1h`, `7d` (`s`, `m`,
+/// `h`, `d`, `w`) before it.
+pub(crate) fn when(
+    params: &mut Params<'_>,
+    field: &str,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let value = params.raw(field)?;
+    if let Some(ago) = relative(&value) {
+        return Some(now - ago);
+    }
+    match DateTime::parse_from_rfc3339(&value) {
+        Ok(at) => Some(at.with_timezone(&Utc)),
+        Err(_) => {
+            params.fail(
+                field,
+                format!(
+                    "The {field} must be an RFC 3339 time, like 2026-11-13T09:30:00Z, or relative, like 1h or 7d."
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// `30m` as a duration: a whole number and one of `s`, `m`, `h`, `d`, `w`,
+/// up to a year.
+fn relative(value: &str) -> Option<Duration> {
+    let unit = value.chars().last()?;
+    let n: i64 = value[..value.len() - unit.len_utf8()].parse().ok()?;
+    let seconds = match unit {
+        's' => n,
+        'm' => n.checked_mul(60)?,
+        'h' => n.checked_mul(3600)?,
+        'd' => n.checked_mul(86_400)?,
+        'w' => n.checked_mul(604_800)?,
+        _ => return None,
+    };
+    (0..=366 * 86_400).contains(&seconds).then(|| Duration::seconds(seconds))
+}
+
+/// The window the health API reads: `since` (default an hour ago), `until`
+/// (default now; never past it) and the bucket length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Window {
+    pub(crate) since: DateTime<Utc>,
+    pub(crate) until: DateTime<Utc>,
+    pub(crate) period_s: u32,
+}
+
+impl Window {
+    /// As the answers carry it.
+    pub(crate) fn json(&self) -> Value {
+        serde_json::json!({
+            "since": self.since.to_rfc3339(),
+            "until": self.until.to_rfc3339(),
+            "period": self.period_s,
+        })
+    }
+
+    /// The window's length in minutes, at least one second's worth.
+    pub(crate) fn minutes(&self) -> f64 {
+        ((self.until - self.since).num_milliseconds().max(1000) as f64) / 60_000.0
+    }
+}
+
+/// The period giving `span` closest to thirty points, of 60, 600 and 3600.
+pub(crate) fn period_for_points(span: Duration) -> u32 {
+    let seconds = span.num_seconds().max(1) as f64;
+    crate::aggregate::PERIODS
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            let off = |p: u32| (seconds / f64::from(p) / 30.0).ln().abs();
+            off(*a).total_cmp(&off(*b))
+        })
+        .unwrap_or(60)
+}
+
+/// `since`, `until` and `period` for `/api/health`, `/api/requests` and
+/// `/api/rum/*`.
+pub(crate) fn window(params: &mut Params<'_>, now: DateTime<Utc>) -> Window {
+    let since = when(params, "since", now).unwrap_or(now - Duration::hours(1));
+    let until = when(params, "until", now).unwrap_or(now).min(now);
+    if since > now {
+        params.fail("since", "The since must be in the past.");
+    }
+    if until < since {
+        params.fail("until", "The until must not be before since.");
+    }
+    let span = if until > since { until - since } else { Duration::zero() };
+    let period_s = period(params).unwrap_or_else(|| period_for_points(span));
+    if span.num_seconds() / i64::from(period_s) > 2000 {
+        params.fail("since", "That is more than 2000 buckets; use a longer period.");
+    }
+    Window { since, until, period_s }
+}
+
+/// A comma-separated list of names from `allowed`; `None` when absent. An
+/// unknown name, or an empty list, is an error.
+pub(crate) fn names(params: &mut Params<'_>, field: &str, allowed: &[&str]) -> Option<Vec<String>> {
+    let value = params.raw(field)?;
+    let found: Vec<String> =
+        value.split(',').map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty()).collect();
+    if found.is_empty() || found.iter().any(|v| !allowed.contains(&v.as_str())) {
+        params.fail(
+            field,
+            format!("The {field} must be a comma-separated list of: {}.", allowed.join(", ")),
+        );
+        return None;
+    }
+    Some(found)
+}
+
+/// One name from `allowed`; `None` when absent.
+pub(crate) fn one_of(params: &mut Params<'_>, field: &str, allowed: &[&str]) -> Option<String> {
+    let value = params.raw(field)?.to_ascii_lowercase();
+    if allowed.contains(&value.as_str()) {
+        Some(value)
+    } else {
+        params.fail(field, format!("The {field} must be one of: {}.", allowed.join(", ")));
+        None
+    }
+}
+
 /// `GET /api/series/{type}`. The period defaults to one giving the span from
 /// `since` a dozen points or more; a span of more than 2000 buckets is refused.
 pub(crate) fn series_query(

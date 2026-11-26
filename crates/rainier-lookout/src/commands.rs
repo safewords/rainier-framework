@@ -277,6 +277,7 @@ impl StatusCommand {
 
         let watchers: Vec<Vec<String>> = crate::entry::EntryType::ALL
             .iter()
+            .filter(|t| !t.is_rollup())
             .map(|&t| {
                 let w = config.watcher(t);
                 vec![

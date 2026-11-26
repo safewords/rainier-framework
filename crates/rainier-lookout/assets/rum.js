@@ -101,7 +101,10 @@
   ;['pointerdown', 'keydown', 'scroll', 'touchstart'].forEach(function (type) {
     addEventListener(type, active, { passive: true, capture: true })
   })
-  var activity = { loadSent: false, navigations: [], errors: [], longTasks: { count: 0, total: 0, longest: 0 } }
+  var activity = { loadSent: false, settledSent: false, navigations: [], errors: [], longTasks: { count: 0, total: 0, longest: 0 } }
+  // The page the view landed on: its largest paint belongs to it, whatever
+  // route the app has moved to since.
+  var landing = location.pathname
 
   function round(n) {
     return typeof n === 'number' && isFinite(n) ? Math.round(n * 10) / 10 : undefined
@@ -198,16 +201,24 @@
 
   // What the page did since its last report, or null when there is nothing
   // to say. A sampled page view reports its activity; any page view reports
-  // a script error.
-  function pageActivity() {
+  // a script error. `hiding`: the page is being hidden or closed, so its
+  // vitals have settled — said once (`settled`), for the rollups to count.
+  function pageActivity(hiding) {
     var a = activity
-    var news = !a.loadSent || a.navigations.length || a.errors.length || a.longTasks.count
+    var settle = hiding === true && sampled && !a.settledSent
+    var news = !a.loadSent || settle || a.navigations.length || a.errors.length || a.longTasks.count
     if (!news || !(sampled || a.errors.length)) return null
     var out = {
+      sampled: sampled,
       navigations: a.navigations.splice(0),
       errors: a.errors.splice(0),
       long_tasks: a.longTasks.count ? { count: a.longTasks.count, total: round(a.longTasks.total), longest: round(a.longTasks.longest) } : undefined,
       vitals: vitals,
+    }
+    if (settle) {
+      out.settled = true
+      out.landing = landing
+      a.settledSent = true
     }
     a.longTasks = { count: 0, total: 0, longest: 0 }
     if (!a.loadSent) {
@@ -229,9 +240,9 @@
     return out
   }
 
-  function flush() {
+  function flush(hiding) {
     // Activity waits for a token to vouch for it; calls carry their own.
-    var act = proof ? pageActivity() : null
+    var act = proof ? pageActivity(hiding) : null
     if (!queue.length && !act) return
     var calls = queue.splice(0, 50)
     var body = JSON.stringify({ view: view, session: session(), context: context || undefined, user: user || undefined, proof: proof || undefined, page: page(), device: device(), calls: calls, activity: act || undefined })
@@ -489,7 +500,9 @@
 
   setInterval(flush, 10000)
   addEventListener('visibilitychange', function () {
-    if (document.visibilityState === 'hidden') flush()
+    if (document.visibilityState === 'hidden') flush(true)
   })
-  addEventListener('pagehide', flush)
+  addEventListener('pagehide', function () {
+    flush(true)
+  })
 })()

@@ -470,7 +470,7 @@ pub(crate) fn status_value(
         StoreKind::Cache { .. } => "cache",
     };
     let mut watchers = Map::new();
-    for &t in EntryType::ALL {
+    for &t in EntryType::ALL.iter().filter(|t| !t.is_rollup()) {
         let w = config.watcher(t);
         watchers.insert(
             t.as_str().to_string(),

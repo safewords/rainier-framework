@@ -383,3 +383,81 @@ async fn outside_local_an_async_viewer_predicate_is_awaited() {
     admin.get("/_lookout").await.assert_ok();
     admin.get("/_lookout/api/batches").await.assert_ok();
 }
+
+#[tokio::test]
+async fn a_reader_reads_the_health_api_and_nothing_else() {
+    let app = builder()
+        .with_lookout(on(false))
+        .with_lookout_viewers::<User>()
+        .with_lookout_readers_where_async(|request: &rainier_http::Request| {
+            let token = request.header("authorization").map(str::to_string);
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                token.as_deref() == Some("Bearer service-token")
+            })
+        })
+        .with_instance_arc(auth())
+        .with_instance(Gate::<User>::new().define_simple("viewLookout", |u: &User| u.admin))
+        .boot()
+        .await
+        .unwrap();
+    let app = TestApp::new(app).unwrap();
+    let reader = || {
+        TestApp::new(Arc::clone(app.app()))
+            .unwrap()
+            .with_header("authorization", "Bearer service-token")
+    };
+    for uri in [
+        "/_lookout/api/health",
+        "/_lookout/api/health?since=24h&apdex_t_ms=500",
+        "/_lookout/api/requests?group=route,method,status",
+        "/_lookout/api/rum/vitals",
+        "/_lookout/api/rum/errors",
+        "/_lookout/api/aggregates/request",
+        "/_lookout/api/series/request",
+        "/_lookout/api/cases",
+        "/_lookout/api/status",
+    ] {
+        reader().get(uri).await.assert_ok();
+    }
+    reader().get("/_lookout/api/health?since=soon").await.assert_invalid();
+    for uri in [
+        "/_lookout",
+        "/_lookout/api/batches",
+        "/_lookout/api/batches/x",
+        "/_lookout/api/entries/query",
+        "/_lookout/api/cases/x",
+        "/_lookout/api/insights",
+    ] {
+        reader().get(uri).await.assert_not_found();
+    }
+    reader().delete("/_lookout/api/batches").await.assert_not_found();
+    reader()
+        .post("/_lookout/api/cases/x", &serde_json::json!({ "action": "resolve" }))
+        .await
+        .assert_not_found();
+
+    // Another token, or none, is no reader; a viewer still sees everything.
+    TestApp::new(Arc::clone(app.app()))
+        .unwrap()
+        .with_header("authorization", "Bearer guess")
+        .get("/_lookout/api/health")
+        .await
+        .assert_not_found();
+    TestApp::new(Arc::clone(app.app()))
+        .unwrap()
+        .get("/_lookout/api/health")
+        .await
+        .assert_not_found();
+    let admin = TestApp::new(Arc::clone(app.app())).unwrap().with_token("admin-token");
+    admin.get("/_lookout/api/health").await.assert_ok();
+    admin.get("/_lookout").await.assert_ok();
+}
+
+#[tokio::test]
+async fn without_readers_a_service_token_opens_nothing() {
+    let app = builder().with_lookout(on(false)).boot().await.unwrap();
+    let app = TestApp::new(app).unwrap().with_header("authorization", "Bearer service-token");
+    app.get("/_lookout/api/health").await.assert_not_found();
+    app.get("/_lookout/api/status").await.assert_not_found();
+}

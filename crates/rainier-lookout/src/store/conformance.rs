@@ -319,6 +319,7 @@ pub async fn run(store: &dyn Store) {
     aggregates_roll_up_and_order(store).await;
     aggregates_merge_across_writes_into_one_bucket(store).await;
     counted_aggregates_add_without_storing_batches(store).await;
+    rollups_are_kept_merged_and_pruned_like_any_aggregate(store).await;
     prune_cuts_batches_and_aggregates_independently(store).await;
     clear_removes_everything(store).await;
 }
@@ -863,6 +864,125 @@ pub async fn counted_aggregates_add_without_storing_batches(store: &dyn Store) {
         "[{name}] kept and counted together"
     );
     assert_eq!(minute[0].histogram.values().sum::<u64>(), 3, "[{name}] all three timed");
+}
+
+/// The health API's rollups — [`RequestFacet`](EntryType::RequestFacet),
+/// [`JobFacet`](EntryType::JobFacet), [`RumView`](EntryType::RumView) and
+/// [`RumError`](EntryType::RumError) — are aggregate rows like any other:
+/// rolled up from a stored batch's request, and from counted ones; written as
+/// given, with their JSON keys, counter slots past the durations' and a
+/// Unix second in `max_us`; merged across writes; pruned and cleared with
+/// the rest.
+pub async fn rollups_are_kept_merged_and_pruned_like_any_aggregate(store: &dyn Store) {
+    let name = store.name();
+    seed(store, Vec::new()).await;
+    let served = |id: &str, s, status: u16, us| {
+        let mut e = entry(id, 0, EntryType::Request, "posts.index", at(s, 0), Some(us));
+        e.content = json!({
+            "http.request.method": "GET",
+            "http.response.status_code": status,
+            "rainier.route.name": "posts.index",
+        });
+        e
+    };
+    // A kept batch rolls its request into a facet; a counted one adds to it.
+    let mut kept = batch("f1", BatchKind::Request, at(5, 0));
+    kept.entries = vec![served("f1", 5, 200, 100)];
+    let counted =
+        aggregate::rollup_entries(&[served("f2", 15, 200, 300), served("f3", 25, 503, 900)]);
+    store.store_counting(vec![kept], counted).await.expect("store and count");
+    let mut facets =
+        store.aggregate_rows(EntryType::RequestFacet, 60, at(0, 0)).await.expect("rows");
+    facets.sort_by(|a, b| a.key.cmp(&b.key));
+    assert_eq!(
+        facets.iter().map(|r| (r.key.as_str(), r.count, r.sum_us, r.max_us)).collect::<Vec<_>>(),
+        vec![("GET 2xx posts.index", 2, 400, 300), ("GET 5xx posts.index", 1, 900, 900)],
+        "[{name}] request facets, kept and counted"
+    );
+    assert_eq!(facets[0].histogram.values().sum::<u64>(), 2, "[{name}] facets are timed");
+
+    // Rows written as the RUM ingest writes them, twice into one bucket.
+    let view_key = r#"["/posts/{id}","Safari","iOS","mobile","4g","NZ"]"#;
+    let error_key = json!([
+        "x is \"undefined\" — ünïcode",
+        "https://app/app.js",
+        7,
+        "/posts/{id}",
+        "Safari",
+        "iOS",
+        "mobile",
+        "4g",
+        "NZ"
+    ])
+    .to_string();
+    let rum = |views, last_seen, errors| {
+        vec![
+            Aggregate {
+                bucket_start: at(60, 0),
+                period_s: 60,
+                entry_type: EntryType::RumView,
+                key: view_key.to_string(),
+                count: views,
+                sum_us: 0,
+                max_us: 0,
+                histogram: [(aggregate::slot(1_800_000), views), (6144, errors), (6145, 3)]
+                    .into_iter()
+                    .collect(),
+            },
+            Aggregate {
+                bucket_start: at(60, 0),
+                period_s: 60,
+                entry_type: EntryType::RumError,
+                key: error_key.clone(),
+                count: errors,
+                sum_us: 0,
+                max_us: last_seen,
+                histogram: Default::default(),
+            },
+        ]
+    };
+    let second = u64::try_from(T0).expect("a positive instant");
+    store.store_counting(Vec::new(), rum(1, second + 61, 2)).await.expect("first report");
+    store.store_counting(Vec::new(), rum(2, second + 75, 1)).await.expect("second report");
+    let views = store.aggregate_rows(EntryType::RumView, 60, at(0, 0)).await.expect("rows");
+    assert_eq!(views.len(), 1, "[{name}] one view row: {views:?}");
+    assert_eq!((views[0].key.as_str(), views[0].count), (view_key, 3), "[{name}] views add");
+    assert_eq!(
+        views[0].histogram,
+        [(aggregate::slot(1_800_000), 3), (6144, 3), (6145, 6)].into_iter().collect(),
+        "[{name}] metrics and counters add, slot for slot"
+    );
+    let errors = store.aggregate_rows(EntryType::RumError, 60, at(0, 0)).await.expect("rows");
+    assert_eq!(errors.len(), 1, "[{name}] one error row");
+    assert_eq!(
+        (errors[0].key.as_str(), errors[0].count, errors[0].max_us),
+        (error_key.as_str(), 3, second + 75),
+        "[{name}] counts add, the last sighting is the latest"
+    );
+    assert!(
+        store.aggregate_rows(EntryType::Request, 60, at(0, 0)).await.expect("rows").len() == 1,
+        "[{name}] the route's own row is still one"
+    );
+
+    // Pruned with every other aggregate.
+    store.prune(at(-3_600, 0), at(120, 0)).await.expect("prune");
+    for t in EntryType::ROLLUPS {
+        assert!(
+            store.aggregate_rows(*t, 60, at(-3_600, 0)).await.expect("rows").is_empty(),
+            "[{name}] {t} pruned"
+        );
+    }
+    let counted = aggregate::rollup_entries(&[served("f4", 200, 200, 1)]);
+    store.store_counting(Vec::new(), counted).await.expect("count");
+    store.clear().await.expect("clear");
+    assert!(
+        store
+            .aggregate_rows(EntryType::RequestFacet, 60, at(-3_600, 0))
+            .await
+            .expect("rows")
+            .is_empty(),
+        "[{name}] cleared"
+    );
 }
 
 /// Prune removes old batches (their entries and tags too) and old aggregate

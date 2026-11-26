@@ -274,6 +274,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_request_is_counted_by_route_method_and_status_class_kept_or_not() {
+        use crate::store::Store as _;
+        // Production's rule: the fine requests are counted, not kept.
+        let config = LookoutConfig::default().enabled(true).local(false);
+        let store = Arc::new(MemoryStore::new(10));
+        let lookout = Lookout::new(config, store.clone());
+        let (kernel, events) = wired(&lookout);
+        for uri in ["/health", "/health", "/posts/1", "/boom", "/nowhere"] {
+            kernel.handle_request(get(uri)).await;
+        }
+        flushed(&lookout, &events).await;
+
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let rows = store.aggregate_rows(EntryType::RequestFacet, 60, since).await.unwrap();
+        let mut facets: Vec<(String, u64)> =
+            rows.iter().map(|r| (r.key.clone(), r.count)).collect();
+        facets.sort();
+        assert_eq!(
+            facets,
+            vec![
+                ("GET 2xx health".to_string(), 2),
+                ("GET 2xx posts.show".to_string(), 1),
+                ("GET 4xx (no route)".to_string(), 1),
+                ("GET 5xx /boom".to_string(), 1),
+            ],
+            "every request, kept or not, by its route's name or else its pattern"
+        );
+        assert!(store.all().len() < 5, "and most were not kept");
+    }
+
+    #[tokio::test]
     async fn the_middleware_attaches_route_status_and_user_through_a_real_kernel() {
         let mut config = LookoutConfig::default().enabled(true).local(true).scope(Scope {
             routes: Patterns { include: vec![], exclude: vec!["health".into()] },

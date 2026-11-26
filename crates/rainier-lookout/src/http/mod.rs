@@ -21,6 +21,10 @@
 //! | `GET` | `/api/cases/{id}` | `lookout.api.case` | One case |
 //! | `POST` | `/api/cases/{id}` | `lookout.api.case.act` | `{"action": "resolve"\|"reopen"\|"ignore"\|"severity", "severity"?, "note"?}` — needs `X-Lookout: 1` |
 //! | `GET` | `/api/status` | `lookout.api.status` | Store, watchers, sample rates, retention |
+//! | `GET` | `/api/health` | `lookout.api.health` | One service's health over a window: requests, error rate, percentiles, Apdex, jobs, exceptions, cases, a status and the routes behind it |
+//! | `GET` | `/api/requests` | `lookout.api.requests` | Every request, grouped by any of route, method and status class, and filtered |
+//! | `GET` | `/api/rum/vitals` | `lookout.api.rum.vitals` | Real users' page views and their p75 vitals, grouped by one dimension |
+//! | `GET` | `/api/rum/errors` | `lookout.api.rum.errors` | Real users' script errors, by message, file and line |
 //! | `GET` | `/{rest*}` | `lookout.app` | The same shell, for the app's own client-side routes |
 //!
 //! The fallback never answers under `/api/` or `/assets/`: an unknown API
@@ -42,6 +46,15 @@
 //! The check is the application's: typically "authenticate with the
 //! dashboard's guard, then ask the `Gate` for [`Dashboard::ability`]". This
 //! module takes it as a closure so it depends on neither.
+//!
+//! # Readers
+//!
+//! Another service may be let in as a **reader**
+//! ([`LookoutGate::with_readers`]): a check over the request alone — a
+//! service token, say — that admits it to the read-only API another service
+//! needs and nothing else: `GET` on [`READER_ROUTES`]. Everything else, the
+//! dashboard's shell included, stays the viewers' alone, and a refused
+//! reader gets the same 404 as anyone refused.
 //!
 //! # What every response carries
 //!
@@ -73,6 +86,7 @@ use crate::config::{Dashboard, LookoutConfig};
 use crate::store::Store;
 
 pub(crate) mod api;
+pub(crate) mod health;
 mod params;
 mod rum;
 mod shell;
@@ -105,6 +119,7 @@ pub type AccessCheck = Arc<dyn Fn(&Request) -> BoxFuture<'static, bool> + Send +
 #[derive(Clone)]
 pub struct LookoutGate {
     check: AccessCheck,
+    readers: Option<AccessCheck>,
 }
 
 impl std::fmt::Debug for LookoutGate {
@@ -130,12 +145,55 @@ impl LookoutGate {
     pub fn new(
         check: impl Fn(&Request) -> BoxFuture<'static, bool> + Send + Sync + 'static,
     ) -> Self {
-        Self { check: Arc::new(check) }
+        Self { check: Arc::new(check), readers: None }
     }
 
     /// A gate from an already-shared check.
     pub fn from_check(check: AccessCheck) -> Self {
-        Self { check }
+        Self { check, readers: None }
+    }
+
+    /// Also let in, to the read-only API another service needs — `GET` on
+    /// [`READER_ROUTES`] and nothing else — whoever `check` admits: a check
+    /// over the request alone, such as a service's bearer token. Off unless
+    /// given. A reader `check` refuses still has the viewer's check to pass.
+    ///
+    /// ```
+    /// use rainier_lookout::LookoutGate;
+    ///
+    /// let gate = LookoutGate::deny_all().with_readers(|request| {
+    ///     let ok = request.header("authorization") == Some("Bearer service-token");
+    ///     Box::pin(async move { ok })
+    /// });
+    /// # let _ = gate;
+    /// ```
+    pub fn with_readers(
+        self,
+        check: impl Fn(&Request) -> BoxFuture<'static, bool> + Send + Sync + 'static,
+    ) -> Self {
+        self.with_reader_check(Arc::new(check))
+    }
+
+    /// [`with_readers`](Self::with_readers), from an already-shared check.
+    pub fn with_reader_check(mut self, check: AccessCheck) -> Self {
+        self.readers = Some(check);
+        self
+    }
+
+    /// Whether `request` may call a reader's route: as a reader, or else as a
+    /// viewer ([`allows`](Self::allows)).
+    pub async fn allows_reader(
+        &self,
+        request: &Request,
+        dashboard: &Dashboard,
+        environment: &str,
+    ) -> bool {
+        if let Some(readers) = &self.readers {
+            if (readers)(request).await {
+                return true;
+            }
+        }
+        self.allows(request, dashboard, environment).await
     }
 
     /// A gate that lets nobody in — except, through
@@ -169,6 +227,19 @@ impl LookoutGate {
     }
 }
 
+/// The routes a reader ([`LookoutGate::with_readers`]) may call, with `GET`
+/// (and `HEAD`) only, as patterns under the dashboard's path.
+pub const READER_ROUTES: &[&str] = &[
+    "/api/health",
+    "/api/requests",
+    "/api/rum/vitals",
+    "/api/rum/errors",
+    "/api/aggregates/{type}",
+    "/api/series/{type}",
+    "/api/cases",
+    "/api/status",
+];
+
 /// Whether `environment` is the local one — the only place
 /// [`Dashboard::open_locally`] applies. `testing` is deliberately not: a test
 /// asserting on the gate should see the production behaviour.
@@ -189,6 +260,9 @@ pub(crate) struct Shared {
     pub(crate) tail: Arc<stream::Tail>,
     /// How much each address has reported this minute.
     pub(crate) rum_limiter: crate::rum::Limiter,
+    /// The distinct pages, view keys and errors the RUM rollups have counted
+    /// this hour, for their caps.
+    pub(crate) rum_caps: crate::rum_rollup::Caps,
 }
 
 /// Declare the dashboard and its API on a new [`Router`], under
@@ -231,6 +305,7 @@ pub fn routes(
         base: base.clone(),
         tail: stream::Tail::new(),
         rum_limiter: crate::rum::Limiter::default(),
+        rum_caps: crate::rum_rollup::Caps::default(),
     });
 
     let group = GroupAttributes::new().prefix(base).name("lookout.");
@@ -244,17 +319,21 @@ pub fn routes(
         router.get("/api/batches/{id}", guarded(&state, api::batch)).name("api.batch");
         router.get("/api/entries/{type}", guarded(&state, api::entries)).name("api.entries");
         router
-            .get("/api/aggregates/{type}", guarded(&state, api::aggregates))
+            .get("/api/aggregates/{type}", readable(&state, api::aggregates))
             .name("api.aggregates");
-        router.get("/api/series/{type}", guarded(&state, api::series)).name("api.series");
+        router.get("/api/series/{type}", readable(&state, api::series)).name("api.series");
         router.get("/api/families/{type}/{id}", guarded(&state, api::family)).name("api.family");
         router.get("/api/models", guarded(&state, api::models)).name("api.models");
         router.get("/api/models/{model}", guarded(&state, api::model)).name("api.model");
         router.get("/api/insights", guarded(&state, api::insights)).name("api.insights");
-        router.get("/api/cases", guarded(&state, api::cases)).name("api.cases");
+        router.get("/api/cases", readable(&state, api::cases)).name("api.cases");
         router.get("/api/cases/{id}", guarded(&state, api::case)).name("api.case");
         router.post("/api/cases/{id}", guarded(&state, api::act_on_case)).name("api.case.act");
-        router.get("/api/status", guarded(&state, api::status)).name("api.status");
+        router.get("/api/status", readable(&state, api::status)).name("api.status");
+        router.get("/api/health", readable(&state, health::health)).name("api.health");
+        router.get("/api/requests", readable(&state, health::requests)).name("api.requests");
+        router.get("/api/rum/vitals", readable(&state, health::rum_vitals)).name("api.rum.vitals");
+        router.get("/api/rum/errors", readable(&state, health::rum_errors)).name("api.rum.errors");
         router.get("/api/stream", guarded(&state, stream::stream)).name("api.stream");
 
         // Real user monitoring: public, because every visitor's browser
@@ -313,6 +392,35 @@ where
         let handler = handler.clone();
         Box::pin(async move {
             if !state.gate.allows(&request, &state.config.dashboard, &state.environment).await {
+                return denied(&request);
+            }
+            secure(handler(state, request).await.into_response())
+        })
+    }
+}
+
+/// Wrap a handler a reader may call: the reader's check, else the viewer's,
+/// and the response headers. Registered for `GET` only, so every other
+/// method on its path falls to the viewers' catch-all.
+fn readable<F, Fut, R>(
+    state: &Arc<Shared>,
+    handler: F,
+) -> impl Fn(Req) -> BoxFuture<'static, Response> + Clone + Send + Sync + 'static
+where
+    F: Fn(Arc<Shared>, Req) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = R> + Send + 'static,
+    R: rainier_http::IntoResponse,
+{
+    let state = Arc::clone(state);
+    move |request: Req| {
+        let state = Arc::clone(&state);
+        let handler = handler.clone();
+        Box::pin(async move {
+            let allowed = state
+                .gate
+                .allows_reader(&request, &state.config.dashboard, &state.environment)
+                .await;
+            if !allowed {
                 return denied(&request);
             }
             secure(handler(state, request).await.into_response())

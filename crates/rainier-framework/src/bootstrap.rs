@@ -99,6 +99,10 @@ pub struct Rainier {
     /// its user type.
     #[cfg(feature = "lookout")]
     lookout_viewers: Option<crate::lookout::Viewers>,
+    /// Which other services may read Lookout's health API — `None`, nobody,
+    /// until the application says.
+    #[cfg(feature = "lookout")]
+    lookout_readers: Option<crate::lookout::http::AccessCheck>,
     /// Additions to the MCP server, applied in order at boot.
     #[cfg(feature = "mcp")]
     mcp: Vec<crate::mcp::Adjustment>,
@@ -158,6 +162,8 @@ impl Rainier {
             lookout: Vec::new(),
             #[cfg(feature = "lookout")]
             lookout_viewers: None,
+            #[cfg(feature = "lookout")]
+            lookout_readers: None,
             #[cfg(feature = "mcp")]
             mcp: Vec::new(),
             #[cfg(feature = "mcp")]
@@ -751,6 +757,45 @@ impl Rainier {
         self
     }
 
+    /// Let another service read Lookout's health API when `allow` says so —
+    /// a check over the request alone, with no user and no guard: a bearer
+    /// service token, say.
+    ///
+    /// A reader may call `GET` on the read-only routes another service
+    /// needs — `{path}/api/health`, `/api/requests`, `/api/rum/vitals`,
+    /// `/api/rum/errors`, `/api/aggregates/{type}`, `/api/series/{type}`,
+    /// `/api/cases` and `/api/status`
+    /// ([`READER_ROUTES`](crate::lookout::http::READER_ROUTES)) — and
+    /// nothing else: never the dashboard, a batch with its bodies, a case's
+    /// actions or a `DELETE`. A request `allow` refuses still has the
+    /// viewers' check to pass; one refused by both gets the same 404 as any
+    /// refused request. Off unless called; a later call replaces this one.
+    ///
+    /// `allow` returns a `'static` future: copy what it needs (the header)
+    /// out of the request before the `async` block, and answer `false` when
+    /// the check cannot be made.
+    ///
+    /// ```no_run
+    /// # use rainier_framework::Rainier;
+    /// # fn wire(app: Rainier) -> Rainier {
+    /// app.with_lookout_readers_where_async(|request: &rainier_http::Request| {
+    ///     let token = request.header("authorization").map(str::to_string);
+    ///     Box::pin(async move { token.as_deref() == Some("Bearer service-token") })
+    /// })
+    /// # }
+    /// ```
+    #[cfg(feature = "lookout")]
+    pub fn with_lookout_readers_where_async(
+        mut self,
+        allow: impl Fn(&rainier_http::Request) -> rainier_support::BoxFuture<'static, bool>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.lookout_readers = Some(Arc::new(allow));
+        self
+    }
+
     /// Add to the MCP server: tools, resources, prompts, instructions.
     ///
     /// Each closure is handed the server and returns it, in order. Nothing
@@ -1264,6 +1309,10 @@ impl Rainier {
                     config.dashboard.clone(),
                 )),
                 None => crate::lookout::LookoutGate::deny_all(),
+            };
+            let gate = match &self.lookout_readers {
+                Some(readers) => gate.with_reader_check(Arc::clone(readers)),
+                None => gate,
             };
             self.router.merge(crate::lookout::routes(
                 Arc::clone(&*app.resolve::<Arc<dyn crate::lookout::Store>>()?),

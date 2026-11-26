@@ -204,9 +204,13 @@ fn routes_are_named_under_lookout() {
             "lookout.api.clear",
             "lookout.api.entries",
             "lookout.api.family",
+            "lookout.api.health",
             "lookout.api.insights",
             "lookout.api.model",
             "lookout.api.models",
+            "lookout.api.requests",
+            "lookout.api.rum.errors",
+            "lookout.api.rum.vitals",
             "lookout.api.series",
             "lookout.api.status",
             "lookout.api.stream",
@@ -833,4 +837,306 @@ async fn lists_cases_and_closes_one() {
     assert_eq!(open["data"].as_array().unwrap().len(), 0);
     let bad = get(&router, "/_lookout/api/cases?status=sideways&severity=huge").await;
     assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+// --- the service-health API ---------------------------------------------------
+
+/// A request's root entry as the subscriber records it, `ago_s` seconds ago.
+fn served(method: &str, status: u16, route: &str, ago_s: i64, us: u64) -> crate::entry::Entry {
+    let mut e = entry("h", "r", EntryType::Request, route, Utc::now(), 0, Some(us));
+    e.occurred_at = Utc::now() - chrono::Duration::seconds(ago_s);
+    e.content = serde_json::json!({
+        "http.request.method": method,
+        "http.response.status_code": status,
+        "rainier.route.name": route,
+    });
+    e
+}
+
+use chrono::Utc;
+
+/// Ten requests — eight fine, one failing, one refused — a failed job and an
+/// exception, all counted and none kept, as in production.
+fn traffic() -> Arc<FakeStore> {
+    let mut entries: Vec<crate::entry::Entry> =
+        (0..8).map(|i| served("GET", 200, "posts.index", 30 + i, 100_000)).collect();
+    entries.push(served("GET", 500, "posts.show", 40, 2_000_000));
+    entries.push(served("POST", 422, "posts.store", 50, 50_000));
+    let mut job = entry("j", "j", EntryType::Job, "SendInvoice", Utc::now(), 0, Some(10));
+    job.tags.push("failed".into());
+    entries.push(job);
+    entries.push(entry("x", "x", EntryType::Exception, "Boom@app", Utc::now(), 0, None));
+    let store = FakeStore::default();
+    *store.aggregates.lock().unwrap() = crate::aggregate::rollup_entries(&entries);
+    Arc::new(store)
+}
+
+#[tokio::test]
+async fn health_judges_every_request_counted() {
+    let router = app(traffic());
+    let answer = get(&router, "/_lookout/api/health").await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text);
+    let data = &answer.json()["data"];
+    let requests = &data["requests"];
+    assert_eq!(requests["count"], 10, "{data}");
+    assert_eq!(requests["errors_5xx"], 1);
+    assert_eq!(requests["client_errors_4xx"], 1);
+    assert_eq!(requests["error_rate"], 0.1);
+    assert_eq!(requests["apdex_t_ms"], 300);
+    // Nine at or under 300 ms, one at 2 s (over 4T): (9 + 0/2) / 10.
+    assert_eq!(requests["apdex"], 0.9);
+    assert!(requests["p50_us"].as_u64().unwrap() > 90_000);
+    assert_eq!(data["status"], "failing", "10% is failing");
+    assert_eq!(data["jobs"], serde_json::json!({ "count": 1, "failed": 1 }));
+    assert_eq!(data["exceptions"]["count"], 1);
+    assert_eq!(data["window"]["period"], 60, "an hour in minutes");
+    assert!(data["series"].as_array().unwrap().len() >= 60);
+    assert_eq!(data["top_routes"][0]["route"], "posts.index");
+    assert_eq!(data["top_routes"][0]["count"], 8);
+    assert_eq!(data["slowest_routes"][0]["route"], "posts.show");
+    assert_eq!(data["failing_routes"].as_array().unwrap().len(), 1);
+    assert_eq!(data["failing_routes"][0]["route"], "posts.show");
+
+    // A tighter target, and a window with nothing in it.
+    let strict = get(&router, "/_lookout/api/health?apdex_t_ms=10").await.json();
+    assert_eq!(strict["data"]["requests"]["apdex"], 0.0);
+    let idle = get(&router, "/_lookout/api/health?since=7d&until=6d").await.json();
+    assert_eq!(idle["data"]["status"], "idle", "{idle}");
+    assert_eq!(idle["data"]["requests"]["apdex"], Value::Null);
+    assert_eq!(idle["data"]["window"]["period"], 3600, "a day in hours");
+}
+
+#[tokio::test]
+async fn requests_group_filter_and_order() {
+    let router = app(traffic());
+    let body = get(&router, "/_lookout/api/requests").await.json();
+    let rows = body["data"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{body}");
+    assert_eq!(rows[0]["route"], "posts.index");
+    assert_eq!(rows[0]["method"], Value::Null, "grouped away");
+    assert_eq!(body["data"]["totals"]["count"], 10);
+    assert_eq!(body["data"]["totals"]["route"], Value::Null);
+    assert!(body["data"].get("series").is_none());
+
+    let body = get(&router, "/_lookout/api/requests?group=method,status&order=error_rate&series=1")
+        .await
+        .json();
+    let rows = body["data"]["rows"].as_array().unwrap();
+    assert_eq!(rows[0]["method"], "GET");
+    assert_eq!(rows[0]["status"], "5xx");
+    assert_eq!(rows[0]["error_rate"], 1.0);
+    assert_eq!(rows[0]["route"], Value::Null);
+    assert!(body["data"]["series"].as_array().unwrap().len() >= 60);
+
+    let body =
+        get(&router, "/_lookout/api/requests?route=posts.*&method=post&limit=1").await.json();
+    assert_eq!(body["data"]["rows"][0]["route"], "posts.store", "{body}");
+    assert_eq!(body["data"]["totals"]["count"], 1);
+    let body = get(&router, "/_lookout/api/requests?q=SHOW&status=5xx&order=p95").await.json();
+    assert_eq!(body["data"]["totals"]["errors_5xx"], 1);
+    assert_eq!(body["data"]["rows"][0]["max_us"], 2_000_000);
+}
+
+#[tokio::test]
+async fn bad_health_parameters_are_a_422_in_rainiers_shape() {
+    let router = app(traffic());
+    let answer = get(
+        &router,
+        "/_lookout/api/requests?group=route,planet&order=loudest&status=6xx&limit=501&since=yesterday&series=perhaps",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let body = answer.json();
+    assert_eq!(body["message"], "The given data was invalid.");
+    for field in ["group", "order", "status", "limit", "since", "series"] {
+        assert!(body["errors"][field].is_array(), "{field}: {body}");
+    }
+    for uri in [
+        "/_lookout/api/health?apdex_t_ms=0",
+        "/_lookout/api/health?period=61",
+        "/_lookout/api/health?since=1h&until=2h",
+        "/_lookout/api/health?since=60d&period=60",
+        "/_lookout/api/rum/vitals?group=planet",
+        "/_lookout/api/rum/vitals?order=vibes&limit=201",
+        "/_lookout/api/rum/errors?limit=0",
+    ] {
+        assert_eq!(get(&router, uri).await.status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn accepted_page_reports_roll_up_into_vitals_and_errors() {
+    let mut config = LookoutConfig::default().enabled(true);
+    config.rum.enabled = true;
+    config.rum.origins = vec!["https://app.example.com".into()];
+    config.rum.secret = b"k".to_vec();
+    config.rum.country_header = Some("cf-ipcountry".into());
+    let store = Arc::new(crate::store::memory::MemoryStore::new(10));
+    let mut router = Router::new();
+    router.merge(routes(store, Arc::new(config), LookoutGate::allow_all(), "production"));
+    let router = router.compile(&Container::new()).unwrap();
+
+    let report = |proof: &str| {
+        serde_json::json!({
+            "view": "0123456789abcdef0123456789abcdef",
+            "proof": proof,
+            "page": { "url": "https://app.example.com/posts/42" },
+            "device": { "connection": { "type": "3g" } },
+            "activity": {
+                "sampled": true,
+                "load": { "ttfb": 200.0, "load": 1500.0 },
+                "vitals": { "fcp": 400.0, "lcp": 1800.0, "cls": 0.1, "inp": 120.0 },
+                "settled": true,
+                "landing": "/posts/42",
+                "errors": [{ "message": "x is undefined", "source": "https://app.example.com/app.js", "line": 7, "page": "/posts/42" }],
+                "long_tasks": { "count": 2 },
+            }
+        })
+        .to_string()
+    };
+    let post = |body: String| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/_lookout/rum")
+            .header("origin", "https://app.example.com")
+            .header("cf-ipcountry", "nz")
+            .header(
+                "user-agent",
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
+            )
+            .body(body)
+            .build()
+    };
+    // A report that cannot prove its page talked to this application counts
+    // for nothing.
+    router.dispatch(post(report("forged.0000000000000000"))).await;
+    let empty = get(&router, "/_lookout/api/rum/vitals").await.json();
+    assert_eq!(empty["data"]["totals"]["views"], 0, "{empty}");
+    assert_eq!(empty["data"]["enabled"], true);
+
+    let proof = crate::rum::token(b"k", "trace-1");
+    assert_eq!(router.dispatch(post(report(&proof))).await.status().as_u16(), 204);
+
+    let vitals = get(&router, "/_lookout/api/rum/vitals?group=country").await.json();
+    let row = &vitals["data"]["rows"][0];
+    assert_eq!(row["key"], "NZ", "{vitals}");
+    assert_eq!(row["views"], 1);
+    assert_eq!(row["js_errors"], 1);
+    assert_eq!(row["long_tasks"], 2);
+    assert!(row["lcp_p75_ms"].as_f64().unwrap() > 1700.0);
+    let by_page = get(&router, "/_lookout/api/rum/vitals?device=mobile&connection=3g").await.json();
+    assert_eq!(by_page["data"]["rows"][0]["key"], "/posts/{id}", "{by_page}");
+    let none = get(&router, "/_lookout/api/rum/vitals?browser=Firefox").await.json();
+    assert_eq!(none["data"]["rows"].as_array().unwrap().len(), 0);
+
+    let errors = get(&router, "/_lookout/api/rum/errors?country=NZ").await.json();
+    let row = &errors["data"]["rows"][0];
+    assert_eq!(row["message"], "x is undefined", "{errors}");
+    assert_eq!(row["file"], "https://app.example.com/app.js");
+    assert_eq!(row["line"], 7);
+    assert_eq!(row["count"], 1);
+    assert_eq!(row["pages"], 1);
+    assert_eq!(row["browsers"], serde_json::json!([["Safari", 1]]));
+    assert!(row["first_seen"].is_string() && row["last_seen"].is_string());
+}
+
+// --- readers -----------------------------------------------------------------
+
+const TOKEN: &str = "Bearer service-token";
+
+fn readers() -> LookoutGate {
+    LookoutGate::deny_all().with_readers(|request| {
+        let ok = request.header("authorization") == Some(TOKEN);
+        Box::pin(async move { ok })
+    })
+}
+
+const READER_GETS: &[&str] = &[
+    "/_lookout/api/health",
+    "/_lookout/api/requests?group=route,status",
+    "/_lookout/api/rum/vitals",
+    "/_lookout/api/rum/errors",
+    "/_lookout/api/aggregates/request",
+    "/_lookout/api/series/request",
+    "/_lookout/api/cases",
+    "/_lookout/api/status",
+];
+
+#[test]
+fn the_reader_routes_are_the_contracts() {
+    let declared: Vec<String> = READER_GETS
+        .iter()
+        .map(|u| u.trim_start_matches("/_lookout").split('?').next().unwrap().to_string())
+        .collect();
+    let expected: Vec<String> =
+        READER_ROUTES.iter().map(|r| r.replace("{type}", "request")).collect();
+    assert_eq!(declared, expected);
+}
+
+#[tokio::test]
+async fn a_reader_may_call_the_read_only_api_and_nothing_else() {
+    let router = app_with(traffic(), readers(), "production");
+    let auth = [("authorization", TOKEN)];
+    for uri in READER_GETS {
+        let answer = send(&router, Method::GET, uri, &auth).await;
+        assert_eq!(answer.status, StatusCode::OK, "{uri}: {}", answer.text);
+        assert_eq!(answer.header("cache-control"), Some("no-store"), "{uri}");
+    }
+
+    let mut nothing = Router::new();
+    nothing.get("/elsewhere", || async { "x" });
+    let nothing = nothing.compile(&Container::new()).unwrap();
+    // Without the token, or with another, the reader routes are not there.
+    for uri in READER_GETS {
+        for headers in [&[][..], &[("authorization", "Bearer guess")][..]] {
+            let answer = send(&router, Method::GET, uri, headers).await;
+            assert_eq!(answer.status, StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(answer.text, get(&nothing, uri).await.text, "{uri}");
+        }
+    }
+    // With it, everything else is not there either: the shell, batches with
+    // their bodies, entries, a case, the stream, and every write.
+    for (method, uri) in [
+        (Method::GET, "/_lookout"),
+        (Method::GET, "/_lookout/requests"),
+        (Method::GET, "/_lookout/assets/lookout.js"),
+        (Method::GET, "/_lookout/api/batches"),
+        (Method::GET, "/_lookout/api/batches/b1"),
+        (Method::GET, "/_lookout/api/entries/query"),
+        (Method::GET, "/_lookout/api/families/request/0000000000000000"),
+        (Method::GET, "/_lookout/api/models"),
+        (Method::GET, "/_lookout/api/insights"),
+        (Method::GET, "/_lookout/api/cases/abc"),
+        (Method::GET, "/_lookout/api/stream"),
+        (Method::POST, "/_lookout/api/cases/abc"),
+        (Method::DELETE, "/_lookout/api/batches"),
+        (Method::POST, "/_lookout/api/health"),
+        (Method::DELETE, "/_lookout/api/cases"),
+    ] {
+        let headers = [("authorization", TOKEN), ("x-lookout", "1")];
+        let answer = send(&router, method.clone(), uri, &headers).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{method} {uri}");
+        assert_eq!(
+            answer.text,
+            send(&nothing, method.clone(), uri, &[]).await.text,
+            "{method} {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn readers_are_off_unless_registered_and_viewers_keep_everything() {
+    // No readers: the token opens nothing.
+    let router = app_with(traffic(), LookoutGate::deny_all(), "production");
+    let answer =
+        send(&router, Method::GET, "/_lookout/api/health", &[("authorization", TOKEN)]).await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+    // A viewer reaches the reader routes as before, readers or not.
+    let viewer = LookoutGate::allow_all().with_readers(|_| Box::pin(async { false }));
+    let router = app_with(traffic(), viewer, "production");
+    for uri in
+        READER_GETS.iter().chain(&["/_lookout", "/_lookout/api/batches", "/_lookout/api/insights"])
+    {
+        assert_eq!(get(&router, uri).await.status, StatusCode::OK, "{uri}");
+    }
 }

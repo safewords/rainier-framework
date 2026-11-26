@@ -249,6 +249,10 @@ are the API's, and an invalid one comes back as a tool error naming it.
 | Tool | What |
 |---|---|
 | `lookout_status` | the store, watchers, sample rates, retention — what can be found |
+| `lookout_health` | one service's health over a window: requests, error rate, p50/p95/p99, Apdex, failed jobs, exceptions, cases, a status and the routes behind it ([service health](lookout.md#service-health)) |
+| `lookout_requests` | every request grouped by route, method and status class, filtered and ordered |
+| `lookout_rum_vitals` | real users' page views and p75 vitals by page, browser, system, device, connection or country |
+| `lookout_rum_errors` | real users' script errors by message, file and line |
 | `lookout_batches` | kept batches, newest first, filtered by kind, route, user, tag, trace, exception, slow or text |
 | `lookout_batch` | one batch with its entries — the waterfall — cut to `max_entries` (300) |
 | `lookout_entries` | entries of one type across batches, one family, or matching text |
@@ -275,7 +279,7 @@ report:
 
 | Prompt | Arguments | What |
 |---|---|---|
-| `lookout_health` | `since` | errors, latency and what changed, in five lines |
+| `lookout_health` | `since` | the health tool, then what changed, in five lines |
 | `lookout_triage` | `severity` | the open cases, worst first, with likely causes |
 | `lookout_slow_route` | `route`, `since` | where a route's time goes, and what to change |
 | `lookout_investigate_case` | `case` (required) | one case: what fails, for whom, since when, the fix |

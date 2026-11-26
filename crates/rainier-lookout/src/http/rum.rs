@@ -77,6 +77,21 @@ pub(crate) async fn ingest(state: Arc<Shared>, request: Req) -> Response {
     }
 
     let page = rum::page_batch(&state.config, &report, request.ip(), request.header("user-agent"));
+    // The rollups count a page report only once it is accepted — from a page
+    // that proved it talked to this application.
+    let rolled = match &page {
+        Some(_) => {
+            let country = rum.country_header.as_deref().and_then(|name| request.header(name));
+            crate::rum_rollup::observe(
+                &state.rum_caps,
+                &report,
+                request.header("user-agent"),
+                country,
+                chrono::Utc::now(),
+            )
+        }
+        None => Vec::new(),
+    };
     let mut batches =
         rum::batches(&state.config, report, request.ip(), request.header("user-agent"));
 
@@ -103,10 +118,11 @@ pub(crate) async fn ingest(state: Arc<Shared>, request: Req) -> Response {
     }
 
     batches.extend(page);
-    if !batches.is_empty() {
+    if !batches.is_empty() || !rolled.is_empty() {
         // Stored as they are: a browser batch adds nothing to the request
         // counts, and is never sampled away — the browser already sampled.
-        let _ = state.store.store_counting(batches, Vec::new()).await;
+        // The page's rollups go in the same write.
+        let _ = state.store.store_counting(batches, rolled).await;
     }
     done().with_header("access-control-allow-origin", &origin).with_header("vary", "origin")
 }

@@ -12,6 +12,35 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Lookout service health** (`rainier-lookout`, `rainier-framework`): four
+  read-only endpoints under the dashboard's path, answered from rollups that
+  count every request, job run and accepted RUM page report, kept or not —
+  `GET /api/health` (request count and rate, 5xx and 4xx, error rate,
+  p50/p95/p99, Apdex against `apdex_t_ms`, failed jobs, exceptions, open and
+  new cases, an `ok`/`degraded`/`failing`/`idle` status, a series, and the
+  busiest, slowest and failing routes), `GET /api/requests` (grouped by any of
+  route, method and status class, filtered, ordered), `GET /api/rum/vitals`
+  (p75 LCP, INP, CLS, TTFB, FCP and load, script errors and long tasks by
+  page, browser, system, device, connection or country) and
+  `GET /api/rum/errors` (script errors by message, file and line). `since` and
+  `until` take relative times (`1h`, `7d`). The rollups are four new
+  aggregate-only entry types — `request_facet`, `job_facet`, `rum_view`,
+  `rum_error` — kept by every store with no migration; the RUM ones are
+  bounded per replica and hour, everything past a cap filed under `other`.
+  `LOOKOUT_RUM_COUNTRY_HEADER` (`cf-ipcountry`) names the header the country
+  comes from. `rum.js` now marks a page view's settled vitals once, when the
+  page is first hidden. MCP gains `lookout_health`, `lookout_requests`,
+  `lookout_rum_vitals` and `lookout_rum_errors`. See
+  `docs/lookout.md#service-health`.
+
+- **Lookout readers** (`rainier-lookout`, `rainier-framework`):
+  `Rainier::with_lookout_readers_where_async(|request| …)` lets another
+  service — a service token, say — `GET` the health API, `/api/aggregates`,
+  `/api/series`, `/api/cases` and `/api/status`, and nothing else; refused, it
+  gets the same 404 as anyone. Off unless registered. `LookoutGate::with_readers`
+  and `READER_ROUTES` are the same in code. See
+  `docs/lookout.md#readers-another-service`.
+
 - **A Redis relay** (`rainier-broadcast`, `rainier-framework`): `RedisRelay`
   reads back what `RedisBroadcaster` publishes, and `relay::spawn_redis`
   hands each message to any sink — `relay::spawn_redis_into` with a

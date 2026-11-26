@@ -58,6 +58,20 @@ pub enum EntryType {
     Slow,
     /// Anything else a custom watcher records.
     Custom,
+    /// Rolled up, never an entry: every request counted by route, method and
+    /// status class. See [`facets`](crate::facets).
+    RequestFacet,
+    /// Rolled up, never an entry: every job run counted by job and outcome.
+    /// See [`facets`](crate::facets).
+    JobFacet,
+    /// Rolled up, never an entry: real users' page views and their vitals,
+    /// by page, browser, system, device, connection and country. See
+    /// [`rum_rollup`](crate::rum_rollup).
+    RumView,
+    /// Rolled up, never an entry: script errors from real users' browsers,
+    /// by message, file and line and the same dimensions as
+    /// [`RumView`](Self::RumView). See [`rum_rollup`](crate::rum_rollup).
+    RumError,
 }
 
 impl EntryType {
@@ -83,7 +97,24 @@ impl EntryType {
         EntryType::NPlusOne,
         EntryType::Slow,
         EntryType::Custom,
+        EntryType::RequestFacet,
+        EntryType::JobFacet,
+        EntryType::RumView,
+        EntryType::RumError,
     ];
+
+    /// The types that exist only as aggregate rows — no watcher records an
+    /// entry of one, and no setting turns one on or off. They are written
+    /// whenever Lookout is on and read by the health API
+    /// (`/api/health`, `/api/requests`, `/api/rum/*`).
+    pub const ROLLUPS: &'static [EntryType] =
+        &[EntryType::RequestFacet, EntryType::JobFacet, EntryType::RumView, EntryType::RumError];
+
+    /// Whether this type exists only as aggregate rows. See
+    /// [`ROLLUPS`](Self::ROLLUPS).
+    pub fn is_rollup(self) -> bool {
+        Self::ROLLUPS.contains(&self)
+    }
 
     /// The snake_case name used in storage, config and the API.
     pub fn as_str(self) -> &'static str {
@@ -108,6 +139,10 @@ impl EntryType {
             EntryType::NPlusOne => "n_plus_one",
             EntryType::Slow => "slow",
             EntryType::Custom => "custom",
+            EntryType::RequestFacet => "request_facet",
+            EntryType::JobFacet => "job_facet",
+            EntryType::RumView => "rum_view",
+            EntryType::RumError => "rum_error",
         }
     }
 

@@ -83,6 +83,45 @@ pub fn add_histogram(into: &mut Histogram, from: &Histogram) {
     }
 }
 
+/// How many of the durations in `histogram` were at most `us` microseconds.
+///
+/// Whole slots below `us` count fully; the slot holding `us` counts in
+/// proportion to how far into it `us` falls, geometrically — the same
+/// reading [`percentile`] makes, the other way round.
+pub fn count_at_or_below(histogram: &Histogram, us: u64) -> f64 {
+    let holding = slot(us);
+    let mut total = 0.0;
+    for (&s, &count) in histogram {
+        if s < holding {
+            total += count as f64;
+        } else if s == holding {
+            if s == 0 {
+                total += count as f64;
+            } else {
+                let lower = lower_bound(s);
+                let into = ((us as f64) / lower).log2() * SLOTS_PER_DOUBLING;
+                total += count as f64 * into.clamp(0.0, 1.0);
+            }
+        }
+    }
+    total
+}
+
+/// The [Apdex](https://en.wikipedia.org/wiki/Apdex) of the durations in
+/// `histogram` against a target of `target_us`: satisfied at or under it,
+/// tolerating at or under four times it, `(satisfied + tolerating / 2) /
+/// total`. `None` when the histogram is empty.
+pub fn apdex(histogram: &Histogram, target_us: u64) -> Option<f64> {
+    let total: u64 = histogram.values().sum();
+    if total == 0 {
+        return None;
+    }
+    let satisfied = count_at_or_below(histogram, target_us);
+    let tolerable = count_at_or_below(histogram, target_us.saturating_mul(4));
+    let tolerating = (tolerable - satisfied).max(0.0);
+    Some(((satisfied + tolerating / 2.0) / total as f64).clamp(0.0, 1.0))
+}
+
 /// The bucket lengths every entry is rolled into, in seconds.
 pub const PERIODS: &[u32] = &[60, 600, 3600];
 
@@ -126,35 +165,44 @@ pub fn rollup(batches: &[Batch]) -> Vec<Aggregate> {
 
 /// Roll entries into aggregates, as [`rollup`] does for whole batches — for
 /// the entries of a batch that was counted but not kept.
+///
+/// A request's entry is also counted under its
+/// [`RequestFacet`](EntryType::RequestFacet) — route, method and status
+/// class — and a job run's under its [`JobFacet`](EntryType::JobFacet), so
+/// the health API can group and filter every request and job, kept or not.
+/// See [`facets`](crate::facets).
 pub fn rollup_entries<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> Vec<Aggregate> {
     let mut acc: BTreeMap<BucketKey, Totals> = BTreeMap::new();
-    {
-        for entry in entries {
-            if !AGGREGATED.contains(&entry.entry_type) {
-                continue;
+    let mut add = |entry: &Entry, entry_type: EntryType, key: &str| {
+        let duration = entry.duration_us.unwrap_or(0);
+        for &period in PERIODS {
+            let slot = acc
+                .entry((
+                    bucket_start(entry.occurred_at, period),
+                    period,
+                    entry_type,
+                    key.to_string(),
+                ))
+                .or_insert_with(|| (0, 0, 0, Histogram::new()));
+            slot.0 += 1;
+            slot.1 = slot.1.saturating_add(duration);
+            slot.2 = slot.2.max(duration);
+            // An exception without a duration is counted, not timed.
+            if let Some(us) = entry.duration_us {
+                *slot.3.entry(self::slot(us)).or_insert(0) += 1;
             }
-            if entry.duration_us.is_none() && !counted_untimed(entry.entry_type) {
-                continue;
-            }
-            let duration = entry.duration_us.unwrap_or(0);
-            let key = entry.family_key().to_string();
-            for &period in PERIODS {
-                let slot = acc
-                    .entry((
-                        bucket_start(entry.occurred_at, period),
-                        period,
-                        entry.entry_type,
-                        key.clone(),
-                    ))
-                    .or_insert_with(|| (0, 0, 0, Histogram::new()));
-                slot.0 += 1;
-                slot.1 = slot.1.saturating_add(duration);
-                slot.2 = slot.2.max(duration);
-                // An exception without a duration is counted, not timed.
-                if let Some(us) = entry.duration_us {
-                    *slot.3.entry(self::slot(us)).or_insert(0) += 1;
-                }
-            }
+        }
+    };
+    for entry in entries {
+        if !AGGREGATED.contains(&entry.entry_type) {
+            continue;
+        }
+        if entry.duration_us.is_none() && !counted_untimed(entry.entry_type) {
+            continue;
+        }
+        add(entry, entry.entry_type, entry.family_key());
+        if let Some((facet, key)) = crate::facets::facet_of(entry) {
+            add(entry, facet, &key);
         }
     }
     acc.into_iter()

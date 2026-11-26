@@ -31,6 +31,7 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod entry;
+pub mod facets;
 pub mod http;
 #[cfg(feature = "mcp")]
 pub mod mcp;
@@ -38,6 +39,7 @@ pub mod middleware;
 pub mod recorder;
 pub mod redact;
 pub mod rum;
+pub mod rum_rollup;
 pub mod store;
 pub mod subscriber;
 #[cfg(test)]

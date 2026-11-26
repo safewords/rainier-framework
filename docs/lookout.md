@@ -98,6 +98,7 @@ Read at boot through the application's `Env` (so `.env` counts), with
 | `LOOKOUT_RUM_SLOW_MS` | a request this slow in the browser is reported whatever the sample | milliseconds | `1000` |
 | `LOOKOUT_RUM_SECRET` | the key reports are signed with | a string | derived from `APP_KEY` |
 | `LOOKOUT_RUM_HOLD_SECONDS` | how long a request from a frontend is held for a browser report to [pair](#pairing) with | an integer; `0` holds none | `120` |
+| `LOOKOUT_RUM_COUNTRY_HEADER` | the request header a proxy puts the visitor's country in, for the [RUM rollups](#rum-rollups)' `country` (`cf-ipcountry` behind Cloudflare) | a header name | none: every report is `unknown` |
 | `LOOKOUT_RUM_REPLAY` | [session replay](#session-replay), masked, around failures | a boolean | `false` |
 | `LOOKOUT_RUM_REPLAY_MODE` | upload around failures only, or the whole page view | `errors`, `always` | `errors` |
 | `LOOKOUT_RUM_REPLAY_EXCEPT` | pages never recorded | comma-separated globs over the page's path | none |
@@ -247,6 +248,12 @@ need line tables (`[profile.release] debug = "line-tables-only"`).
 `broadcast`, `session`, `auth_attempt`, `n_plus_one`, `slow`, `custom`. The
 activity kind each comes from is catalogued in `rainier_lookout::subscriber`.
 
+Four more exist only as aggregate rows, never as entries, for the
+[service-health API](#service-health): `request_facet`, `job_facet`,
+`rum_view` and `rum_error`. No watcher records them and no setting turns them
+off; they are written whenever Lookout is on, and `lookout:status` and
+`/api/status` leave them out of the watchers.
+
 ### Model changes
 
 A `model` entry is a [`ModelChanged`](models.md#every-write-modelchanged) heard
@@ -279,6 +286,12 @@ A batch's page lists the other batches in its trace.
 | `memory` | this process, the last 1000 batches | development, tests — each replica keeps its own |
 | `database` | Lookout's own four tables, on the named connection | anything shared and durable |
 | `cache` | a ring buffer of the last `LOOKOUT_CAPACITY` batches in the named cache store | a shared store such as Redis in production, with no migrations |
+
+The [service-health](#service-health) rollups (`request_facet`, `job_facet`,
+`rum_view`, `rum_error`) are aggregate rows like the rest: the database
+store keeps them in `lookout_aggregates` and `lookout_aggregate_histograms`
+and the cache store in its bucket keys, so they need no migration of their
+own and are pruned and cleared with everything else.
 
 The framework builds the store at boot from what it has already bound — the
 database manager, the cache manager — so `LOOKOUT_CONNECTION` and
@@ -577,6 +590,42 @@ The phases are zero when the browser withholds them: the response's
 `Timing-Allow-Origin` did not name the page's origin, or a reused connection
 had no DNS or handshake to measure. The page says which.
 
+### RUM rollups
+
+Each accepted page report — from a listed origin, under the rate, with a
+proof that verifies — is also counted, as it arrives, into rollups that
+`/api/rum/vitals` and `/api/rum/errors` [answer from](#service-health). They
+are aggregate rows like every other (types `rum_view` and `rum_error`), so
+every store keeps them, `lookout:prune` trims them at aggregate retention and
+they cover every report, whether or not its `page` batch is kept.
+
+| Dimension | From | Values |
+|---|---|---|
+| `page` | the page's path | its route: no host or query, numbers, long hex and UUIDs as `{id}`, at most eight segments |
+| `browser` | this server's reading of the report's `User-Agent` | `Chrome`, `Safari`, `Firefox`, `Edge`, `Opera`, `Samsung Internet`, `Chromium`, `other`, `unknown` |
+| `os` | the same | `iOS`, `Android`, `Windows`, `ChromeOS`, `macOS`, `Linux`, `other`, `unknown` |
+| `device` | the same | `mobile`, `tablet`, `desktop`, `bot`, `unknown` |
+| `connection` | the browser's effective connection type | `slow-2g`, `2g`, `3g`, `4g`, `other`, `unknown` |
+| `country` | the header `LOOKOUT_RUM_COUNTRY_HEADER` names | a two-letter code, upper case; `unknown` without the header or the setting |
+
+What is counted, once each per page view: **a view**, with its TTFB, first
+paint and load, from the report carrying the page's load; **LCP, INP and
+CLS** from the report the script sends when the page is first hidden or
+closed — when they have settled — filed under the page the view landed on;
+**script errors and long tasks** from every report, each being sent once.
+Views and vitals come from sampled page views (`LOOKOUT_RUM_SAMPLE_RATE`);
+script errors from every page view, as any page that throws reports. A p75
+is read off a histogram of quarter-doublings, so it is within about 9% of the
+true value.
+
+A report is anyone's, so the rollups are bounded: a time is believed up to
+ten minutes and a layout shift up to 100; the dimensions other than the page
+come from closed sets; and each replica counts at most 200 distinct pages,
+1000 distinct view keys (page × browser × … × country), 200 distinct script
+errors (message, file and line) and 1000 distinct error keys an hour —
+anything past a cap is filed under `other`. An error's message is cut to 300
+characters and its file loses its query string.
+
 ### Pairing
 
 A browser report about an API call is most use beside the request it was on
@@ -843,6 +892,7 @@ API takes them as `window`, `min`, `change` and `forecast`.
 |---|---|
 | `APP_ENV=local` (with `dashboard.open_locally`, the default) | everyone |
 | anywhere else | a viewer the dashboard's guard authenticates **and** the `Gate` lets through `dashboard.ability` — `viewLookout` by default |
+| the read-only health API only | a [reader](#readers-another-service) the application registered, if any |
 
 Anyone else gets **the router's own 404**, on every path and method under the
 dashboard — the same bytes as a path that never existed — so a probe cannot
@@ -902,6 +952,38 @@ Rainier::new(".")
 
 Answer `false` on an error: a check that cannot be made refuses the viewer.
 
+#### Readers: another service
+
+A service that watches this one — a status page, a deploy gate, an
+operations dashboard — has no user to sign in as. Register a **reader**: an
+async predicate over the request alone, with no guard and no user — a bearer
+token from another service, typically:
+
+```rust
+Rainier::new(".")
+    .with_lookout_readers_where_async(|request: &Request| {
+        let token = request.header("authorization").map(str::to_string);
+        Box::pin(async move { service_tokens().allows(token.as_deref(), "lookout.read").await })
+    })
+```
+
+A reader may call **`GET` only, on these and nothing else**:
+`{path}/api/health`, `/api/requests`, `/api/rum/vitals`, `/api/rum/errors`,
+`/api/aggregates/{type}`, `/api/series/{type}`, `/api/cases` (the list) and
+`/api/status`. Never the dashboard's shell or assets, a batch (which holds
+bodies and headers), entries, a case or its actions, the stream, or a
+`DELETE`. A request the reader predicate refuses still has the viewer's
+check to pass, so the dashboard's own pages keep working on those routes; one
+both refuse gets the same 404 as any refused request. The reader predicate runs first
+on those routes, for the dashboard's own requests too, so answer `false`
+straight away when the request carries no token. Without the call there
+are no readers. In code outside the framework,
+`LookoutGate::with_readers` does the same, and `READER_ROUTES` lists the
+routes.
+
+In Safewords applications the predicate checks a service token from identity
+carrying the capability `lookout.read` — see devenv's `docs/service-auth.md`.
+
 `LookoutConfig::local` decides "local", not the raw `APP_ENV`: an application
 can turn it off in a local environment with `.local(false)`.
 
@@ -928,6 +1010,82 @@ shape.
 | `GET` | `/api/cases/{id}` | one case |
 | `POST` | `/api/cases/{id}` | `{"action": "resolve" \| "reopen" \| "ignore" \| "severity", "severity"?, "note"?}` — needs `X-Lookout: 1` |
 | `GET` | `/api/status` | the store, watchers, sample rates, retention and insight thresholds |
+| `GET` | `/api/health` | one service's health over a window — see [service health](#service-health) |
+| `GET` | `/api/requests` | every request, grouped and filtered — see [service health](#service-health) |
+| `GET` | `/api/rum/vitals` | real users' page metrics, grouped and filtered |
+| `GET` | `/api/rum/errors` | real users' script errors, by message, file and line |
+
+### Service health
+
+Four read-only endpoints say how the service is doing, from rollups that
+count every request, job and accepted page report — kept or not — so they are
+right in production, where most batches are not kept. Each answers
+`{"data": {...}}` and takes the same window:
+
+- `since`, `until` — RFC 3339, or relative to now (`30m`, `1h`, `24h`,
+  `7d`); an hour ago and now by default.
+- `period` — the bucket length, 60, 600 or 3600 seconds; by default the one
+  giving the window closest to thirty points.
+
+A bad parameter is a `422` in the framework's validation shape, naming every
+field at fault.
+
+**`GET /api/health`** — `apdex_t_ms` sets the Apdex target (300 by default).
+
+| Field | What |
+|---|---|
+| `window` | `{"since", "until", "period"}` |
+| `requests` | `count`, `per_minute`, `errors_5xx`, `client_errors_4xx`, `error_rate` (5xx / count, 0 to 1), `p50_us`, `p95_us`, `p99_us`, `apdex` (0 to 1; `null` with no requests), `apdex_t_ms` |
+| `jobs` | `count` (runs, not dispatches), `failed` |
+| `exceptions` | `count` |
+| `cases` | `open`, `new_in_window` — each counted from at most 200 cases per status |
+| `status` | `idle` with no requests; `failing` at an error rate of 5% or more; `ok` under 1% with the p95 under four times the Apdex target; `degraded` otherwise |
+| `series` | `[{"at", "count", "errors_5xx", "p95_us"}]`, a zero-filled point per bucket |
+| `top_routes`, `slowest_routes`, `failing_routes` | up to five route rows each — by count, by p95, and by 5xx (only routes with any) |
+
+Apdex is read off the duration histogram: satisfied at or under T, tolerating
+at or under 4T, `(satisfied + tolerating / 2) / count`, the slot holding T
+split where T falls in it.
+
+**`GET /api/requests`** — every request, by route (its name, else its
+pattern, else `(no route)`), method and status class (`1xx` … `5xx`, or
+`unknown` with none).
+
+| Parameter | What |
+|---|---|
+| `group` | a comma-separated list of `route`, `method`, `status` — `route` by default |
+| `route` | the route exactly, or a glob with `*` |
+| `method`, `status` | a method; a status class (`5xx`) |
+| `q` | text in the route |
+| `order` | `count` (default), `p95`, `errors`, `error_rate`, each highest first |
+| `limit` | up to 500, 100 by default |
+| `series` | `1` for a series of the filtered set |
+
+It answers `{"rows": [...], "totals": {...}, "window": {...}}` (and `series`
+when asked); a row is `{"route", "method", "status", "count", "errors_5xx",
+"error_rate", "p50_us", "p95_us", "p99_us", "max_us"}`, with a field grouped
+away `null` — and all three `null` in `totals`.
+
+**`GET /api/rum/vitals`** — `group` is one of `page`, `browser`, `os`,
+`device`, `connection`, `country` (`page` by default); each of the six is
+also a filter (`page` a glob, the rest exact, in any case); `order` is
+`views` (default), `lcp`, `inp`, `cls` or `errors`; `limit` up to 200 (50).
+It answers `{"rows", "totals", "group", "window", "enabled"}`; a row is
+`{"key", "views", "lcp_p75_ms", "inp_p75_ms", "cls_p75", "ttfb_p75_ms",
+"fcp_p75_ms", "load_p75_ms", "js_errors", "long_tasks"}`, `key` `null` in
+`totals`; `enabled` says whether RUM is on. See [RUM rollups](#rum-rollups)
+for what is counted.
+
+**`GET /api/rum/errors`** — the same filters and `limit`. A row is
+`{"message", "file", "line", "count", "pages"` (distinct), `"browsers"`
+(the top three, `[name, count]`), `"first_seen", "last_seen"}`, most
+frequent first. `last_seen` is to the second; `first_seen` to the bucket
+(the period), and never before `since`.
+
+Request and job facets are rolled up on the writer, beside every request's
+and job's own aggregate; RUM rollups on the report's own request, in the
+write that stores its batches — nothing more happens on an application
+request's thread.
 
 ### Over MCP
 
@@ -1017,6 +1175,17 @@ database store needs the prune.
   about 76 µs. The test also prints what the subscriber's thread and the
   writer do afterwards. `cache_store_cost` in the same directory measures
   what the cache store costs the cache per write and per dashboard read.
+- **The health rollups.** Every request is also counted under its route,
+  method and status class, and every job run under its outcome, by the
+  writer, in the roll-up it already does — nothing more on the request's
+  thread. Measured with `hot_path_cost` (release, Apple M-series,
+  2026-11-26), the writer's flush per ordinary request was 12.6 µs with them
+  and 12.4 µs without, inside the run-to-run noise; the request thread's cost
+  is unchanged (4–5 µs). They add one aggregate row per bucket and period
+  for each route × method × status class seen, and `cache_store_cost` counts
+  six to eight more cache commands per write (48 instead of 40 for five
+  batches). RUM rollups cost the report's own request one capped map update
+  and its rows in the write it already makes.
 - **Log lines below `RUST_LOG`.** Lookout records log lines at
   `LOOKOUT_LOG_LEVEL` whatever the log filter says, so the framework's
   `RUST_LOG` filter is a per-layer filter on the log lines (and the
