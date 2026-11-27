@@ -43,6 +43,7 @@
 #![warn(missing_docs)]
 
 mod fetch;
+mod fleet;
 mod http;
 mod stitch;
 
@@ -54,7 +55,11 @@ use rainier_support::{BoxFuture, Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use fleet::Endpoint;
 pub use http::{routes, Gate};
+/// The key Longmire's private link to each Lookout is signed and sealed
+/// with — see [`Longmire::link`].
+pub use rainier_lookout_link::LinkKey;
 pub use stitch::{merge_recent, stitch, Part, RECENT_LIMIT};
 
 /// One Lookout to read: a service, where it is, and where it mounts Lookout.
@@ -70,6 +75,11 @@ pub struct Source {
     /// Where it mounts Lookout (`LOOKOUT_PATH`): `/_lookout` when not given.
     #[serde(default = "default_path")]
     pub path: String,
+    /// Other hosts the service is called by — its public name, a second
+    /// in-cluster name — so the [map](Longmire::map) knows a call to one is a
+    /// call to it. Its URL's own host always counts.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 }
 
 fn default_path() -> String {
@@ -79,7 +89,14 @@ fn default_path() -> String {
 impl Source {
     /// A Lookout at `url`, mounted at the default path.
     pub fn new(id: impl Into<String>, url: impl Into<String>) -> Self {
-        Self { id: id.into(), name: String::new(), url: url.into(), path: default_path() }.tidy()
+        Self {
+            id: id.into(),
+            name: String::new(),
+            url: url.into(),
+            path: default_path(),
+            hosts: Vec::new(),
+        }
+        .tidy()
     }
 
     /// What a person reads.
@@ -92,6 +109,30 @@ impl Source {
     pub fn path(mut self, path: impl Into<String>) -> Self {
         self.path = path.into();
         self.tidy()
+    }
+
+    /// Another host the service is called by (see [`hosts`](Self::hosts)).
+    pub fn host(mut self, host: impl Into<String>) -> Self {
+        self.hosts.push(host.into());
+        self.tidy()
+    }
+
+    /// Every host a call to this service could name: its URL's, and its
+    /// [`hosts`](Self::hosts), lowercased.
+    pub fn all_hosts(&self) -> Vec<String> {
+        let authority = self.url.split_once("://").map_or(self.url.as_str(), |(_, rest)| rest);
+        let authority = authority.split('/').next().unwrap_or_default();
+        let host = authority.rsplit('@').next().unwrap_or_default();
+        let host = match host.rsplit_once(':') {
+            Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+            _ => host,
+        };
+        let mut hosts = vec![host.to_ascii_lowercase()];
+        hosts.extend(
+            self.hosts.iter().map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()),
+        );
+        hosts.dedup();
+        hosts
     }
 
     /// Trailing slashes off the URL, a leading one on the path, the name
@@ -164,6 +205,7 @@ fn is_cursor(value: &str) -> bool {
 #[derive(Clone)]
 pub struct Longmire {
     sources: Vec<Source>,
+    link: Option<rainier_lookout_link::LinkKey>,
     credentials: Option<Credentials>,
     timeout: Duration,
     transport: Option<Arc<dyn Transport>>,
@@ -173,6 +215,7 @@ impl std::fmt::Debug for Longmire {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Longmire")
             .field("sources", &self.sources)
+            .field("link", &self.link.as_ref().map(|k| k.id().to_string()))
             .field("credentials", &self.credentials.is_some())
             .field("timeout", &self.timeout)
             .finish()
@@ -196,7 +239,13 @@ impl Longmire {
                 kept.push(source);
             }
         }
-        Self { sources: kept, credentials: None, timeout: DEFAULT_TIMEOUT, transport: None }
+        Self {
+            sources: kept,
+            link: None,
+            credentials: None,
+            timeout: DEFAULT_TIMEOUT,
+            transport: None,
+        }
     }
 
     /// Longmire over the sources in `json` — an array of
@@ -206,6 +255,16 @@ impl Longmire {
         let sources: Vec<Source> = serde_json::from_str(json)
             .map_err(|e| Error::bad_request(format!("Longmire's sources are not valid: {e}")))?;
         Ok(Self::new(sources))
+    }
+
+    /// Read every source over Longmire's private link: each request signed
+    /// with `key`, each answer sealed for it and opened here. The sources'
+    /// Lookouts hold the same key in `LOOKOUT_LONGMIRE_KEYS`. With a link,
+    /// [`credentials`](Self::credentials) are not sent, and an answer that is
+    /// not sealed is refused. See `docs/longmire.md`, "The link".
+    pub fn link(mut self, key: rainier_lookout_link::LinkKey) -> Self {
+        self.link = Some(key);
+        self
     }
 
     /// How to sign in to each source's Lookout.
@@ -403,6 +462,72 @@ mod tests {
             "http://billing.test/ops/lookout/api/traces"
         );
         assert!(Longmire::from_json("{").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_map_is_who_calls_whom_with_real_rates() {
+        let health = |status: &str| {
+            json!({ "data": { "status": status,
+                "window": { "since": "2026-11-27T09:00:00+00:00", "until": "2026-11-27T10:00:00+00:00" },
+                "requests": { "per_minute": 12.5, "error_rate": 0.01, "p95_us": 40000 } } })
+        };
+        let mut answers = BTreeMap::new();
+        answers.insert(
+            "http://orders.test/_lookout/api/health?since=1h".to_string(),
+            (200, health("ok")),
+        );
+        answers.insert(
+            "http://billing.test/_lookout/api/health?since=1h".to_string(),
+            (200, health("failing")),
+        );
+        answers.insert(
+            "http://orders.test/_lookout/api/aggregates/call_facet?since=1h".to_string(),
+            (200, json!({ "data": [
+                { "key": "2xx billing.internal", "count": 90, "average_us": 1000, "p95_us": 3000 },
+                { "key": "5xx billing.internal", "count": 10, "average_us": 2000, "p95_us": 9000 },
+                { "key": "failed api.payments.example", "count": 2, "average_us": 5000000, "p95_us": 5000000 }
+            ]})),
+        );
+        answers.insert(
+            "http://billing.test/_lookout/api/aggregates/call_facet?since=1h".to_string(),
+            (200, json!({ "data": [{ "key": "2xx api.payments.example", "count": 30, "average_us": 80000, "p95_us": 200000 }] })),
+        );
+        let transport = Arc::new(Lookouts { answers, ..Lookouts::default() });
+        let longmire = Longmire::new([
+            Source::new("orders", "http://orders.test"),
+            Source::new("billing", "http://billing.test").host("Billing.Internal"),
+        ])
+        .through(Arc::clone(&transport) as Arc<dyn Transport>);
+
+        let map = longmire.map("since=1h&q=ignored").await;
+
+        let node = |id: &str| {
+            map["nodes"].as_array().unwrap().iter().find(|n| n["id"] == id).cloned().unwrap()
+        };
+        assert_eq!(node("billing")["status"], "failing");
+        assert_eq!(node("api.payments.example")["kind"], "external");
+        let edge = |from: &str, to: &str| {
+            map["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["from"] == from && e["to"] == to)
+                .cloned()
+                .unwrap()
+        };
+        let calls = edge("orders", "billing");
+        assert_eq!(calls["calls"], 100, "both classes, one edge: the host is billing's");
+        assert_eq!(calls["errors"], 10);
+        assert_eq!(calls["error_rate"], 0.1);
+        assert_eq!(calls["average_us"], 1100);
+        assert_eq!(calls["p95_us"], 9000, "the worst class's");
+        assert_eq!(calls["per_minute"], 1.67);
+        assert_eq!(
+            edge("orders", "api.payments.example")["errors"],
+            2,
+            "a call with no answer is an error"
+        );
+        assert_eq!(edge("billing", "api.payments.example")["calls"], 30);
     }
 
     #[tokio::test]

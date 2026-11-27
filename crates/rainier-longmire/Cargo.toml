@@ -11,11 +11,15 @@ repository.workspace = true
 rainier-support = { workspace = true }
 # Each Lookout is read over HTTP, through the framework's client.
 rainier-http-client = { workspace = true }
+# The private link to each Lookout.
+rainier-lookout-link = { workspace = true }
 # The optional routes an application mounts.
 rainier-http = { workspace = true }
 rainier-routing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# A window's length, from the times Lookout gives.
+chrono = { workspace = true }
 # Every Lookout asked at once, each within a deadline.
 tokio = { version = "1", default-features = false, features = ["time", "rt"] }
 futures-util = { workspace = true, features = ["alloc"] }

@@ -23,7 +23,8 @@ flowchart LR
 
 Lookout's [request tracing](lookout.md#traces-across-services) on
 (`LOOKOUT_REQUEST_TRACING=true`), which turns on
-[request tagging](observability.md#request-tagging), and a Lookout
+[request tagging](observability.md#request-tagging), and a way for that
+Lookout to recognise Longmire: [the link](#the-link) (preferred), or a Lookout
 [reader](lookout.md#readers-another-service) that accepts the console's
 credentials. Request tracing records, on each side, the span id every call put
 on the wire: the caller's batch as the call's `call.span_id`, the callee's as
@@ -93,6 +94,85 @@ billing   POST /charges 500       remote_parent_span_id = S1 ─┘
 unanswered: POST api.payments.example/v1/charges (from billing)
 ```
 
+## The fleet
+
+Besides traces, Longmire answers for the whole fleet at once, from the
+rollups every Lookout keeps — which count every request, call and page view,
+kept or not, so the numbers are the real ones:
+
+| Call | Answers |
+|---|---|
+| `longmire.health(query)` | every source's `status` (`ok`, `degraded`, `failing`, `idle`, `unknown` with the `reason`) and its `health`, plus how many are in each status |
+| `longmire.requests(query)` | requests by route, method and status class across every source, busiest first, each row naming its `service`; each source's `totals` |
+| `longmire.rum_vitals(query)` / `rum_errors(query)` | real users' page metrics and script errors across every frontend |
+| `longmire.cases(query)` | exceptions across every source, most frequent first |
+| `longmire.map(query)` | who calls whom — below |
+| `longmire.one(source, Endpoint::…, query)` | one source's answer as its Lookout gave it, for a page about one service |
+
+`query` is a query string; only each Lookout endpoint's own parameters are
+forwarded (`since`, `until`, `period`, and the endpoint's filters and order —
+see [service health](lookout.md#service-health)), each once, none longer than
+200 characters, still encoded. Every source is asked at once.
+
+### The service map
+
+`map` is the fleet as a graph over the window (`since`, `until`):
+
+```mermaid
+flowchart LR
+    orders((orders<br/>ok)) -- "1.7/min · 10% errors · p95 9 ms" --> billing((billing<br/>failing))
+    billing -- "0.5/min · p95 200 ms" --> pay[api.payments.example]
+```
+
+- **Nodes**: every source, with its status, requests a minute, error rate and
+  p95; and every host a source calls that is not a source, as `external`.
+- **Edges**: every caller and callee, with its calls, calls a minute, `errors`
+  (5xx answers and calls that got no answer at all), `client_errors` (4xx),
+  `error_rate`, mean latency and a p95 (the worst status class's).
+
+Edges come from each Lookout's `call_facet` rollup: every outbound call
+counted by the host it went to and its status class. A host is a source when
+it is the host of the source's URL or one of its `hosts` — the other names a
+service is called by (`Source::new(…).host("billing.example.com")`, or
+`"hosts": [...]` in JSON).
+
+## The link
+
+Longmire and Lookout have a link of their own, so that nothing but Longmire
+can read a Lookout this way and nothing on the network learns what it said.
+Both ends hold a **link key** — an id and a secret of at least 32 bytes,
+shared by the fleet:
+
+```env
+# On every service
+LOOKOUT_LONGMIRE_KEYS=2026-11:base64-secret        # comma-separate two to rotate
+```
+
+```rust
+// In the console
+let longmire = Longmire::from_json(&sources)?
+    .link(LinkKey::parse(&env.string("LONGMIRE_KEY", ""))?);
+```
+
+- **Every request is signed**: HMAC-SHA256 over the method, the path and
+  query, a timestamp and a fresh nonce, in `x-lookout-link`.
+- **Lookout recognises it** only when the key is one it holds, the signature
+  matches (compared in constant time), the timestamp is within a minute of
+  its clock, and it has not seen the nonce — a request captured on the way
+  cannot be sent again. Anything else gets the same 404 as a path that does
+  not exist: nothing says the link is there.
+- **The answer is sealed**: AES-256-GCM under a key derived for sealing, the
+  request's nonce authenticated with it, so it can be read only by the
+  holder of the key, only as the answer to that request, and not altered on
+  the way. Longmire refuses an answer that is not sealed.
+- The secret never crosses the wire, and the signing and sealing keys are
+  derived from it separately (HKDF-SHA256).
+
+The link reaches what a reader may read — health, requests, RUM, cases,
+aggregates and, with request tracing on, traces — and nothing else. With a
+link, Longmire sends no other credentials. The protocol is
+`rainier-lookout-link`, which both ends use.
+
 ## Routes
 
 To serve the same answers as JSON, mount `longmire::routes` with a check of
@@ -109,8 +189,11 @@ let router = rainier_framework::longmire::routes(
 app_router.group(GroupAttributes::new().prefix("/ops/longmire"), |r| r.merge(router));
 ```
 
-`GET /traces` (`kept`, `before`, `limit`) and `GET /traces/{trace}`, each
-answering `{"data": …}`; a malformed trace id is a `400`. An application with
+`GET /traces` (`kept`, `before`, `limit`), `GET /traces/{trace}`, `GET
+/health`, `/requests`, `/rum/vitals`, `/rum/errors`, `/cases` and `/map`, each
+answering `{"data": …}`, and `GET /sources/{source}/{health|requests|rum/vitals|rum/errors|cases}`
+answering one source's own answer (a `502` with the reason when it has none);
+a malformed trace id is a `400`. An application with
 its own response envelope or access rules can call `trace` and `recent` from
 its own handlers instead.
 

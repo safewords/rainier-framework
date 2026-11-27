@@ -114,6 +114,7 @@ Read at boot through the application's `Env` (so `.env` counts), with
 | `LOOKOUT_REQUEST_TRACING` | [request tracing](#traces-across-services): keep traces that cross services whole, and let readers read their shape | a boolean | `false` |
 | `LOOKOUT_TRACE_SAMPLE_RATE` | in request tracing, the fraction of traces kept whole, decided from the trace id so every service agrees | `0.0..=1.0` | `0.01` |
 | `LOOKOUT_SERVICE` | the name this service goes by in a trace | a string | `APP_NAME` |
+| `LOOKOUT_LONGMIRE_KEYS` | the keys [Longmire's link](longmire.md#the-link) is recognised by: a request signed with one may read what a reader may, answered sealed | comma-separated `id:base64-secret`, each secret 32 bytes or more | none: no link |
 | `APP_ENV` | `local` when it is `local` | — | — |
 
 Booleans accept `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`; an empty
@@ -251,9 +252,12 @@ need line tables (`[profile.release] debug = "line-tables-only"`).
 `broadcast`, `session`, `auth_attempt`, `n_plus_one`, `slow`, `custom`. The
 activity kind each comes from is catalogued in `rainier_lookout::subscriber`.
 
-Four more exist only as aggregate rows, never as entries, for the
-[service-health API](#service-health): `request_facet`, `job_facet`,
-`rum_view` and `rum_error`. No watcher records them and no setting turns them
+Five more exist only as aggregate rows, never as entries, for the
+[service-health API](#service-health) and [Longmire's map](longmire.md#the-service-map):
+`request_facet`, `job_facet`, `rum_view`, `rum_error` and `call_facet` (every
+outbound HTTP call by the host it went to and its status class — or `failed`
+when no answer came — keyed `5xx billing.internal`; read it on
+`/api/aggregates/call_facet`). No watcher records them and no setting turns them
 off; they are written whenever Lookout is on, and `lookout:status` and
 `/api/status` leave them out of the watchers.
 
@@ -290,7 +294,7 @@ A batch's page lists the other batches in its trace.
 | `database` | Lookout's own four tables, on the named connection | anything shared and durable |
 | `cache` | a ring buffer of the last `LOOKOUT_CAPACITY` batches in the named cache store | a shared store such as Redis in production, with no migrations |
 
-The [service-health](#service-health) rollups (`request_facet`, `job_facet`,
+The [service-health](#service-health) rollups (`request_facet`, `job_facet`, `call_facet`,
 `rum_view`, `rum_error`) are aggregate rows like the rest: the database
 store keeps them in `lookout_aggregates` and `lookout_aggregate_histograms`
 and the cache store in its bucket keys, so they need no migration of their

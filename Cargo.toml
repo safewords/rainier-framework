@@ -26,6 +26,7 @@ members = [
     "crates/rainier-otel",
     "crates/rainier-request-tagging",
     "crates/rainier-longmire",
+    "crates/rainier-lookout-link",
     "crates/rainier-websocket",
     "crates/rainier-notify",
     "crates/rainier-scheduler",
@@ -89,6 +90,7 @@ rainier-openapi = { path = "crates/rainier-openapi", version = "2.0.0" }
 rainier-otel = { path = "crates/rainier-otel", version = "2.0.0" }
 rainier-request-tagging = { path = "crates/rainier-request-tagging", version = "2.0.0" }
 rainier-longmire = { path = "crates/rainier-longmire", version = "2.0.0" }
+rainier-lookout-link = { path = "crates/rainier-lookout-link", version = "2.0.0" }
 rainier-websocket = { path = "crates/rainier-websocket", version = "2.0.0" }
 rainier-notify = { path = "crates/rainier-notify", version = "2.0.0" }
 rainier-scheduler = { path = "crates/rainier-scheduler", version = "2.0.0" }

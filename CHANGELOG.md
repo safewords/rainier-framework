@@ -36,6 +36,17 @@ the release as a whole and names the crate it landed in.
   the parts into one tree, each service's work under the call that reached
   it, with the calls nobody answered listed apart. `trace` and `recent` in
   code, or `longmire::routes` behind a check of your own.
+- **Longmire's fleet answers and service map** (`rainier-longmire`):
+  `health`, `requests`, `rum_vitals`, `rum_errors` and `cases` across every
+  source in one answer, each row naming its service; `one` for a single
+  source; and `map`, who calls whom, with calls a minute, error rate and p95
+  per edge, from a new Lookout rollup, `call_facet` (every outbound call by
+  host and status class, kept or not). Routes for each.
+- **Longmire's link** (`rainier-lookout-link`, new; `LOOKOUT_LONGMIRE_KEYS`,
+  `Longmire::link`): Lookout recognises Longmire's requests by a shared key —
+  signed, fresh, never replayed — and seals its answers to them (AES-256-GCM),
+  so nothing else can read a Lookout this way and nothing on the network
+  learns what it said. Anything else gets Lookout's 404.
 - **Lookout service health** (`rainier-lookout`, `rainier-framework`): four
   read-only endpoints under the dashboard's path, answered from rollups that
   count every request, job run and accepted RUM page report, kept or not —

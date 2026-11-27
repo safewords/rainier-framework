@@ -17,6 +17,7 @@
 //! |---|---|---|
 //! | `request_facet` | `{METHOD} {class} {route}` | `GET 2xx posts.index` |
 //! | `job_facet` | `{ok\|failed} {job}` | `failed SendInvoice` |
+//! | `call_facet` | `{class} {host}` | `5xx billing.internal` |
 //!
 //! The method is one of the standard nine or `OTHER`; the class is `1xx` to
 //! `5xx`, or `unknown` when the request recorded no status; the route is the
@@ -70,8 +71,28 @@ pub fn facet_of(entry: &Entry) -> Option<(EntryType, String)> {
             let outcome = if failed { "failed" } else { "ok" };
             Some((EntryType::JobFacet, format!("{outcome} {job}")))
         }
+        EntryType::HttpClient => {
+            let host = text("server.address").filter(|h| !h.is_empty()).unwrap_or("(unknown)");
+            let status = entry.content.get("http.response.status_code").and_then(|v| {
+                v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+            });
+            // No answer at all — refused, timed out — is its own class: the
+            // call failed without a status to file it under.
+            let class = match status {
+                Some(_) => status_class(status),
+                None if text("error.type").is_some() => "failed",
+                None => "unknown",
+            };
+            Some((EntryType::CallFacet, call_key(class, host)))
+        }
         _ => None,
     }
+}
+
+/// A call facet's key: the status class (or `failed`), and the host.
+pub fn call_key(class: &str, host: &str) -> String {
+    let host: String = host.chars().take(200).collect();
+    format!("{class} {host}")
 }
 
 /// `GET`, or `OTHER` for a method outside the standard nine.
@@ -429,6 +450,14 @@ mod tests {
         assert_eq!(facet_of(&job).unwrap().1, "failed SendInvoice");
         job.family_hash = Some("dispatch:SendInvoice".into());
         assert_eq!(facet_of(&job), None);
+
+        let mut call = request("get", None, None, 10);
+        call.entry_type = EntryType::HttpClient;
+        call.content =
+            json!({ "server.address": "billing.internal", "http.response.status_code": 502 });
+        assert_eq!(facet_of(&call).unwrap(), (EntryType::CallFacet, "5xx billing.internal".into()));
+        call.content = json!({ "server.address": "billing.internal", "error.type": "timeout" });
+        assert_eq!(facet_of(&call).unwrap().1, "failed billing.internal");
     }
 
     #[test]

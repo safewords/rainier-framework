@@ -1229,3 +1229,129 @@ async fn without_request_tracing_a_reader_cannot_read_a_trace() {
         StatusCode::OK
     );
 }
+
+// --- Longmire's link -----------------------------------------------------------
+
+fn link_key(id: &str) -> rainier_lookout_link::LinkKey {
+    rainier_lookout_link::LinkKey::new(
+        id,
+        format!("{id}: a secret the fleet shares, long enough").into_bytes(),
+    )
+}
+
+/// The Lookout answering Longmire: request tracing on, the link key held,
+/// and no reader — nothing but the link can read it.
+fn linked(store: Arc<FakeStore>, keys: Vec<rainier_lookout_link::LinkKey>) -> Arc<CompiledRouter> {
+    let mut config = LookoutConfig::default().enabled(true);
+    config.request_tracing.enabled = true;
+    config.longmire_keys = keys;
+    let mut router = Router::new();
+    router.merge(routes(store, Arc::new(config), LookoutGate::deny_all(), "production"));
+    Arc::new(router.compile(&Container::new()).unwrap())
+}
+
+/// The Lookout's router as a transport, and every answer it gave, as sent.
+struct Wire {
+    router: Arc<CompiledRouter>,
+    heard: std::sync::Mutex<Vec<(u16, Vec<u8>, rainier_http_client::transport::OutboundRequest)>>,
+}
+
+impl rainier_http_client::Transport for Wire {
+    fn send<'a>(
+        &'a self,
+        request: rainier_http_client::transport::OutboundRequest,
+    ) -> rainier_support::BoxFuture<
+        'a,
+        rainier_support::Result<rainier_http_client::transport::RawResponse>,
+    > {
+        Box::pin(async move {
+            let path = request.url.splitn(4, '/').nth(3).unwrap_or_default().to_string();
+            let mut builder = Request::builder().method(Method::GET).uri(format!("/{path}"));
+            for (name, value) in &request.headers {
+                builder = builder.header(name, value);
+            }
+            let mut response = self.router.dispatch(builder.build()).await;
+            let status = response.status().as_u16();
+            let headers = response
+                .headers()
+                .iter()
+                .filter_map(|(n, v)| Some((n.as_str().to_string(), v.to_str().ok()?.to_string())))
+                .collect();
+            let body = response.take_body().collect().await.unwrap().to_vec();
+            self.heard.lock().unwrap().push((status, body.clone(), request));
+            Ok(rainier_http_client::transport::RawResponse { status, headers, body })
+        })
+    }
+
+    fn name(&self) -> &str {
+        "wire"
+    }
+}
+
+fn longmire_over(
+    wire: &Arc<Wire>,
+    key: rainier_lookout_link::LinkKey,
+) -> rainier_longmire::Longmire {
+    rainier_longmire::Longmire::new([rainier_longmire::Source::new("orders", "http://orders.test")])
+        .link(key)
+        .through(Arc::clone(wire) as Arc<dyn rainier_http_client::Transport>)
+}
+
+#[tokio::test]
+async fn longmire_reads_over_the_link_and_nothing_on_the_wire_can() {
+    let wire = Arc::new(Wire {
+        router: linked(distributed(), vec![link_key("2026-11")]),
+        heard: Default::default(),
+    });
+
+    let trace = longmire_over(&wire, link_key("2026-11")).trace(TRACE_ID).await.unwrap();
+    assert_eq!(trace["services"][0]["status"], "ok", "{trace}");
+    assert_eq!(trace["batches"][0]["id"], "b9");
+
+    let heard = wire.heard.lock().unwrap();
+    let (status, body, sent) = &heard[0];
+    assert_eq!(*status, 200);
+    let on_the_wire = String::from_utf8_lossy(body);
+    assert!(
+        !on_the_wire.contains("b9") && !on_the_wire.contains("orders"),
+        "sealed: {on_the_wire}"
+    );
+    assert!(sent.header("authorization").is_none(), "no credentials beside the link");
+}
+
+#[tokio::test]
+async fn a_replayed_request_another_key_or_no_link_get_the_404() {
+    let router = linked(distributed(), vec![link_key("2026-11")]);
+    let wire = Arc::new(Wire { router: Arc::clone(&router), heard: Default::default() });
+
+    // Another key: refused, and Longmire says why.
+    let trace = longmire_over(&wire, link_key("2026-10")).trace(TRACE_ID).await.unwrap();
+    assert_eq!(trace["services"][0]["status"], "unknown");
+    assert!(trace["services"][0]["reason"].as_str().unwrap().contains("404"));
+
+    // A genuine request, captured and sent again.
+    longmire_over(&wire, link_key("2026-11")).trace(TRACE_ID).await.unwrap();
+    let captured = wire.heard.lock().unwrap().last().unwrap().2.clone();
+    let replay = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/_lookout/api/traces/{TRACE_ID}"))
+        .header(
+            rainier_lookout_link::HEADER,
+            captured.header(rainier_lookout_link::HEADER).unwrap(),
+        )
+        .build();
+    assert_eq!(router.dispatch(replay).await.status(), StatusCode::NOT_FOUND, "used once");
+
+    // Nothing at all: the same 404 as a path that does not exist.
+    let plain = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/_lookout/api/traces/{TRACE_ID}"))
+        .build();
+    assert_eq!(router.dispatch(plain).await.status(), StatusCode::NOT_FOUND);
+
+    // A Lookout holding no link key recognises no link at all.
+    let unlinked = linked(distributed(), Vec::new());
+    let wire = Arc::new(Wire { router: unlinked, heard: Default::default() });
+    let trace = longmire_over(&wire, link_key("2026-11")).trace(TRACE_ID).await.unwrap();
+    assert_eq!(trace["services"][0]["status"], "unknown");
+}

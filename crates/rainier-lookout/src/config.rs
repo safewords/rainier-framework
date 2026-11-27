@@ -696,6 +696,11 @@ pub struct LookoutConfig {
     /// Keeping traces that cross services whole: off unless turned on.
     #[serde(default)]
     pub request_tracing: RequestTracing,
+    /// The keys Longmire's link is recognised by (`LOOKOUT_LONGMIRE_KEYS`):
+    /// a request signed with one may read what a reader may, and its answer
+    /// is sealed. None by default — no link. Never serialised.
+    #[serde(skip)]
+    pub longmire_keys: Vec<rainier_lookout_link::LinkKey>,
 }
 
 impl std::fmt::Debug for LookoutConfig {
@@ -720,6 +725,7 @@ impl std::fmt::Debug for LookoutConfig {
             .field("insights", &self.insights)
             .field("rum", &self.rum)
             .field("request_tracing", &self.request_tracing)
+            .field("longmire_keys", &self.longmire_keys.iter().map(|k| k.id()).collect::<Vec<_>>())
             .finish()
     }
 }
@@ -768,6 +774,7 @@ impl Default for LookoutConfig {
                 ..Rum::default()
             },
             request_tracing: RequestTracing::default(),
+            longmire_keys: Vec::new(),
         }
     }
 }
@@ -1110,6 +1117,15 @@ impl LookoutConfig {
             config.request_tracing.trace_sample_rate = parse_rate("LOOKOUT_TRACE_SAMPLE_RATE", &v)?;
         }
         config.request_tracing.service = get("LOOKOUT_SERVICE").or_else(|| get("APP_NAME"));
+        if let Some(v) = get("LOOKOUT_LONGMIRE_KEYS") {
+            config.longmire_keys = rainier_lookout_link::LinkKey::parse_list(&v).map_err(|_| {
+                ConfigError::new(
+                    "LOOKOUT_LONGMIRE_KEYS",
+                    "(redacted)",
+                    "comma-separated `id:base64-secret`, each secret at least 32 bytes",
+                )
+            })?;
+        }
         if let Some(v) = get("LOOKOUT_RUM_SECRET") {
             config.rum.secret = v.into_bytes();
         }

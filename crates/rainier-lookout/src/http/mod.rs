@@ -270,6 +270,8 @@ pub(crate) struct Shared {
     /// The distinct pages, view keys and errors the RUM rollups have counted
     /// this hour, for their caps.
     pub(crate) rum_caps: crate::rum_rollup::Caps,
+    /// The nonces of Longmire requests already answered.
+    pub(crate) replay: rainier_lookout_link::ReplayGuard,
 }
 
 /// Declare the dashboard and its API on a new [`Router`], under
@@ -313,6 +315,7 @@ pub fn routes(
         tail: stream::Tail::new(),
         rum_limiter: crate::rum::Limiter::default(),
         rum_caps: crate::rum_rollup::Caps::default(),
+        replay: rainier_lookout_link::ReplayGuard::default(),
     });
 
     let group = GroupAttributes::new().prefix(base).name("lookout.");
@@ -432,6 +435,16 @@ where
         let state = Arc::clone(&state);
         let handler = handler.clone();
         Box::pin(async move {
+            // Longmire's link: a request signed with one of the link keys,
+            // answered sealed. A request that says it is one and is not gets
+            // the same 404 as anything else refused.
+            if let Some(header) = request.header(rainier_lookout_link::HEADER) {
+                let Some(seen) = recognise_link(&state, &request, header) else {
+                    return denied(&request);
+                };
+                let response = handler(Arc::clone(&state), request).await.into_response();
+                return secure(seal_for_link(&state, &seen, response).await);
+            }
             let allowed = state
                 .gate
                 .allows_reader(&request, &state.config.dashboard, &state.environment)
@@ -441,6 +454,54 @@ where
             }
             secure(handler(state, request).await.into_response())
         })
+    }
+}
+
+/// A Longmire request, recognised by one of the configured link keys —
+/// signature, freshness, first use. `None` for anything else.
+fn recognise_link(
+    state: &Shared,
+    request: &Request,
+    header: &str,
+) -> Option<rainier_lookout_link::Verified> {
+    let keys = &state.config.longmire_keys;
+    if keys.is_empty() {
+        return None;
+    }
+    let path_and_query = request.uri().path_and_query().map_or(request.path(), |p| p.as_str());
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    rainier_lookout_link::verify(
+        header,
+        keys,
+        request.method().as_str(),
+        path_and_query,
+        now,
+        &state.replay,
+    )
+}
+
+/// The answer to a Longmire request, sealed for it: its status kept, its body
+/// readable only by the holder of the key, and only as the answer to that
+/// request.
+async fn seal_for_link(
+    state: &Shared,
+    seen: &rainier_lookout_link::Verified,
+    mut response: Response,
+) -> Response {
+    use rainier_http::IntoResponse as _;
+    let Some(key) = state.config.longmire_keys.iter().find(|k| k.id() == seen.key_id) else {
+        return Error::internal("link key vanished").into_response();
+    };
+    let status = response.status();
+    let body = match response.take_body().collect().await {
+        Ok(body) => body,
+        Err(_) => return Error::internal("could not read the answer").into_response(),
+    };
+    match rainier_lookout_link::seal(key, &seen.nonce, &body) {
+        Ok(sealed) => {
+            Response::ok(sealed).with_status(status).with_content_type(rainier_lookout_link::SEALED)
+        }
+        Err(error) => error.into_response(),
     }
 }
 
