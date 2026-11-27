@@ -366,6 +366,9 @@ the release as a whole and names the crate it landed in.
 
 ### Fixed
 
+- **Longmire's service map read nothing**: Lookout's aggregates endpoint
+  refused the rollup types (`call_facet`, `request_facet`, …) and relative
+  times. It now serves the rollups, and Longmire asks it in exact times.
 - **`rainier-mfa` with only `passkeys`** compiles: it asked for `rsa` without
   the `pkcs1v15` feature its RS256 check uses, and built only when another
   crate in the graph happened to turn that on.

@@ -1355,3 +1355,16 @@ async fn a_replayed_request_another_key_or_no_link_get_the_404() {
     let trace = longmire_over(&wire, link_key("2026-11")).trace(TRACE_ID).await.unwrap();
     assert_eq!(trace["services"][0]["status"], "unknown");
 }
+
+#[tokio::test]
+async fn a_reader_reads_the_rollups_as_aggregates() {
+    let router = app_with(traffic(), readers(), "production");
+    let auth = [("authorization", TOKEN)];
+    for rollup in ["call_facet", "request_facet"] {
+        let uri = format!(
+            "/_lookout/api/aggregates/{rollup}?since=2026-11-27T09:00:00Z&order=count&limit=100"
+        );
+        let answer = send(&router, Method::GET, &uri, &auth).await;
+        assert_eq!(answer.status, StatusCode::OK, "{rollup}: {}", answer.text);
+    }
+}

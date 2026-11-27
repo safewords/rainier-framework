@@ -370,7 +370,9 @@ pub(crate) fn series_query(
     default_forecast: usize,
 ) -> Option<SeriesQuery> {
     if let Some(t) = entry_type {
-        if !AGGREGATED.contains(&t) {
+        // The rollups (request and call facets, RUM) exist only as
+        // aggregate rows: what they are for is to be read here.
+        if !AGGREGATED.contains(&t) && !t.is_rollup() {
             params.fail("type", format!("Entries of type {t} are not aggregated."));
         }
     }
@@ -434,7 +436,9 @@ pub(crate) fn aggregate_query(
     now: DateTime<Utc>,
 ) -> Option<AggregateQuery> {
     if let Some(t) = entry_type {
-        if !AGGREGATED.contains(&t) {
+        // The rollups (request and call facets, RUM) exist only as
+        // aggregate rows: what they are for is to be read here.
+        if !AGGREGATED.contains(&t) && !t.is_rollup() {
             params.fail("type", format!("Entries of type {t} are not aggregated."));
         }
     }

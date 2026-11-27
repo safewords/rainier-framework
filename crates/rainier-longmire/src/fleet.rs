@@ -258,9 +258,9 @@ impl Longmire {
     /// real ones. A host is a source when it is the host of the source's URL
     /// or one of its [`hosts`](Source::hosts).
     pub async fn map(&self, raw_query: &str) -> Value {
-        let window = Endpoint::Health.filter(raw_query);
+        let calls_query = call_facet_query(raw_query, chrono::Utc::now());
         let (calls, health) = futures_util::future::join(
-            self.ask_all("aggregates/call_facet", &window),
+            self.ask_all("aggregates/call_facet", &calls_query),
             self.health(raw_query),
         )
         .await;
@@ -359,6 +359,52 @@ impl Longmire {
     }
 }
 
+/// The aggregates endpoint takes exact times: `since=1h` (or `15m`, `7d`, as
+/// the health endpoint takes them) becomes an RFC 3339 time before `now`; an
+/// RFC 3339 `since` or `until` is passed on. Every host, busiest first.
+fn call_facet_query(raw_query: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    let mut parts = Vec::new();
+    for pair in raw_query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else { continue };
+        if !matches!(key, "since" | "until") || value.is_empty() || value.len() > 40 {
+            continue;
+        }
+        let value = value.replace("%3A", ":").replace("%2B", "+");
+        let at = match relative(&value) {
+            Some(span) => now - span,
+            None => match chrono::DateTime::parse_from_rfc3339(&value) {
+                Ok(at) => at.with_timezone(&chrono::Utc),
+                Err(_) => continue,
+            },
+        };
+        if !parts.iter().any(|p: &String| p.starts_with(&format!("{key}="))) {
+            parts.push(format!("{key}={}", at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)));
+        }
+    }
+    if !parts.iter().any(|p| p.starts_with("since=")) {
+        let hour = now - chrono::Duration::hours(1);
+        parts.insert(
+            0,
+            format!("since={}", hour.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        );
+    }
+    parts.push("order=count".into());
+    parts.push("limit=100".into());
+    parts.join("&")
+}
+
+/// `15m`, `6h`, `7d` as a duration.
+fn relative(value: &str) -> Option<chrono::Duration> {
+    let (number, unit) = value.split_at(value.len().checked_sub(1)?);
+    let n: i64 = number.parse().ok().filter(|n| *n > 0 && *n <= 10_000)?;
+    match unit {
+        "m" => Some(chrono::Duration::minutes(n)),
+        "h" => Some(chrono::Duration::hours(n)),
+        "d" => Some(chrono::Duration::days(n)),
+        _ => None,
+    }
+}
+
 /// How long a Lookout `window` (`{since, until}`, RFC 3339) is, in minutes.
 fn window_minutes(window: &Value) -> Option<f64> {
     let at = |key: &str| chrono::DateTime::parse_from_rfc3339(window.get(key)?.as_str()?).ok();
@@ -369,6 +415,26 @@ fn window_minutes(window: &Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_calls_query_is_in_exact_times() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-27T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            call_facet_query("since=15m&q=x", now),
+            "since=2026-11-27T09:45:00Z&order=count&limit=100"
+        );
+        assert_eq!(
+            call_facet_query("since=2026-11-27T08%3A00%3A00Z&until=7d", now),
+            "since=2026-11-27T08:00:00Z&until=2026-11-20T10:00:00Z&order=count&limit=100"
+        );
+        assert_eq!(call_facet_query("", now), "since=2026-11-27T09:00:00Z&order=count&limit=100");
+        assert_eq!(
+            call_facet_query("since=soon", now),
+            "since=2026-11-27T09:00:00Z&order=count&limit=100"
+        );
+    }
 
     #[test]
     fn a_window_is_measured_in_minutes() {
