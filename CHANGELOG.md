@@ -12,23 +12,23 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
-- **Request tagging** (`rainier-telemetry`, `rainier-http-client`,
+- **Request tagging** (`rainier-request-tagging`, new; `rainier-http-client`,
   `rainier-framework`): tag a request and follow it across services, on its
-  own — no OpenTelemetry. `REQUEST_TAGGING_ENABLED` puts `Trace` outermost
-  without the `telemetry` feature, and every call through the HTTP client then
-  carries `traceparent` with a span id of its own. `REQUEST_TAGGING_HEADER`
-  (`Trace::request_id_header`) lets a frontend start the trace with a UUID,
-  echoed on the response. `rainier_http_client::telemetry::instrument` is
-  public, for a transport of your own.
-- **Lookout request tracing** (`rainier-lookout`, `rainier-events`): built on
-  request tagging, and turns it on — one switch per service — to keep a trace that crosses services whole
-  (`LOOKOUT_REQUEST_TRACING`, `LOOKOUT_TRACE_SAMPLE_RATE`, `LOOKOUT_SERVICE`):
-  services agree on a sample from the trace id, pass `tracestate: rainier=keep`
-  down, and answer `traceresponse` so a failure downstream keeps the path to
-  it. `GET /api/traces` and `GET /api/traces/{trace}` give each service's part
-  of a trace as spans without their content — readable by a
-  [reader](docs/lookout.md#readers-another-service) while it is on — so
-  an operations console can stitch a request across every service it reached.
+  own — no OpenTelemetry. `REQUEST_TAGGING_ENABLED` puts `Trace` outermost,
+  and every call through the HTTP client then carries `traceparent` with a
+  span id of its own. `REQUEST_TAGGING_HEADER` (`Trace::request_id_header`)
+  lets a frontend start the trace with a UUID, echoed on the response.
+  `rainier_http_client::telemetry::instrument` is public, for a transport of
+  your own.
+- **Lookout request tracing** (`rainier-lookout`): records, on each service's
+  side, which call from another service a request answered and which calls it
+  made, and serves it — `GET /api/traces` and `GET /api/traces/{trace}`, spans
+  without their content, readable by a
+  [reader](docs/lookout.md#readers-another-service) while it is on — so an
+  operations console can pull every service's part and link a request across
+  all of them. Lookouts never talk to one another; a sample decided from the
+  trace id (`LOOKOUT_TRACE_SAMPLE_RATE`) keeps the same traces in every
+  service. `LOOKOUT_REQUEST_TRACING` turns it, and request tagging, on.
 - **Lookout service health** (`rainier-lookout`, `rainier-framework`): four
   read-only endpoints under the dashboard's path, answered from rollups that
   count every request, job run and accepted RUM page report, kept or not —
@@ -241,6 +241,13 @@ the release as a whole and names the crate it landed in.
 
 ### Changed
 
+- **`rainier-telemetry` is now `rainier-otel`, and only OpenTelemetry**
+  (real span ids, the OTLP exporter behind `otlp`) and the log line format.
+  W3C trace context moved to the new `rainier-request-tagging`:
+  `rainier_telemetry::{Trace, TraceContext, TraceState, propagation}` are now
+  `rainier_request_tagging::…` (`rainier_framework::request_tagging`; `Trace`
+  stays in the prelude), and `propagation::adopt` is `rainier_otel::adopt`.
+  `rainier_framework::telemetry` is `rainier_framework::otel`.
 - **A client hanging up no longer cancels the handler** (`rainier-server`).
   The server now runs each request's work in a task of its own. The default
   policy finishes the work when the client hangs up, and still cancels it at

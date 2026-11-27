@@ -1,7 +1,6 @@
-//! `traceparent` on the wire, always; an `http.client.request` span per
-//! attempt behind the `telemetry` feature; and an
-//! [`HttpClientRequestSent`](crate::HttpClientRequestSent) event per attempt,
-//! always.
+//! `traceparent` on the wire, an `http.client.request` span per attempt behind
+//! the `telemetry` feature, and an
+//! [`HttpClientRequestSent`](crate::HttpClientRequestSent) event per attempt.
 //!
 //! Applied inside the **transports**, not the [`PendingRequest`](crate::PendingRequest)
 //! builder, because the builder is not the only way out: the mail APIs, the
@@ -13,23 +12,12 @@
 //! building*, including the `traceparent` header — so a test can assert the
 //! trace reaches the other service.
 //!
-//! # Tagging a call
+//! # Request tagging
 //!
-//! Inside a trace, every attempt carries a `traceparent` naming the same trace
-//! and **a span id of its own** ([`propagation::outbound`]), so the service it
-//! reaches can say which call its work answered. With the `telemetry` feature
-//! that span id is the client span's; without it, a fresh one. A caller that
-//! set `traceparent` itself keeps it.
-//!
-//! When the unit of work takes part in keeping traces whole
-//! ([`TraceKeeping`]) — Lookout's request tracing turns it on — the attempt
-//! also carries `tracestate: rainier=on` (or `rainier=keep`), and a callee
-//! taking part answers with a `traceresponse` whose sampled flag says whether
-//! it kept its part. A kept part makes this unit keep its trace too, so the
-//! path from the first service to the one that kept something is kept whole.
-//! What was sent and what came back go onto the event as
-//! `rainier.trace.span_id`, `rainier.trace.peer_kept` and
-//! `rainier.trace.peer_span_id`.
+//! Each attempt is tagged by `rainier-request-tagging` ([`outbound::tag`]):
+//! inside a trace it carries `traceparent` with the same trace id and a span
+//! id naming this attempt. This crate decides nothing about traces. The event
+//! carries the span id sent, as `rainier.trace.span_id`.
 //!
 //! # What is recorded
 //!
@@ -45,24 +33,19 @@
 //! # With nobody listening
 //!
 //! Without the `telemetry` feature, outside any trace and with nothing
-//! subscribed, a send reads two thread-locals, asks the bus once and returns
-//! the transport's own future: no copy of the URL, no clock read, no extra
-//! future.
+//! subscribed, a send reads a thread-local, asks the bus once and returns the
+//! transport's own future: no copy of the URL, no clock read, no extra future.
 //!
-//! [`propagation::outbound`]: rainier_telemetry::propagation::outbound
-//! [`TraceKeeping`]: rainier_events::TraceKeeping
+//! [`outbound::tag`]: rainier_request_tagging::outbound::tag
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use rainier_events::{Dispatcher, TraceKeeping, Unit};
+use rainier_events::Dispatcher;
+use rainier_request_tagging::outbound::{self, Tagged};
 use rainier_support::{BoxFuture, Result};
 
 use crate::transport::{OutboundRequest, RawResponse};
-
-/// The header a participating callee answers with: its own place in the
-/// trace, and in its flags whether it kept its part.
-pub const TRACERESPONSE: &str = "traceresponse";
 
 /// What an attempt's event needs, taken before the request is handed over —
 /// only when something will hear it.
@@ -89,91 +72,12 @@ impl Sending {
         let Self { events, method, url, .. } = self;
         events.publish_activity_with(|| {
             crate::events::HttpClientRequestSent::new(&method, &url, result, duration)
-                .with_trace(tagged.span_id(), peer_of(result, tagged))
+                .with_trace_span(tagged.span_id())
         });
     }
 }
 
-/// What this attempt said about its trace.
-#[derive(Default)]
-struct Tagged {
-    /// The `traceparent` it carried, when it carried one.
-    traceparent: Option<String>,
-    /// The unit taking part in keeping its trace, when it is.
-    keeping: Option<Arc<Unit>>,
-}
-
-impl Tagged {
-    #[cfg_attr(feature = "telemetry", expect(dead_code, reason = "the span path always wraps"))]
-    fn is_empty(&self) -> bool {
-        self.traceparent.is_none() && self.keeping.is_none()
-    }
-
-    /// The span id this call named as the callee's parent.
-    fn span_id(&self) -> Option<String> {
-        let header = self.traceparent.as_deref()?;
-        let context = rainier_telemetry::TraceContext::parse(header).ok()?;
-        Some(context.parent_id().to_string())
-    }
-
-    /// Hear the callee's answer: a part it kept keeps this unit's trace.
-    fn heard(&self, result: &Result<RawResponse>) {
-        if let (Some(unit), Some((true, _))) = (&self.keeping, peer_of(result, self)) {
-            unit.keep_trace();
-        }
-    }
-}
-
-/// Write the trace onto `request`: `traceparent` naming this call, and
-/// `tracestate` when the unit takes part in keeping traces whole.
-fn tag(request: &mut OutboundRequest, span: &tracing::Span) -> Tagged {
-    let mut tagged = Tagged::default();
-
-    // A caller that set its own keeps it: it is propagating a trace this
-    // process does not know about, which is its business.
-    match request.headers.get("traceparent") {
-        Some(theirs) => tagged.traceparent = Some(theirs.clone()),
-        None => {
-            if let Some(header) = rainier_telemetry::propagation::outbound(span) {
-                request.headers.insert("traceparent".to_string(), header.clone());
-                tagged.traceparent = Some(header);
-            }
-        }
-    }
-
-    if tagged.traceparent.is_none() {
-        return tagged;
-    }
-    let Some(unit) = rainier_events::Context::current_unit() else { return tagged };
-    let Some(value) = unit.trace_keeping().member_value() else { return tagged };
-
-    let member = format!("{}={value}", TraceKeeping::MEMBER);
-    let state = match request.headers.get("tracestate") {
-        // Ours already: the caller knows better.
-        Some(theirs) if TraceKeeping::from_tracestate(theirs) != TraceKeeping::Off => {
-            theirs.clone()
-        }
-        // W3C: a member a vendor adds or changes goes on the left.
-        Some(theirs) if !theirs.trim().is_empty() => format!("{member},{theirs}"),
-        _ => member,
-    };
-    request.headers.insert("tracestate".to_string(), state);
-    tagged.keeping = Some(unit);
-    tagged
-}
-
-/// What a participating callee said about its part: whether it kept it, and
-/// the span its work hangs from. `None` when this call was not taking part or
-/// the callee said nothing.
-fn peer_of(result: &Result<RawResponse>, tagged: &Tagged) -> Option<(bool, String)> {
-    tagged.keeping.as_ref()?;
-    let header = result.as_ref().ok()?.headers.get(TRACERESPONSE)?;
-    let context = rainier_telemetry::TraceContext::parse(header).ok()?;
-    Some((context.is_sampled(), context.parent_id().to_string()))
-}
-
-/// Observe one send: its event, its `traceparent` (and `tracestate`), and with
-/// `telemetry` its client span.
+/// Observe one send: its tag, its event, and with `telemetry` its client span.
 ///
 /// The built-in transports call it around every send. A [`Transport`] of
 /// your own should too, or what it sends carries no trace and is recorded
@@ -212,7 +116,7 @@ pub fn instrument<'a>(
     #[cfg(not(feature = "telemetry"))]
     {
         let mut request = request;
-        let tagged = tag(&mut request, &tracing::Span::none());
+        let tagged = outbound::tag(&mut request.headers, &tracing::Span::none());
         let sending = Sending::start(&request);
         if sending.is_none() && tagged.is_empty() {
             // Nobody to tell and nothing to hear: the transport's own future.
@@ -220,7 +124,6 @@ pub fn instrument<'a>(
         }
         Box::pin(async move {
             let result = send(request).await;
-            tagged.heard(&result);
             if let Some(sending) = sending {
                 sending.finish(&result, &tagged);
             }
@@ -229,7 +132,7 @@ pub fn instrument<'a>(
     }
 }
 
-/// Wrap one send in a client span, writing the trace onto the request.
+/// Wrap one send in a client span, tagging the request.
 #[cfg(feature = "telemetry")]
 fn traced<'a>(
     mut request: OutboundRequest,
@@ -251,7 +154,7 @@ fn traced<'a>(
         http.response.status_code = Empty,
     );
 
-    let tagged = tag(&mut request, &span);
+    let tagged = outbound::tag(&mut request.headers, &span);
     let sending = Sending::start(&request);
 
     let traced = span.clone();
@@ -268,7 +171,6 @@ fn traced<'a>(
                 }
                 Err(error) => rainier_support::telemetry::record_error(&traced, error),
             }
-            tagged.heard(&result);
             if let Some(sending) = sending {
                 sending.finish(&result, &tagged);
             }
@@ -322,9 +224,9 @@ impl Target {
 mod tests {
     use super::*;
     use crate::{FakeTransport, Http};
+    use rainier_request_tagging::TraceContext;
     #[cfg(feature = "telemetry")]
     use rainier_support::telemetry::testing::Recorder;
-    use rainier_telemetry::TraceContext;
     use std::sync::Arc;
 
     const UPSTREAM: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -349,7 +251,7 @@ mod tests {
         let fake = Arc::new(FakeTransport::new());
         fake.responding(503, "busy").responding(200, "ok");
 
-        rainier_telemetry::propagation::scope(Some(UPSTREAM.to_string()), async {
+        rainier_request_tagging::propagation::scope(Some(UPSTREAM.to_string()), async {
             Http::get("https://api.example.com/v1/things")
                 .retry(2, crate::Backoff::fixed(std::time::Duration::ZERO))
                 .through(Arc::clone(&fake) as _)
@@ -378,7 +280,7 @@ mod tests {
         let fake = Arc::new(FakeTransport::new());
         fake.responding(503, "busy").responding(200, "ok");
 
-        rainier_telemetry::propagation::scope(Some(UPSTREAM.to_string()), async {
+        rainier_request_tagging::propagation::scope(Some(UPSTREAM.to_string()), async {
             Http::get("https://api.example.com/v1/things?api_key=secret")
                 .retry(2, crate::Backoff::fixed(std::time::Duration::ZERO))
                 .through(Arc::clone(&fake) as _)
@@ -402,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn a_traceparent_the_caller_set_is_left_alone() {
         let fake = Arc::new(FakeTransport::new());
-        rainier_telemetry::propagation::scope(Some(UPSTREAM.to_string()), async {
+        rainier_request_tagging::propagation::scope(Some(UPSTREAM.to_string()), async {
             Http::get("https://example.com")
                 .header("traceparent", "00-theirs")
                 .through(Arc::clone(&fake) as _)
@@ -424,55 +326,19 @@ mod tests {
         assert_eq!(fake.recorded()[0].header("tracestate"), None);
     }
 
-    /// A request's unit, in a trace, taking part in keeping traces whole.
-    fn participating(keep: bool) -> Arc<Unit> {
-        let unit = Unit::new(rainier_events::UnitKind::Request, None, None);
-        unit.set_trace(None, Some(UPSTREAM));
-        unit.join_trace_keeping(keep);
-        unit
-    }
-
     #[tokio::test]
-    async fn a_participating_unit_says_so_and_a_kept_part_keeps_its_trace() {
+    async fn the_span_id_sent_is_recorded_on_the_event() {
+        let events = Arc::new(rainier_events::Dispatcher::new());
+        let _bus = rainier_events::bus::set_default(Arc::clone(&events));
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        events.on::<crate::HttpClientRequestSent>().run_sync(move |sent, _| {
+            sink.lock().unwrap().push(rainier_events::Activity::collect_fields(sent));
+            Ok(())
+        });
         let fake = Arc::new(FakeTransport::new());
-        fake.responding_with_header(
-            200,
-            "ok",
-            TRACERESPONSE,
-            format!("00-{TRACE}-b7ad6b7169203331-01"),
-        );
-        let unit = participating(false);
 
-        unit.scope(async {
-            Http::get("https://b.example.com/x")
-                .header("tracestate", "congo=t61rcWkgMzE")
-                .through(Arc::clone(&fake) as _)
-                .send()
-                .await
-                .unwrap();
-        })
-        .await;
-
-        assert_eq!(
-            fake.recorded()[0].header("tracestate"),
-            Some("rainier=on,congo=t61rcWkgMzE"),
-            "ours on the left, theirs kept"
-        );
-        assert_eq!(unit.trace_keeping(), TraceKeeping::Keep, "the callee kept its part");
-    }
-
-    #[tokio::test]
-    async fn a_part_the_callee_let_go_changes_nothing() {
-        let fake = Arc::new(FakeTransport::new());
-        fake.responding_with_header(
-            200,
-            "ok",
-            TRACERESPONSE,
-            format!("00-{TRACE}-b7ad6b7169203331-00"),
-        );
-        let unit = participating(false);
-
-        unit.scope(async {
+        rainier_request_tagging::propagation::scope(Some(UPSTREAM.to_string()), async {
             Http::get("https://b.example.com/x")
                 .through(Arc::clone(&fake) as _)
                 .send()
@@ -480,51 +346,9 @@ mod tests {
                 .unwrap();
         })
         .await;
+        events.settled().await;
 
-        assert_eq!(fake.recorded()[0].header("tracestate"), Some("rainier=on"));
-        assert_eq!(unit.trace_keeping(), TraceKeeping::On);
-    }
-
-    #[tokio::test]
-    async fn a_kept_trace_tells_the_callee_to_keep() {
-        let fake = Arc::new(FakeTransport::new());
-        let unit = participating(true);
-
-        unit.scope(async {
-            Http::get("https://b.example.com/x")
-                .through(Arc::clone(&fake) as _)
-                .send()
-                .await
-                .unwrap();
-        })
-        .await;
-
-        assert_eq!(fake.recorded()[0].header("tracestate"), Some("rainier=keep"));
-    }
-
-    #[tokio::test]
-    async fn a_traceresponse_is_not_heard_from_a_call_that_was_not_taking_part() {
-        // A third party answering `traceresponse` must not decide what this
-        // service keeps.
-        let fake = Arc::new(FakeTransport::new());
-        fake.responding_with_header(
-            200,
-            "ok",
-            TRACERESPONSE,
-            format!("00-{TRACE}-b7ad6b7169203331-01"),
-        );
-        let unit = Unit::new(rainier_events::UnitKind::Request, None, None);
-        unit.set_trace(None, Some(UPSTREAM));
-
-        unit.scope(async {
-            Http::get("https://b.example.com/x")
-                .through(Arc::clone(&fake) as _)
-                .send()
-                .await
-                .unwrap();
-        })
-        .await;
-
-        assert_eq!(unit.trace_keeping(), TraceKeeping::Off);
+        let sent = TraceContext::parse(fake.recorded()[0].header("traceparent").unwrap()).unwrap();
+        assert_eq!(heard.lock().unwrap()[0].text("rainier.trace.span_id"), Some(sent.parent_id()));
     }
 }

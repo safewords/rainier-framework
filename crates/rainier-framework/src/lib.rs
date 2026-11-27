@@ -203,7 +203,10 @@ pub use rainier_notify as notify;
 #[cfg(feature = "oauth-server")]
 pub use rainier_oauth_server as oauth_server;
 pub use rainier_openapi as openapi;
+pub use rainier_otel as otel;
 pub use rainier_queue as queue;
+/// Request tagging: a trace id on every request and every call it makes.
+pub use rainier_request_tagging as request_tagging;
 pub use rainier_routing as routing;
 pub use rainier_scheduler as scheduler;
 pub use rainier_server as server;
@@ -211,7 +214,6 @@ pub use rainier_session as session;
 #[cfg(feature = "sso")]
 pub use rainier_sso as sso;
 pub use rainier_support as support;
-pub use rainier_telemetry as telemetry;
 pub use rainier_validation as validation;
 pub use rainier_view as view;
 pub use rainier_websocket as websocket;
@@ -243,7 +245,7 @@ pub mod prelude {
     // The macros live at their crates' roots, so they are reachable as
     // `rainier_framework::config::config_keys!` without being imported.
     pub use rainier_config::{AppEnv, Key as ConfigurationKey, Setting as _};
-    pub use rainier_telemetry::LogFormat;
+    pub use rainier_otel::LogFormat;
 
     pub use crate::binding::{Bound, BoundAs};
     pub use crate::deferred::defer;
@@ -293,7 +295,7 @@ pub mod prelude {
     pub use rainier_metrics::{Metrics, RecordMetrics};
     pub use rainier_notify::{Channels, Notifiable, Notification, Notifier};
     pub use rainier_queue::{Job, JobContext, QueueDriver, QueueManager};
-    pub use rainier_telemetry::Trace;
+    pub use rainier_request_tagging::Trace;
     pub use rainier_view::View as ViewData;
     pub use rainier_websocket::{Rooms, Socket, WebSocketHandler, WebSocketRoutes};
 

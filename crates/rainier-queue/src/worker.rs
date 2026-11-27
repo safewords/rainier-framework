@@ -1233,7 +1233,7 @@ impl Worker {
         // span is first entered, which is when OpenTelemetry fixes it. And
         // anything the job calls joins the same trace.
         if let Some(parent) = &job.traceparent {
-            rainier_telemetry::propagation::adopt(&span, parent);
+            rainier_otel::adopt(&span, parent);
         }
         // The trace this run belongs to: the dispatcher's; else the span's own,
         // when OpenTelemetry started one; else a new one. Recorded as
@@ -1244,12 +1244,12 @@ impl Worker {
         let trace = job
             .traceparent
             .as_deref()
-            .and_then(|header| rainier_telemetry::TraceContext::parse(header).ok())
+            .and_then(|header| rainier_request_tagging::TraceContext::parse(header).ok())
             .or_else(|| {
-                rainier_telemetry::propagation::for_span(&span)
-                    .and_then(|header| rainier_telemetry::TraceContext::parse(&header).ok())
+                rainier_request_tagging::propagation::for_span(&span)
+                    .and_then(|header| rainier_request_tagging::TraceContext::parse(&header).ok())
             })
-            .unwrap_or_else(|| rainier_telemetry::TraceContext::start(true));
+            .unwrap_or_else(|| rainier_request_tagging::TraceContext::start(true));
         span.record("trace_id", trace.trace_id());
         // And on the attempt's own unit, when it has one: a job joined into a
         // request keeps the request's trace.
@@ -1258,7 +1258,7 @@ impl Worker {
         {
             unit.set_trace(Some(trace.trace_id()), None);
         }
-        let outbound = Some(rainier_telemetry::propagation::child_of(&trace));
+        let outbound = Some(rainier_request_tagging::propagation::child_of(&trace));
 
         let (queue, name, attempt) = (job.queue.clone(), job.name.clone(), job.attempts);
         if let Some(observer) = &self.observer {
@@ -1266,7 +1266,7 @@ impl Worker {
         }
 
         let result = tracing::Instrument::instrument(
-            rainier_telemetry::propagation::scope(outbound, self.process_untraced(job, ran)),
+            rainier_request_tagging::propagation::scope(outbound, self.process_untraced(job, ran)),
             span.clone(),
         )
         .await;
@@ -3373,10 +3373,10 @@ mod telemetry_tests {
 
         async fn handle(&self, _: &JobContext) -> Result<()> {
             if self.card_number == "traced" {
-                *SEEN_TRACE.lock().unwrap() = rainier_telemetry::propagation::current();
+                *SEEN_TRACE.lock().unwrap() = rainier_request_tagging::propagation::current();
             }
             if self.card_number == "untraced" {
-                *SEEN_FRESH.lock().unwrap() = rainier_telemetry::propagation::current();
+                *SEEN_FRESH.lock().unwrap() = rainier_request_tagging::propagation::current();
             }
             if self.card_number == "declined" {
                 return Err(Error::internal("card declined"));
@@ -3524,7 +3524,7 @@ mod telemetry_tests {
         let registry = Arc::new(JobRegistry::new().with::<Charge>());
         let manager = crate::QueueManager::new(Arc::clone(&queue) as _, Arc::clone(&registry));
 
-        rainier_telemetry::propagation::scope(Some(UPSTREAM.to_string()), async {
+        rainier_request_tagging::propagation::scope(Some(UPSTREAM.to_string()), async {
             manager.dispatch(Charge { card_number: "traced".into() }).await.unwrap();
         })
         .await;
@@ -3533,7 +3533,7 @@ mod telemetry_tests {
         worker(queue, Arc::new(Observed::default())).run_next().await.unwrap();
 
         let seen = SEEN_TRACE.lock().unwrap().clone().expect("the handler saw a trace");
-        let seen = rainier_telemetry::TraceContext::parse(&seen).unwrap();
+        let seen = rainier_request_tagging::TraceContext::parse(&seen).unwrap();
         assert_eq!(seen.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736", "the same trace");
     }
 
@@ -3568,7 +3568,7 @@ mod telemetry_tests {
         let _ = RELAY_MANAGER.set(Arc::clone(&manager));
 
         // The request: what the `Trace` middleware puts in force.
-        rainier_telemetry::propagation::scope(Some(UPSTREAM.to_string()), async {
+        rainier_request_tagging::propagation::scope(Some(UPSTREAM.to_string()), async {
             manager.dispatch(Relay).await.unwrap();
         })
         .await;
@@ -3580,7 +3580,7 @@ mod telemetry_tests {
         assert_eq!(relayed.len(), 1, "the relay queued its job");
         let carried = relayed[0].traceparent.as_deref().expect("carries the trace");
         assert_eq!(
-            rainier_telemetry::TraceContext::parse(carried).unwrap().trace_id(),
+            rainier_request_tagging::TraceContext::parse(carried).unwrap().trace_id(),
             "4bf92f3577b34da6a3ce929d0e0e4736"
         );
         assert_eq!(worker.run_next().await.unwrap(), Outcome::Processed, "the relayed job");
@@ -3630,7 +3630,7 @@ mod telemetry_tests {
         assert_eq!(started.len(), 32);
         // What a dispatch from inside the job would carry: the same trace.
         let seen = SEEN_FRESH.lock().unwrap().clone().expect("the handler saw a trace");
-        let seen = rainier_telemetry::TraceContext::parse(&seen).unwrap();
+        let seen = rainier_request_tagging::TraceContext::parse(&seen).unwrap();
         assert_eq!(seen.trace_id(), started);
     }
 

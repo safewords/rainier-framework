@@ -249,9 +249,11 @@ pub enum ClientIp {
     None,
 }
 
-/// Request tracing: keeping a trace that crosses services whole, and saying
-/// enough about it for something outside — an operations console — to put
-/// the services' parts of it back together. See `docs/lookout.md`,
+/// Request tracing: recording, on this service's side, which call from
+/// another service each request answered and which calls it made — by the
+/// span ids request tagging puts on the wire — and serving that for
+/// something outside, an operations console, to put a trace across services
+/// back together. Lookouts never talk to one another. See `docs/lookout.md`,
 /// "Traces across services".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -261,7 +263,8 @@ pub struct RequestTracing {
     /// The fraction of traces kept whole, `0.0..=1.0`
     /// (`LOOKOUT_TRACE_SAMPLE_RATE`). Decided from the trace id, so every
     /// service with the same rate keeps the same traces without asking one
-    /// another. Failures and slow work keep their trace whatever the rate.
+    /// another. Outside the sample, each service keeps its part by its own
+    /// rule — failed and slow work, as ever.
     pub trace_sample_rate: f64,
     /// The name this service goes by in a trace (`LOOKOUT_SERVICE`, else
     /// `APP_NAME`).

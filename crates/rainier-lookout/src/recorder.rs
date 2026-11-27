@@ -315,20 +315,10 @@ impl Lookout {
     /// its trace id), or with `None` the one the calling code is running in.
     ///
     /// A tag in [`Scope::monitored_tags`](crate::config::Scope::monitored_tags)
-    /// keeps the batch whatever the sampling and keep rule — and, in
-    /// request tracing, tagging the batch the calling code runs in keeps its
-    /// whole trace: every service it calls from then on keeps its part.
-    /// Returns whether a batch was found.
+    /// keeps the batch whatever the sampling and keep rule. Returns whether a
+    /// batch was found.
     pub fn tag(&self, batch: Option<&str>, tag: impl Into<String>) -> bool {
         let tag = tag.into();
-        if batch.is_none()
-            && self.inner.config.request_tracing.enabled
-            && self.inner.config.scope.monitored_tags.contains(&tag)
-        {
-            if let Some(unit) = Context::current_unit() {
-                unit.keep_trace();
-            }
-        }
         let cell = self.inner.find(batch);
         match cell {
             Some(cell) => {
@@ -686,8 +676,6 @@ pub(crate) struct Pending {
     /// Request tracing: the span in another service this work answered —
     /// the parent id of the `traceparent` the request arrived with.
     pub(crate) remote_parent: Option<String>,
-    /// Request tracing: the unit's trace was to be kept whole when it ended.
-    pub(crate) trace_kept: bool,
 }
 
 impl Pending {
@@ -734,7 +722,6 @@ impl Pending {
             root: None,
             operations: HashMap::new(),
             remote_parent: None,
-            trace_kept: false,
         }
     }
 
@@ -1015,7 +1002,7 @@ impl Inner {
         } else {
             false
         };
-        let remote_parent = self.join_trace(request);
+        let remote_parent = self.remote_parent_of(request);
         let mut state = cell.lock();
         if let Some(pending) = state.as_mut() {
             pending.remote_parent = remote_parent;
@@ -1028,61 +1015,18 @@ impl Inner {
         }
     }
 
-    /// Request tracing: put the request's unit in the agreement on which
-    /// traces to keep whole, and return the span in another service it
-    /// answers, if it came from one.
-    ///
-    /// The trace is kept when the caller said `rainier=keep`, or when its id
-    /// falls in the sample every service computes the same way.
-    fn join_trace(&self, request: &rainier_http::Request) -> Option<String> {
-        let tracing = &self.config.request_tracing;
-        if !tracing.enabled {
+    /// Request tracing: the call in another service this request answers —
+    /// the parent span of the `traceparent` it arrived with, when it is in
+    /// the request's trace.
+    fn remote_parent_of(&self, request: &rainier_http::Request) -> Option<String> {
+        if !self.config.request_tracing.enabled {
             return None;
         }
         let unit = rainier_events::Context::current_unit()?;
-        let trace_id = unit.trace_id()?.to_string();
-        let asked = request.header("tracestate").map_or(
-            rainier_events::TraceKeeping::Off,
-            rainier_events::TraceKeeping::from_tracestate,
-        );
-        let keep = asked == rainier_events::TraceKeeping::Keep || tracing.samples(&trace_id);
-        unit.join_trace_keeping(keep);
-        request.header("traceparent").and_then(|header| remote_parent(header, &trace_id))
-    }
-
-    /// Request tracing, once the response is ready: keep the trace if this
-    /// part of it failed or was slow, and — to a caller that takes part —
-    /// answer whether this part is kept, with `traceresponse`.
-    ///
-    /// Decided here, before the batch closes, so the caller hears it while it
-    /// can still keep its own part; and kept by the recorder because the unit
-    /// says so, so the answer is never a promise the batch then breaks.
-    pub(crate) fn answer_trace(
-        &self,
-        response: Response,
-        asked: rainier_events::TraceKeeping,
-    ) -> Response {
-        if !self.config.request_tracing.enabled {
-            return response;
-        }
-        let Some(unit) = rainier_events::Context::current_unit() else { return response };
-        if unit.trace_keeping() == rainier_events::TraceKeeping::Off {
-            return response;
-        }
-        let slow_ms = self.config.watcher(EntryType::Request).slow_ms;
-        let slow = slow_ms.is_some_and(|ms| unit.elapsed() >= Duration::from_millis(ms));
-        if response.status().is_server_error() || slow {
-            unit.keep_trace();
-        }
-        if asked == rainier_events::TraceKeeping::Off {
-            // Not asked by a service taking part: say nothing about Lookout.
-            return response;
-        }
-        let Some(trace_id) = unit.trace_id() else { return response };
-        let kept = unit.trace_keeping() == rainier_events::TraceKeeping::Keep;
-        let header =
-            format!("00-{trace_id}-{}-{}", unit.id_string(), if kept { "01" } else { "00" });
-        response.with_header("traceresponse", &header)
+        let trace_id = unit.trace_id()?;
+        let incoming =
+            rainier_request_tagging::TraceContext::parse(request.header("traceparent")?).ok()?;
+        (incoming.trace_id() == trace_id).then(|| incoming.parent_id().to_string())
     }
 
     /// The client's address as the application settled on it (after its
@@ -1248,8 +1192,6 @@ impl Inner {
             if pending.name.is_none() && pending.kind != BatchKind::Request {
                 pending.name = done.name.clone();
             }
-            pending.trace_kept = self.config.request_tracing.enabled
-                && done.trace_keeping == rainier_events::TraceKeeping::Keep;
         }
         match pending.root.take() {
             Some(root) => {
@@ -1736,14 +1678,17 @@ pub(crate) fn finalize(
 
     // Request tracing: whether this batch is part of a trace that crosses
     // services — it answered another service, or called one with the trace —
-    // and whether the services agreed to keep that trace.
+    // and whether its trace is in the sample.
     let distributed = config.request_tracing.enabled
         && (pending.remote_parent.is_some()
             || pending.entries.iter().any(|e| {
                 e.entry_type == EntryType::HttpClient
                     && e.content.get("rainier.trace.span_id").is_some()
             }));
-    let trace_kept = pending.trace_kept;
+    // In the sample every service computes the same way from the trace id:
+    // kept whole without any of them asking another.
+    let trace_kept = distributed
+        && pending.trace_id.as_deref().is_some_and(|id| config.request_tracing.samples(id));
     if distributed {
         tags.insert(crate::http::traces::DISTRIBUTED.to_string());
     }
@@ -1947,18 +1892,6 @@ pub(crate) fn finalize(
     } else {
         Finalized::Counted(batch.entries)
     }
-}
-
-/// The parent span a `traceparent` names, when it is in `trace_id`: the
-/// span in another service this work answers. `version-trace-parent-flags`,
-/// each part hex of its fixed length.
-fn remote_parent(header: &str, trace_id: &str) -> Option<String> {
-    let mut parts = header.trim().split('-');
-    let (_, trace, parent) = (parts.next()?, parts.next()?, parts.next()?);
-    let hex =
-        |part: &str, len: usize| part.len() == len && part.bytes().all(|b| b.is_ascii_hexdigit());
-    (trace == trace_id && hex(parent, 16) && parent != "0000000000000000")
-        .then(|| parent.to_ascii_lowercase())
 }
 
 /// Point every entry whose parent is an operation that was not recorded —

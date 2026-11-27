@@ -202,17 +202,11 @@ Inside a trace — a request the `Trace` middleware joined (with
 [request tagging](observability.md#request-tagging) on), a
 job that carried one — every attempt carries a W3C `traceparent` with the same trace id and **a
 span id of its own**, so the service it reaches can tell which of several
-calls its work answered. With the `telemetry` feature that is the client
-span's id; without it, a fresh one. Outside any trace nothing is added, and a
+calls its work answered. With `rainier-otel`'s exporter installed that is the
+client span's id; without it, a fresh one. The tagging itself is
+`rainier-request-tagging`'s: this crate only asks it, before each attempt. Outside any trace nothing is added, and a
 `traceparent` the caller set is left alone. The event carries the span id it
 sent as `rainier.trace.span_id`.
-
-When [Lookout's request tracing](lookout.md#traces-across-services) is on, an
-attempt also carries `tracestate: rainier=on` (or `rainier=keep`), and reads
-the callee's `traceresponse`: a callee that kept its part makes this unit keep
-its trace too. The event carries what came back as `rainier.trace.peer_kept`
-and `rainier.trace.peer_span_id`. A `traceresponse` from a call that did not
-say `rainier=…` — a third party's — is ignored.
 
 A transport of your own wraps its send in
 `rainier_http_client::telemetry::instrument`, or what it sends carries no trace

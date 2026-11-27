@@ -1164,8 +1164,6 @@ fn distributed() -> Arc<FakeStore> {
         "server.address": "billing",
         "http.response.status_code": 200,
         "rainier.trace.span_id": "b7ad6b7169203331",
-        "rainier.trace.peer_kept": true,
-        "rainier.trace.peer_span_id": "000000000000002a",
     });
     let mut batch = request("b9", "orders.show", 200, 5, vec![root, call]);
     batch.trace_id = TRACE_ID.into();
@@ -1203,7 +1201,6 @@ async fn a_trace_is_its_shape_and_never_its_content() {
     let call = &batch["spans"][1]["call"];
     assert_eq!(call["span_id"], "b7ad6b7169203331", "the call it made");
     assert_eq!(call["host"], "billing");
-    assert_eq!(call["peer_kept"], true);
     assert!(!answer.text.contains("secret-token"), "no content: {}", answer.text);
     assert!(!answer.text.contains("\"42\""), "no user: {}", answer.text);
 

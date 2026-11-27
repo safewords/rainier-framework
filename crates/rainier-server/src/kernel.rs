@@ -493,7 +493,7 @@ fn server_span(request: &Request) -> tracing::Span {
     // Before the span is first entered: OpenTelemetry fixes a span's parent
     // when it starts, and an incoming `traceparent` is that parent.
     if let Some(traceparent) = request.header("traceparent") {
-        rainier_telemetry::propagation::adopt(&span, traceparent);
+        rainier_otel::adopt(&span, traceparent);
     }
 
     span

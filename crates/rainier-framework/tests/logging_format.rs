@@ -5,7 +5,7 @@
 use rainier_framework::config::Config;
 use rainier_framework::keys;
 use rainier_framework::observability::TelemetrySettings;
-use rainier_telemetry::LogFormat;
+use rainier_otel::LogFormat;
 
 /// Run with `--nocapture` to see the line this prints; it should be one JSON
 /// object with `message` and `field` at the top level, not nested under

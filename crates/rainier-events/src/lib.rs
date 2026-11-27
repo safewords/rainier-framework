@@ -62,7 +62,7 @@ pub use bus::{
     bus, has_subscribers, install, installed, publish, publish_with, set_default, AnySubscription,
     Subscription,
 };
-pub use context::{Context, Operation, TraceKeeping, Unit, UnitCompleted, UnitKind};
+pub use context::{Context, Operation, Unit, UnitCompleted, UnitKind};
 pub use dispatcher::Dispatcher;
 pub use event::{Event, EventSubscriber, Listener, WildcardListener};
 pub use report::{

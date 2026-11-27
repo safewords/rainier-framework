@@ -20,7 +20,7 @@ use crate::context::{TraceContext, TRACEPARENT, TRACESTATE};
 /// Everything except send spans anywhere. The trace id is on the request, on
 /// the response and on every log line, so a request can be followed across
 /// services by grepping — which is most of the value, and it costs no
-/// dependency. The [`otlp`](crate) feature adds the exporter.
+/// dependency. `rainier-otel` adds an exporter, if you want one.
 pub struct Trace {
     /// Whether to sample when nothing upstream has decided.
     sample: bool,
@@ -62,7 +62,7 @@ impl Trace {
     /// wins, because it names the caller's span as well.
     ///
     /// ```
-    /// use rainier_telemetry::Trace;
+    /// use rainier_request_tagging::Trace;
     ///
     /// let trace = Trace::new().request_id_header("x-request-id");
     /// # let _ = trace;

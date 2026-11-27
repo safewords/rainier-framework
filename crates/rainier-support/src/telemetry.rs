@@ -4,7 +4,7 @@
 //! feature of its own, and with it off the crate compiles no span at all. With
 //! it on, the crate wraps its real seams — a query, a cache read, a job, a mail
 //! send — in a [`tracing`] span named and attributed after the OpenTelemetry
-//! semantic conventions, so the OTLP exporter in `rainier-telemetry` turns each
+//! semantic conventions, so the OTLP exporter in `rainier-otel` turns each
 //! into a span a trace viewer already knows how to draw.
 //!
 //! This module is the part they would otherwise each write: [`span!`](crate::span)

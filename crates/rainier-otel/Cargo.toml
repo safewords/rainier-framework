@@ -1,6 +1,6 @@
 [package]
-name = "rainier-telemetry"
-description = "OpenTelemetry for Rainier: trace context propagation, and an OTLP exporter behind a feature."
+name = "rainier-otel"
+description = "OpenTelemetry for Rainier: real span ids and an OTLP exporter behind a feature, building on rainier-request-tagging; and the shape of a log line."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,10 +9,10 @@ repository.workspace = true
 
 [dependencies]
 rainier-support = { workspace = true }
-rainier-http = { workspace = true }
-rainier-middleware = { workspace = true }
+# The trace context spans join and name: request tagging. Only the exporter
+# gives spans ids worth naming.
+rainier-request-tagging = { workspace = true, optional = true }
 
-async-trait = { workspace = true }
 tracing = { workspace = true }
 
 # The exporter. Off by default: it is a large dependency tree, and an
@@ -22,13 +22,14 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
-# The trace goes onto the request's unit of work, and a flush that fails is
-# reported on the bus.
-rainier-events = { workspace = true }
+# A flush that fails is reported on the bus.
+rainier-events = { workspace = true, optional = true }
 
 [features]
 default = []
 otlp = [
+    "dep:rainier-request-tagging",
+    "dep:rainier-events",
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
     "dep:opentelemetry-otlp",
@@ -37,8 +38,8 @@ otlp = [
 ]
 
 [dev-dependencies]
+# The exporter's own tests run on a runtime.
 tokio = { workspace = true }
-http-body-util = { workspace = true }
 
 [lints]
 workspace = true

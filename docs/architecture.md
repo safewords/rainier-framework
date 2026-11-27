@@ -48,7 +48,8 @@ graph TD
     websocket[rainier-websocket<br/><i>socket handlers, rooms</i>]
     metrics[rainier-metrics<br/><i>registry, exposition, timing</i>]
     openapi[rainier-openapi<br/><i>the document</i>]
-    telemetry[rainier-telemetry<br/><i>trace context, OTLP</i>]
+    tagging[rainier-request-tagging<br/><i>W3C trace context</i>]
+    telemetry[rainier-otel<br/><i>OpenTelemetry, OTLP</i>]
     server[rainier-server<br/><i>kernel, hyper</i>]
     console[rainier-console<br/><i>the console kernel</i>]
 
@@ -99,7 +100,8 @@ graph TD
     http --> websocket
     middleware --> metrics
     routing --> openapi
-    middleware --> telemetry
+    middleware --> tagging
+    tagging --> telemetry
 
     routing --> server
     middleware --> server
@@ -118,6 +120,7 @@ graph TD
     websocket --> server
     metrics --> framework
     openapi --> framework
+    tagging --> framework
     telemetry --> framework
     console --> framework
     validation --> framework
@@ -174,7 +177,8 @@ in drivers; the port crates are adapters over it.**
 | `rainier-metrics` | the Prometheus registry, its text format, request timing |
 | `rainier-openapi` | the OpenAPI document, and rules-to-schema |
 | `rainier-mcp` | a Model Context Protocol server: tools, resources and prompts over HTTP |
-| `rainier-telemetry` | W3C trace context, and OTLP behind a feature |
+| `rainier-request-tagging` | Request tagging: W3C trace context on every request and outbound call |
+| `rainier-otel` | OpenTelemetry: real span ids and OTLP behind a feature; the log line format |
 | `rainier-server` | the HTTP kernel and the hyper server |
 | `rainier-console` | the console: commands, arguments, the kernel |
 | `rainier-crypt` | encryption, signing, key rotation, password hashing |

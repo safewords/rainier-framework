@@ -80,9 +80,9 @@ use rainier_crypt::{CryptScheme, HashDriver};
 use rainier_database::Databases;
 use rainier_filesystem::Disks;
 use rainier_mail::{MailDriver, MailEncryption};
+use rainier_otel::LogFormat;
 use rainier_queue::{Connections as QueueConnections, QueueDriver};
 use rainier_session::SessionDriver;
-use rainier_telemetry::LogFormat;
 
 config_keys! {
     // --- app ---------------------------------------------------------------
@@ -215,7 +215,7 @@ config_keys! {
 
     /// Whether to tag requests so they can be followed across services:
     /// join an incoming `traceparent` (or start a trace), and carry it on
-    /// every outbound call and queued job. The [`Trace`](crate::telemetry::Trace)
+    /// every outbound call and queued job. The [`Trace`](crate::request_tagging::Trace)
     /// middleware, without OpenTelemetry. `telemetry.enabled` implies it.
     pub REQUEST_TAGGING_ENABLED: bool = "request_tagging.enabled";
 

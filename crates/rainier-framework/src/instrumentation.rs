@@ -13,7 +13,7 @@
 //! | At boot | What happens |
 //! |---|---|
 //! | the subscriber | logging as before, plus the OTLP layer when an endpoint is set — one subscriber, installed once |
-//! | the kernel | [`Trace`](rainier_telemetry::Trace) outermost in the global stack, unless the application already put one there |
+//! | the kernel | [`Trace`](rainier_request_tagging::Trace) outermost in the global stack, unless the application already put one there |
 //! | `queue:work` | a [`QueueMetrics`] observer on every worker, when a `Metrics` registry is bound |
 //! | `schedule:run` / `schedule:work` | each pass's task timings into the registry, when one is bound |
 //!
@@ -38,9 +38,9 @@ use std::time::Duration;
 
 use rainier_config::{Config, Env};
 use rainier_metrics::{labels, Metrics};
+use rainier_otel::Otlp;
 use rainier_queue::{JobTiming, QueueObserver};
 use rainier_scheduler::RunSummary;
-use rainier_telemetry::Otlp;
 
 use crate::keys;
 use crate::observability::TelemetrySettings;
@@ -129,7 +129,7 @@ pub use crate::observability::install_trace_middleware;
 
 /// Flush spans the batch exporter is still holding. Call before exiting.
 pub fn shutdown() {
-    rainier_telemetry::shutdown();
+    rainier_otel::shutdown();
 }
 
 /// A [`QueueObserver`] over the application's `Metrics` registry.
@@ -356,7 +356,7 @@ mod tests {
     use super::*;
     use rainier_middleware::Middleware;
     use rainier_queue::JobOutcome;
-    use rainier_telemetry::Trace;
+    use rainier_request_tagging::Trace;
 
     fn env(pairs: &[(&str, &str)]) -> Env {
         Env::from_map(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string()))).isolated()

@@ -182,8 +182,6 @@ fn span(entry: &Entry) -> Value {
             "span_id": field("rainier.trace.span_id"),
             "host": field("server.address"),
             "status": field("http.response.status_code"),
-            "peer_kept": field("rainier.trace.peer_kept"),
-            "peer_span_id": field("rainier.trace.peer_span_id"),
         });
     }
     value

@@ -47,14 +47,6 @@ impl LookoutMiddleware {
     }
 }
 
-/// What a calling service said about keeping this trace, in its
-/// `tracestate`: `Off` for a caller that does not take part.
-fn asked_to_keep(request: &Request) -> rainier_events::TraceKeeping {
-    request
-        .header("tracestate")
-        .map_or(rainier_events::TraceKeeping::Off, rainier_events::TraceKeeping::from_tracestate)
-}
-
 #[async_trait::async_trait]
 impl Middleware for LookoutMiddleware {
     async fn handle(&self, request: Request, next: Next) -> Response {
@@ -66,10 +58,8 @@ impl Middleware for LookoutMiddleware {
         if Context::current_unit().is_some() {
             inner.before_request(&request);
             let path = request.path().to_string();
-            let asked = asked_to_keep(&request);
             let response = next.run(request).await;
             inner.after_response(&response);
-            let response = inner.answer_trace(response, asked);
             return self.lookout.mark_for_rum(response, &path);
         }
 
@@ -82,10 +72,8 @@ impl Middleware for LookoutMiddleware {
         let started = Instant::now();
         let work = async move {
             lookout.inner.before_request(&request);
-            let asked = asked_to_keep(&request);
             let response = next.run(request).await;
             lookout.inner.after_response(&response);
-            let response = lookout.inner.answer_trace(response, asked);
             let matched = response.extensions().get::<rainier_routing::MatchedRoute>();
             events.publish_activity(RequestHandled {
                 method,
@@ -287,20 +275,17 @@ mod tests {
 
     const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 
-    /// A request from another service in trace [`TRACE`], answering its span
-    /// `parent`, saying `state` about keeping it.
-    fn called(uri: &str, parent: &str, state: Option<&str>) -> Request {
-        let mut builder = Request::builder()
+    /// A request from another service in trace [`TRACE`], answering its
+    /// call `parent`.
+    fn called(uri: &str, parent: &str) -> Request {
+        Request::builder()
             .method(Method::GET)
             .uri(uri)
-            .header("traceparent", &format!("00-{TRACE}-{parent}-01"));
-        if let Some(state) = state {
-            builder = builder.header("tracestate", state);
-        }
-        builder.build()
+            .header("traceparent", &format!("00-{TRACE}-{parent}-01"))
+            .build()
     }
 
-    fn aggregating(rate: f64) -> LookoutConfig {
+    fn tracing(rate: f64) -> LookoutConfig {
         let mut config = LookoutConfig::default().enabled(true).local(false);
         config.request_tracing.enabled = true;
         config.request_tracing.trace_sample_rate = rate;
@@ -308,57 +293,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_request_tracing_a_caller_hears_whether_its_callee_kept_its_part() {
+    async fn a_request_from_another_service_records_the_call_it_answered() {
         let store = Arc::new(MemoryStore::new(10));
-        let lookout = Lookout::new(aggregating(0.0), store.clone());
+        let lookout = Lookout::new(tracing(1.0), store.clone());
         let (kernel, events) = wired(&lookout);
 
-        let fine =
-            kernel.handle_request(called("/posts/1", "000000000000000a", Some("rainier=on"))).await;
-        let failed =
-            kernel.handle_request(called("/boom", "000000000000000b", Some("rainier=on"))).await;
-        let asked = kernel
-            .handle_request(called("/posts/2", "000000000000000c", Some("rainier=keep")))
-            .await;
+        let response = kernel.handle_request(called("/posts/1", "000000000000000a")).await;
         flushed(&lookout, &events).await;
 
-        let answer = |response: &Response| {
-            response.headers().get("traceresponse").map(|v| v.to_str().unwrap().to_string())
-        };
-        let fine = answer(&fine).expect("a participating caller is answered");
-        assert!(fine.starts_with(&format!("00-{TRACE}-")) && fine.ends_with("-00"), "{fine}");
-        assert!(answer(&failed).unwrap().ends_with("-01"), "a failure keeps its part");
-        assert!(answer(&asked).unwrap().ends_with("-01"), "asked to keep, it keeps");
-
+        assert!(
+            response.headers().get("traceresponse").is_none(),
+            "Lookouts say nothing to each other"
+        );
         let kept = store.all();
-        let paths: Vec<Option<&str>> = kept.iter().map(|b| b.route_name.as_deref()).collect();
-        assert_eq!(kept.len(), 2, "the fine one is let go: {paths:?}");
-        for batch in &kept {
-            assert_eq!(batch.trace_id, TRACE);
-            assert!(batch.tags.iter().any(|t| t == "trace:kept"), "{:?}", batch.tags);
-            assert!(batch.tags.iter().any(|t| t == "trace:distributed"), "{:?}", batch.tags);
-            let root =
-                batch.entries.iter().find(|e| e.span_id.as_deref() == Some(&batch.id)).unwrap();
-            let parent = root.content["rainier.trace.parent_span_id"].as_str().unwrap();
-            assert!(["000000000000000b", "000000000000000c"].contains(&parent), "{parent}");
-        }
-        // The answer names the batch it kept, so a caller can hang it under
-        // its call.
-        let failed_answer = answer(&failed).unwrap();
-        assert!(kept.iter().any(|b| failed_answer.contains(&b.id)), "{failed_answer}");
+        assert_eq!(kept.len(), 1, "in the sample: kept though fine");
+        let batch = &kept[0];
+        assert_eq!(batch.trace_id, TRACE);
+        assert!(batch.tags.iter().any(|t| t == "trace:distributed"), "{:?}", batch.tags);
+        assert!(batch.tags.iter().any(|t| t == "trace:kept"), "{:?}", batch.tags);
+        let root = batch.entries.iter().find(|e| e.span_id.as_deref() == Some(&batch.id)).unwrap();
+        assert_eq!(root.content["rainier.trace.parent_span_id"], "000000000000000a");
     }
 
     #[tokio::test]
-    async fn every_service_keeps_the_same_sampled_traces_and_says_nothing_unasked() {
+    async fn outside_the_sample_a_fine_request_is_let_go_and_a_failure_kept() {
         let store = Arc::new(MemoryStore::new(10));
-        let lookout = Lookout::new(aggregating(1.0), store.clone());
+        let lookout = Lookout::new(tracing(0.0), store.clone());
         let (kernel, events) = wired(&lookout);
 
-        let response = kernel.handle_request(called("/posts/1", "000000000000000a", None)).await;
+        kernel.handle_request(called("/posts/1", "000000000000000a")).await;
+        kernel.handle_request(called("/boom", "000000000000000b")).await;
         flushed(&lookout, &events).await;
 
-        assert!(response.headers().get("traceresponse").is_none(), "not asked, nothing said");
-        assert_eq!(store.all().len(), 1, "in the sample: kept though fine");
+        let kept = store.all();
+        assert_eq!(kept.len(), 1, "only the failure");
+        let root =
+            kept[0].entries.iter().find(|e| e.span_id.as_deref() == Some(&kept[0].id)).unwrap();
+        assert_eq!(root.content["rainier.trace.parent_span_id"], "000000000000000b");
+        assert!(
+            !kept[0].tags.iter().any(|t| t == "trace:kept"),
+            "kept for failing, not the sample"
+        );
     }
 
     /// Another service's kernel as a transport: what the client sends, it
@@ -408,17 +383,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failure_two_services_down_keeps_the_whole_trace_and_it_fits_back_together() {
-        // The callee: fails, so keeps its part and says so.
+    async fn two_services_each_record_their_side_of_one_call_and_it_fits_back_together() {
+        // The callee, a Lookout of its own.
         let billing_store = Arc::new(MemoryStore::new(10));
-        let billing = Lookout::new(aggregating(0.0), billing_store.clone());
+        let billing = Lookout::new(tracing(1.0), billing_store.clone());
         let (billing_kernel, billing_events) = wired(&billing);
         let billing_kernel = Arc::new(billing_kernel);
 
-        // The caller: fine itself, and not in the sample — kept only because
-        // the service it called kept its part.
+        // The caller, another, sharing nothing with the first but the rate.
         let orders_store = Arc::new(MemoryStore::new(10));
-        let orders = Lookout::new(aggregating(0.0), orders_store.clone());
+        let orders = Lookout::new(tracing(1.0), orders_store.clone());
         let orders_events = Arc::new(Dispatcher::new());
         orders.subscribe(&orders_events);
         let mut router = Router::new();
@@ -441,45 +415,37 @@ mod tests {
         let orders_kernel = Kernel::with_middleware(compiled, vec![Arc::new(orders.middleware())])
             .with_events(Arc::clone(&orders_events));
 
-        // From a browser: a trace, and nothing said about keeping it.
-        let response =
-            orders_kernel.handle_request(called("/checkout", "00000000000000ff", None)).await;
+        let response = orders_kernel.handle_request(called("/checkout", "00000000000000ff")).await;
         assert_eq!(response.status().as_u16(), 200);
         flushed(&billing, &billing_events).await;
         flushed(&orders, &orders_events).await;
 
         let callee = billing_store.all();
         let caller = orders_store.all();
-        assert_eq!((caller.len(), callee.len()), (1, 1), "both parts kept");
+        assert_eq!((caller.len(), callee.len()), (1, 1), "both parts kept: the same sample");
         let (caller, callee) = (&caller[0], &callee[0]);
-        assert_eq!(caller.trace_id, TRACE);
-        assert_eq!(callee.trace_id, TRACE, "one trace across both");
-        assert!(caller.tags.iter().any(|t| t == "trace:kept"), "{:?}", caller.tags);
+        assert_eq!((caller.trace_id.as_str(), callee.trace_id.as_str()), (TRACE, TRACE));
 
-        // The stitch: the caller's call names the span the callee answered.
-        let call = caller
-            .entries
-            .iter()
-            .find(|e| e.entry_type == EntryType::HttpClient)
-            .expect("the call is recorded");
+        // The link, recorded on each side by each Lookout on its own.
+        let call = caller.entries.iter().find(|e| e.entry_type == EntryType::HttpClient).unwrap();
         let sent = call.content["rainier.trace.span_id"].as_str().expect("the span it sent");
         let callee_root =
             callee.entries.iter().find(|e| e.span_id.as_deref() == Some(&callee.id)).unwrap();
         assert_eq!(callee_root.content["rainier.trace.parent_span_id"].as_str(), Some(sent));
-        assert_eq!(call.content["rainier.trace.peer_kept"], true);
-        assert_eq!(call.content["rainier.trace.peer_span_id"].as_str(), Some(callee.id.as_str()));
 
-        // And the trace API says the same, without content.
-        let shaped = crate::http::traces::shape(callee);
-        assert_eq!(shaped["remote_parent_span_id"].as_str(), Some(sent));
+        // And what each serves for something else to put together.
+        assert_eq!(
+            crate::http::traces::shape(callee)["remote_parent_span_id"].as_str(),
+            Some(sent)
+        );
         let shaped = crate::http::traces::shape(caller);
-        let call = shaped["spans"]
+        let span = shaped["spans"]
             .as_array()
             .unwrap()
             .iter()
             .find(|s| s["type"] == "http_client")
             .unwrap();
-        assert_eq!(call["call"]["span_id"].as_str(), Some(sent));
+        assert_eq!(span["call"]["span_id"].as_str(), Some(sent));
     }
 
     #[tokio::test]
@@ -489,12 +455,9 @@ mod tests {
             Lookout::new(LookoutConfig::default().enabled(true).local(false), store.clone());
         let (kernel, events) = wired(&lookout);
 
-        let response = kernel
-            .handle_request(called("/posts/1", "000000000000000a", Some("rainier=keep")))
-            .await;
+        kernel.handle_request(called("/posts/1", "000000000000000a")).await;
         flushed(&lookout, &events).await;
 
-        assert!(response.headers().get("traceresponse").is_none());
         assert!(store.all().is_empty(), "fine, so not kept");
     }
 

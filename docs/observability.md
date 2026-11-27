@@ -232,7 +232,8 @@ tracing.
 
 ### Request tagging
 
-Request tagging is that propagation and nothing else — no OpenTelemetry, no
+`rainier-request-tagging` — re-exported as `rainier_framework::request_tagging`,
+with `Trace` in the prelude. Request tagging is that propagation and nothing else — no OpenTelemetry, no
 exporter, no decision about what is recorded. It tags a request with a trace
 id and carries the tag on every call it makes to another service and every job
 it queues, so the work in all of them can be linked. Turn it on without the
@@ -296,12 +297,12 @@ trace at all.
 
 ### Exporting
 
-Doing it by hand — `rainier-telemetry` in `Cargo.toml`, and the subscriber
+Doing it by hand — `rainier-otel` in `Cargo.toml`, and the subscriber
 installed in `main` before the application boots, with `endpoint` your
 collector's URL:
 
 ```toml
-rainier-telemetry = { version = "2", features = ["otlp"] }
+rainier-otel = { version = "2", features = ["otlp"] }
 ```
 
 ```rust

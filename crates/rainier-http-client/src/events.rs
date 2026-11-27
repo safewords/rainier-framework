@@ -43,10 +43,6 @@ pub struct HttpClientRequestSent {
     /// `traceparent`, when it carried one — `rainier.trace.span_id`. A
     /// recorder on the other side sees the same id as its work's parent.
     pub trace_span_id: Option<String>,
-    /// What a callee taking part in keeping traces whole answered: whether it
-    /// kept its part (`rainier.trace.peer_kept`), and the span its work hangs
-    /// from (`rainier.trace.peer_span_id`). See [`crate::telemetry`].
-    pub peer: Option<(bool, String)>,
 }
 
 impl HttpClientRequestSent {
@@ -68,14 +64,12 @@ impl HttpClientRequestSent {
             duration,
             code_trace,
             trace_span_id: None,
-            peer: None,
         }
     }
 
-    /// The trace this attempt carried, and what the callee said about it.
-    pub fn with_trace(mut self, span_id: Option<String>, peer: Option<(bool, String)>) -> Self {
+    /// The span id this attempt named in its `traceparent`.
+    pub fn with_trace_span(mut self, span_id: Option<String>) -> Self {
         self.trace_span_id = span_id;
-        self.peer = peer;
         self
     }
 }
@@ -96,11 +90,6 @@ impl Activity for HttpClientRequestSent {
             .set("url.full", self.url.clone())
             .maybe("http.response.status_code", self.status)
             .maybe("rainier.trace.span_id", self.trace_span_id.clone());
-        if let Some((kept, span)) = &self.peer {
-            fields
-                .set("rainier.trace.peer_kept", *kept)
-                .set("rainier.trace.peer_span_id", span.clone());
-        }
         match (self.status, self.error) {
             (Some(status), _) if status >= 400 => {
                 fields.set("otel.status_code", "ERROR").set("error.type", status.to_string());

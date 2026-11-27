@@ -3968,14 +3968,15 @@ dependencies = [
  "rainier-oauth-server",
  "rainier-openapi",
  "rainier-orm",
+ "rainier-otel",
  "rainier-queue",
+ "rainier-request-tagging",
  "rainier-routing",
  "rainier-scheduler",
  "rainier-server",
  "rainier-session",
  "rainier-sso",
  "rainier-support",
- "rainier-telemetry",
  "rainier-validation",
  "rainier-view",
  "rainier-websocket",
@@ -4010,8 +4011,8 @@ name = "rainier-http-client"
 version = "2.0.0"
 dependencies = [
  "rainier-events",
+ "rainier-request-tagging",
  "rainier-support",
- "rainier-telemetry",
  "reqwest",
  "rustls",
  "serde",
@@ -4041,6 +4042,7 @@ dependencies = [
  "rainier-mcp",
  "rainier-middleware",
  "rainier-orm",
+ "rainier-request-tagging",
  "rainier-routing",
  "rainier-server",
  "rainier-support",
@@ -4213,6 +4215,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rainier-otel"
+version = "2.0.0"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "rainier-events",
+ "rainier-request-tagging",
+ "rainier-support",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rainier-queue"
 version = "2.0.0"
 dependencies = [
@@ -4227,11 +4245,26 @@ dependencies = [
  "rainier-drivers",
  "rainier-events",
  "rainier-orm",
+ "rainier-otel",
+ "rainier-request-tagging",
  "rainier-support",
- "rainier-telemetry",
  "rustls",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rainier-request-tagging"
+version = "2.0.0"
+dependencies = [
+ "async-trait",
+ "http-body-util",
+ "rainier-events",
+ "rainier-http",
+ "rainier-middleware",
+ "rainier-support",
  "tokio",
  "tracing",
 ]
@@ -4280,9 +4313,9 @@ dependencies = [
  "rainier-events",
  "rainier-http",
  "rainier-middleware",
+ "rainier-otel",
  "rainier-routing",
  "rainier-support",
- "rainier-telemetry",
  "rainier-websocket",
  "serde_json",
  "tokio",
@@ -4342,25 +4375,6 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-core",
-]
-
-[[package]]
-name = "rainier-telemetry"
-version = "2.0.0"
-dependencies = [
- "async-trait",
- "http-body-util",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "rainier-events",
- "rainier-http",
- "rainier-middleware",
- "rainier-support",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
 ]
 
 [[package]]

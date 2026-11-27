@@ -84,7 +84,8 @@ hyper.
 | `rainier-metrics` | the **Prometheus** registry and request timing | middleware |
 | `rainier-openapi` | the **OpenAPI** document, and rules-to-schema | routing, validation |
 | `rainier-mcp` | a **Model Context Protocol** server: tools, resources, prompts | routing |
-| `rainier-telemetry` | **trace context**, and OTLP behind a feature | middleware |
+| `rainier-request-tagging` | **request tagging**: the W3C trace id on every request and every call it makes | middleware |
+| `rainier-otel` | OpenTelemetry: real span ids, OTLP behind a feature; the log line format | middleware |
 | `rainier-server` | the HTTP kernel and the hyper server | routing, middleware |
 | `rainier-console` | the console kernel and its commands | container |
 | `rainier-crypt` | **ciphers**, signing, key rotation, **password hashing** | support |

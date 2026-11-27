@@ -42,6 +42,8 @@ rainier-container = { workspace = true }
 tokio = { workspace = true }
 # `log-layer`: Lookout asks `log_layer` for log lines at its `log_level`.
 rainier-events = { workspace = true, features = ["log-layer"] }
+# Request tracing reads the call a request answered from its `traceparent`.
+rainier-request-tagging = { workspace = true }
 rainier-middleware = { workspace = true }
 async-trait = { workspace = true }
 # Real user monitoring: a report names the request it describes by a token
