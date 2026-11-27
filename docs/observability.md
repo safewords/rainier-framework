@@ -230,6 +230,43 @@ A missing or malformed header starts a fresh trace rather than failing the
 request — an upstream with a misconfigured proxy must not stop this service
 tracing.
 
+### Request tracing: tagging on its own
+
+Request tracing is that propagation and nothing else — no OpenTelemetry, no
+exporter, no decision about what is recorded. It tags a request with a trace
+id and carries the tag on every call it makes to another service and every job
+it queues, so the work in all of them can be linked. Turn it on without the
+`telemetry` feature:
+
+```env
+REQUEST_TRACING_ENABLED=true
+# Optional: let a frontend start the trace.
+REQUEST_TRACING_HEADER=x-request-id
+```
+
+(`request_tracing.enabled` and `request_tracing.header` in configuration win
+over the environment; `telemetry.enabled` implies request tracing.) Boot puts
+`Trace` outermost, as below.
+
+**A frontend can start it.** With `REQUEST_TRACING_HEADER` set, a request that
+carries that header with a UUID — with or without its dashes, or 32 hex digits;
+`crypto.randomUUID()` in a browser — and no `traceparent` is traced under that
+id. The response carries the header back, every service the request reaches
+records the same id, and that is the id to look the request up by. An id that
+is not one is ignored and the request starts a trace of its own; a
+`traceparent` on the same request wins, because it names the caller's span as
+well. In code: `Trace::new().request_id_header("x-request-id")`.
+
+**Every call carries it.** The [HTTP client](http-client.md#traces) writes
+`traceparent` onto every call made while a trace is in force — the same trace
+id, and a span id naming that one call. A service with request tracing off
+starts no trace, but passes on one it was handed (a job queued by a traced
+request), so a chain is not broken half way.
+
+What consumes the tag is separate: [Lookout](lookout.md#traces-across-services)
+links each service's recorded work by it, and an OpenTelemetry collector would
+by the same header.
+
 ### Put it outermost
 
 In the function that registers your global middleware (the sample project's

@@ -38,7 +38,6 @@ use std::time::Duration;
 
 use rainier_config::{Config, Env};
 use rainier_metrics::{labels, Metrics};
-use rainier_middleware::Middleware;
 use rainier_queue::{JobTiming, QueueObserver};
 use rainier_scheduler::RunSummary;
 use rainier_telemetry::Otlp;
@@ -55,6 +54,7 @@ impl TelemetrySettings {
         if config.get(keys::TELEMETRY_ENABLED).is_none() {
             settings.enabled = env.bool("TELEMETRY_ENABLED", false);
         }
+        settings = settings.with_request_tracing_env(config, env);
         if settings.endpoint.is_none() {
             settings.endpoint =
                 env.get("OTEL_EXPORTER_OTLP_ENDPOINT").filter(|value| !value.trim().is_empty());
@@ -125,25 +125,7 @@ impl TelemetrySettings {
     }
 }
 
-/// Put [`Trace`](rainier_telemetry::Trace) outermost in `global`, unless it is off or already there.
-///
-/// Outermost so that every log line — including the ones from middleware that
-/// rejected the request — carries the trace id, and so that the outbound
-/// calls and jobs a request causes inherit its trace.
-pub fn install_trace_middleware(
-    global: &mut Vec<Arc<dyn Middleware>>,
-    settings: &TelemetrySettings,
-) {
-    let Some(trace) = settings.middleware() else { return };
-
-    // By its label: an application that registered its own `Trace` — with its
-    // own sampling or header choices — keeps exactly that one.
-    if global.iter().any(|stage| stage.name() == "Trace") {
-        return;
-    }
-
-    global.insert(0, Arc::new(trace));
-}
+pub use crate::observability::install_trace_middleware;
 
 /// Flush spans the batch exporter is still holding. Call before exiting.
 pub fn shutdown() {
@@ -372,6 +354,7 @@ pub async fn serve_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rainier_middleware::Middleware;
     use rainier_queue::JobOutcome;
     use rainier_telemetry::Trace;
 
@@ -410,6 +393,27 @@ mod tests {
 
         assert!(!settings.enabled);
         assert_eq!(settings.service_name, "api");
+    }
+
+    #[test]
+    fn request_tracing_installs_the_middleware_without_exporting_anything() {
+        let settings = TelemetrySettings::from_config_and_env(
+            &Config::new(),
+            &env(&[
+                ("REQUEST_TRACING_ENABLED", "true"),
+                ("REQUEST_TRACING_HEADER", "x-request-id"),
+            ]),
+        );
+
+        assert!(!settings.enabled, "not OpenTelemetry");
+        assert!(!settings.exports());
+        assert!(settings.request_tracing);
+        assert_eq!(settings.request_id_header.as_deref(), Some("x-request-id"));
+
+        let mut global: Vec<Arc<dyn Middleware>> = Vec::new();
+        install_trace_middleware(&mut global, &settings);
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].name(), "Trace");
     }
 
     #[test]

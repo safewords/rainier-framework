@@ -213,6 +213,16 @@ config_keys! {
     /// A trace that arrives with a decision keeps it, whatever this says.
     pub TELEMETRY_SAMPLE_RATIO: f64 = "telemetry.sample_ratio";
 
+    /// Whether to tag requests so they can be followed across services:
+    /// join an incoming `traceparent` (or start a trace), and carry it on
+    /// every outbound call and queued job. The [`Trace`](crate::telemetry::Trace)
+    /// middleware, without OpenTelemetry. `telemetry.enabled` implies it.
+    pub REQUEST_TRACING_ENABLED: bool = "request_tracing.enabled";
+
+    /// The header a frontend may start a trace with, sending a UUID —
+    /// `x-request-id`. Unset, only `traceparent` starts one.
+    pub REQUEST_TRACING_HEADER: String = "request_tracing.header";
+
     /// Which encryption envelope this application writes — `native` or
     /// `php`.
     ///

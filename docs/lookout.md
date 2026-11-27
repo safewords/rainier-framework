@@ -993,6 +993,10 @@ can turn it off in a local environment with `.local(false)`.
 
 ### Traces across services
 
+Lookout consumes [request tracing](observability.md#request-tracing-tagging-on-its-own):
+turn that on in every service first (`REQUEST_TRACING_ENABLED=true`), or there
+is nothing to link — boot warns when aggregation mode is on without it.
+
 Each service's Lookout records its own work. A request that calls another
 Rainier service is one trace — the same trace id on both sides — but each
 service decides on its own whether to keep its part, so with the default
@@ -1012,10 +1016,10 @@ sequenceDiagram
     Note over A: its callee kept a part: keeps its own
 ```
 
-**What goes on the wire.** Every outbound call carries `traceparent` with the
-trace id and a span id of its own (`S1` above) — with or without the
-`telemetry` feature ([the HTTP client](http-client.md#traces)). In aggregation
-mode it also carries `tracestate: rainier=on`, or `rainier=keep` once the
+**What goes on the wire.** Request tracing puts `traceparent` on every
+outbound call, with the trace id and a span id of its own (`S1` above). That
+much is the tag, and Lookout adds nothing to it unless aggregation mode is on.
+Then a call also carries `tracestate: rainier=on`, or `rainier=keep` once the
 trace is to be kept. A service in aggregation mode that is asked answers with
 `traceresponse`: the trace, the span its work is (`B`, the batch id), and the
 sampled flag set when it kept its part. A request that did not say

@@ -198,8 +198,9 @@ and runs the transport's own future — no copy of the URL, no clock read.
 
 ## Traces
 
-Inside a trace — a request the `Trace` middleware joined, a job that carried
-one — every attempt carries a W3C `traceparent` with the same trace id and **a
+Inside a trace — a request the `Trace` middleware joined (with
+[request tracing](observability.md#request-tracing-tagging-on-its-own) on), a
+job that carried one — every attempt carries a W3C `traceparent` with the same trace id and **a
 span id of its own**, so the service it reaches can tell which of several
 calls its work answered. With the `telemetry` feature that is the client
 span's id; without it, a fresh one. Outside any trace nothing is added, and a

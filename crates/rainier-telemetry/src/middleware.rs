@@ -26,6 +26,8 @@ pub struct Trace {
     sample: bool,
     /// Echo the trace id back on the response.
     respond_with_header: bool,
+    /// The header a frontend may start a trace with, by sending an id.
+    request_id_header: Option<String>,
 }
 
 impl Default for Trace {
@@ -37,7 +39,7 @@ impl Default for Trace {
 impl Trace {
     /// Sampling everything, and echoing the header back.
     pub fn new() -> Self {
-        Self { sample: true, respond_with_header: true }
+        Self { sample: true, respond_with_header: true, request_id_header: None }
     }
 
     /// Whether to sample a trace this service starts.
@@ -47,6 +49,27 @@ impl Trace {
     /// trace with holes in it.
     pub fn sampling(mut self, sample: bool) -> Self {
         self.sample = sample;
+        self
+    }
+
+    /// Let a frontend start the trace: a request carrying `header` with a
+    /// UUID (or 32 hex digits), and no `traceparent`, is traced under that id
+    /// — in this service, in every service it calls, and in every job it
+    /// queues — and the response carries the header back with it.
+    ///
+    /// The id is only a tag: it links the work, and decides nothing about
+    /// what is recorded or kept. A `traceparent` the request also carries
+    /// wins, because it names the caller's span as well.
+    ///
+    /// ```
+    /// use rainier_telemetry::Trace;
+    ///
+    /// let trace = Trace::new().request_id_header("x-request-id");
+    /// # let _ = trace;
+    /// ```
+    pub fn request_id_header(mut self, header: impl Into<String>) -> Self {
+        let header = header.into().trim().to_ascii_lowercase();
+        self.request_id_header = (!header.is_empty()).then_some(header);
         self
     }
 
@@ -64,7 +87,15 @@ impl Trace {
 #[async_trait::async_trait]
 impl Middleware for Trace {
     async fn handle(&self, mut request: Request, next: Next) -> Response {
-        let context = TraceContext::extract(request.header(TRACEPARENT), self.sample);
+        let incoming = request.header(TRACEPARENT).and_then(|h| TraceContext::parse(h).ok());
+        let chosen = || {
+            let header = self.request_id_header.as_deref()?;
+            TraceContext::from_request_id(request.header(header)?, self.sample)
+        };
+        let context = match incoming {
+            Some(context) => context,
+            None => chosen().unwrap_or_else(|| TraceContext::extract(None, self.sample)),
+        };
         let state = request.header(TRACESTATE).map(str::to_string);
 
         let header = context.to_header();
@@ -112,6 +143,10 @@ impl Middleware for Trace {
         )
         .await;
 
+        let response = match &self.request_id_header {
+            Some(name) => response.with_header(name, &trace_id),
+            None => response,
+        };
         if self.respond_with_header {
             return response.with_header(TRACEPARENT, &header);
         }
@@ -168,6 +203,47 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_of(response).await, "4bf92f3577b34da6a3ce929d0e0e4736");
+    }
+
+    const UUID: &str = "1b4e28ba-2fa1-11d2-883f-0016d3cca427";
+
+    #[tokio::test]
+    async fn a_frontend_starts_the_trace_with_an_id_of_its_own() {
+        let trace = || Trace::new().request_id_header("X-Request-Id");
+        let request = Request::builder().header("x-request-id", UUID).build();
+
+        let response = through(trace(), request).await;
+
+        assert_eq!(
+            response.headers().get("x-request-id").and_then(|v| v.to_str().ok()),
+            Some("1b4e28ba2fa111d2883f0016d3cca427"),
+            "echoed, as the trace id it became"
+        );
+        assert_eq!(body_of(response).await, "1b4e28ba2fa111d2883f0016d3cca427");
+    }
+
+    #[tokio::test]
+    async fn a_traceparent_wins_over_a_request_id_and_a_bad_id_is_ignored() {
+        let trace = || Trace::new().request_id_header("x-request-id");
+
+        let both =
+            Request::builder().header(TRACEPARENT, EXAMPLE).header("x-request-id", UUID).build();
+        assert_eq!(body_of(through(trace(), both).await).await, "4bf92f3577b34da6a3ce929d0e0e4736");
+
+        for bad in [
+            "not-an-id",
+            "00000000-0000-0000-0000-000000000000",
+            "1b4e28ba-2fa1-11d2-883f-0016d3cca42",
+        ] {
+            let request = Request::builder().header("x-request-id", bad).build();
+            let id = body_of(through(trace(), request).await).await;
+            assert_eq!(id.len(), 32, "{bad}: a fresh trace");
+            assert_ne!(id, bad.replace('-', ""), "{bad}");
+        }
+
+        // Not configured: the header means nothing.
+        let request = Request::builder().header("x-request-id", UUID).build();
+        assert_ne!(body_of(through(Trace::new(), request).await).await, UUID.replace('-', ""));
     }
 
     #[tokio::test]

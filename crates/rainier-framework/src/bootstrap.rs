@@ -1365,17 +1365,23 @@ impl Rainier {
         // the route table that carries it instead.
         let cors = crate::cors::warn_if_cors_cannot_answer_a_preflight(&global, &compiled);
 
-        // Outermost of all, with the `telemetry` feature: every log line and
-        // every span below it — the timeout and compression included — joins
-        // the request's trace.
-        #[cfg(feature = "telemetry")]
-        crate::instrumentation::install_trace_middleware(
-            &mut global,
-            &crate::observability::TelemetrySettings::from_config_and_env(
-                app.resolve::<Config>()?.as_ref(),
-                app.resolve::<Env>()?.as_ref(),
-            ),
-        );
+        // Outermost of all, with the `telemetry` feature or request tracing
+        // on: every log line and every span below it — the timeout and
+        // compression included — joins the request's trace, and every call it
+        // makes to another service carries it.
+        {
+            let config = app.resolve::<Config>()?;
+            let env = app.resolve::<Env>()?;
+            #[cfg(feature = "telemetry")]
+            let settings = crate::observability::TelemetrySettings::from_config_and_env(
+                config.as_ref(),
+                env.as_ref(),
+            );
+            #[cfg(not(feature = "telemetry"))]
+            let settings = crate::observability::TelemetrySettings::from_config(config.as_ref())
+                .with_request_tracing_env(config.as_ref(), env.as_ref());
+            crate::observability::install_trace_middleware(&mut global, &settings);
+        }
 
         // Lookout just inside `Trace` — outermost after it — so it sees every
         // request, including the ones a timeout, a throttle or the
@@ -1383,6 +1389,14 @@ impl Rainier {
         #[cfg(feature = "lookout")]
         if let Some((lookout, _)) = &lookout {
             let at = global.iter().position(|stage| stage.name() == "Trace").map_or(0, |i| i + 1);
+            // Aggregation mode consumes request tracing; without it there is
+            // nothing to link, and it would quietly record nothing more.
+            if lookout.config().aggregation.enabled && at == 0 {
+                tracing::warn!(
+                    "Lookout aggregation mode is on but request tracing is not \
+                     (REQUEST_TRACING_ENABLED, or a Trace middleware): traces will not link across services"
+                );
+            }
             global.insert(at, Arc::new(lookout.middleware()));
             // And innermost, after the application's `TrustProxies`: the
             // client's address as the application believes it, rather than
