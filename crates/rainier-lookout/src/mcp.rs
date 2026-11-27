@@ -74,6 +74,7 @@ pub fn register(
         tail: crate::http::stream::Tail::new(),
         rum_limiter: crate::rum::Limiter::default(),
         rum_caps: crate::rum_rollup::Caps::default(),
+        replay: rainier_lookout_link::ReplayGuard::default(),
     });
     let mut server = server.instructions(INSTRUCTIONS);
     for tool in tools(&state) {

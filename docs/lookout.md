@@ -111,6 +111,10 @@ Read at boot through the application's `Env` (so `.env` counts), with
 | `LOOKOUT_INSIGHTS_MIN_COUNT` | how many a key needs before a change in it is reported | a positive integer | `5` |
 | `LOOKOUT_INSIGHTS_CHANGE_PERCENT` | the smallest change reported | a positive integer | `50` |
 | `LOOKOUT_INSIGHTS_FORECAST_BUCKETS` | how many buckets a forecast reaches; `0` draws none | `0..=100` | `6` |
+| `LOOKOUT_REQUEST_TRACING` | [request tracing](#traces-across-services): keep traces that cross services whole, and let readers read their shape | a boolean | `false` |
+| `LOOKOUT_TRACE_SAMPLE_RATE` | in request tracing, the fraction of traces kept whole, decided from the trace id so every service agrees | `0.0..=1.0` | `0.01` |
+| `LOOKOUT_SERVICE` | the name this service goes by in a trace | a string | `APP_NAME` |
+| `LOOKOUT_LONGMIRE_KEYS` | the keys [Longmire's link](longmire.md#the-link) is recognised by: a request signed with one may read what a reader may, answered sealed | comma-separated `id:base64-secret`, each secret 32 bytes or more | none: no link |
 | `APP_ENV` | `local` when it is `local` | — | — |
 
 Booleans accept `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`; an empty
@@ -248,9 +252,12 @@ need line tables (`[profile.release] debug = "line-tables-only"`).
 `broadcast`, `session`, `auth_attempt`, `n_plus_one`, `slow`, `custom`. The
 activity kind each comes from is catalogued in `rainier_lookout::subscriber`.
 
-Four more exist only as aggregate rows, never as entries, for the
-[service-health API](#service-health): `request_facet`, `job_facet`,
-`rum_view` and `rum_error`. No watcher records them and no setting turns them
+Five more exist only as aggregate rows, never as entries, for the
+[service-health API](#service-health) and [Longmire's map](longmire.md#the-service-map):
+`request_facet`, `job_facet`, `rum_view`, `rum_error` and `call_facet` (every
+outbound HTTP call by the host it went to and its status class — or `failed`
+when no answer came — keyed `5xx billing.internal`; read it on
+`/api/aggregates/call_facet`). No watcher records them and no setting turns them
 off; they are written whenever Lookout is on, and `lookout:status` and
 `/api/status` leave them out of the watchers.
 
@@ -287,7 +294,7 @@ A batch's page lists the other batches in its trace.
 | `database` | Lookout's own four tables, on the named connection | anything shared and durable |
 | `cache` | a ring buffer of the last `LOOKOUT_CAPACITY` batches in the named cache store | a shared store such as Redis in production, with no migrations |
 
-The [service-health](#service-health) rollups (`request_facet`, `job_facet`,
+The [service-health](#service-health) rollups (`request_facet`, `job_facet`, `call_facet`,
 `rum_view`, `rum_error`) are aggregate rows like the rest: the database
 store keeps them in `lookout_aggregates` and `lookout_aggregate_histograms`
 and the cache store in its bucket keys, so they need no migration of their
@@ -970,7 +977,8 @@ Rainier::new(".")
 A reader may call **`GET` only, on these and nothing else**:
 `{path}/api/health`, `/api/requests`, `/api/rum/vitals`, `/api/rum/errors`,
 `/api/aggregates/{type}`, `/api/series/{type}`, `/api/cases` (the list) and
-`/api/status`. Never the dashboard's shell or assets, a batch (which holds
+`/api/status` — and, while [request tracing](#traces-across-services) is on,
+`/api/traces` and `/api/traces/{trace}`. Never the dashboard's shell or assets, a batch (which holds
 bodies and headers), entries, a case or its actions, the stream, or a
 `DELETE`. A request the reader predicate refuses still has the viewer's
 check to pass, so the dashboard's own pages keep working on those routes; one
@@ -978,14 +986,84 @@ both refuse gets the same 404 as any refused request. The reader predicate runs 
 on those routes, for the dashboard's own requests too, so answer `false`
 straight away when the request carries no token. Without the call there
 are no readers. In code outside the framework,
-`LookoutGate::with_readers` does the same, and `READER_ROUTES` lists the
-routes.
+`LookoutGate::with_readers` does the same, `READER_ROUTES` lists the
+routes, and `TRACING_READER_ROUTES` the two request tracing adds.
 
 In Safewords applications the predicate checks a service token from identity
 carrying the capability `lookout.read` — see devenv's `docs/service-auth.md`.
 
 `LookoutConfig::local` decides "local", not the raw `APP_ENV`: an application
 can turn it off in a local environment with `.local(false)`.
+
+### Traces across services
+
+**Request tracing** (`LOOKOUT_REQUEST_TRACING=true`, or
+`LookoutConfig::request_tracing`) records, on this service's side, how its
+work joins the work of other services — and serves it, so that something
+outside, an operations console, can pull every service's part and put a
+request back together across all of them. **Lookouts never talk to one
+another**: each records its own side, and the linking happens in whatever
+pulls from them.
+
+It is built on [request tagging](observability.md#request-tagging), and
+turning it on turns tagging on too — one switch per service. Set
+`REQUEST_TAGGING_HEADER` as well to let a frontend start the trace with an id
+of its own.
+
+```mermaid
+flowchart LR
+    subgraph orders
+      OA[request batch] --> OC["call to billing<br/>rainier.trace.span_id = S1"]
+    end
+    subgraph billing
+      BA["request batch<br/>rainier.trace.parent_span_id = S1"]
+    end
+    OC -. "traceparent …-S1-…<br/>(request tagging)" .-> BA
+    C[operations console] -- "GET /api/traces/T" --> orders
+    C -- "GET /api/traces/T" --> billing
+```
+
+**What each service records.** Request tagging gives every outbound call a
+span id of its own, on the wire in `traceparent` (`S1` above). The caller's
+batch records the call with that id as `rainier.trace.span_id`; the callee's
+batch records it on its root entry as `rainier.trace.parent_span_id` — the
+call it answered. Same id, recorded independently on both sides: that is the
+whole link. A kept batch that answered another service or called one with the
+trace is tagged `trace:distributed`.
+
+**Which parts are kept.** Each service keeps its part by its own rule —
+failures, slow work, monitored tags, as for any batch. To keep whole traces
+without the services asking one another, a fraction of traces
+(`LOOKOUT_TRACE_SAMPLE_RATE`, default `0.01`) is kept everywhere: the decision
+is a function of the trace id alone, so every service with the same rate
+keeps the same traces. Those batches are tagged `trace:kept`.
+
+**Reading a trace.** `GET {path}/api/traces` lists the `trace:distributed`
+batches (`?kept=1` only those in the sample); `GET {path}/api/traces/{trace}`
+returns every batch this service kept in that trace, each with its
+`root_span_id`, its `remote_parent_span_id` and its spans — type, summary,
+start, duration, failed, slow and, for an outbound call, `call.span_id`,
+`call.host` and `call.status`. **Never their content**: no bodies, headers,
+bindings, user or guard. While request tracing is on a
+[reader](#readers-another-service) may call both; otherwise only viewers.
+
+**Putting it together** is the console's job — [Longmire](longmire.md) does
+it: ask each service for `/api/traces/{trace}`, then hang every batch whose
+`remote_parent_span_id` equals some call's `call.span_id` under that call.
+
+```text
+orders   GET /checkout ──┬─ query …
+                         └─ GET billing/charge 500   call.span_id = S1
+billing  GET /charge 500    remote_parent_span_id = S1 ─┘
+```
+
+**What it does not cover.**
+
+- Outside the sample, a part is kept only if its own service keeps it: a
+  slow call into a fast service shows the call in the caller's part, and the
+  callee's part only if the callee kept it for a reason of its own.
+- Only calls through Rainier's HTTP client are tagged.
+- Services must share a `LOOKOUT_TRACE_SAMPLE_RATE` to keep the same traces.
 
 ### The JSON API
 
@@ -1014,6 +1092,8 @@ shape.
 | `GET` | `/api/requests` | every request, grouped and filtered — see [service health](#service-health) |
 | `GET` | `/api/rum/vitals` | real users' page metrics, grouped and filtered |
 | `GET` | `/api/rum/errors` | real users' script errors, by message, file and line |
+| `GET` | `/api/traces` | kept batches that are part of a trace crossing services, newest first — `kept` (only traces kept whole), `before`, `limit`. See [traces across services](#traces-across-services) |
+| `GET` | `/api/traces/{trace}` | every batch this service kept in one trace, as spans without their content |
 
 ### Service health
 

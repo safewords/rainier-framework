@@ -48,9 +48,9 @@ use rainier_framework::queue::{
     Job, JobContext, JobRegistry, MemoryQueue, Queue, QueueManager, QueuedJob, Worker,
 };
 use rainier_framework::rainier_orm::{ColumnType, Dialect};
+use rainier_framework::request_tagging::TraceContext;
 use rainier_framework::routing::Req;
 use rainier_framework::support::Result;
-use rainier_framework::telemetry::TraceContext;
 use rainier_framework::testing::TestApp;
 use rainier_framework::{keys, Rainier};
 use serde::{Deserialize, Serialize};
@@ -131,7 +131,7 @@ impl Job for ShipOrder {
         println!(
             "  [job] shipping order {} — trace in force here: {}",
             self.order,
-            rainier_framework::telemetry::propagation::current().unwrap_or_default()
+            rainier_framework::request_tagging::propagation::current().unwrap_or_default()
         );
         Ok(())
     }

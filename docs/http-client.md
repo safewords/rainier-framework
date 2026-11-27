@@ -196,6 +196,34 @@ subscriber asked for, a code trace of where it was sent from.
 With nothing subscribed (and without `telemetry`), a send asks the bus once
 and runs the transport's own future — no copy of the URL, no clock read.
 
+## Traces
+
+Inside a trace — a request the `Trace` middleware joined (with
+[request tagging](observability.md#request-tagging) on), a
+job that carried one — every attempt carries a W3C `traceparent` with the same trace id and **a
+span id of its own**, so the service it reaches can tell which of several
+calls its work answered. With `rainier-otel`'s exporter installed that is the
+client span's id; without it, a fresh one. The tagging itself is
+`rainier-request-tagging`'s: this crate only asks it, before each attempt. Outside any trace nothing is added, and a
+`traceparent` the caller set is left alone. The event carries the span id it
+sent as `rainier.trace.span_id`.
+
+A transport of your own wraps its send in
+`rainier_http_client::telemetry::instrument`, or what it sends carries no trace
+and publishes no event:
+
+```rust
+impl Transport for Loopback {
+    fn send<'a>(&'a self, request: OutboundRequest) -> BoxFuture<'a, Result<RawResponse>> {
+        rainier_http_client::telemetry::instrument(request, |request| self.wire(request))
+    }
+
+    fn name(&self) -> &str {
+        "loopback"
+    }
+}
+```
+
 ## What is not here
 
 **No connection pooling knobs, no proxy configuration, no cookie jar, no

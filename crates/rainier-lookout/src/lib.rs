@@ -50,7 +50,7 @@ pub mod watchers;
 
 pub use config::LookoutConfig;
 pub use entry::{Aggregate, Batch, BatchKind, BatchSummary, Entry, EntryType};
-pub use http::{routes, LookoutGate};
+pub use http::{routes, LookoutGate, READER_ROUTES, TRACING_READER_ROUTES};
 pub use middleware::{LookoutClientMiddleware, LookoutMiddleware};
 pub use recorder::{Lookout, WriterHandle};
 pub use store::cache::CacheStore;

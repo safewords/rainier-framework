@@ -17,7 +17,7 @@ setting_enum! {
     ///
     /// ```
     /// use rainier_support::Setting;
-    /// use rainier_telemetry::LogFormat;
+    /// use rainier_otel::LogFormat;
     ///
     /// assert_eq!(LogFormat::parse("json").unwrap(), LogFormat::Json);
     /// assert!(LogFormat::parse("jsn").is_err());
@@ -57,7 +57,7 @@ impl LogFormat {
     /// that cannot rehearse an incident.
     ///
     /// ```
-    /// use rainier_telemetry::LogFormat;
+    /// use rainier_otel::LogFormat;
     ///
     /// assert_eq!(LogFormat::Auto.resolve("production"), LogFormat::Json);
     /// assert_eq!(LogFormat::Auto.resolve("local"), LogFormat::Pretty);

@@ -1,7 +1,7 @@
 //! The OTLP exporter — spans to a collector.
 //!
 //! Behind the `otlp` feature, because it is a large dependency tree and an
-//! application that only wants [trace headers propagated](crate::Trace) should
+//! application that only wants trace headers propagated (`rainier-request-tagging`) should
 //! not pay for it.
 
 use std::sync::OnceLock;
@@ -140,6 +140,8 @@ impl Otlp {
     {
         let provider = self.build()?;
         let tracer = provider.tracer(self.service_name.clone());
+        // Spans have real ids now: outbound calls name their client span.
+        rainier_request_tagging::propagation::set_span_source(crate::spans::otel::header_of);
 
         // Registered globally so anything else in the process that asks for a
         // tracer gets this one, and kept here so `shutdown` can flush it: the

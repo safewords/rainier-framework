@@ -12,6 +12,41 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Request tagging** (`rainier-request-tagging`, new; `rainier-http-client`,
+  `rainier-framework`): tag a request and follow it across services, on its
+  own — no OpenTelemetry. `REQUEST_TAGGING_ENABLED` puts `Trace` outermost,
+  and every call through the HTTP client then carries `traceparent` with a
+  span id of its own. `REQUEST_TAGGING_HEADER` (`Trace::request_id_header`)
+  lets a frontend start the trace with a UUID, echoed on the response.
+  `rainier_http_client::telemetry::instrument` is public, for a transport of
+  your own.
+- **Lookout request tracing** (`rainier-lookout`): records, on each service's
+  side, which call from another service a request answered and which calls it
+  made, and serves it — `GET /api/traces` and `GET /api/traces/{trace}`, spans
+  without their content, readable by a
+  [reader](docs/lookout.md#readers-another-service) while it is on — so an
+  operations console can pull every service's part and link a request across
+  all of them. Lookouts never talk to one another; a sample decided from the
+  trace id (`LOOKOUT_TRACE_SAMPLE_RATE`) keeps the same traces in every
+  service. `LOOKOUT_REQUEST_TRACING` turns it, and request tagging, on.
+- **Longmire** (`rainier-longmire`, new; the `longmire` feature): one view
+  across many Lookouts. An application that can reach every service — an
+  operations console — names the Lookouts and how to sign in to each, and
+  Longmire asks all of them at once for their part of a request and links
+  the parts into one tree, each service's work under the call that reached
+  it, with the calls nobody answered listed apart. `trace` and `recent` in
+  code, or `longmire::routes` behind a check of your own.
+- **Longmire's fleet answers and service map** (`rainier-longmire`):
+  `health`, `requests`, `rum_vitals`, `rum_errors` and `cases` across every
+  source in one answer, each row naming its service; `one` for a single
+  source; and `map`, who calls whom, with calls a minute, error rate and p95
+  per edge, from a new Lookout rollup, `call_facet` (every outbound call by
+  host and status class, kept or not). Routes for each.
+- **Longmire's link** (`rainier-lookout-link`, new; `LOOKOUT_LONGMIRE_KEYS`,
+  `Longmire::link`): Lookout recognises Longmire's requests by a shared key —
+  signed, fresh, never replayed — and seals its answers to them (AES-256-GCM),
+  so nothing else can read a Lookout this way and nothing on the network
+  learns what it said. Anything else gets Lookout's 404.
 - **Lookout service health** (`rainier-lookout`, `rainier-framework`): four
   read-only endpoints under the dashboard's path, answered from rollups that
   count every request, job run and accepted RUM page report, kept or not —
@@ -224,6 +259,13 @@ the release as a whole and names the crate it landed in.
 
 ### Changed
 
+- **`rainier-telemetry` is now `rainier-otel`, and only OpenTelemetry**
+  (real span ids, the OTLP exporter behind `otlp`) and the log line format.
+  W3C trace context moved to the new `rainier-request-tagging`:
+  `rainier_telemetry::{Trace, TraceContext, TraceState, propagation}` are now
+  `rainier_request_tagging::…` (`rainier_framework::request_tagging`; `Trace`
+  stays in the prelude), and `propagation::adopt` is `rainier_otel::adopt`.
+  `rainier_framework::telemetry` is `rainier_framework::otel`.
 - **A client hanging up no longer cancels the handler** (`rainier-server`).
   The server now runs each request's work in a task of its own. The default
   policy finishes the work when the client hangs up, and still cancels it at

@@ -39,6 +39,10 @@ pub struct HttpClientRequestSent {
     /// Where it was sent from, when it was slow enough for a subscriber to
     /// have asked ([`code_trace`]).
     pub code_trace: Option<Arc<Backtrace>>,
+    /// The span id this attempt named as the callee's parent in its
+    /// `traceparent`, when it carried one — `rainier.trace.span_id`. A
+    /// recorder on the other side sees the same id as its work's parent.
+    pub trace_span_id: Option<String>,
 }
 
 impl HttpClientRequestSent {
@@ -59,7 +63,14 @@ impl HttpClientRequestSent {
             error: result.as_ref().err().map(|error| error.kind()),
             duration,
             code_trace,
+            trace_span_id: None,
         }
+    }
+
+    /// The span id this attempt named in its `traceparent`.
+    pub fn with_trace_span(mut self, span_id: Option<String>) -> Self {
+        self.trace_span_id = span_id;
+        self
     }
 }
 
@@ -77,7 +88,8 @@ impl Activity for HttpClientRequestSent {
             .set("server.port", self.port)
             .set("url.scheme", self.scheme.clone())
             .set("url.full", self.url.clone())
-            .maybe("http.response.status_code", self.status);
+            .maybe("http.response.status_code", self.status)
+            .maybe("rainier.trace.span_id", self.trace_span_id.clone());
         match (self.status, self.error) {
             (Some(status), _) if status >= 400 => {
                 fields.set("otel.status_code", "ERROR").set("error.type", status.to_string());

@@ -214,6 +214,8 @@ fn routes_are_named_under_lookout() {
             "lookout.api.series",
             "lookout.api.status",
             "lookout.api.stream",
+            "lookout.api.trace",
+            "lookout.api.traces",
             "lookout.app",
             "lookout.assets.css",
             "lookout.assets.js",
@@ -1139,4 +1141,217 @@ async fn readers_are_off_unless_registered_and_viewers_keep_everything() {
     {
         assert_eq!(get(&router, uri).await.status, StatusCode::OK, "{uri}");
     }
+}
+
+// --- traces across services ---------------------------------------------------
+
+const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+/// A batch that answered a call from another service and made one of its own.
+fn distributed() -> Arc<FakeStore> {
+    let e = epoch();
+    let mut root =
+        entry("b9", "r", EntryType::Request, "GET /orders/{order} 200", e, 0, Some(9_000));
+    root.span_id = Some("b9".into());
+    root.content = serde_json::json!({
+        "rainier.trace.parent_span_id": "00f067aa0ba902b7",
+        "http.request.header.authorization": "Bearer secret-token",
+    });
+    let mut call =
+        entry("b9", "h1", EntryType::HttpClient, "GET http://billing/x 200", e, 1, Some(4_000));
+    call.parent_span_id = Some("b9".into());
+    call.content = serde_json::json!({
+        "server.address": "billing",
+        "http.response.status_code": 200,
+        "rainier.trace.span_id": "b7ad6b7169203331",
+    });
+    let mut batch = request("b9", "orders.show", 200, 5, vec![root, call]);
+    batch.trace_id = TRACE_ID.into();
+    batch.user_id = Some("42".into());
+    batch.tags = vec!["trace:distributed".into(), "trace:kept".into(), "user:42".into()];
+    let store = FakeStore::default();
+    store.batches.lock().unwrap().push(batch);
+    Arc::new(store)
+}
+
+fn aggregating(store: Arc<FakeStore>, gate: LookoutGate) -> CompiledRouter {
+    let mut config = LookoutConfig::default().enabled(true);
+    config.request_tracing.enabled = true;
+    config.request_tracing.service = Some("orders".into());
+    let mut router = Router::new();
+    router.merge(routes(store, Arc::new(config), gate, "production"));
+    router.compile(&Container::new()).unwrap()
+}
+
+#[tokio::test]
+async fn a_trace_is_its_shape_and_never_its_content() {
+    let router = aggregating(distributed(), readers());
+    let auth = [("authorization", TOKEN)];
+
+    let answer =
+        send(&router, Method::GET, &format!("/_lookout/api/traces/{TRACE_ID}"), &auth).await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text);
+    let body: serde_json::Value = serde_json::from_str(&answer.text).unwrap();
+    let trace = &body["data"];
+    assert_eq!(trace["service"], "orders");
+    let batch = &trace["batches"][0];
+    assert_eq!(batch["root_span_id"], "b9");
+    assert_eq!(batch["remote_parent_span_id"], "00f067aa0ba902b7", "the call it answered");
+    assert_eq!(batch["kept"], true);
+    let call = &batch["spans"][1]["call"];
+    assert_eq!(call["span_id"], "b7ad6b7169203331", "the call it made");
+    assert_eq!(call["host"], "billing");
+    assert!(!answer.text.contains("secret-token"), "no content: {}", answer.text);
+    assert!(!answer.text.contains("\"42\""), "no user: {}", answer.text);
+
+    let listed = send(&router, Method::GET, "/_lookout/api/traces?kept=1", &auth).await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.text);
+    let body: serde_json::Value = serde_json::from_str(&listed.text).unwrap();
+    assert_eq!(body["data"][0]["trace_id"], TRACE_ID);
+    assert_eq!(body["data"][0]["kept"], true);
+
+    let broken = send(&router, Method::GET, "/_lookout/api/traces/a%20b", &auth).await;
+    assert_eq!(broken.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn without_request_tracing_a_reader_cannot_read_a_trace() {
+    let router = app_with(distributed(), readers(), "production");
+    let auth = [("authorization", TOKEN)];
+    for uri in ["/_lookout/api/traces", &format!("/_lookout/api/traces/{TRACE_ID}")] {
+        let answer = send(&router, Method::GET, uri, &auth).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{uri}");
+    }
+    // A viewer still can.
+    let viewer = app(distributed());
+    assert_eq!(
+        get(&viewer, &format!("/_lookout/api/traces/{TRACE_ID}")).await.status,
+        StatusCode::OK
+    );
+}
+
+// --- Longmire's link -----------------------------------------------------------
+
+fn link_key(id: &str) -> rainier_lookout_link::LinkKey {
+    rainier_lookout_link::LinkKey::new(
+        id,
+        format!("{id}: a secret the fleet shares, long enough").into_bytes(),
+    )
+}
+
+/// The Lookout answering Longmire: request tracing on, the link key held,
+/// and no reader — nothing but the link can read it.
+fn linked(store: Arc<FakeStore>, keys: Vec<rainier_lookout_link::LinkKey>) -> Arc<CompiledRouter> {
+    let mut config = LookoutConfig::default().enabled(true);
+    config.request_tracing.enabled = true;
+    config.longmire_keys = keys;
+    let mut router = Router::new();
+    router.merge(routes(store, Arc::new(config), LookoutGate::deny_all(), "production"));
+    Arc::new(router.compile(&Container::new()).unwrap())
+}
+
+/// The Lookout's router as a transport, and every answer it gave, as sent.
+struct Wire {
+    router: Arc<CompiledRouter>,
+    heard: std::sync::Mutex<Vec<(u16, Vec<u8>, rainier_http_client::transport::OutboundRequest)>>,
+}
+
+impl rainier_http_client::Transport for Wire {
+    fn send<'a>(
+        &'a self,
+        request: rainier_http_client::transport::OutboundRequest,
+    ) -> rainier_support::BoxFuture<
+        'a,
+        rainier_support::Result<rainier_http_client::transport::RawResponse>,
+    > {
+        Box::pin(async move {
+            let path = request.url.splitn(4, '/').nth(3).unwrap_or_default().to_string();
+            let mut builder = Request::builder().method(Method::GET).uri(format!("/{path}"));
+            for (name, value) in &request.headers {
+                builder = builder.header(name, value);
+            }
+            let mut response = self.router.dispatch(builder.build()).await;
+            let status = response.status().as_u16();
+            let headers = response
+                .headers()
+                .iter()
+                .filter_map(|(n, v)| Some((n.as_str().to_string(), v.to_str().ok()?.to_string())))
+                .collect();
+            let body = response.take_body().collect().await.unwrap().to_vec();
+            self.heard.lock().unwrap().push((status, body.clone(), request));
+            Ok(rainier_http_client::transport::RawResponse { status, headers, body })
+        })
+    }
+
+    fn name(&self) -> &str {
+        "wire"
+    }
+}
+
+fn longmire_over(
+    wire: &Arc<Wire>,
+    key: rainier_lookout_link::LinkKey,
+) -> rainier_longmire::Longmire {
+    rainier_longmire::Longmire::new([rainier_longmire::Source::new("orders", "http://orders.test")])
+        .link(key)
+        .through(Arc::clone(wire) as Arc<dyn rainier_http_client::Transport>)
+}
+
+#[tokio::test]
+async fn longmire_reads_over_the_link_and_nothing_on_the_wire_can() {
+    let wire = Arc::new(Wire {
+        router: linked(distributed(), vec![link_key("2026-11")]),
+        heard: Default::default(),
+    });
+
+    let trace = longmire_over(&wire, link_key("2026-11")).trace(TRACE_ID).await.unwrap();
+    assert_eq!(trace["services"][0]["status"], "ok", "{trace}");
+    assert_eq!(trace["batches"][0]["id"], "b9");
+
+    let heard = wire.heard.lock().unwrap();
+    let (status, body, sent) = &heard[0];
+    assert_eq!(*status, 200);
+    let on_the_wire = String::from_utf8_lossy(body);
+    assert!(
+        !on_the_wire.contains("b9") && !on_the_wire.contains("orders"),
+        "sealed: {on_the_wire}"
+    );
+    assert!(sent.header("authorization").is_none(), "no credentials beside the link");
+}
+
+#[tokio::test]
+async fn a_replayed_request_another_key_or_no_link_get_the_404() {
+    let router = linked(distributed(), vec![link_key("2026-11")]);
+    let wire = Arc::new(Wire { router: Arc::clone(&router), heard: Default::default() });
+
+    // Another key: refused, and Longmire says why.
+    let trace = longmire_over(&wire, link_key("2026-10")).trace(TRACE_ID).await.unwrap();
+    assert_eq!(trace["services"][0]["status"], "unknown");
+    assert!(trace["services"][0]["reason"].as_str().unwrap().contains("404"));
+
+    // A genuine request, captured and sent again.
+    longmire_over(&wire, link_key("2026-11")).trace(TRACE_ID).await.unwrap();
+    let captured = wire.heard.lock().unwrap().last().unwrap().2.clone();
+    let replay = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/_lookout/api/traces/{TRACE_ID}"))
+        .header(
+            rainier_lookout_link::HEADER,
+            captured.header(rainier_lookout_link::HEADER).unwrap(),
+        )
+        .build();
+    assert_eq!(router.dispatch(replay).await.status(), StatusCode::NOT_FOUND, "used once");
+
+    // Nothing at all: the same 404 as a path that does not exist.
+    let plain = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/_lookout/api/traces/{TRACE_ID}"))
+        .build();
+    assert_eq!(router.dispatch(plain).await.status(), StatusCode::NOT_FOUND);
+
+    // A Lookout holding no link key recognises no link at all.
+    let unlinked = linked(distributed(), Vec::new());
+    let wire = Arc::new(Wire { router: unlinked, heard: Default::default() });
+    let trace = longmire_over(&wire, link_key("2026-11")).trace(TRACE_ID).await.unwrap();
+    assert_eq!(trace["services"][0]["status"], "unknown");
 }

@@ -230,6 +230,44 @@ A missing or malformed header starts a fresh trace rather than failing the
 request — an upstream with a misconfigured proxy must not stop this service
 tracing.
 
+### Request tagging
+
+`rainier-request-tagging` — re-exported as `rainier_framework::request_tagging`,
+with `Trace` in the prelude. Request tagging is that propagation and nothing else — no OpenTelemetry, no
+exporter, no decision about what is recorded. It tags a request with a trace
+id and carries the tag on every call it makes to another service and every job
+it queues, so the work in all of them can be linked. Turn it on without the
+`telemetry` feature:
+
+```env
+REQUEST_TAGGING_ENABLED=true
+# Optional: let a frontend start the trace.
+REQUEST_TAGGING_HEADER=x-request-id
+```
+
+(`request_tagging.enabled` and `request_tagging.header` in configuration win
+over the environment; `telemetry.enabled` implies request tagging.) Boot puts
+`Trace` outermost, as below.
+
+**A frontend can start it.** With `REQUEST_TAGGING_HEADER` set, a request that
+carries that header with a UUID — with or without its dashes, or 32 hex digits;
+`crypto.randomUUID()` in a browser — and no `traceparent` is traced under that
+id. The response carries the header back, every service the request reaches
+records the same id, and that is the id to look the request up by. An id that
+is not one is ignored and the request starts a trace of its own; a
+`traceparent` on the same request wins, because it names the caller's span as
+well. In code: `Trace::new().request_id_header("x-request-id")`.
+
+**Every call carries it.** The [HTTP client](http-client.md#traces) writes
+`traceparent` onto every call made while a trace is in force — the same trace
+id, and a span id naming that one call. A service with request tagging off
+starts no trace, but passes on one it was handed (a job queued by a traced
+request), so a chain is not broken half way.
+
+What consumes the tag is separate: [Lookout's request tracing](lookout.md#traces-across-services)
+links each service's recorded work by it (and turns tagging on itself), and an OpenTelemetry collector would
+by the same header.
+
 ### Put it outermost
 
 In the function that registers your global middleware (the sample project's
@@ -259,12 +297,12 @@ trace at all.
 
 ### Exporting
 
-Doing it by hand — `rainier-telemetry` in `Cargo.toml`, and the subscriber
+Doing it by hand — `rainier-otel` in `Cargo.toml`, and the subscriber
 installed in `main` before the application boots, with `endpoint` your
 collector's URL:
 
 ```toml
-rainier-telemetry = { version = "2", features = ["otlp"] }
+rainier-otel = { version = "2", features = ["otlp"] }
 ```
 
 ```rust
@@ -472,7 +510,10 @@ readers and other retention than the log line the message is still on.
   its parent, so this service's spans hang off the caller's.
 - **Out over HTTP.** Every outbound request — through the `Http` facade, a mail
   API, a payment API, anything that reaches a transport — carries a
-  `traceparent` naming its own client span. A caller that set one keeps it.
+  `traceparent` naming a span of its own: its client span with the exporter,
+  a fresh span id without it. This needs no `telemetry` feature. A caller that
+  set one keeps it. A [transport of your own](http-client.md#the-transport) gets
+  the same by calling `rainier_http_client::telemetry::instrument`.
 - **Through the queue.** A dispatch writes the `traceparent` in force onto the
   job's envelope, and the worker's `queue.process` span adopts it: a job run
   ten minutes later in another process is part of the request that queued it.

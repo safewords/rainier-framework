@@ -1,0 +1,25 @@
+[package]
+name = "rainier-request-tagging"
+description = "Request tagging for Rainier: a W3C trace id on every request, carried on every call it makes to another service. No tracer, no exporter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-support = { workspace = true }
+rainier-http = { workspace = true }
+rainier-middleware = { workspace = true }
+# The trace goes onto the request's unit of work.
+rainier-events = { workspace = true }
+
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+http-body-util = { workspace = true }
+
+[lints]
+workspace = true

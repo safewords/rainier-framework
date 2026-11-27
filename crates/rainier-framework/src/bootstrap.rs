@@ -1365,17 +1365,31 @@ impl Rainier {
         // the route table that carries it instead.
         let cors = crate::cors::warn_if_cors_cannot_answer_a_preflight(&global, &compiled);
 
-        // Outermost of all, with the `telemetry` feature: every log line and
-        // every span below it — the timeout and compression included — joins
-        // the request's trace.
-        #[cfg(feature = "telemetry")]
-        crate::instrumentation::install_trace_middleware(
-            &mut global,
-            &crate::observability::TelemetrySettings::from_config_and_env(
-                app.resolve::<Config>()?.as_ref(),
-                app.resolve::<Env>()?.as_ref(),
-            ),
-        );
+        // Outermost of all, with the `telemetry` feature or request tagging
+        // on: every log line and every span below it — the timeout and
+        // compression included — joins the request's trace, and every call it
+        // makes to another service carries it.
+        {
+            let config = app.resolve::<Config>()?;
+            let env = app.resolve::<Env>()?;
+            #[cfg(feature = "telemetry")]
+            let settings = crate::observability::TelemetrySettings::from_config_and_env(
+                config.as_ref(),
+                env.as_ref(),
+            );
+            #[cfg(not(feature = "telemetry"))]
+            let settings = crate::observability::TelemetrySettings::from_config(config.as_ref())
+                .with_request_tagging_env(config.as_ref(), env.as_ref());
+            // Lookout's request tracing is built on request tagging, so it
+            // turns tagging on: one switch, not two.
+            #[cfg(feature = "lookout")]
+            let settings = crate::observability::TelemetrySettings {
+                request_tagging: settings.request_tagging
+                    || lookout.as_ref().is_some_and(|(l, _)| l.config().request_tracing.enabled),
+                ..settings
+            };
+            crate::observability::install_trace_middleware(&mut global, &settings);
+        }
 
         // Lookout just inside `Trace` — outermost after it — so it sees every
         // request, including the ones a timeout, a throttle or the

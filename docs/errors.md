@@ -265,7 +265,7 @@ one of them also carries:
 | `Database` | `DatabaseFailed` | `connection: Option`, `operation` | the database layer working around a failure (`rainier-database` `connection.rs`) |
 | `Filesystem` | `FilesystemFailed` | `disk`, `operation` | a filesystem operation worked around — a temporary file not cleaned up, a write retried (`rainier-filesystem` `local.rs`) |
 | `Integration` | `IntegrationFailed` | `service`, `operation` | calls to outside services — captcha verification, service `captcha:<provider>`, `meta.extra["fail_open"]` (`rainier-framework` `captcha.rs`) |
-| `Telemetry` | `TelemetryFailed` | `operation` | exporters and the worker's metrics endpoint (`rainier-telemetry` `otlp.rs`; `rainier-framework` `instrumentation.rs`, `commands.rs`) |
+| `Telemetry` | `TelemetryFailed` | `operation` | exporters and the worker's metrics endpoint (`rainier-otel` `otlp.rs`; `rainier-framework` `instrumentation.rs`, `commands.rs`) |
 | `Configuration` | `ConfigurationFailed` | `setting` | configuration ignored or replaced with a default — a generated `APP_KEY`, CORS no preflight can reach, a per-process rate limiter or scheduler lock, a symlink out of `public/`, a bare `--option` (`rainier-framework` `bootstrap.rs`, `cors.rs`, `limits.rs`, `scheduling.rs`, `public.rs`; `rainier-console` `arguments.rs`; `rainier-container`, `rainier-debug`, `rainier-middleware` `proxy.rs`, `rainier-openapi`, `rainier-queue` `manager.rs`, `redis.rs`) |
 | `Application` | `ApplicationFailed` | — | your code — `rainier_framework::report`, `Reporter::report_error`, `report::report_error` |
 

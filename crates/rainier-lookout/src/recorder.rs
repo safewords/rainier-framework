@@ -318,13 +318,14 @@ impl Lookout {
     /// keeps the batch whatever the sampling and keep rule. Returns whether a
     /// batch was found.
     pub fn tag(&self, batch: Option<&str>, tag: impl Into<String>) -> bool {
+        let tag = tag.into();
         let cell = self.inner.find(batch);
         match cell {
             Some(cell) => {
                 let mut state = cell.lock();
                 match state.as_mut() {
                     Some(pending) => {
-                        pending.tags.insert(tag.into());
+                        pending.tags.insert(tag);
                         true
                     }
                     None => false,
@@ -672,6 +673,9 @@ pub(crate) struct Pending {
     /// Operation span ids, and the span id each ran inside — for entries
     /// whose parent is an operation that was not itself recorded.
     pub(crate) operations: HashMap<String, Option<String>>,
+    /// Request tracing: the span in another service this work answered —
+    /// the parent id of the `traceparent` the request arrived with.
+    pub(crate) remote_parent: Option<String>,
 }
 
 impl Pending {
@@ -717,6 +721,7 @@ impl Pending {
             rum_hold: false,
             root: None,
             operations: HashMap::new(),
+            remote_parent: None,
         }
     }
 
@@ -997,8 +1002,10 @@ impl Inner {
         } else {
             false
         };
+        let remote_parent = self.remote_parent_of(request);
         let mut state = cell.lock();
         if let Some(pending) = state.as_mut() {
+            pending.remote_parent = remote_parent;
             pending.rum_hold = rum_hold;
             pending.method.get_or_insert_with(|| request.method().as_str().to_string());
             pending.path.get_or_insert(path);
@@ -1006,6 +1013,20 @@ impl Inner {
             pending.request_body = body;
             pending.client = client;
         }
+    }
+
+    /// Request tracing: the call in another service this request answers —
+    /// the parent span of the `traceparent` it arrived with, when it is in
+    /// the request's trace.
+    fn remote_parent_of(&self, request: &rainier_http::Request) -> Option<String> {
+        if !self.config.request_tracing.enabled {
+            return None;
+        }
+        let unit = rainier_events::Context::current_unit()?;
+        let trace_id = unit.trace_id()?;
+        let incoming =
+            rainier_request_tagging::TraceContext::parse(request.header("traceparent")?).ok()?;
+        (incoming.trace_id() == trace_id).then(|| incoming.parent_id().to_string())
     }
 
     /// The client's address as the application settled on it (after its
@@ -1655,8 +1676,28 @@ pub(crate) fn finalize(
                 .iter()
                 .any(|e| e.tags.iter().any(|t| scope.monitored_tags.contains(t))));
 
+    // Request tracing: whether this batch is part of a trace that crosses
+    // services — it answered another service, or called one with the trace —
+    // and whether its trace is in the sample.
+    let distributed = config.request_tracing.enabled
+        && (pending.remote_parent.is_some()
+            || pending.entries.iter().any(|e| {
+                e.entry_type == EntryType::HttpClient
+                    && e.content.get("rainier.trace.span_id").is_some()
+            }));
+    // In the sample every service computes the same way from the trace id:
+    // kept whole without any of them asking another.
+    let trace_kept = distributed
+        && pending.trace_id.as_deref().is_some_and(|id| config.request_tracing.samples(id));
+    if distributed {
+        tags.insert(crate::http::traces::DISTRIBUTED.to_string());
+    }
+    if trace_kept {
+        tags.insert(crate::http::traces::KEPT.to_string());
+    }
+
     let sampled_out = pending.sampled_out || pending.rejected == Some(Rejection::Sampled);
-    let reduced = out_of_scope || (sampled_out && !monitored);
+    let reduced = out_of_scope || (sampled_out && !monitored && !trace_kept);
     if reduced {
         // Failures are never lost to scope or sampling: keep them, with the
         // root entry for context, and nothing else.
@@ -1695,6 +1736,7 @@ pub(crate) fn finalize(
             && !hold
             && !config.local
             && !monitored
+            && !trace_kept
             && pending.kind != BatchKind::Other
             && !has_exception
             && !pending.failed_job
@@ -1706,6 +1748,21 @@ pub(crate) fn finalize(
     }
 
     resolve_parents(&mut pending);
+    // The span in another service this answered, on the root: the trace API
+    // hangs this batch under the call that made it.
+    if let Some(parent) = pending.remote_parent.take().filter(|_| distributed) {
+        let root = pending.id.clone();
+        if let Some(entry) =
+            pending.entries.iter_mut().find(|e| e.span_id.as_deref() == Some(root.as_str()))
+        {
+            if let Some(content) = entry.content.as_object_mut() {
+                content.insert(
+                    crate::http::traces::PARENT_FIELD.to_string(),
+                    serde_json::Value::String(parent),
+                );
+            }
+        }
+    }
     pending.entries.sort_by_key(|e| e.occurred_at);
     // Unique per batch: a job shares its trace with the request that queued
     // it, and a store replaces on equal ids.
@@ -1818,8 +1875,11 @@ pub(crate) fn finalize(
         entries: pending.entries,
     };
 
+    // A trace the services agreed to keep is kept whatever the keep rule:
+    // the agreement is only worth anything if every service honours it.
     let keep = reduced
         || monitored
+        || trace_kept
         || pending.kind == BatchKind::Other
         || match &config.keep {
             Some(rule) => rule(&batch),

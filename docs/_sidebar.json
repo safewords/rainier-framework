@@ -20,7 +20,7 @@
     "authentication", "authorization", "hashing", "encryption", "sessions", "captcha"
   ] },
   { "group": "Observability", "items": [
-    "observability", "lookout"
+    "observability", "lookout", "longmire"
   ] },
   { "group": "Testing", "items": [
     "testing"

@@ -595,7 +595,7 @@ impl QueueManager {
             // Else the trace of the unit of work that queued it, which is
             // known even where no `Trace` middleware put one in force.
             if job.traceparent.is_none() {
-                job.traceparent = rainier_telemetry::propagation::for_span(&span)
+                job.traceparent = rainier_request_tagging::propagation::for_span(&span)
                     .or_else(crate::events::current_traceparent);
             }
             let traced = span.clone();

@@ -1,5 +1,5 @@
 //! Carrying a trace across an await, a socket and a queue — [`current`],
-//! [`scope`] and [`adopt`].
+//! [`scope`] and [`outbound`].
 //!
 //! The [`Trace`](crate::Trace) middleware knows which trace a request belongs
 //! to. The outbound HTTP client and the queue, three crates away, need to know
@@ -11,21 +11,19 @@
 //!
 //! - [`scope`] runs a future with a `traceparent` in force.
 //! - [`current`] reads the one in force — what an outbound call should send.
-//! - [`adopt`] makes a span the child of a remote parent, so a job's span joins
-//!   the trace of the request that queued it.
 //!
 //! # Two sources, best first
 //!
-//! With the `otlp` feature and the exporter installed, every span has a real
-//! OpenTelemetry span context, and [`current`] answers from the **current
-//! span** — so a downstream service's span hangs off the `HTTP GET` client
-//! span that called it, which is the tree a trace viewer should draw.
+//! A tracer that gives spans real ids — OpenTelemetry, through
+//! `rainier-otel` — can plug them in with [`set_span_source`], and then
+//! [`current`] and [`outbound`] answer from the **span**: a downstream
+//! service's span hangs off the client span that called it. This crate knows
+//! nothing about any tracer.
 //!
-//! Without it there are no span ids to cite, and [`current`] answers from the
-//! scope: the trace id the request arrived with, and the span id this service
-//! minted for itself. One level shallower, the same trace — which is what lets
-//! `grep <trace id>` find every log line across every service, with no
-//! collector at all.
+//! Without one, [`current`] answers from the scope: the trace id the request
+//! arrived with, and the span id this service minted for itself. One level
+//! shallower, the same trace — which is what lets `grep <trace id>` find every
+//! log line across every service, with no collector at all.
 //!
 //! # Why not a tokio task-local
 //!
@@ -39,9 +37,26 @@ use std::future::Future;
 use std::mem::DropGuard;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 
 use crate::context::TraceContext;
+
+/// Where a span's own `traceparent` comes from, when a tracer gives spans ids.
+type SpanSource = fn(&tracing::Span) -> Option<String>;
+
+static SPAN_SOURCE: OnceLock<SpanSource> = OnceLock::new();
+
+/// Let a tracer that gives spans real ids name them in `traceparent`: `source`
+/// answers a span's own header, or `None` when it has none. Set once per
+/// process — `rainier-otel` does it when its exporter is installed.
+pub fn set_span_source(source: SpanSource) {
+    let _ = SPAN_SOURCE.set(source);
+}
+
+fn from_span(span: &tracing::Span) -> Option<String> {
+    SPAN_SOURCE.get().and_then(|source| source(span))
+}
 
 thread_local! {
     static CURRENT: RefCell<Option<Arc<str>>> = const { RefCell::new(None) };
@@ -53,8 +68,7 @@ thread_local! {
 /// telemetry off — and an outbound call then sends no header, which is what it
 /// sent before any of this existed.
 pub fn current() -> Option<String> {
-    #[cfg(feature = "otlp")]
-    if let Some(header) = otel::current_span_header() {
+    if let Some(header) = from_span(&tracing::Span::current()) {
         return Some(header);
     }
 
@@ -68,15 +82,48 @@ pub fn current() -> Option<String> {
 /// server it reaches hangs off that span rather than off the request that
 /// caused it.
 pub fn for_span(span: &tracing::Span) -> Option<String> {
-    #[cfg(feature = "otlp")]
-    if let Some(header) = otel::header_of(span) {
+    if let Some(header) = from_span(span) {
         return Some(header);
     }
 
-    #[cfg(not(feature = "otlp"))]
-    let _ = span;
-
     CURRENT.with(|current| current.borrow().as_deref().map(str::to_string))
+}
+
+/// The `traceparent` one outbound call should carry: the same trace, and a
+/// span id that names **this call** and no other.
+///
+/// With a span source ([`set_span_source`]) that is
+/// `span`'s own id — the client span the call opened. Without one it is a
+/// fresh span id under the trace in force ([`current`]), or, outside any
+/// [`scope`], under the trace of the current unit of work — a job, a
+/// scheduled task — when it has one.
+///
+/// A fresh id per call is what lets a recorder on the other side say which of
+/// several calls to it a piece of its work answered: two calls from one
+/// request to the same service would otherwise name the same parent.
+///
+/// `None` outside any trace, and the call then sends no header.
+pub fn outbound(span: &tracing::Span) -> Option<String> {
+    if let Some(header) = from_span(span) {
+        return Some(header);
+    }
+
+    let in_force = CURRENT.with(|current| current.borrow().as_deref().map(str::to_string));
+    let in_force = in_force.or_else(|| {
+        let unit = rainier_events::Context::current_unit()?;
+        match (unit.traceparent(), unit.trace_id()) {
+            (Some(parent), _) => Some(parent.to_string()),
+            // A trace id with no header: a job that learned only the id.
+            (None, Some(id)) => Some(format!("00-{id}-0000000000000001-01")),
+            (None, None) => None,
+        }
+    })?;
+
+    Some(match TraceContext::parse(&in_force) {
+        Ok(context) => context.child().to_header(),
+        // Not ours to fix: pass on what is in force.
+        Err(_) => in_force,
+    })
 }
 
 /// Run `future` with `traceparent` in force for [`current`].
@@ -85,20 +132,6 @@ pub fn for_span(span: &tracing::Span) -> Option<String> {
 /// should see — not the trace of whatever ran on this thread before.
 pub fn scope<F: Future>(traceparent: Option<String>, future: F) -> Scoped<F> {
     Scoped { traceparent: traceparent.map(Arc::from), inner: Box::pin(future) }
-}
-
-/// Make `span` a child of the remote span `traceparent` names.
-///
-/// Must be called **before** the span is first entered: OpenTelemetry fixes a
-/// span's parent when it starts. A no-op without the `otlp` feature, or when
-/// the header does not parse — a broken parent is not a reason to lose the
-/// span.
-pub fn adopt(span: &tracing::Span, traceparent: &str) {
-    #[cfg(feature = "otlp")]
-    otel::adopt(span, traceparent);
-
-    #[cfg(not(feature = "otlp"))]
-    let _ = (span, traceparent);
 }
 
 /// The header for **this** service's work inside a trace that arrived as
@@ -136,58 +169,6 @@ impl<F: Future> Future for Scoped<F> {
 impl<F> std::fmt::Debug for Scoped<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Scoped").field("traceparent", &self.traceparent).finish()
-    }
-}
-
-#[cfg(feature = "otlp")]
-mod otel {
-    use opentelemetry::trace::{
-        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
-    };
-    use tracing_opentelemetry::OpenTelemetrySpanExt;
-
-    use crate::context::TraceContext;
-
-    /// The current span's own context, as a header — when it has one.
-    pub(super) fn current_span_header() -> Option<String> {
-        header_of(&tracing::Span::current())
-    }
-
-    pub(super) fn header_of(span: &tracing::Span) -> Option<String> {
-        if span.is_disabled() {
-            return None;
-        }
-
-        let context = span.context();
-        let span_context = context.span().span_context().clone();
-        if !span_context.is_valid() {
-            return None;
-        }
-
-        Some(format!(
-            "00-{}-{}-{:02x}",
-            span_context.trace_id(),
-            span_context.span_id(),
-            span_context.trace_flags().to_u8()
-        ))
-    }
-
-    pub(super) fn adopt(span: &tracing::Span, traceparent: &str) {
-        let Ok(incoming) = TraceContext::parse(traceparent) else {
-            return;
-        };
-        let (Ok(trace_id), Ok(span_id)) =
-            (TraceId::from_hex(incoming.trace_id()), SpanId::from_hex(incoming.parent_id()))
-        else {
-            return;
-        };
-
-        let flags = if incoming.is_sampled() { TraceFlags::SAMPLED } else { TraceFlags::default() };
-        let remote = SpanContext::new(trace_id, span_id, flags, true, TraceState::default());
-
-        // An error means the layer is not installed or the span has started;
-        // either way the span is still worth having without its parent.
-        let _ = span.set_parent(opentelemetry::Context::new().with_remote_span_context(remote));
     }
 }
 
@@ -239,9 +220,33 @@ mod tests {
         assert_eq!(child.is_sampled(), incoming.is_sampled());
     }
 
-    #[test]
-    fn adopting_a_broken_parent_is_harmless() {
-        adopt(&tracing::Span::none(), "garbage");
-        adopt(&tracing::Span::none(), EXAMPLE);
+    #[tokio::test]
+    async fn every_outbound_call_names_a_span_of_its_own_in_the_same_trace() {
+        let (first, second) = scope(Some(EXAMPLE.to_string()), async {
+            (outbound(&tracing::Span::none()), outbound(&tracing::Span::none()))
+        })
+        .await;
+        let (first, second) = (
+            TraceContext::parse(&first.unwrap()).unwrap(),
+            TraceContext::parse(&second.unwrap()).unwrap(),
+        );
+
+        assert_eq!(first.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(second.trace_id(), first.trace_id());
+        assert_ne!(first.parent_id(), second.parent_id(), "one span per call");
+        assert_ne!(first.parent_id(), "00f067aa0ba902b7", "not the scope's own");
+    }
+
+    #[tokio::test]
+    async fn outside_a_scope_the_units_trace_is_used() {
+        assert_eq!(outbound(&tracing::Span::none()), None, "no trace, no header");
+
+        let unit = rainier_events::Unit::new(rainier_events::UnitKind::Job, None, None);
+        unit.set_trace(Some("4bf92f3577b34da6a3ce929d0e0e4736"), None);
+        let header = unit.scope(async { outbound(&tracing::Span::none()) }).await;
+        assert_eq!(
+            TraceContext::parse(&header.unwrap()).unwrap().trace_id(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
     }
 }

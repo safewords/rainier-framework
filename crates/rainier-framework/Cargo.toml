@@ -42,6 +42,8 @@ rainier-compat = { workspace = true, optional = true }
 rainier-mfa = { workspace = true, optional = true }
 # Lookout, the diagnostics suite: see the `lookout` feature.
 rainier-lookout = { workspace = true, optional = true }
+# Longmire, one view across many Lookouts: see the `longmire` feature.
+rainier-longmire = { workspace = true, optional = true }
 # A Model Context Protocol server: see the `mcp` feature.
 rainier-mcp = { workspace = true, optional = true }
 rainier-cache = { workspace = true }
@@ -51,7 +53,8 @@ rainier-filesystem = { workspace = true }
 rainier-broadcast = { workspace = true }
 rainier-metrics = { workspace = true }
 rainier-openapi = { workspace = true }
-rainier-telemetry = { workspace = true }
+rainier-otel = { workspace = true }
+rainier-request-tagging = { workspace = true }
 rainier-websocket = { workspace = true }
 rainier-notify = { workspace = true }
 rainier-scheduler = { workspace = true }
@@ -150,7 +153,7 @@ libsql-http = ["rainier-database/libsql-http"]
 # it is compiled. See `docs/observability.md#passive-instrumentation`.
 telemetry = [
     "rainier-support/telemetry",
-    "rainier-telemetry/otlp",
+    "rainier-otel/otlp",
     "rainier-server/telemetry",
     "rainier-routing/telemetry",
     "rainier-http-client/telemetry",
@@ -175,6 +178,11 @@ telemetry = [
 # layer. It needs no `telemetry`: that feature is OpenTelemetry — spans and
 # the OTLP exporter — and is independent of Lookout. See `docs/lookout.md`.
 lookout = ["dep:rainier-lookout", "rainier-events/log-layer"]
+# Longmire: pull every service's Lookout request tracing and link it into one
+# view per request. For the one application that reads the others — an
+# operations console. It reads them over HTTP, so it brings the real client.
+# See `docs/longmire.md`.
+longmire = ["dep:rainier-longmire", "http-client"]
 # A Model Context Protocol server at `/_mcp`: the application's own tools,
 # resources and prompts for an AI client, and Lookout's when Lookout is on too.
 # Off unless `MCP_ENABLED=true`. See `docs/mcp.md`.

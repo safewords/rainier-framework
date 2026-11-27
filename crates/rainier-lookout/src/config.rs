@@ -249,6 +249,51 @@ pub enum ClientIp {
     None,
 }
 
+/// Request tracing: recording, on this service's side, which call from
+/// another service each request answered and which calls it made — by the
+/// span ids request tagging puts on the wire — and serving that for
+/// something outside, an operations console, to put a trace across services
+/// back together. Lookouts never talk to one another. See `docs/lookout.md`,
+/// "Traces across services".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RequestTracing {
+    /// Off unless turned on (`LOOKOUT_REQUEST_TRACING`).
+    pub enabled: bool,
+    /// The fraction of traces kept whole, `0.0..=1.0`
+    /// (`LOOKOUT_TRACE_SAMPLE_RATE`). Decided from the trace id, so every
+    /// service with the same rate keeps the same traces without asking one
+    /// another. Outside the sample, each service keeps its part by its own
+    /// rule — failed and slow work, as ever.
+    pub trace_sample_rate: f64,
+    /// The name this service goes by in a trace (`LOOKOUT_SERVICE`, else
+    /// `APP_NAME`).
+    pub service: Option<String>,
+}
+
+impl Default for RequestTracing {
+    fn default() -> Self {
+        Self { enabled: false, trace_sample_rate: 0.01, service: None }
+    }
+}
+
+impl RequestTracing {
+    /// Whether the trace `trace_id` is in the sample every service agrees on:
+    /// its first sixteen hex digits, as a fraction of the largest, below the
+    /// rate. A trace id that is not hex is never sampled.
+    pub fn samples(&self, trace_id: &str) -> bool {
+        if self.trace_sample_rate <= 0.0 {
+            return false;
+        }
+        if self.trace_sample_rate >= 1.0 {
+            return true;
+        }
+        let Some(head) = trace_id.get(..16) else { return false };
+        let Ok(value) = u64::from_str_radix(head, 16) else { return false };
+        (value as f64 / u64::MAX as f64) < self.trace_sample_rate
+    }
+}
+
 /// Real user monitoring: how requests looked from the browser that made
 /// them. See `docs/lookout.md`, "Real user monitoring".
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -648,6 +693,14 @@ pub struct LookoutConfig {
     /// Real user monitoring: off unless turned on.
     #[serde(default)]
     pub rum: Rum,
+    /// Keeping traces that cross services whole: off unless turned on.
+    #[serde(default)]
+    pub request_tracing: RequestTracing,
+    /// The keys Longmire's link is recognised by (`LOOKOUT_LONGMIRE_KEYS`):
+    /// a request signed with one may read what a reader may, and its answer
+    /// is sealed. None by default — no link. Never serialised.
+    #[serde(skip)]
+    pub longmire_keys: Vec<rainier_lookout_link::LinkKey>,
 }
 
 impl std::fmt::Debug for LookoutConfig {
@@ -671,6 +724,8 @@ impl std::fmt::Debug for LookoutConfig {
             .field("local", &self.local)
             .field("insights", &self.insights)
             .field("rum", &self.rum)
+            .field("request_tracing", &self.request_tracing)
+            .field("longmire_keys", &self.longmire_keys.iter().map(|k| k.id()).collect::<Vec<_>>())
             .finish()
     }
 }
@@ -718,6 +773,8 @@ impl Default for LookoutConfig {
                 slow_ms: default_rum_slow_ms(),
                 ..Rum::default()
             },
+            request_tracing: RequestTracing::default(),
+            longmire_keys: Vec::new(),
         }
     }
 }
@@ -760,6 +817,13 @@ impl LookoutConfig {
     /// Turn one watcher off.
     pub fn disable(self, entry_type: EntryType) -> Self {
         self.watch(entry_type, |w| WatcherConfig { enabled: false, ..w })
+    }
+
+    /// Turn on request tracing: keep traces that cross services whole, and
+    /// answer for them on the trace API. See [`RequestTracing`].
+    pub fn request_tracing(mut self, request_tracing: RequestTracing) -> Self {
+        self.request_tracing = request_tracing;
+        self
     }
 
     /// Keep only batches that pass `rule`.
@@ -1045,6 +1109,22 @@ impl LookoutConfig {
         }
         if let Some(v) = get("LOOKOUT_RUM_HOLD_SECONDS") {
             config.rum.hold_seconds = parse_u64("LOOKOUT_RUM_HOLD_SECONDS", &v)?;
+        }
+        if let Some(v) = get("LOOKOUT_REQUEST_TRACING") {
+            config.request_tracing.enabled = parse_bool("LOOKOUT_REQUEST_TRACING", &v)?;
+        }
+        if let Some(v) = get("LOOKOUT_TRACE_SAMPLE_RATE") {
+            config.request_tracing.trace_sample_rate = parse_rate("LOOKOUT_TRACE_SAMPLE_RATE", &v)?;
+        }
+        config.request_tracing.service = get("LOOKOUT_SERVICE").or_else(|| get("APP_NAME"));
+        if let Some(v) = get("LOOKOUT_LONGMIRE_KEYS") {
+            config.longmire_keys = rainier_lookout_link::LinkKey::parse_list(&v).map_err(|_| {
+                ConfigError::new(
+                    "LOOKOUT_LONGMIRE_KEYS",
+                    "(redacted)",
+                    "comma-separated `id:base64-secret`, each secret at least 32 bytes",
+                )
+            })?;
         }
         if let Some(v) = get("LOOKOUT_RUM_SECRET") {
             config.rum.secret = v.into_bytes();

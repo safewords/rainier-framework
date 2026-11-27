@@ -13,7 +13,7 @@
 //! | At boot | What happens |
 //! |---|---|
 //! | the subscriber | logging as before, plus the OTLP layer when an endpoint is set — one subscriber, installed once |
-//! | the kernel | [`Trace`](rainier_telemetry::Trace) outermost in the global stack, unless the application already put one there |
+//! | the kernel | [`Trace`](rainier_request_tagging::Trace) outermost in the global stack, unless the application already put one there |
 //! | `queue:work` | a [`QueueMetrics`] observer on every worker, when a `Metrics` registry is bound |
 //! | `schedule:run` / `schedule:work` | each pass's task timings into the registry, when one is bound |
 //!
@@ -38,10 +38,9 @@ use std::time::Duration;
 
 use rainier_config::{Config, Env};
 use rainier_metrics::{labels, Metrics};
-use rainier_middleware::Middleware;
+use rainier_otel::Otlp;
 use rainier_queue::{JobTiming, QueueObserver};
 use rainier_scheduler::RunSummary;
-use rainier_telemetry::Otlp;
 
 use crate::keys;
 use crate::observability::TelemetrySettings;
@@ -55,6 +54,7 @@ impl TelemetrySettings {
         if config.get(keys::TELEMETRY_ENABLED).is_none() {
             settings.enabled = env.bool("TELEMETRY_ENABLED", false);
         }
+        settings = settings.with_request_tagging_env(config, env);
         if settings.endpoint.is_none() {
             settings.endpoint =
                 env.get("OTEL_EXPORTER_OTLP_ENDPOINT").filter(|value| !value.trim().is_empty());
@@ -125,29 +125,11 @@ impl TelemetrySettings {
     }
 }
 
-/// Put [`Trace`](rainier_telemetry::Trace) outermost in `global`, unless it is off or already there.
-///
-/// Outermost so that every log line — including the ones from middleware that
-/// rejected the request — carries the trace id, and so that the outbound
-/// calls and jobs a request causes inherit its trace.
-pub fn install_trace_middleware(
-    global: &mut Vec<Arc<dyn Middleware>>,
-    settings: &TelemetrySettings,
-) {
-    let Some(trace) = settings.middleware() else { return };
-
-    // By its label: an application that registered its own `Trace` — with its
-    // own sampling or header choices — keeps exactly that one.
-    if global.iter().any(|stage| stage.name() == "Trace") {
-        return;
-    }
-
-    global.insert(0, Arc::new(trace));
-}
+pub use crate::observability::install_trace_middleware;
 
 /// Flush spans the batch exporter is still holding. Call before exiting.
 pub fn shutdown() {
-    rainier_telemetry::shutdown();
+    rainier_otel::shutdown();
 }
 
 /// A [`QueueObserver`] over the application's `Metrics` registry.
@@ -372,8 +354,9 @@ pub async fn serve_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rainier_middleware::Middleware;
     use rainier_queue::JobOutcome;
-    use rainier_telemetry::Trace;
+    use rainier_request_tagging::Trace;
 
     fn env(pairs: &[(&str, &str)]) -> Env {
         Env::from_map(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string()))).isolated()
@@ -410,6 +393,27 @@ mod tests {
 
         assert!(!settings.enabled);
         assert_eq!(settings.service_name, "api");
+    }
+
+    #[test]
+    fn request_tagging_installs_the_middleware_without_exporting_anything() {
+        let settings = TelemetrySettings::from_config_and_env(
+            &Config::new(),
+            &env(&[
+                ("REQUEST_TAGGING_ENABLED", "true"),
+                ("REQUEST_TAGGING_HEADER", "x-request-id"),
+            ]),
+        );
+
+        assert!(!settings.enabled, "not OpenTelemetry");
+        assert!(!settings.exports());
+        assert!(settings.request_tagging);
+        assert_eq!(settings.request_id_header.as_deref(), Some("x-request-id"));
+
+        let mut global: Vec<Arc<dyn Middleware>> = Vec::new();
+        install_trace_middleware(&mut global, &settings);
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].name(), "Trace");
     }
 
     #[test]

@@ -72,6 +72,10 @@ pub enum EntryType {
     /// by message, file and line and the same dimensions as
     /// [`RumView`](Self::RumView). See [`rum_rollup`](crate::rum_rollup).
     RumError,
+    /// Rolled up, never an entry: every outbound HTTP call counted by the
+    /// host it went to and its status class — who this service calls, how
+    /// often, how fast, how often it fails. See [`facets`](crate::facets).
+    CallFacet,
 }
 
 impl EntryType {
@@ -101,14 +105,20 @@ impl EntryType {
         EntryType::JobFacet,
         EntryType::RumView,
         EntryType::RumError,
+        EntryType::CallFacet,
     ];
 
     /// The types that exist only as aggregate rows — no watcher records an
     /// entry of one, and no setting turns one on or off. They are written
     /// whenever Lookout is on and read by the health API
     /// (`/api/health`, `/api/requests`, `/api/rum/*`).
-    pub const ROLLUPS: &'static [EntryType] =
-        &[EntryType::RequestFacet, EntryType::JobFacet, EntryType::RumView, EntryType::RumError];
+    pub const ROLLUPS: &'static [EntryType] = &[
+        EntryType::RequestFacet,
+        EntryType::JobFacet,
+        EntryType::RumView,
+        EntryType::RumError,
+        EntryType::CallFacet,
+    ];
 
     /// Whether this type exists only as aggregate rows. See
     /// [`ROLLUPS`](Self::ROLLUPS).
@@ -143,6 +153,7 @@ impl EntryType {
             EntryType::JobFacet => "job_facet",
             EntryType::RumView => "rum_view",
             EntryType::RumError => "rum_error",
+            EntryType::CallFacet => "call_facet",
         }
     }
 

@@ -1,7 +1,6 @@
-//! An `http.client.request` span per attempt, and `traceparent` on the wire —
-//! behind the `telemetry` feature — and an
-//! [`HttpClientRequestSent`](crate::HttpClientRequestSent) event per attempt,
-//! always.
+//! `traceparent` on the wire, an `http.client.request` span per attempt behind
+//! the `telemetry` feature, and an
+//! [`HttpClientRequestSent`](crate::HttpClientRequestSent) event per attempt.
 //!
 //! Applied inside the **transports**, not the [`PendingRequest`](crate::PendingRequest)
 //! builder, because the builder is not the only way out: the mail APIs, the
@@ -10,8 +9,15 @@
 //! what makes every one of them visible without any of them knowing.
 //!
 //! The fake is instrumented too. It records what *would have left the
-//! building*, and with telemetry on, that includes the `traceparent` header —
-//! so a test can assert the trace reaches the other service.
+//! building*, including the `traceparent` header — so a test can assert the
+//! trace reaches the other service.
+//!
+//! # Request tagging
+//!
+//! Each attempt is tagged by `rainier-request-tagging` ([`outbound::tag`]):
+//! inside a trace it carries `traceparent` with the same trace id and a span
+//! id naming this attempt. This crate decides nothing about traces. The event
+//! carries the span id sent, as `rainier.trace.span_id`.
 //!
 //! # What is recorded
 //!
@@ -26,14 +32,17 @@
 //!
 //! # With nobody listening
 //!
-//! Without the `telemetry` feature and with nothing subscribed, a send asks
-//! the bus once and returns the transport's own future: no copy of the URL,
-//! no clock read, no extra future.
+//! Without the `telemetry` feature, outside any trace and with nothing
+//! subscribed, a send reads a thread-local, asks the bus once and returns the
+//! transport's own future: no copy of the URL, no clock read, no extra future.
+//!
+//! [`outbound::tag`]: rainier_request_tagging::outbound::tag
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use rainier_events::Dispatcher;
+use rainier_request_tagging::outbound::{self, Tagged};
 use rainier_support::{BoxFuture, Result};
 
 use crate::transport::{OutboundRequest, RawResponse};
@@ -58,44 +67,76 @@ impl Sending {
         })
     }
 
-    fn finish(self, result: &Result<RawResponse>) {
+    fn finish(self, result: &Result<RawResponse>, tagged: &Tagged) {
         let duration = self.started.elapsed();
         let Self { events, method, url, .. } = self;
         events.publish_activity_with(|| {
             crate::events::HttpClientRequestSent::new(&method, &url, result, duration)
+                .with_trace_span(tagged.span_id())
         });
     }
 }
 
-/// Observe one send: its event, and with `telemetry` its client span and the
-/// `traceparent` it writes onto the request.
-pub(crate) fn instrument<'a>(
+/// Observe one send: its tag, its event, and with `telemetry` its client span.
+///
+/// The built-in transports call it around every send. A [`Transport`] of
+/// your own should too, or what it sends carries no trace and is recorded
+/// nowhere:
+///
+/// ```
+/// use rainier_http_client::transport::{OutboundRequest, RawResponse, Transport};
+/// use rainier_support::{BoxFuture, Result};
+///
+/// struct Loopback;
+///
+/// impl Transport for Loopback {
+///     fn send<'a>(&'a self, request: OutboundRequest) -> BoxFuture<'a, Result<RawResponse>> {
+///         rainier_http_client::telemetry::instrument(request, |request| {
+///             Box::pin(async move {
+///                 let _ = request;
+///                 Ok(RawResponse { status: 204, headers: Default::default(), body: Vec::new() })
+///             })
+///         })
+///     }
+///
+///     fn name(&self) -> &str {
+///         "loopback"
+///     }
+/// }
+/// ```
+///
+/// [`Transport`]: crate::Transport
+pub fn instrument<'a>(
     request: OutboundRequest,
     send: impl FnOnce(OutboundRequest) -> BoxFuture<'a, Result<RawResponse>> + Send + 'a,
 ) -> BoxFuture<'a, Result<RawResponse>> {
-    let sending = Sending::start(&request);
-
     #[cfg(feature = "telemetry")]
-    return traced(request, send, sending);
+    return traced(request, send);
 
     #[cfg(not(feature = "telemetry"))]
-    match sending {
-        // Nobody to tell: the transport's own future, as is.
-        None => send(request),
-        Some(sending) => Box::pin(async move {
+    {
+        let mut request = request;
+        let tagged = outbound::tag(&mut request.headers, &tracing::Span::none());
+        let sending = Sending::start(&request);
+        if sending.is_none() && tagged.is_empty() {
+            // Nobody to tell and nothing to hear: the transport's own future.
+            return send(request);
+        }
+        Box::pin(async move {
             let result = send(request).await;
-            sending.finish(&result);
+            if let Some(sending) = sending {
+                sending.finish(&result, &tagged);
+            }
             result
-        }),
+        })
     }
 }
 
-/// Wrap one send in a client span, writing `traceparent` onto the request.
+/// Wrap one send in a client span, tagging the request.
 #[cfg(feature = "telemetry")]
 fn traced<'a>(
     mut request: OutboundRequest,
     send: impl FnOnce(OutboundRequest) -> BoxFuture<'a, Result<RawResponse>> + Send + 'a,
-    sending: Option<Sending>,
 ) -> BoxFuture<'a, Result<RawResponse>> {
     use tracing::field::Empty;
 
@@ -113,13 +154,8 @@ fn traced<'a>(
         http.response.status_code = Empty,
     );
 
-    // A caller that set its own keeps it: it is propagating a trace this
-    // process does not know about, which is its business.
-    if !request.headers.contains_key("traceparent") {
-        if let Some(header) = rainier_telemetry::propagation::for_span(&span) {
-            request.headers.insert("traceparent".to_string(), header);
-        }
-    }
+    let tagged = outbound::tag(&mut request.headers, &span);
+    let sending = Sending::start(&request);
 
     let traced = span.clone();
     Box::pin(tracing::Instrument::instrument(
@@ -136,7 +172,7 @@ fn traced<'a>(
                 Err(error) => rainier_support::telemetry::record_error(&traced, error),
             }
             if let Some(sending) = sending {
-                sending.finish(&result);
+                sending.finish(&result, &tagged);
             }
             result
         },
@@ -187,12 +223,14 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "telemetry")]
     use crate::{FakeTransport, Http};
+    use rainier_request_tagging::TraceContext;
     #[cfg(feature = "telemetry")]
     use rainier_support::telemetry::testing::Recorder;
-    #[cfg(feature = "telemetry")]
     use std::sync::Arc;
+
+    const UPSTREAM: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 
     #[test]
     fn a_url_loses_its_query_and_its_credentials() {
@@ -208,17 +246,13 @@ mod tests {
         assert_eq!(Target::parse("https://example.com").redacted, "https://example.com");
     }
 
-    #[cfg(feature = "telemetry")]
     #[tokio::test]
-    async fn every_attempt_is_a_client_span_and_the_trace_goes_on_the_wire() {
-        let recorder = Recorder::new();
-        let _guard = recorder.install();
+    async fn every_attempt_carries_the_trace_and_a_span_id_of_its_own() {
         let fake = Arc::new(FakeTransport::new());
         fake.responding(503, "busy").responding(200, "ok");
 
-        let upstream = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-        rainier_telemetry::propagation::scope(Some(upstream.to_string()), async {
-            Http::get("https://api.example.com/v1/things?api_key=secret")
+        rainier_request_tagging::propagation::scope(Some(UPSTREAM.to_string()), async {
+            Http::get("https://api.example.com/v1/things")
                 .retry(2, crate::Backoff::fixed(std::time::Duration::ZERO))
                 .through(Arc::clone(&fake) as _)
                 .send()
@@ -227,11 +261,34 @@ mod tests {
         })
         .await;
 
-        let sent = fake.recorded();
+        let sent: Vec<TraceContext> = fake
+            .recorded()
+            .iter()
+            .map(|r| TraceContext::parse(r.header("traceparent").expect("on the wire")).unwrap())
+            .collect();
         assert_eq!(sent.len(), 2);
-        for request in &sent {
-            assert_eq!(request.header("traceparent"), Some(upstream), "the request's trace");
-        }
+        assert!(sent.iter().all(|c| c.trace_id() == TRACE), "the request's trace");
+        assert_ne!(sent[0].parent_id(), sent[1].parent_id(), "one span per attempt");
+        assert_eq!(fake.recorded()[0].header("tracestate"), None, "not taking part");
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[tokio::test]
+    async fn every_attempt_is_a_client_span() {
+        let recorder = Recorder::new();
+        let _guard = recorder.install();
+        let fake = Arc::new(FakeTransport::new());
+        fake.responding(503, "busy").responding(200, "ok");
+
+        rainier_request_tagging::propagation::scope(Some(UPSTREAM.to_string()), async {
+            Http::get("https://api.example.com/v1/things?api_key=secret")
+                .retry(2, crate::Backoff::fixed(std::time::Duration::ZERO))
+                .through(Arc::clone(&fake) as _)
+                .send()
+                .await
+                .unwrap();
+        })
+        .await;
 
         let spans = recorder.named("http.client.request");
         assert_eq!(spans.len(), 2, "one span per attempt");
@@ -244,11 +301,10 @@ mod tests {
         assert!(!recorder.everything().contains("secret"));
     }
 
-    #[cfg(feature = "telemetry")]
     #[tokio::test]
     async fn a_traceparent_the_caller_set_is_left_alone() {
         let fake = Arc::new(FakeTransport::new());
-        rainier_telemetry::propagation::scope(Some("00-mine".to_string()), async {
+        rainier_request_tagging::propagation::scope(Some(UPSTREAM.to_string()), async {
             Http::get("https://example.com")
                 .header("traceparent", "00-theirs")
                 .through(Arc::clone(&fake) as _)
@@ -261,12 +317,38 @@ mod tests {
         assert_eq!(fake.recorded()[0].header("traceparent"), Some("00-theirs"));
     }
 
-    #[cfg(feature = "telemetry")]
     #[tokio::test]
     async fn outside_a_trace_nothing_is_added() {
         let fake = Arc::new(FakeTransport::new());
         Http::get("https://example.com").through(Arc::clone(&fake) as _).send().await.unwrap();
 
         assert_eq!(fake.recorded()[0].header("traceparent"), None);
+        assert_eq!(fake.recorded()[0].header("tracestate"), None);
+    }
+
+    #[tokio::test]
+    async fn the_span_id_sent_is_recorded_on_the_event() {
+        let events = Arc::new(rainier_events::Dispatcher::new());
+        let _bus = rainier_events::bus::set_default(Arc::clone(&events));
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        events.on::<crate::HttpClientRequestSent>().run_sync(move |sent, _| {
+            sink.lock().unwrap().push(rainier_events::Activity::collect_fields(sent));
+            Ok(())
+        });
+        let fake = Arc::new(FakeTransport::new());
+
+        rainier_request_tagging::propagation::scope(Some(UPSTREAM.to_string()), async {
+            Http::get("https://b.example.com/x")
+                .through(Arc::clone(&fake) as _)
+                .send()
+                .await
+                .unwrap();
+        })
+        .await;
+        events.settled().await;
+
+        let sent = TraceContext::parse(fake.recorded()[0].header("traceparent").unwrap()).unwrap();
+        assert_eq!(heard.lock().unwrap()[0].text("rainier.trace.span_id"), Some(sent.parent_id()));
     }
 }

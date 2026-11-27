@@ -21,12 +21,13 @@
 
 use std::sync::Arc;
 
-use rainier_config::Config;
+use rainier_config::{Config, Env};
 use rainier_metrics::Metrics;
 use rainier_openapi::{OpenApi, Rendered};
+use rainier_otel::LogFormat;
+use rainier_request_tagging::Trace;
 use rainier_routing::CompiledRouter;
 use rainier_support::Result;
-use rainier_telemetry::{LogFormat, Trace};
 
 use crate::keys;
 
@@ -71,6 +72,11 @@ pub struct TelemetrySettings {
     pub sample_ratio: f64,
     /// The shape of a log line.
     pub log_format: LogFormat,
+    /// Whether requests are tagged and the tag carried across services,
+    /// without exporting anything — request tagging. `enabled` implies it.
+    pub request_tagging: bool,
+    /// The header a frontend may start a trace with.
+    pub request_id_header: Option<String>,
 }
 
 impl TelemetrySettings {
@@ -85,12 +91,34 @@ impl TelemetrySettings {
                 .unwrap_or_else(|| "rainier".to_string()),
             sample_ratio: config.get(keys::TELEMETRY_SAMPLE_RATIO).unwrap_or(1.0),
             log_format: config.setting(keys::LOG_FORMAT).unwrap_or_default(),
+            request_tagging: config.get(keys::REQUEST_TAGGING_ENABLED).unwrap_or(false),
+            request_id_header: config.get(keys::REQUEST_TAGGING_HEADER),
         }
     }
 
-    /// The middleware, or `None` when tracing is off.
+    /// The middleware, or `None` when neither tracing nor request tagging is
+    /// on.
     pub fn middleware(&self) -> Option<Trace> {
-        self.enabled.then(|| Trace::new().sampling(self.sample_ratio > 0.0))
+        (self.enabled || self.request_tagging).then(|| {
+            let trace = Trace::new().sampling(self.sample_ratio > 0.0);
+            match &self.request_id_header {
+                Some(header) => trace.request_id_header(header.clone()),
+                None => trace,
+            }
+        })
+    }
+
+    /// Request tagging from the environment — `REQUEST_TAGGING_ENABLED` and
+    /// `REQUEST_TAGGING_HEADER` — for whatever the configuration left unset.
+    pub fn with_request_tagging_env(mut self, config: &Config, env: &Env) -> Self {
+        if config.get(keys::REQUEST_TAGGING_ENABLED).is_none() {
+            self.request_tagging = env.bool("REQUEST_TAGGING_ENABLED", false);
+        }
+        if self.request_id_header.is_none() {
+            self.request_id_header =
+                env.get("REQUEST_TAGGING_HEADER").filter(|value| !value.trim().is_empty());
+        }
+        self
     }
 
     /// Whether spans should be exported, as opposed to only propagated.
@@ -101,6 +129,26 @@ impl TelemetrySettings {
     pub fn exports(&self) -> bool {
         self.enabled && self.endpoint.is_some()
     }
+}
+
+/// Put [`Trace`] outermost in `global`, unless it is off or already there.
+///
+/// Outermost so that every log line — including the ones from middleware that
+/// rejected the request — carries the trace id, and so that the outbound
+/// calls and jobs a request causes inherit its trace.
+pub fn install_trace_middleware(
+    global: &mut Vec<Arc<dyn rainier_middleware::Middleware>>,
+    settings: &TelemetrySettings,
+) {
+    let Some(trace) = settings.middleware() else { return };
+
+    // By its label: an application that registered its own `Trace` — with its
+    // own sampling or header choices — keeps exactly that one.
+    if global.iter().any(|stage| stage.name() == "Trace") {
+        return;
+    }
+
+    global.insert(0, Arc::new(trace));
 }
 
 /// A layer of the framework's subscriber, boxed so layers of different types
@@ -293,6 +341,28 @@ mod tests {
 
     fn config() -> Config {
         Config::new()
+    }
+
+    #[test]
+    fn request_tagging_stands_on_its_own_without_opentelemetry() {
+        let env = Env::from_map(
+            [("REQUEST_TAGGING_ENABLED", "true"), ("REQUEST_TAGGING_HEADER", "x-request-id")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        )
+        .isolated();
+        let settings =
+            TelemetrySettings::from_config(&config()).with_request_tagging_env(&config(), &env);
+        assert!(!settings.enabled && !settings.exports(), "no OpenTelemetry");
+
+        let mut global: Vec<Arc<dyn rainier_middleware::Middleware>> = Vec::new();
+        install_trace_middleware(&mut global, &settings);
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].name(), "Trace");
+
+        let mut off = Vec::new();
+        install_trace_middleware(&mut off, &TelemetrySettings::from_config(&config()));
+        assert!(off.is_empty(), "off unless asked for");
     }
 
     #[test]

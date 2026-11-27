@@ -84,6 +84,24 @@ impl TraceContext {
         }
     }
 
+    /// A trace whose id the caller chose: the request id a frontend sent
+    /// (see [`Trace::request_id_header`](crate::Trace::request_id_header)).
+    ///
+    /// Accepts a UUID, with or without its dashes, or 32 hex digits — what
+    /// `crypto.randomUUID()` gives a browser — and not all zeros. Anything
+    /// else is `None`, and the request starts a trace of its own: an id that
+    /// is not one is not worth joining.
+    pub fn from_request_id(value: &str, sampled: bool) -> Option<Self> {
+        let id: String = value.trim().chars().filter(|c| *c != '-').collect();
+        let dashes = value.trim().len() - id.len();
+        let shaped = id.len() == 32 && (dashes == 0 || dashes == 4) && is_hex(&id);
+        (shaped && id.bytes().any(|b| b != b'0')).then(|| Self {
+            trace_id: id.to_ascii_lowercase(),
+            parent_id: random_hex(16),
+            sampled,
+        })
+    }
+
     /// A brand new trace.
     pub fn start(sampled: bool) -> Self {
         Self { trace_id: random_hex(32), parent_id: random_hex(16), sampled }

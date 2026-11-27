@@ -42,6 +42,10 @@ rainier-container = { workspace = true }
 tokio = { workspace = true }
 # `log-layer`: Lookout asks `log_layer` for log lines at its `log_level`.
 rainier-events = { workspace = true, features = ["log-layer"] }
+# Request tracing reads the call a request answered from its `traceparent`.
+rainier-request-tagging = { workspace = true }
+# Longmire's link: signed requests recognised, answers sealed.
+rainier-lookout-link = { workspace = true }
 rainier-middleware = { workspace = true }
 async-trait = { workspace = true }
 # Real user monitoring: a report names the request it describes by a token
@@ -60,6 +64,11 @@ tokio = { workspace = true }
 # The middleware test runs a real kernel and router. No `telemetry`: Lookout
 # hears the bus, not spans.
 rainier-server = { workspace = true }
+# Two services in one process, one calling the other through the client: the
+# trace across services end to end.
+rainier-http-client = { workspace = true }
+# Longmire reading this Lookout over the link, end to end.
+rainier-longmire = { workspace = true }
 # The executor the database store's tests connect with. Its SQL support comes
 # from the `sea-orm-executor` feature below, not from here: a feature named on
 # a dev-dependency is unified into every crate's tests in `cargo test

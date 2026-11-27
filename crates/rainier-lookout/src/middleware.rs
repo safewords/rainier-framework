@@ -273,6 +273,194 @@ mod tests {
             .with_reporter(Reporter::new(events))
     }
 
+    const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    /// A request from another service in trace [`TRACE`], answering its
+    /// call `parent`.
+    fn called(uri: &str, parent: &str) -> Request {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("traceparent", &format!("00-{TRACE}-{parent}-01"))
+            .build()
+    }
+
+    fn tracing(rate: f64) -> LookoutConfig {
+        let mut config = LookoutConfig::default().enabled(true).local(false);
+        config.request_tracing.enabled = true;
+        config.request_tracing.trace_sample_rate = rate;
+        config
+    }
+
+    #[tokio::test]
+    async fn a_request_from_another_service_records_the_call_it_answered() {
+        let store = Arc::new(MemoryStore::new(10));
+        let lookout = Lookout::new(tracing(1.0), store.clone());
+        let (kernel, events) = wired(&lookout);
+
+        let response = kernel.handle_request(called("/posts/1", "000000000000000a")).await;
+        flushed(&lookout, &events).await;
+
+        assert!(
+            response.headers().get("traceresponse").is_none(),
+            "Lookouts say nothing to each other"
+        );
+        let kept = store.all();
+        assert_eq!(kept.len(), 1, "in the sample: kept though fine");
+        let batch = &kept[0];
+        assert_eq!(batch.trace_id, TRACE);
+        assert!(batch.tags.iter().any(|t| t == "trace:distributed"), "{:?}", batch.tags);
+        assert!(batch.tags.iter().any(|t| t == "trace:kept"), "{:?}", batch.tags);
+        let root = batch.entries.iter().find(|e| e.span_id.as_deref() == Some(&batch.id)).unwrap();
+        assert_eq!(root.content["rainier.trace.parent_span_id"], "000000000000000a");
+    }
+
+    #[tokio::test]
+    async fn outside_the_sample_a_fine_request_is_let_go_and_a_failure_kept() {
+        let store = Arc::new(MemoryStore::new(10));
+        let lookout = Lookout::new(tracing(0.0), store.clone());
+        let (kernel, events) = wired(&lookout);
+
+        kernel.handle_request(called("/posts/1", "000000000000000a")).await;
+        kernel.handle_request(called("/boom", "000000000000000b")).await;
+        flushed(&lookout, &events).await;
+
+        let kept = store.all();
+        assert_eq!(kept.len(), 1, "only the failure");
+        let root =
+            kept[0].entries.iter().find(|e| e.span_id.as_deref() == Some(&kept[0].id)).unwrap();
+        assert_eq!(root.content["rainier.trace.parent_span_id"], "000000000000000b");
+        assert!(
+            !kept[0].tags.iter().any(|t| t == "trace:kept"),
+            "kept for failing, not the sample"
+        );
+    }
+
+    /// Another service's kernel as a transport: what the client sends, it
+    /// handles — on a task of its own, as another process would.
+    struct InProcess(Arc<Kernel>);
+
+    impl rainier_http_client::Transport for InProcess {
+        fn send<'a>(
+            &'a self,
+            request: rainier_http_client::transport::OutboundRequest,
+        ) -> rainier_support::BoxFuture<
+            'a,
+            rainier_support::Result<rainier_http_client::transport::RawResponse>,
+        > {
+            let kernel = Arc::clone(&self.0);
+            rainier_http_client::telemetry::instrument(request, move |request| {
+                Box::pin(async move {
+                    let path = request.url.splitn(4, '/').nth(3).unwrap_or_default().to_string();
+                    let mut builder =
+                        Request::builder().method(Method::GET).uri(format!("/{path}"));
+                    for (name, value) in &request.headers {
+                        builder = builder.header(name, value);
+                    }
+                    let built = builder.build();
+                    let response = tokio::spawn(async move { kernel.handle_request(built).await })
+                        .await
+                        .expect("the callee answers");
+                    let headers = response
+                        .headers()
+                        .iter()
+                        .filter_map(|(n, v)| {
+                            Some((n.as_str().to_string(), v.to_str().ok()?.to_string()))
+                        })
+                        .collect();
+                    Ok(rainier_http_client::transport::RawResponse {
+                        status: response.status().as_u16(),
+                        headers,
+                        body: Vec::new(),
+                    })
+                })
+            })
+        }
+
+        fn name(&self) -> &str {
+            "in-process"
+        }
+    }
+
+    #[tokio::test]
+    async fn two_services_each_record_their_side_of_one_call_and_it_fits_back_together() {
+        // The callee, a Lookout of its own.
+        let billing_store = Arc::new(MemoryStore::new(10));
+        let billing = Lookout::new(tracing(1.0), billing_store.clone());
+        let (billing_kernel, billing_events) = wired(&billing);
+        let billing_kernel = Arc::new(billing_kernel);
+
+        // The caller, another, sharing nothing with the first but the rate.
+        let orders_store = Arc::new(MemoryStore::new(10));
+        let orders = Lookout::new(tracing(1.0), orders_store.clone());
+        let orders_events = Arc::new(Dispatcher::new());
+        orders.subscribe(&orders_events);
+        let mut router = Router::new();
+        let transport: Arc<dyn rainier_http_client::Transport> =
+            Arc::new(InProcess(billing_kernel));
+        router
+            .get("/checkout", move || {
+                let transport = Arc::clone(&transport);
+                async move {
+                    let charged = rainier_http_client::Http::get("http://billing.test/boom")
+                        .through(transport)
+                        .send()
+                        .await
+                        .expect("sent");
+                    format!("charged: {}", charged.status())
+                }
+            })
+            .name("checkout");
+        let compiled = router.compile(&rainier_container::Container::new()).unwrap();
+        let orders_kernel = Kernel::with_middleware(compiled, vec![Arc::new(orders.middleware())])
+            .with_events(Arc::clone(&orders_events));
+
+        let response = orders_kernel.handle_request(called("/checkout", "00000000000000ff")).await;
+        assert_eq!(response.status().as_u16(), 200);
+        flushed(&billing, &billing_events).await;
+        flushed(&orders, &orders_events).await;
+
+        let callee = billing_store.all();
+        let caller = orders_store.all();
+        assert_eq!((caller.len(), callee.len()), (1, 1), "both parts kept: the same sample");
+        let (caller, callee) = (&caller[0], &callee[0]);
+        assert_eq!((caller.trace_id.as_str(), callee.trace_id.as_str()), (TRACE, TRACE));
+
+        // The link, recorded on each side by each Lookout on its own.
+        let call = caller.entries.iter().find(|e| e.entry_type == EntryType::HttpClient).unwrap();
+        let sent = call.content["rainier.trace.span_id"].as_str().expect("the span it sent");
+        let callee_root =
+            callee.entries.iter().find(|e| e.span_id.as_deref() == Some(&callee.id)).unwrap();
+        assert_eq!(callee_root.content["rainier.trace.parent_span_id"].as_str(), Some(sent));
+
+        // And what each serves for something else to put together.
+        assert_eq!(
+            crate::http::traces::shape(callee)["remote_parent_span_id"].as_str(),
+            Some(sent)
+        );
+        let shaped = crate::http::traces::shape(caller);
+        let span = shaped["spans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["type"] == "http_client")
+            .unwrap();
+        assert_eq!(span["call"]["span_id"].as_str(), Some(sent));
+    }
+
+    #[tokio::test]
+    async fn without_request_tracing_nothing_changes() {
+        let store = Arc::new(MemoryStore::new(10));
+        let lookout =
+            Lookout::new(LookoutConfig::default().enabled(true).local(false), store.clone());
+        let (kernel, events) = wired(&lookout);
+
+        kernel.handle_request(called("/posts/1", "000000000000000a")).await;
+        flushed(&lookout, &events).await;
+
+        assert!(store.all().is_empty(), "fine, so not kept");
+    }
+
     #[tokio::test]
     async fn every_request_is_counted_by_route_method_and_status_class_kept_or_not() {
         use crate::store::Store as _;
