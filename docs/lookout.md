@@ -1097,7 +1097,7 @@ shape.
 
 ### Service health
 
-Four read-only endpoints say how the service is doing, from rollups that
+Five read-only endpoints say how the service is doing, from rollups that
 count every request, job and accepted page report — kept or not — so they are
 right in production, where most batches are not kept. Each answers
 `{"data": {...}}` and takes the same window:
@@ -1117,6 +1117,7 @@ field at fault.
 | `window` | `{"since", "until", "period"}` |
 | `requests` | `count`, `per_minute`, `errors_5xx`, `client_errors_4xx`, `error_rate` (5xx / count, 0 to 1), `p50_us`, `p95_us`, `p99_us`, `apdex` (0 to 1; `null` with no requests), `apdex_t_ms` |
 | `jobs` | `count` (runs, not dispatches), `failed` |
+| `queues` | every queue added up — `queues`, `depth` (the backlog now), `runs`, `failures`, `per_minute`, `pushed`, `concurrency`, `capacity`, and `statuses` (how many in each); see [Queues](#queues) |
 | `exceptions` | `count` |
 | `cases` | `open`, `new_in_window` — each counted from at most 200 cases per status |
 | `status` | `idle` with no requests; `failing` at an error rate of 5% or more; `ok` under 1% with the p95 under four times the Apdex target; `degraded` otherwise |
@@ -1162,10 +1163,63 @@ for what is counted.
 frequent first. `last_seen` is to the second; `first_seen` to the bucket
 (the period), and never before `since`.
 
+**`GET /api/queues`** — every job queue; see [Queues](#queues).
+
 Request and job facets are rolled up on the writer, beside every request's
 and job's own aggregate; RUM rollups on the report's own request, in the
 write that stores its batches — nothing more happens on an application
 request's thread.
+
+### Queues
+
+`GET /api/queues` says, for every job queue the service runs or dispatches to,
+how deep it is, how many of its jobs are running against how many slots, how
+fast it drains, and how long its jobs wait and run.
+
+Two things feed it, both into one rollup (`queue_facet`):
+
+- **Every job run and dispatch**, kept or not — a run under its queue and
+  outcome with its run time and wait (from `available_at`, so a delayed job
+  does not count its delay), a dispatch under its queue.
+- **The workers' samples.** A `queue:work` worker with the application's
+  event bus samples every queue it serves on its depth interval (fifteen
+  seconds; `Worker::sample_depth_every`) and publishes a `queue.sample`
+  activity: the depth (`Queue::size`), how many of the queue's jobs that
+  worker is running, and how many it may run (the queue's own ceiling, else
+  the worker's concurrency). Lookout rolls each straight into its counts —
+  a sample belongs to no batch.
+
+Running jobs and slots are kept as **time** (jobs × the interval), so they
+add across replicas: over a window, the queue's slot-time held divided by the
+window is the average number running, however many replicas there were. Depth
+is the same backlog seen by every replica, so it is averaged.
+
+| Parameter | What |
+|---|---|
+| `queue` | only this queue |
+| `order` | `depth` (default: the backlog now, then attempts), `runs`, `wait` (p95), `failures`, `queue` |
+| `limit` | up to 200, 50 by default |
+| `series` | `1` for each queue's points |
+
+It answers `{"rows", "totals", "window"}`. A row:
+
+| Field | What |
+|---|---|
+| `queue` | its name |
+| `status` | `failing` when 5% or more of attempts fail, time out or cannot be settled — or when it is **stalled**: jobs waiting, workers sampling it, and nothing run; `degraded` at 1% or more, a p95 wait of a minute or more, or 90% of slots busy with jobs waiting; `idle` with nothing run and nothing waiting; `ok` otherwise |
+| `depth` | `current` (the newest minute's samples), `average`, `max`, `p95`, `sampled_at` — `null` when no worker sampled it |
+| `concurrency` | `average` jobs running, `capacity` (slots), `utilisation` (0 to 1), `workers` sampling it, `peak_per_worker` — `null` when no worker sampled it |
+| `throughput` | `runs` (attempts), `processed`, `released`, `failed`, `timed_out`, `errors`, `per_minute`, `processed_per_minute`, `pushed`, `pushed_per_minute` |
+| `failure_rate` | failed, timed out and unsettled attempts / attempts |
+| `run`, `wait` | `count`, `average_us`, `p50_us`, `p95_us`, `p99_us`, `max_us` — `null` with none |
+| `series` | `[{"at", "runs", "failed", "pushed", "depth", "concurrency"}]`, zero-filled, when asked |
+
+`totals` adds the rows up as `/api/health`'s `queues` does. A reader may call
+it, and [Longmire](longmire.md#the-fleet) merges every service's into one.
+
+A worker without the event bus — one built by hand without
+`Worker::with_events` — still has its runs counted, but its queues have no
+depth or concurrency. `queue:work` always wires the bus when one is bound.
 
 ### Over MCP
 

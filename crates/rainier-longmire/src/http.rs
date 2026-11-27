@@ -100,11 +100,12 @@ macro_rules! fleet_route {
     }};
 }
 
-/// `/health`, `/requests`, `/rum/vitals`, `/rum/errors`, `/cases`, `/map`
+/// `/health`, `/requests`, `/queues`, `/rum/vitals`, `/rum/errors`, `/cases`, `/map`
 /// across every source, and `/sources/{source}/{endpoint}` for one.
 fn fleet_routes(router: &mut Router, longmire: &Arc<Longmire>, gate: &Gate) {
     fleet_route!(router, longmire, gate, "/health", "longmire.health", health);
     fleet_route!(router, longmire, gate, "/requests", "longmire.requests", requests);
+    fleet_route!(router, longmire, gate, "/queues", "longmire.queues", queues);
     fleet_route!(router, longmire, gate, "/rum/vitals", "longmire.rum.vitals", rum_vitals);
     fleet_route!(router, longmire, gate, "/rum/errors", "longmire.rum.errors", rum_errors);
     fleet_route!(router, longmire, gate, "/cases", "longmire.cases", cases);

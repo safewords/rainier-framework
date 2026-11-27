@@ -174,6 +174,50 @@ impl Activity for JobRan {
     }
 }
 
+/// One worker's look at one queue, taken on its sampling interval: the
+/// `queue.sample` activity.
+///
+/// Published outside every unit of work, by the worker's sampler — never on a
+/// job's path, and never once per job. Every replica samples every queue it
+/// serves, so a reader adds the replicas' `busy` and `capacity` together and
+/// reads `depth` (the same backlog, seen by each) as one value. Each sample
+/// also says how long it stands for (`interval`), so a reader can turn the
+/// samples in a window into time: `busy × interval` summed over a minute is
+/// the slot-time the queue's jobs held that minute, whichever replica held it.
+#[derive(Debug, Clone)]
+pub struct QueueSampled {
+    /// The queue.
+    pub queue: String,
+    /// The driver, as [`Queue::name`](crate::Queue::name) says.
+    pub driver: String,
+    /// How many jobs are waiting on it ([`Queue::size`](crate::Queue::size)),
+    /// or `None` when the driver could not say.
+    pub depth: Option<u64>,
+    /// How many of its jobs this worker is running now.
+    pub busy: u64,
+    /// How many of its jobs this worker may run at once: the queue's own
+    /// ceiling, else the worker's concurrency.
+    pub capacity: u64,
+    /// How long this sample stands for — the sampling interval.
+    pub interval: Duration,
+}
+
+impl Activity for QueueSampled {
+    fn kind(&self) -> &'static str {
+        "queue.sample"
+    }
+
+    fn fields(&self, fields: &mut Fields) {
+        fields
+            .set("messaging.system", crate::telemetry::messaging_system(&self.driver).to_string())
+            .set("messaging.destination.name", self.queue.clone())
+            .maybe("rainier.queue.depth", self.depth)
+            .set("rainier.queue.busy", self.busy)
+            .set("rainier.queue.capacity", self.capacity)
+            .set("rainier.queue.interval_ms", millis(self.interval));
+    }
+}
+
 /// Whole milliseconds, as the span records them.
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)

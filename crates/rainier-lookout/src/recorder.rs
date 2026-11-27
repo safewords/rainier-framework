@@ -1362,6 +1362,20 @@ impl Inner {
         }
     }
 
+    /// Add `rows` to the counts the writer flushes next — for what is
+    /// measured outside every unit of work, such as a worker's queue samples.
+    pub(crate) fn count(&self, rows: Vec<crate::entry::Aggregate>) {
+        if rows.is_empty() || !self.active() {
+            return;
+        }
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        counts.extend(rows);
+        if counts.len() > COUNTS_COMBINE_AT {
+            let all = std::mem::take(&mut *counts);
+            *counts = crate::aggregate::combine(all);
+        }
+    }
+
     /// The counts added up since the last write, combined, and the clock reset.
     fn take_counts(&self) -> Vec<crate::entry::Aggregate> {
         *self.counts_written.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
@@ -3143,6 +3157,50 @@ mod tests {
         assert_eq!(created.content["batch"]["kind"], "request");
         assert_eq!(created.content["batch"]["summary"], batch.summary);
         assert_eq!(models(batch)[1].content["keys"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_workers_queue_sample_is_counted_outside_every_batch() {
+        let rig = rig(production());
+        {
+            let _bus = rainier_events::set_default(Arc::clone(&rig.events));
+            Did::new("queue.sample")
+                .with("messaging.destination.name", "mail")
+                .with("rainier.queue.depth", 12u64)
+                .with("rainier.queue.busy", 2u64)
+                .with("rainier.queue.capacity", 4u64)
+                .with("rainier.queue.interval_ms", 15_000u64)
+                .publish();
+        }
+        rig.flush().await;
+        assert!(rig.store.all().is_empty(), "a sample is no batch");
+        let rows = rig
+            .store
+            .aggregate_rows(EntryType::QueueFacet, 60, Utc::now() - chrono::Duration::minutes(2))
+            .await
+            .expect("rows");
+        let value = |key: &str| rows.iter().find(|r| r.key == key).map(|r| r.sum_us);
+        assert_eq!(value("depth mail"), Some(12));
+        assert_eq!(value("busy mail"), Some(30_000_000));
+        assert_eq!(value("capacity mail"), Some(60_000_000));
+        assert_eq!(value("workers mail"), Some(15_000_000));
+
+        // Paused, nothing is counted.
+        rig.lookout.pause();
+        {
+            let _bus = rainier_events::set_default(Arc::clone(&rig.events));
+            Did::new("queue.sample")
+                .with("messaging.destination.name", "mail")
+                .with("rainier.queue.interval_ms", 15_000u64)
+                .publish();
+        }
+        rig.flush().await;
+        let again = rig
+            .store
+            .aggregate_rows(EntryType::QueueFacet, 60, Utc::now() - chrono::Duration::minutes(2))
+            .await
+            .expect("rows");
+        assert_eq!(again.iter().find(|r| r.key == "workers mail").map(|r| r.count), Some(1));
     }
 
     #[tokio::test]

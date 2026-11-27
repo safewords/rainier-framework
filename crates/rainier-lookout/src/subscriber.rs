@@ -90,6 +90,27 @@ pub(crate) fn classify(kind: &str) -> Option<(EntryType, Option<BatchKind>)> {
     })
 }
 
+impl Inner {
+    /// A `queue.sample`, rolled into the queue's facet.
+    fn on_queue_sample(&self, activity: &dyn Activity, cx: &Context) {
+        let fields = activity.collect_fields();
+        let number = |name: &str| match fields.get(name) {
+            Some(FieldValue::U64(n)) => Some(*n),
+            Some(FieldValue::I64(n)) => u64::try_from(*n).ok(),
+            _ => None,
+        };
+        let Some(queue) = fields.text("messaging.destination.name") else { return };
+        let sample = crate::queues::Sample {
+            queue: queue.to_string(),
+            depth: number("rainier.queue.depth"),
+            busy: number("rainier.queue.busy").unwrap_or(0),
+            capacity: number("rainier.queue.capacity").unwrap_or(0),
+            interval_us: number("rainier.queue.interval_ms").unwrap_or(0).saturating_mul(1000),
+        };
+        self.count(crate::queues::sample_rows(&sample, DateTime::<Utc>::from(cx.at())));
+    }
+}
+
 /// An operation or unit id as an entry's span id: sixteen hex digits.
 pub(crate) fn span_id(id: u64) -> String {
     format!("{id:016x}")
@@ -116,6 +137,12 @@ fn micros(duration: Duration) -> u64 {
 impl Inner {
     /// One activity, on the subscriber's thread.
     pub(crate) fn on_activity(&self, activity: &dyn Activity, cx: &Context) {
+        // A worker's look at a queue belongs to no unit of work: straight
+        // into the counts (`queues`).
+        if activity.kind() == "queue.sample" {
+            self.on_queue_sample(activity, cx);
+            return;
+        }
         let Some(unit) = cx.unit() else { return };
         let kind = activity.kind();
         if kind == "log" {

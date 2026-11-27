@@ -47,7 +47,8 @@ a job class), named by a 16-hex-digit `family` id. A *case* is one \
 exception's fingerprint with its count, users and status. Start with \
 `lookout_health` for whether the service is healthy (status, error rate, \
 latency, Apdex, the failing routes), `lookout_requests` to slice every \
-request by route, method and status, `lookout_rum_vitals` and \
+request by route, method and status, `lookout_queues` for each job queue's \
+depth, concurrency, throughput and waits, `lookout_rum_vitals` and \
 `lookout_rum_errors` for what real visitors' browsers saw, \
 `lookout_status` to see what is recorded, `lookout_insights` for what \
 changed, `lookout_aggregates` for the slowest or busiest, and \
@@ -92,6 +93,7 @@ pub fn tool_names() -> Vec<&'static str> {
         "lookout_status",
         "lookout_health",
         "lookout_requests",
+        "lookout_queues",
         "lookout_rum_vitals",
         "lookout_rum_errors",
         "lookout_batches",
@@ -269,6 +271,32 @@ fn tools(state: &Arc<Shared>) -> Vec<Tool> {
                 },
             }),
             |state, call| async move { answer(health::requests_value(&state, &query(&call, &[])).await) },
+        ),
+        reader(
+            state,
+            "lookout_queues",
+            "Job queues",
+            "Every job queue over a window: depth now (the newest sample), average, p95 and max; \
+             concurrency — jobs running on average, the slots the workers offer, utilisation, \
+             workers sampling it, and the peak one worker ran; throughput — attempts by outcome \
+             (processed, released, failed, timed_out, errors), per minute, and jobs pushed; wait \
+             and run p50/p95/p99 (microseconds); a failure rate and a status (ok, degraded, \
+             failing — failing jobs or stalled with work waiting —, idle). Depth and concurrency \
+             come from the workers' samples (every 15 s by default) and are null when no worker \
+             with the event bus samples the queue.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "since": time_schema("Window start (default 1h ago)"),
+                    "until": time_schema("Window end (default now)"),
+                    "period": period_schema(),
+                    "queue": { "type": "string", "description": "Only this queue." },
+                    "order": { "type": "string", "enum": ["depth", "runs", "wait", "failures", "queue"] },
+                    "limit": limit_schema(200, 50),
+                    "series": { "type": "boolean", "description": "Each queue's points, bucket by bucket." },
+                },
+            }),
+            |state, call| async move { answer(health::queues_value(&state, &query(&call, &[])).await) },
         ),
         reader(
             state,

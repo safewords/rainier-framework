@@ -76,6 +76,10 @@ pub enum EntryType {
     /// host it went to and its status class — who this service calls, how
     /// often, how fast, how often it fails. See [`facets`](crate::facets).
     CallFacet,
+    /// Rolled up, never an entry: every queue's job runs by outcome, their
+    /// waits, its dispatches, and the workers' samples of its depth, running
+    /// jobs and slots. See [`queues`](crate::queues).
+    QueueFacet,
 }
 
 impl EntryType {
@@ -106,6 +110,7 @@ impl EntryType {
         EntryType::RumView,
         EntryType::RumError,
         EntryType::CallFacet,
+        EntryType::QueueFacet,
     ];
 
     /// The types that exist only as aggregate rows — no watcher records an
@@ -118,6 +123,7 @@ impl EntryType {
         EntryType::RumView,
         EntryType::RumError,
         EntryType::CallFacet,
+        EntryType::QueueFacet,
     ];
 
     /// Whether this type exists only as aggregate rows. See
@@ -154,6 +160,7 @@ impl EntryType {
             EntryType::RumView => "rum_view",
             EntryType::RumError => "rum_error",
             EntryType::CallFacet => "call_facet",
+            EntryType::QueueFacet => "queue_facet",
         }
     }
 

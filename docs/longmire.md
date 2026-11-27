@@ -104,6 +104,7 @@ kept or not, so the numbers are the real ones:
 |---|---|
 | `longmire.health(query)` | every source's `status` (`ok`, `degraded`, `failing`, `idle`, `unknown` with the `reason`) and its `health`, plus how many are in each status |
 | `longmire.requests(query)` | requests by route, method and status class across every source, busiest first, each row naming its `service`; each source's `totals` |
+| `longmire.queues(query)` | every job queue across every source — depth, concurrency against slots, throughput, waits, a status — deepest backlog first, each row naming its `service`; each source's `totals`, and the `fleet`'s added up (backlog, attempts, failures, running, slots, utilisation, statuses). See [Queues](lookout.md#queues) |
 | `longmire.rum_vitals(query)` / `rum_errors(query)` | real users' page metrics and script errors across every frontend |
 | `longmire.cases(query)` | exceptions across every source, most frequent first |
 | `longmire.map(query)` | who calls whom — below |
@@ -190,8 +191,8 @@ app_router.group(GroupAttributes::new().prefix("/ops/longmire"), |r| r.merge(rou
 ```
 
 `GET /traces` (`kept`, `before`, `limit`), `GET /traces/{trace}`, `GET
-/health`, `/requests`, `/rum/vitals`, `/rum/errors`, `/cases` and `/map`, each
-answering `{"data": …}`, and `GET /sources/{source}/{health|requests|rum/vitals|rum/errors|cases}`
+/health`, `/requests`, `/queues`, `/rum/vitals`, `/rum/errors`, `/cases` and `/map`, each
+answering `{"data": …}`, and `GET /sources/{source}/{health|requests|queues|rum/vitals|rum/errors|cases}`
 answering one source's own answer (a `502` with the reason when it has none);
 a malformed trace id is a `400`. An application with
 its own response envelope or access rules can call `trace` and `recent` from

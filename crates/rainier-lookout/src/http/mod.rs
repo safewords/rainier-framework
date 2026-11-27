@@ -23,6 +23,7 @@
 //! | `GET` | `/api/status` | `lookout.api.status` | Store, watchers, sample rates, retention |
 //! | `GET` | `/api/health` | `lookout.api.health` | One service's health over a window: requests, error rate, percentiles, Apdex, jobs, exceptions, cases, a status and the routes behind it |
 //! | `GET` | `/api/requests` | `lookout.api.requests` | Every request, grouped by any of route, method and status class, and filtered |
+//! | `GET` | `/api/queues` | `lookout.api.queues` | Every queue: depth, concurrency against slots, throughput by outcome, waits, run times and a status |
 //! | `GET` | `/api/rum/vitals` | `lookout.api.rum.vitals` | Real users' page views and their p75 vitals, grouped by one dimension |
 //! | `GET` | `/api/rum/errors` | `lookout.api.rum.errors` | Real users' script errors, by message, file and line |
 //! | `GET` | `/{rest*}` | `lookout.app` | The same shell, for the app's own client-side routes |
@@ -233,6 +234,7 @@ impl LookoutGate {
 pub const READER_ROUTES: &[&str] = &[
     "/api/health",
     "/api/requests",
+    "/api/queues",
     "/api/rum/vitals",
     "/api/rum/errors",
     "/api/aggregates/{type}",
@@ -342,6 +344,7 @@ pub fn routes(
         router.get("/api/status", readable(&state, api::status)).name("api.status");
         router.get("/api/health", readable(&state, health::health)).name("api.health");
         router.get("/api/requests", readable(&state, health::requests)).name("api.requests");
+        router.get("/api/queues", readable(&state, health::queues)).name("api.queues");
         router.get("/api/rum/vitals", readable(&state, health::rum_vitals)).name("api.rum.vitals");
         router.get("/api/rum/errors", readable(&state, health::rum_errors)).name("api.rum.errors");
         router.get("/api/stream", guarded(&state, stream::stream)).name("api.stream");

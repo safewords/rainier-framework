@@ -129,7 +129,7 @@ pub use connections::{
 };
 pub use database::{DatabaseQueue, FailedJobRow, JobRow};
 pub use driver::QueueDriver;
-pub use events::{JobQueued, JobRan};
+pub use events::{JobQueued, JobRan, QueueSampled};
 pub use job::{Job, JobContext, JobRegistry, QueuedJob};
 #[cfg(feature = "kafka")]
 pub use kafka::{require_shared as require_shared_locks, KafkaQueue};
