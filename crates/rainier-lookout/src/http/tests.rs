@@ -208,6 +208,7 @@ fn routes_are_named_under_lookout() {
             "lookout.api.insights",
             "lookout.api.model",
             "lookout.api.models",
+            "lookout.api.queues",
             "lookout.api.requests",
             "lookout.api.rum.errors",
             "lookout.api.rum.vitals",
@@ -909,6 +910,64 @@ async fn health_judges_every_request_counted() {
 }
 
 #[tokio::test]
+async fn queues_read_depth_concurrency_and_throughput() {
+    // The failed SendInvoice in `traffic` ran on `default`; two more on
+    // `mail`, and a worker's sample of `mail`.
+    let store = traffic();
+    let mut extra = Vec::new();
+    for (i, outcome) in ["processed", "processed"].iter().enumerate() {
+        let mut job =
+            entry(&format!("m{i}"), "m", EntryType::Job, "SendMail", Utc::now(), 0, Some(20));
+        job.content = serde_json::json!({
+            "messaging.destination.name": "mail",
+            "rainier.job.outcome": outcome,
+            "messaging.queue.wait_ms": 300,
+        });
+        extra.push(job);
+    }
+    let mut rows = crate::aggregate::rollup_entries(&extra);
+    rows.extend(crate::queues::sample_rows(
+        &crate::queues::Sample {
+            queue: "mail".into(),
+            depth: Some(7),
+            busy: 1,
+            capacity: 4,
+            interval_us: 15_000_000,
+        },
+        Utc::now(),
+    ));
+    store.aggregates.lock().unwrap().extend(rows);
+    let router = app(store);
+
+    let body = get(&router, "/_lookout/api/queues?series=1").await;
+    assert_eq!(body.status, StatusCode::OK, "{}", body.text);
+    let data = &body.json()["data"];
+    let rows = data["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{data}");
+    assert_eq!(rows[0]["queue"], "mail", "deepest first");
+    assert_eq!(rows[0]["depth"]["current"], 7);
+    assert_eq!(rows[0]["throughput"]["processed"], 2);
+    assert_eq!(rows[0]["wait"]["max_us"], 300_000);
+    assert_eq!(rows[0]["concurrency"]["utilisation"], 0.25);
+    assert_eq!(rows[0]["status"], "ok");
+    assert!(rows[0]["series"].as_array().unwrap().len() >= 60);
+    assert_eq!(rows[1]["queue"], "default");
+    assert_eq!(rows[1]["depth"], Value::Null, "no worker sampled it");
+    assert_eq!(rows[1]["throughput"]["failed"], 1);
+    assert_eq!(rows[1]["status"], "failing");
+    assert_eq!(data["totals"]["queues"], 2);
+
+    let one = get(&router, "/_lookout/api/queues?queue=default").await.json();
+    assert_eq!(one["data"]["rows"].as_array().unwrap().len(), 1);
+    let health = get(&router, "/_lookout/api/health").await.json();
+    assert_eq!(health["data"]["queues"]["depth"], 7, "{health}");
+    assert_eq!(
+        get(&router, "/_lookout/api/queues?order=planet").await.status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+#[tokio::test]
 async fn requests_group_filter_and_order() {
     let router = app(traffic());
     let body = get(&router, "/_lookout/api/requests").await.json();
@@ -1056,6 +1115,7 @@ fn readers() -> LookoutGate {
 const READER_GETS: &[&str] = &[
     "/_lookout/api/health",
     "/_lookout/api/requests?group=route,status",
+    "/_lookout/api/queues",
     "/_lookout/api/rum/vitals",
     "/_lookout/api/rum/errors",
     "/_lookout/api/aggregates/request",

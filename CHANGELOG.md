@@ -12,6 +12,19 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Queue inspection in Lookout** (`rainier-queue`, `rainier-lookout`,
+  `rainier-longmire`): `GET /api/queues` — each job queue's depth now and
+  over the window, jobs running against the workers' slots (concurrency and
+  utilisation, added across replicas), attempts by outcome and per minute,
+  jobs pushed, wait and run percentiles, and a status that calls a queue with
+  work waiting and nothing running stalled. A reader may call it; `/api/health`
+  carries the totals; MCP has `lookout_queues`; Longmire's `queues` (and
+  `GET /queues`) merges every service's. Fed by a new `queue_facet` rollup of
+  every run and dispatch, and by `QueueSampled` (`queue.sample`), which a
+  worker with the event bus now publishes for each queue on its depth
+  interval — sampling no longer needs the `telemetry` feature or an observer.
+  See `docs/lookout.md`, "Queues".
+
 - **Request tagging** (`rainier-request-tagging`, new; `rainier-http-client`,
   `rainier-framework`): tag a request and follow it across services, on its
   own — no OpenTelemetry. `REQUEST_TAGGING_ENABLED` puts `Trace` outermost,

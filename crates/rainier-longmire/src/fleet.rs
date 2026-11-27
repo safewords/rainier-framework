@@ -1,4 +1,4 @@
-//! The fleet: every source's health, requests, real-user timings and
+//! The fleet: every source's health, requests, queues, real-user timings and
 //! exceptions in one answer, and the map of who calls whom.
 //!
 //! Each answer is assembled from what the sources' Lookouts already serve to
@@ -25,6 +25,9 @@ pub enum Endpoint {
     RumErrors,
     /// `/api/cases`: exceptions, by fingerprint.
     Cases,
+    /// `/api/queues`: each job queue's depth, concurrency, throughput and
+    /// waits.
+    Queues,
 }
 
 const WINDOW: [&str; 3] = ["since", "until", "period"];
@@ -34,12 +37,13 @@ const MAX_VALUE: usize = 200;
 
 impl Endpoint {
     /// Every endpoint.
-    pub const ALL: [Endpoint; 5] = [
+    pub const ALL: [Endpoint; 6] = [
         Endpoint::Health,
         Endpoint::Requests,
         Endpoint::RumVitals,
         Endpoint::RumErrors,
         Endpoint::Cases,
+        Endpoint::Queues,
     ];
 
     /// Its path under `{lookout}/api/`.
@@ -50,6 +54,7 @@ impl Endpoint {
             Self::RumVitals => "rum/vitals",
             Self::RumErrors => "rum/errors",
             Self::Cases => "cases",
+            Self::Queues => "queues",
         }
     }
 
@@ -74,6 +79,7 @@ impl Endpoint {
                 params.extend(RUM_FILTERS);
             }
             Self::Cases => return vec!["status", "severity", "q", "limit"],
+            Self::Queues => params.extend(["queue", "order", "limit", "series"]),
         }
         params
     }
@@ -218,6 +224,60 @@ impl Longmire {
         self.merged(Endpoint::Cases, raw_query, "", "occurrences", "").await
     }
 
+    /// Every job queue across every source: each source's rows, each naming
+    /// its service, deepest backlog first (then busiest); each source's own
+    /// totals; and the fleet's — the backlog, attempts, failures and jobs
+    /// running against slots added up, and how many queues are in each
+    /// status.
+    ///
+    /// A queue's depth and concurrency come from its workers' samples, so a
+    /// source whose workers do not sample has its queues with throughput and
+    /// waits only (`depth` and `concurrency` null).
+    pub async fn queues(&self, raw_query: &str) -> Value {
+        let parts =
+            self.ask_all(Endpoint::Queues.path(), &Endpoint::Queues.filter(raw_query)).await;
+        let limit = raw_query
+            .split('&')
+            .find_map(|p| p.strip_prefix("limit=")?.parse::<usize>().ok())
+            .unwrap_or(200)
+            .clamp(1, 500);
+        let mut rows: Vec<Value> = Vec::new();
+        let mut totals = Map::new();
+        let mut fleet = QueueTotals::default();
+        for (source, outcome) in &parts {
+            let Ok(body) = outcome else { continue };
+            if let Some(t) = data(body).get("totals") {
+                totals.insert(source.id.clone(), t.clone());
+                fleet.add(t);
+            }
+            for row in data(body).get("rows").and_then(Value::as_array).into_iter().flatten() {
+                let mut row = row.clone();
+                if let Some(object) = row.as_object_mut() {
+                    object.insert("service".into(), json!(source.id));
+                    object.insert("service_name".into(), json!(source.name));
+                }
+                rows.push(row);
+            }
+        }
+        let measure = |row: &Value, at: &str| row.pointer(at).and_then(Value::as_f64);
+        rows.sort_by(|a, b| {
+            let key = |row: &Value| {
+                (
+                    measure(row, "/depth/current").unwrap_or(-1.0),
+                    measure(row, "/throughput/runs").unwrap_or(0.0),
+                )
+            };
+            key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows.truncate(limit);
+        json!({
+            "services": parts.iter().map(|(s, o)| source_row(s, o)).collect::<Vec<_>>(),
+            "rows": rows,
+            "totals": totals,
+            "fleet": fleet.json(),
+        })
+    }
+
     async fn merged(
         &self,
         endpoint: Endpoint,
@@ -359,6 +419,56 @@ impl Longmire {
     }
 }
 
+/// Every source's queue totals added up.
+#[derive(Debug, Default)]
+struct QueueTotals {
+    queues: u64,
+    depth: u64,
+    runs: u64,
+    failures: u64,
+    pushed: u64,
+    per_minute: f64,
+    concurrency: f64,
+    capacity: f64,
+    statuses: BTreeMap<String, u64>,
+}
+
+impl QueueTotals {
+    fn add(&mut self, totals: &Value) {
+        let n = |key: &str| totals.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let f = |key: &str| totals.get(key).and_then(Value::as_f64).unwrap_or(0.0);
+        self.queues += n("queues");
+        self.depth += n("depth");
+        self.runs += n("runs");
+        self.failures += n("failures");
+        self.pushed += n("pushed");
+        self.per_minute += f("per_minute");
+        self.concurrency += f("concurrency");
+        self.capacity += f("capacity");
+        for (status, count) in
+            totals.get("statuses").and_then(Value::as_object).into_iter().flatten()
+        {
+            *self.statuses.entry(status.clone()).or_default() += count.as_u64().unwrap_or(0);
+        }
+    }
+
+    fn json(&self) -> Value {
+        let two = |x: f64| (x * 100.0).round() / 100.0;
+        json!({
+            "queues": self.queues,
+            "depth": self.depth,
+            "runs": self.runs,
+            "failures": self.failures,
+            "pushed": self.pushed,
+            "per_minute": two(self.per_minute),
+            "concurrency": two(self.concurrency),
+            "capacity": two(self.capacity),
+            "utilisation": if self.capacity > 0.0 { Some((self.concurrency / self.capacity * 10_000.0).round() / 10_000.0) } else { None },
+            "statuses": self.statuses,
+        })
+    }
+}
+
 /// The aggregates endpoint takes exact times: `since=1h` (or `15m`, `7d`, as
 /// the health endpoint takes them) becomes an RFC 3339 time before `now`; an
 /// RFC 3339 `since` or `until` is passed on. Every host, busiest first.
@@ -450,6 +560,11 @@ mod tests {
         assert_eq!(Endpoint::Cases.filter("status=open&since=1h&limit=5"), "status=open&limit=5");
         assert_eq!(Endpoint::parse("rum/vitals"), Some(Endpoint::RumVitals));
         assert_eq!(Endpoint::parse("batches"), None);
+        assert_eq!(Endpoint::parse("queues"), Some(Endpoint::Queues));
+        assert_eq!(
+            Endpoint::Queues.filter("since=1h&queue=mail&apdex_t_ms=9&series=1"),
+            "since=1h&queue=mail&series=1"
+        );
         let long = "x".repeat(201);
         assert_eq!(Endpoint::Requests.filter(&format!("q={long}")), "");
     }

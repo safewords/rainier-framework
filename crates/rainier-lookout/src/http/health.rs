@@ -1,6 +1,6 @@
-//! The service-health API: `/api/health`, `/api/requests`, `/api/rum/vitals`
-//! and `/api/rum/errors` — one service's health, its requests grouped and
-//! filtered, and what its real users saw. Every answer is read from the
+//! The service-health API: `/api/health`, `/api/requests`, `/api/queues`,
+//! `/api/rum/vitals` and `/api/rum/errors` — one service's health, its
+//! requests grouped and filtered, its queues, and what its real users saw. Every answer is read from the
 //! rollups ([`facets`](crate::facets), [`rum_rollup`](crate::rum_rollup)),
 //! which count every request and every accepted page report, kept or not.
 
@@ -46,12 +46,21 @@ pub(crate) async fn health_value(state: &Shared, query: &Value) -> Result<Value>
     let (since, until, period) = (window.since, window.until, window.period_s);
 
     let store = &state.store;
-    let (requests, jobs, exceptions) = futures_util::future::try_join3(
+    let (requests, jobs, exceptions, queue_rows) = futures_util::future::try_join4(
         store.aggregate_rows(EntryType::RequestFacet, period, since),
         store.aggregate_rows(EntryType::JobFacet, period, since),
         store.aggregate_rows(EntryType::Exception, period, since),
+        store.aggregate_rows(EntryType::QueueFacet, period, since),
     )
     .await?;
+    let (_, queues) = crate::queues::summarize(
+        &queue_rows,
+        period,
+        since,
+        until,
+        window.minutes(),
+        &crate::queues::QueueQuery { limit: 1, ..Default::default() },
+    );
 
     let selected = facets::select(&requests, period, since, until, &RequestFilter::default());
     let by_route = |order| {
@@ -109,6 +118,7 @@ pub(crate) async fn health_value(state: &Shared, query: &Value) -> Result<Value>
             "apdex_t_ms": apdex_t_ms,
         },
         "jobs": { "count": job_runs, "failed": job_failures },
+        "queues": queues,
         "exceptions": { "count": exception_count },
         "cases": { "open": open, "new_in_window": new_in_window },
         "status": facets::status(&totals, apdex_t_ms),
@@ -169,6 +179,43 @@ pub(crate) async fn requests_value(state: &Shared, query: &Value) -> Result<Valu
             json!(facets::series(&selected, window.period_s, window.since, window.until));
     }
     Ok(json!({ "data": data }))
+}
+
+/// The most rows `/api/queues` returns.
+const MAX_QUEUE_ROWS: usize = 200;
+
+/// `GET /api/queues`.
+pub(crate) async fn queues(state: Arc<Shared>, request: Req) -> Result<Response> {
+    Ok(Response::json(&queues_value(&state, request.query()).await?))
+}
+
+/// Every queue over the window: its depth, concurrency, throughput, waits and
+/// run times, and a status. See `docs/lookout.md`, "Queues".
+pub(crate) async fn queues_value(state: &Shared, query: &Value) -> Result<Value> {
+    let mut params = Params::new(query);
+    let window = params::window(&mut params, Utc::now());
+    let queue = params.text("queue");
+    let order =
+        params::one_of(&mut params, "order", &["depth", "runs", "wait", "failures", "queue"]);
+    let limit = params.limit(MAX_QUEUE_ROWS, 50);
+    let series = params.boolean("series").unwrap_or(false);
+    params.finish()?;
+
+    let rows =
+        state.store.aggregate_rows(EntryType::QueueFacet, window.period_s, window.since).await?;
+    let (rows, totals) = crate::queues::summarize(
+        &rows,
+        window.period_s,
+        window.since,
+        window.until,
+        window.minutes(),
+        &crate::queues::QueueQuery { queue, order, limit, series },
+    );
+    Ok(json!({ "data": {
+        "window": window.json(),
+        "rows": rows,
+        "totals": totals,
+    }}))
 }
 
 /// The RUM filters, shared by vitals and errors.

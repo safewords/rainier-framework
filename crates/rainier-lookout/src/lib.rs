@@ -36,6 +36,7 @@ pub mod http;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod middleware;
+pub mod queues;
 pub mod recorder;
 pub mod redact;
 pub mod rum;

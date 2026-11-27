@@ -197,12 +197,36 @@ pub enum Outcome {
 ///
 /// Removed at zero rather than left, so the map holds only what is running and
 /// a long run does not accumulate an entry per queue it has ever touched.
-fn finished(running: &mut BTreeMap<String, usize>, queue: &str) {
-    if let Some(count) = running.get_mut(queue) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            running.remove(queue);
+/// How many of each queue's jobs a run has in flight: the run loop's, shared
+/// with the sampler that reports it.
+#[derive(Debug, Clone, Default)]
+struct Running(Arc<std::sync::Mutex<BTreeMap<String, usize>>>);
+
+impl Running {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, usize>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn started(&self, queue: &str) {
+        *self.lock().entry(queue.to_string()).or_insert(0) += 1;
+    }
+
+    fn finished(&self, queue: &str) {
+        let mut running = self.lock();
+        if let Some(count) = running.get_mut(queue) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                running.remove(queue);
+            }
         }
+    }
+
+    fn get(&self, queue: &str) -> u64 {
+        self.lock().get(queue).copied().unwrap_or(0) as u64
+    }
+
+    fn snapshot(&self) -> BTreeMap<String, usize> {
+        self.lock().clone()
     }
 }
 
@@ -301,10 +325,8 @@ fn duration_ms(duration: Duration) -> u64 {
 
 /// Aborts a background task when dropped — the depth sampler, which must not
 /// outlive the run that started it.
-#[cfg(feature = "telemetry")]
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
-#[cfg(feature = "telemetry")]
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
@@ -686,8 +708,8 @@ pub struct Worker {
     /// [`with_observer`](Self::with_observer).
     #[cfg(feature = "telemetry")]
     observer: Option<Arc<dyn crate::telemetry::QueueObserver>>,
-    /// How often the depth of each queue is sampled, while an observer is set.
-    #[cfg(feature = "telemetry")]
+    /// How often each queue is sampled — its depth, and this worker's jobs
+    /// on it — while an observer or an event bus is set.
     depth_interval: Option<Duration>,
 }
 
@@ -721,7 +743,6 @@ impl Worker {
             k8s_runner: None,
             #[cfg(feature = "telemetry")]
             observer: None,
-            #[cfg(feature = "telemetry")]
             depth_interval: Some(Duration::from_secs(15)),
         }
     }
@@ -737,8 +758,8 @@ impl Worker {
         self
     }
 
-    /// How often to sample each queue's depth while an observer is set —
-    /// fifteen seconds by default, `None` to not sample at all.
+    /// How often to sample each queue while an observer or an event bus is
+    /// set — fifteen seconds by default, `None` to not sample at all.
     ///
     /// A sample is one [`Queue::size`] call per queue,
     /// on its own task and its own clock: never on a job's path, and never
@@ -746,7 +767,12 @@ impl Worker {
     /// `replicas × queues` times per interval — cheap for Redis (`XLEN` +
     /// `ZCARD`) and SQS (one attribute read), a `COUNT` for the database
     /// driver, and an offset lookup per partition for Kafka.
-    #[cfg(feature = "telemetry")]
+    ///
+    /// Each sample goes to the observer's [`depth`](crate::QueueObserver::depth)
+    /// and, with [`with_events`](Self::with_events), onto the bus as a
+    /// [`QueueSampled`](crate::QueueSampled) — the depth with this worker's
+    /// running jobs and its slots for the queue, which is what Lookout's
+    /// queue view reads.
     pub fn sample_depth_every(mut self, interval: Option<Duration>) -> Self {
         self.depth_interval = interval.filter(|interval| !interval.is_zero());
         self
@@ -918,15 +944,33 @@ impl Worker {
         self.queue.reserve(queue).await
     }
 
-    /// Sample each queue's depth on its own interval, until dropped.
-    #[cfg(feature = "telemetry")]
-    fn sample_depth(&self) -> Option<AbortOnDrop> {
-        let observer = Arc::clone(self.observer.as_ref()?);
+    /// Sample each queue on its own interval, until dropped: its depth to
+    /// the observer, and the depth with this worker's running jobs and slots
+    /// onto the bus. `None` when nobody would hear a sample.
+    fn sample_depth(&self, running: Running) -> Option<AbortOnDrop> {
+        #[cfg(feature = "telemetry")]
+        let observer = self.observer.clone();
+        #[cfg(feature = "telemetry")]
+        let observed = observer.is_some();
+        #[cfg(not(feature = "telemetry"))]
+        let observed = false;
+        let events = self.events.clone();
+        if !observed && events.is_none() {
+            return None;
+        }
         let interval = self.depth_interval?;
         let queue = Arc::clone(&self.queue);
         let queues = self.options.queues.clone();
         let reporter = self.reporter.clone();
         let connection = self.connection().to_string();
+        let concurrency = self.options.concurrency.max(1);
+        let capacity: BTreeMap<String, u64> = queues
+            .iter()
+            .map(|name| {
+                let limit = self.options.queue_limits.get(name).copied().unwrap_or(concurrency);
+                (name.clone(), limit.min(concurrency) as u64)
+            })
+            .collect();
 
         Some(AbortOnDrop(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -936,8 +980,14 @@ impl Worker {
             loop {
                 ticker.tick().await;
                 for name in &queues {
-                    match queue.size(name).await {
-                        Ok(depth) => observer.depth(name, depth),
+                    let depth = match queue.size(name).await {
+                        Ok(depth) => {
+                            #[cfg(feature = "telemetry")]
+                            if let Some(observer) = &observer {
+                                observer.depth(name, depth);
+                            }
+                            Some(depth)
+                        }
                         // Debug, not warn: a driver that cannot answer
                         // cheaply answers the same way every interval.
                         Err(error) => {
@@ -954,7 +1004,19 @@ impl Worker {
                                 None,
                             );
                             crate::reporting::report_to(reporter.as_ref(), failure).await;
+                            None
                         }
+                    };
+                    if let Some(events) = &events {
+                        let busy = running.get(name);
+                        events.publish_activity_with(|| crate::events::QueueSampled {
+                            queue: name.clone(),
+                            driver: queue.name().to_string(),
+                            depth,
+                            busy,
+                            capacity: capacity.get(name).copied().unwrap_or(1),
+                            interval,
+                        });
                     }
                 }
             }
@@ -992,19 +1054,19 @@ impl Worker {
         let mut consecutive_errors: u32 = 0;
         let mut consecutive_idles: u32 = 0;
 
-        // Off the job path entirely: its own task, its own clock, stopped when
-        // this run ends.
-        #[cfg(feature = "telemetry")]
-        let _sampler = self.sample_depth();
-
-        let concurrency = self.options.concurrency.max(1);
-        let mut in_flight = FuturesUnordered::new();
-
         // How many of each queue's jobs are running, so a per-queue limit can
         // be checked before reserving. Kept beside the futures rather than in
         // the worker, because it is the run's state and two concurrent runs of
-        // the same worker would otherwise share a count neither owns.
-        let mut running: BTreeMap<String, usize> = BTreeMap::new();
+        // the same worker would otherwise share a count neither owns. The
+        // sampler reads it too.
+        let running = Running::default();
+
+        // Off the job path entirely: its own task, its own clock, stopped when
+        // this run ends.
+        let _sampler = self.sample_depth(running.clone());
+
+        let concurrency = self.options.concurrency.max(1);
+        let mut in_flight = FuturesUnordered::new();
 
         loop {
             // Whether the run is finishing. Separated from "break now",
@@ -1037,12 +1099,12 @@ impl Worker {
             // Fill the free slots before waiting on any of them, so a worker
             // with room does not sit on an idle socket while jobs queue up.
             if !finishing && in_flight.len() < concurrency {
-                match self.reserve_within(&running).await {
+                match self.reserve_within(&running.snapshot()).await {
                     Ok(Some((job, reservation))) => {
                         consecutive_errors = 0;
                         consecutive_idles = 0;
                         let queue = job.queue.clone();
-                        *running.entry(queue.clone()).or_insert(0) += 1;
+                        running.started(&queue);
                         in_flight.push(async move {
                             let outcome = self.process(job, reservation).await;
                             (queue, outcome)
@@ -1107,7 +1169,7 @@ impl Worker {
                             tokio::select! {
                                 _ = tokio::time::sleep(backoff) => {}
                                 Some((queue, outcome)) = in_flight.next() => {
-                                    finished(&mut running, &queue);
+                                    running.finished(&queue);
                                     tally(&mut stats, outcome);
                                 }
                             }
@@ -1120,7 +1182,7 @@ impl Worker {
             // Either the slots are full, or the run is finishing with work
             // still out. Both mean: wait for one to land.
             if let Some((queue, outcome)) = in_flight.next().await {
-                finished(&mut running, &queue);
+                running.finished(&queue);
                 tally(&mut stats, outcome);
             }
 
@@ -3646,7 +3708,7 @@ mod telemetry_tests {
         // the sampler's own task.
         let worker = worker(Arc::clone(&queue), Arc::clone(&observer))
             .sample_depth_every(Some(Duration::from_secs(3600)));
-        let sampler = worker.sample_depth().expect("an observer, so a sampler");
+        let sampler = worker.sample_depth(Running::default()).expect("an observer, so a sampler");
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(*observer.depths.lock().unwrap(), [("default".to_string(), 5)]);
         drop(sampler);
@@ -3665,7 +3727,63 @@ mod telemetry_tests {
         let worker = Worker::new(queue, Arc::new(registry), Arc::new(Container::new()))
             .with_options(WorkerOptions::default().stop_when_empty());
 
-        assert!(worker.sample_depth().is_none());
+        assert!(worker.sample_depth(Running::default()).is_none());
         assert_eq!(worker.run_next().await.unwrap(), Outcome::Processed);
+    }
+
+    #[tokio::test]
+    async fn with_a_bus_each_queue_is_sampled_with_this_workers_jobs_and_slots() {
+        let queue = Arc::new(MemoryQueue::new());
+        for _ in 0..3 {
+            queue.push(charge("4242")).await.unwrap();
+        }
+        let events = Arc::new(Dispatcher::new());
+        // (queue, depth, busy, capacity, interval in ms)
+        type Seen = (String, Option<u64>, u64, u64, u64);
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+        let into = Arc::clone(&seen);
+        events.on_activity("test", move |activity, _| {
+            if activity.kind() == "queue.sample" {
+                let f = activity.collect_fields();
+                let n = |name: &str| match f.get(name) {
+                    Some(rainier_events::Value::U64(n)) => Some(*n),
+                    _ => None,
+                };
+                into.lock().unwrap().push((
+                    f.text("messaging.destination.name").unwrap_or_default().to_string(),
+                    n("rainier.queue.depth"),
+                    n("rainier.queue.busy").unwrap(),
+                    n("rainier.queue.capacity").unwrap(),
+                    n("rainier.queue.interval_ms").unwrap(),
+                ));
+            }
+            Ok(())
+        });
+        let registry = JobRegistry::new().with::<Charge>();
+        let worker = Worker::new(queue, Arc::new(registry), Arc::new(Container::new()))
+            .with_events(Arc::clone(&events))
+            .with_options(
+                WorkerOptions::default()
+                    .queues(["default", "mail"])
+                    .concurrency(4)
+                    .queue_limit("mail", 2),
+            )
+            .sample_depth_every(Some(Duration::from_secs(3600)));
+
+        let running = Running::default();
+        running.started("default");
+        let sampler = worker.sample_depth(running).expect("a bus, so a sampler");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        events.settled().await;
+        drop(sampler);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            [
+                ("default".to_string(), Some(3), 1, 4, 3_600_000),
+                ("mail".to_string(), Some(0), 0, 2, 3_600_000),
+            ]
+        );
     }
 }

@@ -170,25 +170,22 @@ pub fn rollup(batches: &[Batch]) -> Vec<Aggregate> {
 /// [`RequestFacet`](EntryType::RequestFacet) — route, method and status
 /// class — and a job run's under its [`JobFacet`](EntryType::JobFacet), so
 /// the health API can group and filter every request and job, kept or not.
-/// See [`facets`](crate::facets).
+/// See [`facets`](crate::facets). A job's run and dispatch also count under
+/// their queue's [`QueueFacet`](EntryType::QueueFacet) — see
+/// [`queues`](crate::queues).
 pub fn rollup_entries<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> Vec<Aggregate> {
     let mut acc: BTreeMap<BucketKey, Totals> = BTreeMap::new();
-    let mut add = |entry: &Entry, entry_type: EntryType, key: &str| {
-        let duration = entry.duration_us.unwrap_or(0);
+    let mut add = |at: DateTime<Utc>, entry_type: EntryType, key: &str, value: Option<u64>| {
+        let duration = value.unwrap_or(0);
         for &period in PERIODS {
             let slot = acc
-                .entry((
-                    bucket_start(entry.occurred_at, period),
-                    period,
-                    entry_type,
-                    key.to_string(),
-                ))
+                .entry((bucket_start(at, period), period, entry_type, key.to_string()))
                 .or_insert_with(|| (0, 0, 0, Histogram::new()));
             slot.0 += 1;
             slot.1 = slot.1.saturating_add(duration);
             slot.2 = slot.2.max(duration);
             // An exception without a duration is counted, not timed.
-            if let Some(us) = entry.duration_us {
+            if let Some(us) = value {
                 *slot.3.entry(self::slot(us)).or_insert(0) += 1;
             }
         }
@@ -200,9 +197,12 @@ pub fn rollup_entries<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> Vec<A
         if entry.duration_us.is_none() && !counted_untimed(entry.entry_type) {
             continue;
         }
-        add(entry, entry.entry_type, entry.family_key());
+        add(entry.occurred_at, entry.entry_type, entry.family_key(), entry.duration_us);
         if let Some((facet, key)) = crate::facets::facet_of(entry) {
-            add(entry, facet, &key);
+            add(entry.occurred_at, facet, &key, entry.duration_us);
+        }
+        for (key, value) in crate::queues::facets_of(entry) {
+            add(entry.occurred_at, EntryType::QueueFacet, &key, Some(value));
         }
     }
     acc.into_iter()

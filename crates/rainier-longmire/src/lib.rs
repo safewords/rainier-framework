@@ -537,6 +537,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queues_from_every_source_sort_together_and_add_up() {
+        let mut answers = BTreeMap::new();
+        answers.insert(
+            "http://orders.test/_lookout/api/queues?since=1h".to_string(),
+            (
+                200,
+                json!({ "data": {
+                "rows": [
+                    { "queue": "default", "depth": { "current": 3 }, "throughput": { "runs": 50 } },
+                    { "queue": "slow", "depth": null, "throughput": { "runs": 900 } }
+                ],
+                "totals": { "queues": 2, "depth": 3, "runs": 950, "failures": 1, "pushed": 940,
+                            "per_minute": 15.83, "concurrency": 1.5, "capacity": 4.0,
+                            "statuses": { "ok": 2 } } } }),
+            ),
+        );
+        answers.insert(
+            "http://billing.test/_lookout/api/queues?since=1h".to_string(),
+            (200, json!({ "data": {
+                "rows": [{ "queue": "charges", "depth": { "current": 40 }, "throughput": { "runs": 0 } }],
+                "totals": { "queues": 1, "depth": 40, "runs": 0, "failures": 0, "pushed": 0,
+                            "per_minute": 0.0, "concurrency": 0.0, "capacity": 4.0,
+                            "statuses": { "failing": 1 } } } })),
+        );
+        let transport = Arc::new(Lookouts { answers, ..Lookouts::default() });
+        let longmire = Longmire::new([
+            Source::new("orders", "http://orders.test"),
+            Source::new("billing", "http://billing.test").name("Billing"),
+            Source::new("mail", "http://mail.test"),
+        ])
+        .through(Arc::clone(&transport) as Arc<dyn Transport>);
+
+        let queues = longmire.queues("since=1h&q=dropped").await;
+
+        let order: Vec<(&str, &str)> = queues["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["service"].as_str().unwrap(), r["queue"].as_str().unwrap()))
+            .collect();
+        assert_eq!(order, [("billing", "charges"), ("orders", "default"), ("orders", "slow")]);
+        assert_eq!(queues["rows"][0]["service_name"], "Billing");
+        assert_eq!(queues["fleet"]["depth"], 43);
+        assert_eq!(queues["fleet"]["queues"], 3);
+        assert_eq!(queues["fleet"]["capacity"], 8.0);
+        assert_eq!(queues["fleet"]["utilisation"], 0.1875);
+        assert_eq!(queues["fleet"]["statuses"]["failing"], 1);
+        assert_eq!(queues["services"][2]["status"], "unknown", "mail did not answer");
+        assert_eq!(queues["totals"]["orders"]["runs"], 950);
+    }
+
+    #[tokio::test]
     async fn a_malformed_id_asks_nobody() {
         let transport = lookouts();
         assert!(longmire(&transport).trace("a/b").await.is_err());
