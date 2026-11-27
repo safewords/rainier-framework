@@ -372,8 +372,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((request.url.clone(), request.header("authorization").map(str::to_string)));
-            let (status, body) =
-                self.answers.get(&request.url).cloned().unwrap_or((404, json!({})));
+            // Exactly, else by path: a query computed from the clock.
+            let path = request.url.split('?').next().unwrap_or_default().to_string();
+            let (status, body) = self
+                .answers
+                .get(&request.url)
+                .or_else(|| self.answers.get(&path))
+                .cloned()
+                .unwrap_or((404, json!({})));
             Box::pin(async move {
                 Ok(RawResponse {
                     status,
@@ -481,7 +487,7 @@ mod tests {
             (200, health("failing")),
         );
         answers.insert(
-            "http://orders.test/_lookout/api/aggregates/call_facet?since=1h".to_string(),
+            "http://orders.test/_lookout/api/aggregates/call_facet".to_string(),
             (200, json!({ "data": [
                 { "key": "2xx billing.internal", "count": 90, "average_us": 1000, "p95_us": 3000 },
                 { "key": "5xx billing.internal", "count": 10, "average_us": 2000, "p95_us": 9000 },
@@ -489,7 +495,7 @@ mod tests {
             ]})),
         );
         answers.insert(
-            "http://billing.test/_lookout/api/aggregates/call_facet?since=1h".to_string(),
+            "http://billing.test/_lookout/api/aggregates/call_facet".to_string(),
             (200, json!({ "data": [{ "key": "2xx api.payments.example", "count": 30, "average_us": 80000, "p95_us": 200000 }] })),
         );
         let transport = Arc::new(Lookouts { answers, ..Lookouts::default() });
