@@ -1,0 +1,28 @@
+[package]
+name = "rainier-longmire"
+description = "Longmire: one view across many Lookouts — pulls each service's part of a request trace and links them into one."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rainier-support = { workspace = true }
+# Each Lookout is read over HTTP, through the framework's client.
+rainier-http-client = { workspace = true }
+# The optional routes an application mounts.
+rainier-http = { workspace = true }
+rainier-routing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Every Lookout asked at once, each within a deadline.
+tokio = { version = "1", default-features = false, features = ["time", "rt"] }
+futures-util = { workspace = true, features = ["alloc"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+rainier-container = { workspace = true }
+
+[lints]
+workspace = true

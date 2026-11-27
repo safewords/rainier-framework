@@ -1043,9 +1043,9 @@ start, duration, failed, slow and, for an outbound call, `call.span_id`,
 bindings, user or guard. While request tracing is on a
 [reader](#readers-another-service) may call both; otherwise only viewers.
 
-**Putting it together** is the console's job: ask each service for
-`/api/traces/{trace}`, then hang every batch whose `remote_parent_span_id`
-equals some call's `call.span_id` under that call.
+**Putting it together** is the console's job — [Longmire](longmire.md) does
+it: ask each service for `/api/traces/{trace}`, then hang every batch whose
+`remote_parent_span_id` equals some call's `call.span_id` under that call.
 
 ```text
 orders   GET /checkout ──┬─ query …

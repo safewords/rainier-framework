@@ -3958,6 +3958,7 @@ dependencies = [
  "rainier-filesystem",
  "rainier-http",
  "rainier-http-client",
+ "rainier-longmire",
  "rainier-lookout",
  "rainier-mail",
  "rainier-mcp",
@@ -4019,6 +4020,21 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rainier-longmire"
+version = "2.0.0"
+dependencies = [
+ "futures-util",
+ "rainier-container",
+ "rainier-http",
+ "rainier-http-client",
+ "rainier-routing",
+ "rainier-support",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -29,6 +29,13 @@ the release as a whole and names the crate it landed in.
   all of them. Lookouts never talk to one another; a sample decided from the
   trace id (`LOOKOUT_TRACE_SAMPLE_RATE`) keeps the same traces in every
   service. `LOOKOUT_REQUEST_TRACING` turns it, and request tagging, on.
+- **Longmire** (`rainier-longmire`, new; the `longmire` feature): one view
+  across many Lookouts. An application that can reach every service — an
+  operations console — names the Lookouts and how to sign in to each, and
+  Longmire asks all of them at once for their part of a request and links
+  the parts into one tree, each service's work under the call that reached
+  it, with the calls nobody answered listed apart. `trace` and `recent` in
+  code, or `longmire::routes` behind a check of your own.
 - **Lookout service health** (`rainier-lookout`, `rainier-framework`): four
   read-only endpoints under the dashboard's path, answered from rollups that
   count every request, job run and accepted RUM page report, kept or not —

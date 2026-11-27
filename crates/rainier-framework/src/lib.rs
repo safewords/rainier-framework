@@ -195,6 +195,9 @@ pub use rainier_events as events;
 pub use rainier_filesystem as filesystem;
 pub use rainier_http as http;
 pub use rainier_http_client as http_client;
+/// Longmire: one view across many Lookouts (the `longmire` feature).
+#[cfg(feature = "longmire")]
+pub use rainier_longmire as longmire;
 pub use rainier_metrics as metrics;
 #[cfg(any(feature = "two-factor", feature = "passkeys"))]
 pub use rainier_mfa as mfa;
