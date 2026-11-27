@@ -1,7 +1,7 @@
 //! `GET /api/traces` and `GET /api/traces/{trace}`: this service's part of
 //! traces that cross services, for something outside to put back together.
 //!
-//! Aggregation mode ([`Aggregation`](crate::config::Aggregation)) tags every
+//! Request tracing ([`RequestTracing`](crate::config::RequestTracing)) tags every
 //! kept batch that answered another service or called one with the trace
 //! (`trace:distributed`). The list is those batches, newest first; one trace
 //! is every batch this service kept in it, each as a tree of spans.
@@ -10,7 +10,7 @@
 //! one-line summary, start, duration and whether it failed or was slow, and
 //! for an outbound call the host, the status and the span id it put on the
 //! wire. No bodies, headers, bindings, users or guards — a reader may call
-//! these routes in aggregation mode, and a batch's content is the viewers'
+//! these routes in request tracing, and a batch's content is the viewers'
 //! alone.
 //!
 //! # Stitching services together
@@ -119,7 +119,7 @@ pub(crate) async fn show_value(state: &Shared, trace_id: &str) -> Result<Value> 
 
 /// The name this service goes by in a trace.
 fn service(state: &Shared) -> Option<String> {
-    state.config.aggregation.service.clone()
+    state.config.request_tracing.service.clone()
 }
 
 /// One batch in the list: enough to choose a trace to open.

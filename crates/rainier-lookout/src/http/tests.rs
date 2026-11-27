@@ -1178,8 +1178,8 @@ fn distributed() -> Arc<FakeStore> {
 
 fn aggregating(store: Arc<FakeStore>, gate: LookoutGate) -> CompiledRouter {
     let mut config = LookoutConfig::default().enabled(true);
-    config.aggregation.enabled = true;
-    config.aggregation.service = Some("orders".into());
+    config.request_tracing.enabled = true;
+    config.request_tracing.service = Some("orders".into());
     let mut router = Router::new();
     router.merge(routes(store, Arc::new(config), gate, "production"));
     router.compile(&Container::new()).unwrap()
@@ -1218,7 +1218,7 @@ async fn a_trace_is_its_shape_and_never_its_content() {
 }
 
 #[tokio::test]
-async fn outside_aggregation_mode_a_reader_cannot_read_a_trace() {
+async fn without_request_tracing_a_reader_cannot_read_a_trace() {
     let router = app_with(distributed(), readers(), "production");
     let auth = [("authorization", TOKEN)];
     for uri in ["/_lookout/api/traces", &format!("/_lookout/api/traces/{TRACE_ID}")] {

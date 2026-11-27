@@ -22,7 +22,7 @@
 //! set `traceparent` itself keeps it.
 //!
 //! When the unit of work takes part in keeping traces whole
-//! ([`TraceKeeping`]) — Lookout's aggregation mode turns it on — the attempt
+//! ([`TraceKeeping`]) — Lookout's request tracing turns it on — the attempt
 //! also carries `tracestate: rainier=on` (or `rainier=keep`), and a callee
 //! taking part answers with a `traceresponse` whose sampled flag says whether
 //! it kept its part. A kept part makes this unit keep its trace too, so the

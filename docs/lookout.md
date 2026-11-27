@@ -111,8 +111,8 @@ Read at boot through the application's `Env` (so `.env` counts), with
 | `LOOKOUT_INSIGHTS_MIN_COUNT` | how many a key needs before a change in it is reported | a positive integer | `5` |
 | `LOOKOUT_INSIGHTS_CHANGE_PERCENT` | the smallest change reported | a positive integer | `50` |
 | `LOOKOUT_INSIGHTS_FORECAST_BUCKETS` | how many buckets a forecast reaches; `0` draws none | `0..=100` | `6` |
-| `LOOKOUT_AGGREGATION` | [aggregation mode](#traces-across-services): keep traces that cross services whole, and let readers read their shape | a boolean | `false` |
-| `LOOKOUT_TRACE_SAMPLE_RATE` | in aggregation mode, the fraction of traces kept whole, decided from the trace id so every service agrees | `0.0..=1.0` | `0.01` |
+| `LOOKOUT_REQUEST_TRACING` | [request tracing](#traces-across-services): keep traces that cross services whole, and let readers read their shape | a boolean | `false` |
+| `LOOKOUT_TRACE_SAMPLE_RATE` | in request tracing, the fraction of traces kept whole, decided from the trace id so every service agrees | `0.0..=1.0` | `0.01` |
 | `LOOKOUT_SERVICE` | the name this service goes by in a trace | a string | `APP_NAME` |
 | `APP_ENV` | `local` when it is `local` | — | — |
 
@@ -973,7 +973,7 @@ Rainier::new(".")
 A reader may call **`GET` only, on these and nothing else**:
 `{path}/api/health`, `/api/requests`, `/api/rum/vitals`, `/api/rum/errors`,
 `/api/aggregates/{type}`, `/api/series/{type}`, `/api/cases` (the list) and
-`/api/status` — and, in [aggregation mode](#traces-across-services) only,
+`/api/status` — and, in [request tracing](#traces-across-services) only,
 `/api/traces` and `/api/traces/{trace}`. Never the dashboard's shell or assets, a batch (which holds
 bodies and headers), entries, a case or its actions, the stream, or a
 `DELETE`. A request the reader predicate refuses still has the viewer's
@@ -983,7 +983,7 @@ on those routes, for the dashboard's own requests too, so answer `false`
 straight away when the request carries no token. Without the call there
 are no readers. In code outside the framework,
 `LookoutGate::with_readers` does the same, `READER_ROUTES` lists the
-routes, and `AGGREGATION_READER_ROUTES` the two aggregation mode adds.
+routes, and `TRACING_READER_ROUTES` the two request tracing adds.
 
 In Safewords applications the predicate checks a service token from identity
 carrying the capability `lookout.read` — see devenv's `docs/service-auth.md`.
@@ -993,16 +993,17 @@ can turn it off in a local environment with `.local(false)`.
 
 ### Traces across services
 
-Lookout consumes [request tracing](observability.md#request-tracing-tagging-on-its-own):
-turn that on in every service first (`REQUEST_TRACING_ENABLED=true`), or there
-is nothing to link — boot warns when aggregation mode is on without it.
+Lookout's request tracing is built on [request tagging](observability.md#request-tagging),
+and turning it on turns tagging on too — one switch per service,
+`LOOKOUT_REQUEST_TRACING=true`. Set `REQUEST_TAGGING_HEADER` as well to let a
+frontend start the trace with an id of its own.
 
 Each service's Lookout records its own work. A request that calls another
 Rainier service is one trace — the same trace id on both sides — but each
 service decides on its own whether to keep its part, so with the default
 keep rule a slow checkout is kept by the service that was slow and let go
-by the one that called it, and nothing fits back together. **Aggregation
-mode** (`LOOKOUT_AGGREGATION=true`, or `LookoutConfig::aggregation`) makes
+by the one that called it, and nothing fits back together. **Request
+tracing** (`LOOKOUT_REQUEST_TRACING=true`, or `LookoutConfig::request_tracing`) makes
 the services agree, and lets something outside — an operations console —
 read each service's part and put the trace back together.
 
@@ -1018,9 +1019,9 @@ sequenceDiagram
 
 **What goes on the wire.** Request tracing puts `traceparent` on every
 outbound call, with the trace id and a span id of its own (`S1` above). That
-much is the tag, and Lookout adds nothing to it unless aggregation mode is on.
+much is the tag, and Lookout adds nothing to it unless request tracing is on.
 Then a call also carries `tracestate: rainier=on`, or `rainier=keep` once the
-trace is to be kept. A service in aggregation mode that is asked answers with
+trace is to be kept. A service in request tracing that is asked answers with
 `traceresponse`: the trace, the span its work is (`B`, the batch id), and the
 sampled flag set when it kept its part. A request that did not say
 `rainier=…` gets no `traceresponse` — a probe learns nothing.
@@ -1052,7 +1053,7 @@ returns every batch this service kept in that trace, each with its
 `root_span_id`, its `remote_parent_span_id` and its spans — type, summary,
 start, duration, failed, slow and, for an outbound call, `call.span_id`,
 `call.host`, `call.status` and `call.peer_kept`. **Never their content**: no
-bodies, headers, bindings, user or guard. In aggregation mode a
+bodies, headers, bindings, user or guard. In request tracing a
 [reader](#readers-another-service) may call both; otherwise only viewers. To
 assemble a trace across services, ask each for `/api/traces/{trace}` and hang
 every batch whose `remote_parent_span_id` equals some call's `call.span_id`

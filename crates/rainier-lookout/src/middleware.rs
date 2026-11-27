@@ -302,13 +302,13 @@ mod tests {
 
     fn aggregating(rate: f64) -> LookoutConfig {
         let mut config = LookoutConfig::default().enabled(true).local(false);
-        config.aggregation.enabled = true;
-        config.aggregation.trace_sample_rate = rate;
+        config.request_tracing.enabled = true;
+        config.request_tracing.trace_sample_rate = rate;
         config
     }
 
     #[tokio::test]
-    async fn in_aggregation_mode_a_caller_hears_whether_its_callee_kept_its_part() {
+    async fn with_request_tracing_a_caller_hears_whether_its_callee_kept_its_part() {
         let store = Arc::new(MemoryStore::new(10));
         let lookout = Lookout::new(aggregating(0.0), store.clone());
         let (kernel, events) = wired(&lookout);
@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outside_aggregation_mode_nothing_changes() {
+    async fn without_request_tracing_nothing_changes() {
         let store = Arc::new(MemoryStore::new(10));
         let lookout =
             Lookout::new(LookoutConfig::default().enabled(true).local(false), store.clone());

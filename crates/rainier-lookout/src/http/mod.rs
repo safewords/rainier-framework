@@ -241,11 +241,11 @@ pub const READER_ROUTES: &[&str] = &[
     "/api/status",
 ];
 
-/// The routes a reader may also call in aggregation mode
-/// ([`Aggregation`](crate::config::Aggregation)): a trace's shape — its
-/// spans and timings, never their content. Outside aggregation mode they are
+/// The routes a reader may also call in request tracing
+/// ([`RequestTracing`](crate::config::RequestTracing)): a trace's shape — its
+/// spans and timings, never their content. Outside request tracing they are
 /// the viewers' alone.
-pub const AGGREGATION_READER_ROUTES: &[&str] = &["/api/traces", "/api/traces/{trace}"];
+pub const TRACING_READER_ROUTES: &[&str] = &["/api/traces", "/api/traces/{trace}"];
 
 /// Whether `environment` is the local one — the only place
 /// [`Dashboard::open_locally`] applies. `testing` is deliberately not: a test
@@ -342,9 +342,9 @@ pub fn routes(
         router.get("/api/rum/vitals", readable(&state, health::rum_vitals)).name("api.rum.vitals");
         router.get("/api/rum/errors", readable(&state, health::rum_errors)).name("api.rum.errors");
         router.get("/api/stream", guarded(&state, stream::stream)).name("api.stream");
-        // A trace's shape is a reader's to read only in aggregation mode,
+        // A trace's shape is a reader's to read only in request tracing,
         // which is what it is for; otherwise the viewers' like a batch.
-        if state.config.aggregation.enabled {
+        if state.config.request_tracing.enabled {
             router.get("/api/traces", readable(&state, traces::list)).name("api.traces");
             router.get("/api/traces/{trace}", readable(&state, traces::show)).name("api.trace");
         } else {

@@ -54,7 +54,7 @@ impl TelemetrySettings {
         if config.get(keys::TELEMETRY_ENABLED).is_none() {
             settings.enabled = env.bool("TELEMETRY_ENABLED", false);
         }
-        settings = settings.with_request_tracing_env(config, env);
+        settings = settings.with_request_tagging_env(config, env);
         if settings.endpoint.is_none() {
             settings.endpoint =
                 env.get("OTEL_EXPORTER_OTLP_ENDPOINT").filter(|value| !value.trim().is_empty());
@@ -396,18 +396,18 @@ mod tests {
     }
 
     #[test]
-    fn request_tracing_installs_the_middleware_without_exporting_anything() {
+    fn request_tagging_installs_the_middleware_without_exporting_anything() {
         let settings = TelemetrySettings::from_config_and_env(
             &Config::new(),
             &env(&[
-                ("REQUEST_TRACING_ENABLED", "true"),
-                ("REQUEST_TRACING_HEADER", "x-request-id"),
+                ("REQUEST_TAGGING_ENABLED", "true"),
+                ("REQUEST_TAGGING_HEADER", "x-request-id"),
             ]),
         );
 
         assert!(!settings.enabled, "not OpenTelemetry");
         assert!(!settings.exports());
-        assert!(settings.request_tracing);
+        assert!(settings.request_tagging);
         assert_eq!(settings.request_id_header.as_deref(), Some("x-request-id"));
 
         let mut global: Vec<Arc<dyn Middleware>> = Vec::new();

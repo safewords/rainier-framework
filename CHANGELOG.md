@@ -12,22 +12,22 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
-- **Request tracing** (`rainier-telemetry`, `rainier-http-client`,
+- **Request tagging** (`rainier-telemetry`, `rainier-http-client`,
   `rainier-framework`): tag a request and follow it across services, on its
-  own — no OpenTelemetry. `REQUEST_TRACING_ENABLED` puts `Trace` outermost
+  own — no OpenTelemetry. `REQUEST_TAGGING_ENABLED` puts `Trace` outermost
   without the `telemetry` feature, and every call through the HTTP client then
-  carries `traceparent` with a span id of its own. `REQUEST_TRACING_HEADER`
+  carries `traceparent` with a span id of its own. `REQUEST_TAGGING_HEADER`
   (`Trace::request_id_header`) lets a frontend start the trace with a UUID,
   echoed on the response. `rainier_http_client::telemetry::instrument` is
   public, for a transport of your own.
-- **Lookout aggregation mode** (`rainier-lookout`, `rainier-events`): consumes
-  request tracing to keep a trace that crosses services whole
-  (`LOOKOUT_AGGREGATION`, `LOOKOUT_TRACE_SAMPLE_RATE`, `LOOKOUT_SERVICE`):
+- **Lookout request tracing** (`rainier-lookout`, `rainier-events`): built on
+  request tagging, and turns it on — one switch per service — to keep a trace that crosses services whole
+  (`LOOKOUT_REQUEST_TRACING`, `LOOKOUT_TRACE_SAMPLE_RATE`, `LOOKOUT_SERVICE`):
   services agree on a sample from the trace id, pass `tracestate: rainier=keep`
   down, and answer `traceresponse` so a failure downstream keeps the path to
   it. `GET /api/traces` and `GET /api/traces/{trace}` give each service's part
   of a trace as spans without their content — readable by a
-  [reader](docs/lookout.md#readers-another-service) in aggregation mode — so
+  [reader](docs/lookout.md#readers-another-service) while it is on — so
   an operations console can stitch a request across every service it reached.
 - **Lookout service health** (`rainier-lookout`, `rainier-framework`): four
   read-only endpoints under the dashboard's path, answered from rollups that

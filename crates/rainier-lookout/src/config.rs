@@ -249,14 +249,14 @@ pub enum ClientIp {
     None,
 }
 
-/// Aggregation mode: keeping a trace that crosses services whole, and saying
+/// Request tracing: keeping a trace that crosses services whole, and saying
 /// enough about it for something outside — an operations console — to put
 /// the services' parts of it back together. See `docs/lookout.md`,
 /// "Traces across services".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct Aggregation {
-    /// Off unless turned on (`LOOKOUT_AGGREGATION`).
+pub struct RequestTracing {
+    /// Off unless turned on (`LOOKOUT_REQUEST_TRACING`).
     pub enabled: bool,
     /// The fraction of traces kept whole, `0.0..=1.0`
     /// (`LOOKOUT_TRACE_SAMPLE_RATE`). Decided from the trace id, so every
@@ -268,13 +268,13 @@ pub struct Aggregation {
     pub service: Option<String>,
 }
 
-impl Default for Aggregation {
+impl Default for RequestTracing {
     fn default() -> Self {
         Self { enabled: false, trace_sample_rate: 0.01, service: None }
     }
 }
 
-impl Aggregation {
+impl RequestTracing {
     /// Whether the trace `trace_id` is in the sample every service agrees on:
     /// its first sixteen hex digits, as a fraction of the largest, below the
     /// rate. A trace id that is not hex is never sampled.
@@ -692,7 +692,7 @@ pub struct LookoutConfig {
     pub rum: Rum,
     /// Keeping traces that cross services whole: off unless turned on.
     #[serde(default)]
-    pub aggregation: Aggregation,
+    pub request_tracing: RequestTracing,
 }
 
 impl std::fmt::Debug for LookoutConfig {
@@ -716,7 +716,7 @@ impl std::fmt::Debug for LookoutConfig {
             .field("local", &self.local)
             .field("insights", &self.insights)
             .field("rum", &self.rum)
-            .field("aggregation", &self.aggregation)
+            .field("request_tracing", &self.request_tracing)
             .finish()
     }
 }
@@ -764,7 +764,7 @@ impl Default for LookoutConfig {
                 slow_ms: default_rum_slow_ms(),
                 ..Rum::default()
             },
-            aggregation: Aggregation::default(),
+            request_tracing: RequestTracing::default(),
         }
     }
 }
@@ -809,10 +809,10 @@ impl LookoutConfig {
         self.watch(entry_type, |w| WatcherConfig { enabled: false, ..w })
     }
 
-    /// Turn on aggregation mode: keep traces that cross services whole, and
-    /// answer for them on the trace API. See [`Aggregation`].
-    pub fn aggregation(mut self, aggregation: Aggregation) -> Self {
-        self.aggregation = aggregation;
+    /// Turn on request tracing: keep traces that cross services whole, and
+    /// answer for them on the trace API. See [`RequestTracing`].
+    pub fn request_tracing(mut self, request_tracing: RequestTracing) -> Self {
+        self.request_tracing = request_tracing;
         self
     }
 
@@ -1100,13 +1100,13 @@ impl LookoutConfig {
         if let Some(v) = get("LOOKOUT_RUM_HOLD_SECONDS") {
             config.rum.hold_seconds = parse_u64("LOOKOUT_RUM_HOLD_SECONDS", &v)?;
         }
-        if let Some(v) = get("LOOKOUT_AGGREGATION") {
-            config.aggregation.enabled = parse_bool("LOOKOUT_AGGREGATION", &v)?;
+        if let Some(v) = get("LOOKOUT_REQUEST_TRACING") {
+            config.request_tracing.enabled = parse_bool("LOOKOUT_REQUEST_TRACING", &v)?;
         }
         if let Some(v) = get("LOOKOUT_TRACE_SAMPLE_RATE") {
-            config.aggregation.trace_sample_rate = parse_rate("LOOKOUT_TRACE_SAMPLE_RATE", &v)?;
+            config.request_tracing.trace_sample_rate = parse_rate("LOOKOUT_TRACE_SAMPLE_RATE", &v)?;
         }
-        config.aggregation.service = get("LOOKOUT_SERVICE").or_else(|| get("APP_NAME"));
+        config.request_tracing.service = get("LOOKOUT_SERVICE").or_else(|| get("APP_NAME"));
         if let Some(v) = get("LOOKOUT_RUM_SECRET") {
             config.rum.secret = v.into_bytes();
         }

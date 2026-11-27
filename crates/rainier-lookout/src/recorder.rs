@@ -316,13 +316,13 @@ impl Lookout {
     ///
     /// A tag in [`Scope::monitored_tags`](crate::config::Scope::monitored_tags)
     /// keeps the batch whatever the sampling and keep rule — and, in
-    /// aggregation mode, tagging the batch the calling code runs in keeps its
+    /// request tracing, tagging the batch the calling code runs in keeps its
     /// whole trace: every service it calls from then on keeps its part.
     /// Returns whether a batch was found.
     pub fn tag(&self, batch: Option<&str>, tag: impl Into<String>) -> bool {
         let tag = tag.into();
         if batch.is_none()
-            && self.inner.config.aggregation.enabled
+            && self.inner.config.request_tracing.enabled
             && self.inner.config.scope.monitored_tags.contains(&tag)
         {
             if let Some(unit) = Context::current_unit() {
@@ -683,10 +683,10 @@ pub(crate) struct Pending {
     /// Operation span ids, and the span id each ran inside — for entries
     /// whose parent is an operation that was not itself recorded.
     pub(crate) operations: HashMap<String, Option<String>>,
-    /// Aggregation mode: the span in another service this work answered —
+    /// Request tracing: the span in another service this work answered —
     /// the parent id of the `traceparent` the request arrived with.
     pub(crate) remote_parent: Option<String>,
-    /// Aggregation mode: the unit's trace was to be kept whole when it ended.
+    /// Request tracing: the unit's trace was to be kept whole when it ended.
     pub(crate) trace_kept: bool,
 }
 
@@ -1028,15 +1028,15 @@ impl Inner {
         }
     }
 
-    /// Aggregation mode: put the request's unit in the agreement on which
+    /// Request tracing: put the request's unit in the agreement on which
     /// traces to keep whole, and return the span in another service it
     /// answers, if it came from one.
     ///
     /// The trace is kept when the caller said `rainier=keep`, or when its id
     /// falls in the sample every service computes the same way.
     fn join_trace(&self, request: &rainier_http::Request) -> Option<String> {
-        let aggregation = &self.config.aggregation;
-        if !aggregation.enabled {
+        let tracing = &self.config.request_tracing;
+        if !tracing.enabled {
             return None;
         }
         let unit = rainier_events::Context::current_unit()?;
@@ -1045,12 +1045,12 @@ impl Inner {
             rainier_events::TraceKeeping::Off,
             rainier_events::TraceKeeping::from_tracestate,
         );
-        let keep = asked == rainier_events::TraceKeeping::Keep || aggregation.samples(&trace_id);
+        let keep = asked == rainier_events::TraceKeeping::Keep || tracing.samples(&trace_id);
         unit.join_trace_keeping(keep);
         request.header("traceparent").and_then(|header| remote_parent(header, &trace_id))
     }
 
-    /// Aggregation mode, once the response is ready: keep the trace if this
+    /// Request tracing, once the response is ready: keep the trace if this
     /// part of it failed or was slow, and — to a caller that takes part —
     /// answer whether this part is kept, with `traceresponse`.
     ///
@@ -1062,7 +1062,7 @@ impl Inner {
         response: Response,
         asked: rainier_events::TraceKeeping,
     ) -> Response {
-        if !self.config.aggregation.enabled {
+        if !self.config.request_tracing.enabled {
             return response;
         }
         let Some(unit) = rainier_events::Context::current_unit() else { return response };
@@ -1248,7 +1248,7 @@ impl Inner {
             if pending.name.is_none() && pending.kind != BatchKind::Request {
                 pending.name = done.name.clone();
             }
-            pending.trace_kept = self.config.aggregation.enabled
+            pending.trace_kept = self.config.request_tracing.enabled
                 && done.trace_keeping == rainier_events::TraceKeeping::Keep;
         }
         match pending.root.take() {
@@ -1734,10 +1734,10 @@ pub(crate) fn finalize(
                 .iter()
                 .any(|e| e.tags.iter().any(|t| scope.monitored_tags.contains(t))));
 
-    // Aggregation mode: whether this batch is part of a trace that crosses
+    // Request tracing: whether this batch is part of a trace that crosses
     // services — it answered another service, or called one with the trace —
     // and whether the services agreed to keep that trace.
-    let distributed = config.aggregation.enabled
+    let distributed = config.request_tracing.enabled
         && (pending.remote_parent.is_some()
             || pending.entries.iter().any(|e| {
                 e.entry_type == EntryType::HttpClient

@@ -72,8 +72,8 @@ pub struct TelemetrySettings {
     /// The shape of a log line.
     pub log_format: LogFormat,
     /// Whether requests are tagged and the tag carried across services,
-    /// without exporting anything — request tracing. `enabled` implies it.
-    pub request_tracing: bool,
+    /// without exporting anything — request tagging. `enabled` implies it.
+    pub request_tagging: bool,
     /// The header a frontend may start a trace with.
     pub request_id_header: Option<String>,
 }
@@ -90,15 +90,15 @@ impl TelemetrySettings {
                 .unwrap_or_else(|| "rainier".to_string()),
             sample_ratio: config.get(keys::TELEMETRY_SAMPLE_RATIO).unwrap_or(1.0),
             log_format: config.setting(keys::LOG_FORMAT).unwrap_or_default(),
-            request_tracing: config.get(keys::REQUEST_TRACING_ENABLED).unwrap_or(false),
-            request_id_header: config.get(keys::REQUEST_TRACING_HEADER),
+            request_tagging: config.get(keys::REQUEST_TAGGING_ENABLED).unwrap_or(false),
+            request_id_header: config.get(keys::REQUEST_TAGGING_HEADER),
         }
     }
 
-    /// The middleware, or `None` when neither tracing nor request tracing is
+    /// The middleware, or `None` when neither tracing nor request tagging is
     /// on.
     pub fn middleware(&self) -> Option<Trace> {
-        (self.enabled || self.request_tracing).then(|| {
+        (self.enabled || self.request_tagging).then(|| {
             let trace = Trace::new().sampling(self.sample_ratio > 0.0);
             match &self.request_id_header {
                 Some(header) => trace.request_id_header(header.clone()),
@@ -107,15 +107,15 @@ impl TelemetrySettings {
         })
     }
 
-    /// Request tracing from the environment — `REQUEST_TRACING_ENABLED` and
-    /// `REQUEST_TRACING_HEADER` — for whatever the configuration left unset.
-    pub fn with_request_tracing_env(mut self, config: &Config, env: &Env) -> Self {
-        if config.get(keys::REQUEST_TRACING_ENABLED).is_none() {
-            self.request_tracing = env.bool("REQUEST_TRACING_ENABLED", false);
+    /// Request tagging from the environment — `REQUEST_TAGGING_ENABLED` and
+    /// `REQUEST_TAGGING_HEADER` — for whatever the configuration left unset.
+    pub fn with_request_tagging_env(mut self, config: &Config, env: &Env) -> Self {
+        if config.get(keys::REQUEST_TAGGING_ENABLED).is_none() {
+            self.request_tagging = env.bool("REQUEST_TAGGING_ENABLED", false);
         }
         if self.request_id_header.is_none() {
             self.request_id_header =
-                env.get("REQUEST_TRACING_HEADER").filter(|value| !value.trim().is_empty());
+                env.get("REQUEST_TAGGING_HEADER").filter(|value| !value.trim().is_empty());
         }
         self
     }
@@ -343,15 +343,15 @@ mod tests {
     }
 
     #[test]
-    fn request_tracing_stands_on_its_own_without_opentelemetry() {
+    fn request_tagging_stands_on_its_own_without_opentelemetry() {
         let env = Env::from_map(
-            [("REQUEST_TRACING_ENABLED", "true"), ("REQUEST_TRACING_HEADER", "x-request-id")]
+            [("REQUEST_TAGGING_ENABLED", "true"), ("REQUEST_TAGGING_HEADER", "x-request-id")]
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string())),
         )
         .isolated();
         let settings =
-            TelemetrySettings::from_config(&config()).with_request_tracing_env(&config(), &env);
+            TelemetrySettings::from_config(&config()).with_request_tagging_env(&config(), &env);
         assert!(!settings.enabled && !settings.exports(), "no OpenTelemetry");
 
         let mut global: Vec<Arc<dyn rainier_middleware::Middleware>> = Vec::new();
