@@ -111,6 +111,9 @@ Read at boot through the application's `Env` (so `.env` counts), with
 | `LOOKOUT_INSIGHTS_MIN_COUNT` | how many a key needs before a change in it is reported | a positive integer | `5` |
 | `LOOKOUT_INSIGHTS_CHANGE_PERCENT` | the smallest change reported | a positive integer | `50` |
 | `LOOKOUT_INSIGHTS_FORECAST_BUCKETS` | how many buckets a forecast reaches; `0` draws none | `0..=100` | `6` |
+| `LOOKOUT_AGGREGATION` | [aggregation mode](#traces-across-services): keep traces that cross services whole, and let readers read their shape | a boolean | `false` |
+| `LOOKOUT_TRACE_SAMPLE_RATE` | in aggregation mode, the fraction of traces kept whole, decided from the trace id so every service agrees | `0.0..=1.0` | `0.01` |
+| `LOOKOUT_SERVICE` | the name this service goes by in a trace | a string | `APP_NAME` |
 | `APP_ENV` | `local` when it is `local` | — | — |
 
 Booleans accept `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`; an empty
@@ -970,7 +973,8 @@ Rainier::new(".")
 A reader may call **`GET` only, on these and nothing else**:
 `{path}/api/health`, `/api/requests`, `/api/rum/vitals`, `/api/rum/errors`,
 `/api/aggregates/{type}`, `/api/series/{type}`, `/api/cases` (the list) and
-`/api/status`. Never the dashboard's shell or assets, a batch (which holds
+`/api/status` — and, in [aggregation mode](#traces-across-services) only,
+`/api/traces` and `/api/traces/{trace}`. Never the dashboard's shell or assets, a batch (which holds
 bodies and headers), entries, a case or its actions, the stream, or a
 `DELETE`. A request the reader predicate refuses still has the viewer's
 check to pass, so the dashboard's own pages keep working on those routes; one
@@ -978,14 +982,97 @@ both refuse gets the same 404 as any refused request. The reader predicate runs 
 on those routes, for the dashboard's own requests too, so answer `false`
 straight away when the request carries no token. Without the call there
 are no readers. In code outside the framework,
-`LookoutGate::with_readers` does the same, and `READER_ROUTES` lists the
-routes.
+`LookoutGate::with_readers` does the same, `READER_ROUTES` lists the
+routes, and `AGGREGATION_READER_ROUTES` the two aggregation mode adds.
 
 In Safewords applications the predicate checks a service token from identity
 carrying the capability `lookout.read` — see devenv's `docs/service-auth.md`.
 
 `LookoutConfig::local` decides "local", not the raw `APP_ENV`: an application
 can turn it off in a local environment with `.local(false)`.
+
+### Traces across services
+
+Each service's Lookout records its own work. A request that calls another
+Rainier service is one trace — the same trace id on both sides — but each
+service decides on its own whether to keep its part, so with the default
+keep rule a slow checkout is kept by the service that was slow and let go
+by the one that called it, and nothing fits back together. **Aggregation
+mode** (`LOOKOUT_AGGREGATION=true`, or `LookoutConfig::aggregation`) makes
+the services agree, and lets something outside — an operations console —
+read each service's part and put the trace back together.
+
+```mermaid
+sequenceDiagram
+    participant A as orders
+    participant B as billing
+    A->>B: traceparent 00-T-S1-01, tracestate rainier=on
+    Note over B: fails: keeps its part
+    B-->>A: 500, traceresponse 00-T-B-01
+    Note over A: its callee kept a part: keeps its own
+```
+
+**What goes on the wire.** Every outbound call carries `traceparent` with the
+trace id and a span id of its own (`S1` above) — with or without the
+`telemetry` feature ([the HTTP client](http-client.md#traces)). In aggregation
+mode it also carries `tracestate: rainier=on`, or `rainier=keep` once the
+trace is to be kept. A service in aggregation mode that is asked answers with
+`traceresponse`: the trace, the span its work is (`B`, the batch id), and the
+sampled flag set when it kept its part. A request that did not say
+`rainier=…` gets no `traceresponse` — a probe learns nothing.
+
+**Which traces are kept whole.** A trace is kept by every service it reaches
+when:
+
+- its id falls in the sample (`LOOKOUT_TRACE_SAMPLE_RATE`). The decision is a
+  function of the trace id alone, so every service with the same rate keeps
+  the same traces without asking one another;
+- a service upstream said `rainier=keep`: it was in the sample, or the code
+  [tagged](#scope-and-sampling) the batch with one of `scope.monitored_tags`;
+- or a service downstream kept its part — it answered `5xx`, took longer than
+  the request watcher's `slow_ms`, or was itself told to keep — and said so in
+  its `traceresponse`. That travels back up every hop, so the path from the
+  first service to the one that failed is kept whole.
+
+A kept trace is kept **whatever the keep rule and the sample rates**, and its
+batches are tagged `trace:kept`. Every kept batch that answered another
+service or called one with the trace is tagged `trace:distributed`. A batch
+that answered a call carries the call's span id on its root entry as
+`rainier.trace.parent_span_id`; an outbound call's entry carries the span id
+it sent as `rainier.trace.span_id`, and what the callee said as
+`rainier.trace.peer_kept` and `rainier.trace.peer_span_id`.
+
+**Reading a trace.** `GET {path}/api/traces` lists the `trace:distributed`
+batches (`?kept=1` only those kept whole); `GET {path}/api/traces/{trace}`
+returns every batch this service kept in that trace, each with its
+`root_span_id`, its `remote_parent_span_id` and its spans — type, summary,
+start, duration, failed, slow and, for an outbound call, `call.span_id`,
+`call.host`, `call.status` and `call.peer_kept`. **Never their content**: no
+bodies, headers, bindings, user or guard. In aggregation mode a
+[reader](#readers-another-service) may call both; otherwise only viewers. To
+assemble a trace across services, ask each for `/api/traces/{trace}` and hang
+every batch whose `remote_parent_span_id` equals some call's `call.span_id`
+under that call:
+
+```text
+orders   GET /checkout 200 ─┬─ query …
+                            └─ GET billing/charge 500   call.span_id = S1
+billing  GET /charge 500    remote_parent_span_id = S1 ─┘
+```
+
+**What it does not cover.**
+
+- A trace the caller decides to keep only **after** a call returned — the
+  caller became slow later — has the callee's part only if the callee kept it
+  for a reason of its own. The call is still in the caller's batch, with its
+  host, status and span id.
+- Jobs carry the trace (the queue propagates `traceparent`) but do not take
+  part in the agreement: a job's batch is kept by the ordinary rule.
+- Only Rainier's HTTP client takes part. A call through another client
+  carries no trace unless that client sends one.
+- Services must share a `LOOKOUT_TRACE_SAMPLE_RATE` to agree on the sample;
+  with different rates the higher keeps more, and the lower's parts of those
+  traces are missing unless something else kept them.
 
 ### The JSON API
 
@@ -1014,6 +1101,8 @@ shape.
 | `GET` | `/api/requests` | every request, grouped and filtered — see [service health](#service-health) |
 | `GET` | `/api/rum/vitals` | real users' page metrics, grouped and filtered |
 | `GET` | `/api/rum/errors` | real users' script errors, by message, file and line |
+| `GET` | `/api/traces` | kept batches that are part of a trace crossing services, newest first — `kept` (only traces kept whole), `before`, `limit`. See [traces across services](#traces-across-services) |
+| `GET` | `/api/traces/{trace}` | every batch this service kept in one trace, as spans without their content |
 
 ### Service health
 

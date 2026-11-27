@@ -60,6 +60,9 @@ tokio = { workspace = true }
 # The middleware test runs a real kernel and router. No `telemetry`: Lookout
 # hears the bus, not spans.
 rainier-server = { workspace = true }
+# Two services in one process, one calling the other through the client: the
+# trace across services end to end.
+rainier-http-client = { workspace = true }
 # The executor the database store's tests connect with. Its SQL support comes
 # from the `sea-orm-executor` feature below, not from here: a feature named on
 # a dev-dependency is unified into every crate's tests in `cargo test

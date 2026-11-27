@@ -91,6 +91,7 @@ mod params;
 mod rum;
 mod shell;
 pub(crate) mod stream;
+pub(crate) mod traces;
 
 #[cfg(test)]
 pub(crate) mod fake;
@@ -240,6 +241,12 @@ pub const READER_ROUTES: &[&str] = &[
     "/api/status",
 ];
 
+/// The routes a reader may also call in aggregation mode
+/// ([`Aggregation`](crate::config::Aggregation)): a trace's shape — its
+/// spans and timings, never their content. Outside aggregation mode they are
+/// the viewers' alone.
+pub const AGGREGATION_READER_ROUTES: &[&str] = &["/api/traces", "/api/traces/{trace}"];
+
 /// Whether `environment` is the local one — the only place
 /// [`Dashboard::open_locally`] applies. `testing` is deliberately not: a test
 /// asserting on the gate should see the production behaviour.
@@ -335,6 +342,15 @@ pub fn routes(
         router.get("/api/rum/vitals", readable(&state, health::rum_vitals)).name("api.rum.vitals");
         router.get("/api/rum/errors", readable(&state, health::rum_errors)).name("api.rum.errors");
         router.get("/api/stream", guarded(&state, stream::stream)).name("api.stream");
+        // A trace's shape is a reader's to read only in aggregation mode,
+        // which is what it is for; otherwise the viewers' like a batch.
+        if state.config.aggregation.enabled {
+            router.get("/api/traces", readable(&state, traces::list)).name("api.traces");
+            router.get("/api/traces/{trace}", readable(&state, traces::show)).name("api.trace");
+        } else {
+            router.get("/api/traces", guarded(&state, traces::list)).name("api.traces");
+            router.get("/api/traces/{trace}", guarded(&state, traces::show)).name("api.trace");
+        }
 
         // Real user monitoring: public, because every visitor's browser
         // loads the script and reports. Only while it is on.

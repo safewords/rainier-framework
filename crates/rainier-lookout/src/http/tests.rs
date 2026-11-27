@@ -214,6 +214,8 @@ fn routes_are_named_under_lookout() {
             "lookout.api.series",
             "lookout.api.status",
             "lookout.api.stream",
+            "lookout.api.trace",
+            "lookout.api.traces",
             "lookout.app",
             "lookout.assets.css",
             "lookout.assets.js",
@@ -1139,4 +1141,94 @@ async fn readers_are_off_unless_registered_and_viewers_keep_everything() {
     {
         assert_eq!(get(&router, uri).await.status, StatusCode::OK, "{uri}");
     }
+}
+
+// --- traces across services ---------------------------------------------------
+
+const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+/// A batch that answered a call from another service and made one of its own.
+fn distributed() -> Arc<FakeStore> {
+    let e = epoch();
+    let mut root =
+        entry("b9", "r", EntryType::Request, "GET /orders/{order} 200", e, 0, Some(9_000));
+    root.span_id = Some("b9".into());
+    root.content = serde_json::json!({
+        "rainier.trace.parent_span_id": "00f067aa0ba902b7",
+        "http.request.header.authorization": "Bearer secret-token",
+    });
+    let mut call =
+        entry("b9", "h1", EntryType::HttpClient, "GET http://billing/x 200", e, 1, Some(4_000));
+    call.parent_span_id = Some("b9".into());
+    call.content = serde_json::json!({
+        "server.address": "billing",
+        "http.response.status_code": 200,
+        "rainier.trace.span_id": "b7ad6b7169203331",
+        "rainier.trace.peer_kept": true,
+        "rainier.trace.peer_span_id": "000000000000002a",
+    });
+    let mut batch = request("b9", "orders.show", 200, 5, vec![root, call]);
+    batch.trace_id = TRACE_ID.into();
+    batch.user_id = Some("42".into());
+    batch.tags = vec!["trace:distributed".into(), "trace:kept".into(), "user:42".into()];
+    let store = FakeStore::default();
+    store.batches.lock().unwrap().push(batch);
+    Arc::new(store)
+}
+
+fn aggregating(store: Arc<FakeStore>, gate: LookoutGate) -> CompiledRouter {
+    let mut config = LookoutConfig::default().enabled(true);
+    config.aggregation.enabled = true;
+    config.aggregation.service = Some("orders".into());
+    let mut router = Router::new();
+    router.merge(routes(store, Arc::new(config), gate, "production"));
+    router.compile(&Container::new()).unwrap()
+}
+
+#[tokio::test]
+async fn a_trace_is_its_shape_and_never_its_content() {
+    let router = aggregating(distributed(), readers());
+    let auth = [("authorization", TOKEN)];
+
+    let answer =
+        send(&router, Method::GET, &format!("/_lookout/api/traces/{TRACE_ID}"), &auth).await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text);
+    let body: serde_json::Value = serde_json::from_str(&answer.text).unwrap();
+    let trace = &body["data"];
+    assert_eq!(trace["service"], "orders");
+    let batch = &trace["batches"][0];
+    assert_eq!(batch["root_span_id"], "b9");
+    assert_eq!(batch["remote_parent_span_id"], "00f067aa0ba902b7", "the call it answered");
+    assert_eq!(batch["kept"], true);
+    let call = &batch["spans"][1]["call"];
+    assert_eq!(call["span_id"], "b7ad6b7169203331", "the call it made");
+    assert_eq!(call["host"], "billing");
+    assert_eq!(call["peer_kept"], true);
+    assert!(!answer.text.contains("secret-token"), "no content: {}", answer.text);
+    assert!(!answer.text.contains("\"42\""), "no user: {}", answer.text);
+
+    let listed = send(&router, Method::GET, "/_lookout/api/traces?kept=1", &auth).await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.text);
+    let body: serde_json::Value = serde_json::from_str(&listed.text).unwrap();
+    assert_eq!(body["data"][0]["trace_id"], TRACE_ID);
+    assert_eq!(body["data"][0]["kept"], true);
+
+    let broken = send(&router, Method::GET, "/_lookout/api/traces/a%20b", &auth).await;
+    assert_eq!(broken.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn outside_aggregation_mode_a_reader_cannot_read_a_trace() {
+    let router = app_with(distributed(), readers(), "production");
+    let auth = [("authorization", TOKEN)];
+    for uri in ["/_lookout/api/traces", &format!("/_lookout/api/traces/{TRACE_ID}")] {
+        let answer = send(&router, Method::GET, uri, &auth).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{uri}");
+    }
+    // A viewer still can.
+    let viewer = app(distributed());
+    assert_eq!(
+        get(&viewer, &format!("/_lookout/api/traces/{TRACE_ID}")).await.status,
+        StatusCode::OK
+    );
 }

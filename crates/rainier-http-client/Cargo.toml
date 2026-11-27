@@ -27,8 +27,9 @@ reqwest = { workspace = true, optional = true }
 # Only to install ring as the process-level provider before reqwest builds a
 # client — see `install_tls_provider`.
 rustls = { workspace = true, optional = true }
-# Only with `telemetry`: the trace a request is part of, to put on the wire.
-rainier-telemetry = { workspace = true, optional = true }
+# The trace a request is part of, to put on the wire — always: propagating a
+# trace needs no exporter, and this crate is light (no OpenTelemetry).
+rainier-telemetry = { workspace = true }
 
 [features]
 # Nothing by default, deliberately. `reqwest` brings a TLS stack, an HTTP/2
@@ -38,9 +39,9 @@ rainier-telemetry = { workspace = true, optional = true }
 default = []
 # A real transport, over reqwest with rustls.
 reqwest-transport = ["dep:reqwest", "dep:rustls"]
-# An `http.client.request` span per attempt, and `traceparent` on the wire —
-# see `rainier_http_client::telemetry`.
-telemetry = ["rainier-support/telemetry", "dep:rainier-telemetry"]
+# An `http.client.request` span per attempt — see
+# `rainier_http_client::telemetry`. `traceparent` goes on the wire without it.
+telemetry = ["rainier-support/telemetry"]
 
 [dev-dependencies]
 tokio = { workspace = true }

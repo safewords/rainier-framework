@@ -35,7 +35,7 @@
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Instant, SystemTime};
@@ -89,6 +89,66 @@ pub struct Unit {
     events: OnceLock<Arc<Dispatcher>>,
     /// Families a code trace has been taken for in this unit.
     traced: std::sync::Mutex<Vec<u64>>,
+    /// Whether this unit takes part in keeping traces whole across services,
+    /// and whether its trace is to be kept — a [`TraceKeeping`] as a byte.
+    keeping: AtomicU8,
+}
+
+/// Whether a unit of work takes part in keeping distributed traces whole, and
+/// whether its trace is being kept.
+///
+/// A diagnostics recorder that keeps only some units — the slow ones, the
+/// failed ones, a sample — keeps a trace that crosses services in fragments
+/// unless the services agree on which traces to keep. This is the state of
+/// that agreement for one unit: the recorder sets it as the unit starts
+/// ([`join_trace_keeping`](Unit::join_trace_keeping)), the outbound HTTP
+/// client reads it to tell the next service (`tracestate: rainier=on|keep`),
+/// and either side can raise it to [`Keep`](Self::Keep) when it learns the
+/// trace matters ([`keep_trace`](Unit::keep_trace)). It only ever rises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TraceKeeping {
+    /// Not taking part: nothing is said to other services.
+    Off,
+    /// Taking part, with no decision to keep yet.
+    On,
+    /// This trace is to be kept, by this service and every one it calls.
+    Keep,
+}
+
+impl TraceKeeping {
+    /// The `tracestate` member key the decision travels under.
+    pub const MEMBER: &'static str = "rainier";
+
+    /// The `tracestate` member value: `on` or `keep`; `None` when off.
+    pub fn member_value(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::On => Some("on"),
+            Self::Keep => Some("keep"),
+        }
+    }
+
+    /// Read the decision out of a `tracestate` header: the value of its
+    /// `rainier` member. `Off` when there is none — the caller does not take
+    /// part, or is not a Rainier service.
+    pub fn from_tracestate(header: &str) -> Self {
+        header
+            .split(',')
+            .filter_map(|member| member.trim().split_once('='))
+            .find(|(key, _)| key.trim() == Self::MEMBER)
+            .map_or(Self::Off, |(_, value)| match value.trim() {
+                "keep" => Self::Keep,
+                _ => Self::On,
+            })
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Off,
+            1 => Self::On,
+            _ => Self::Keep,
+        }
+    }
 }
 
 impl Unit {
@@ -106,6 +166,7 @@ impl Unit {
             started_at: SystemTime::now(),
             events: OnceLock::new(),
             traced: std::sync::Mutex::new(Vec::new()),
+            keeping: AtomicU8::new(0),
         })
     }
 
@@ -178,6 +239,30 @@ impl Unit {
     /// The request path, for a request.
     pub fn path(&self) -> Option<&str> {
         self.path.as_deref()
+    }
+
+    /// Whether this unit takes part in keeping its trace whole across
+    /// services, and whether it is being kept. See [`TraceKeeping`].
+    pub fn trace_keeping(&self) -> TraceKeeping {
+        TraceKeeping::from_u8(self.keeping.load(Ordering::Relaxed))
+    }
+
+    /// Take part in keeping traces whole: at least [`TraceKeeping::On`], and
+    /// [`Keep`](TraceKeeping::Keep) when `keep`. Never lowers a decision
+    /// already made.
+    pub fn join_trace_keeping(&self, keep: bool) {
+        let level = if keep { TraceKeeping::Keep } else { TraceKeeping::On };
+        self.keeping.fetch_max(level as u8, Ordering::Relaxed);
+    }
+
+    /// Keep this unit's trace: every service it calls from now on is told
+    /// to keep its part, and the recorder keeps this unit's own. A no-op for
+    /// a unit not [taking part](Self::join_trace_keeping) — nothing would
+    /// hear it.
+    pub fn keep_trace(&self) {
+        let _ = self.keeping.try_update(Ordering::Relaxed, Ordering::Relaxed, |now| {
+            (now != TraceKeeping::Off as u8).then_some(TraceKeeping::Keep as u8)
+        });
     }
 
     /// The OpenTelemetry trace id (32 hex digits), when known.
@@ -267,6 +352,7 @@ impl Drop for Unit {
                 name: self.name.take(),
                 path: self.path.take(),
                 trace_id: self.trace_id.take(),
+                trace_keeping: TraceKeeping::from_u8(self.keeping.load(Ordering::Relaxed)),
                 started_at: self.started_at,
                 duration: self.started.elapsed(),
             },
@@ -300,6 +386,8 @@ pub struct UnitCompleted {
     pub path: Option<String>,
     /// Its trace id, if one was recorded.
     pub trace_id: Option<String>,
+    /// Whether its trace is being kept whole, as it stood when it ended.
+    pub trace_keeping: TraceKeeping,
     /// When it opened.
     pub started_at: SystemTime,
     /// From opening until the last of its events was delivered.
@@ -589,6 +677,30 @@ mod tests {
         let command = Unit::new(UnitKind::Command, Some("queue:work".into()), None);
         let own = command.scope(async { Unit::open_or_join(UnitKind::Job, None, None) }).await;
         assert!(own.is_some());
+    }
+
+    #[test]
+    fn trace_keeping_only_rises_and_keep_needs_a_participant() {
+        let unit = Unit::new(UnitKind::Request, None, None);
+        assert_eq!(unit.trace_keeping(), TraceKeeping::Off);
+        unit.keep_trace();
+        assert_eq!(unit.trace_keeping(), TraceKeeping::Off, "nobody to tell");
+
+        unit.join_trace_keeping(false);
+        assert_eq!(unit.trace_keeping(), TraceKeeping::On);
+        unit.keep_trace();
+        assert_eq!(unit.trace_keeping(), TraceKeeping::Keep);
+        unit.join_trace_keeping(false);
+        assert_eq!(unit.trace_keeping(), TraceKeeping::Keep, "never lowered");
+    }
+
+    #[test]
+    fn trace_keeping_reads_its_tracestate_member() {
+        assert_eq!(TraceKeeping::from_tracestate("congo=t61rcWkgMzE"), TraceKeeping::Off);
+        assert_eq!(TraceKeeping::from_tracestate("congo=x, rainier=on"), TraceKeeping::On);
+        assert_eq!(TraceKeeping::from_tracestate("rainier=keep,congo=x"), TraceKeeping::Keep);
+        assert_eq!(TraceKeeping::Keep.member_value(), Some("keep"));
+        assert_eq!(TraceKeeping::Off.member_value(), None);
     }
 
     #[test]

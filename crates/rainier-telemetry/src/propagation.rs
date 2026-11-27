@@ -79,6 +79,47 @@ pub fn for_span(span: &tracing::Span) -> Option<String> {
     CURRENT.with(|current| current.borrow().as_deref().map(str::to_string))
 }
 
+/// The `traceparent` one outbound call should carry: the same trace, and a
+/// span id that names **this call** and no other.
+///
+/// With a real span context (the `otlp` feature, exporter installed) that is
+/// `span`'s own id — the client span the call opened. Without one it is a
+/// fresh span id under the trace in force ([`current`]), or, outside any
+/// [`scope`], under the trace of the current unit of work — a job, a
+/// scheduled task — when it has one.
+///
+/// A fresh id per call is what lets a recorder on the other side say which of
+/// several calls to it a piece of its work answered: two calls from one
+/// request to the same service would otherwise name the same parent.
+///
+/// `None` outside any trace, and the call then sends no header.
+pub fn outbound(span: &tracing::Span) -> Option<String> {
+    #[cfg(feature = "otlp")]
+    if let Some(header) = otel::header_of(span) {
+        return Some(header);
+    }
+
+    #[cfg(not(feature = "otlp"))]
+    let _ = span;
+
+    let in_force = CURRENT.with(|current| current.borrow().as_deref().map(str::to_string));
+    let in_force = in_force.or_else(|| {
+        let unit = rainier_events::Context::current_unit()?;
+        match (unit.traceparent(), unit.trace_id()) {
+            (Some(parent), _) => Some(parent.to_string()),
+            // A trace id with no header: a job that learned only the id.
+            (None, Some(id)) => Some(format!("00-{id}-0000000000000001-01")),
+            (None, None) => None,
+        }
+    })?;
+
+    Some(match TraceContext::parse(&in_force) {
+        Ok(context) => context.child().to_header(),
+        // Not ours to fix: pass on what is in force.
+        Err(_) => in_force,
+    })
+}
+
 /// Run `future` with `traceparent` in force for [`current`].
 ///
 /// `None` clears it, which is what a job running for a request with no trace
@@ -237,6 +278,36 @@ mod tests {
         assert_eq!(child.trace_id(), incoming.trace_id());
         assert_ne!(child.parent_id(), incoming.parent_id());
         assert_eq!(child.is_sampled(), incoming.is_sampled());
+    }
+
+    #[tokio::test]
+    async fn every_outbound_call_names_a_span_of_its_own_in_the_same_trace() {
+        let (first, second) = scope(Some(EXAMPLE.to_string()), async {
+            (outbound(&tracing::Span::none()), outbound(&tracing::Span::none()))
+        })
+        .await;
+        let (first, second) = (
+            TraceContext::parse(&first.unwrap()).unwrap(),
+            TraceContext::parse(&second.unwrap()).unwrap(),
+        );
+
+        assert_eq!(first.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(second.trace_id(), first.trace_id());
+        assert_ne!(first.parent_id(), second.parent_id(), "one span per call");
+        assert_ne!(first.parent_id(), "00f067aa0ba902b7", "not the scope's own");
+    }
+
+    #[tokio::test]
+    async fn outside_a_scope_the_units_trace_is_used() {
+        assert_eq!(outbound(&tracing::Span::none()), None, "no trace, no header");
+
+        let unit = rainier_events::Unit::new(rainier_events::UnitKind::Job, None, None);
+        unit.set_trace(Some("4bf92f3577b34da6a3ce929d0e0e4736"), None);
+        let header = unit.scope(async { outbound(&tracing::Span::none()) }).await;
+        assert_eq!(
+            TraceContext::parse(&header.unwrap()).unwrap().trace_id(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
     }
 
     #[test]

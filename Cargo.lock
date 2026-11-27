@@ -4037,6 +4037,7 @@ dependencies = [
  "rainier-drivers",
  "rainier-events",
  "rainier-http",
+ "rainier-http-client",
  "rainier-mcp",
  "rainier-middleware",
  "rainier-orm",

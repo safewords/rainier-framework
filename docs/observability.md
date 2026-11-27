@@ -472,7 +472,10 @@ readers and other retention than the log line the message is still on.
   its parent, so this service's spans hang off the caller's.
 - **Out over HTTP.** Every outbound request — through the `Http` facade, a mail
   API, a payment API, anything that reaches a transport — carries a
-  `traceparent` naming its own client span. A caller that set one keeps it.
+  `traceparent` naming a span of its own: its client span with the exporter,
+  a fresh span id without it. This needs no `telemetry` feature. A caller that
+  set one keeps it. A [transport of your own](http-client.md#the-transport) gets
+  the same by calling `rainier_http_client::telemetry::instrument`.
 - **Through the queue.** A dispatch writes the `traceparent` in force onto the
   job's envelope, and the worker's `queue.process` span adopts it: a job run
   ten minutes later in another process is part of the request that queued it.
