@@ -131,7 +131,7 @@ impl TelemetrySettings {
     }
 }
 
-/// Put [`Trace`](rainier_request_tagging::Trace) outermost in `global`, unless it is off or already there.
+/// Put [`Trace`] outermost in `global`, unless it is off or already there.
 ///
 /// Outermost so that every log line — including the ones from middleware that
 /// rejected the request — carries the trace id, and so that the outbound

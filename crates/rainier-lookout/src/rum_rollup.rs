@@ -9,7 +9,7 @@
 //!   `["page", "browser", "os", "device", "connection", "country"]`, as a
 //!   JSON array. `count` is page views. The histogram holds six metrics side
 //!   by side, each in its own range of slots (`metric × 1024 +`
-//!   [`slot`](crate::aggregate::slot)): LCP, INP, CLS, TTFB, FCP and load, in
+//!   [`slot`]): LCP, INP, CLS, TTFB, FCP and load, in
 //!   microseconds (CLS in millionths); and two counters, script errors and
 //!   long tasks, in slots of their own. Histograms add when rows merge, so
 //!   counters and metrics merge exactly as every other aggregate does.

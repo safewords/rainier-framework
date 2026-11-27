@@ -1,7 +1,7 @@
 //! The OTLP exporter — spans to a collector.
 //!
 //! Behind the `otlp` feature, because it is a large dependency tree and an
-//! application that only wants [trace headers propagated](crate::Trace) should
+//! application that only wants trace headers propagated (`rainier-request-tagging`) should
 //! not pay for it.
 
 use std::sync::OnceLock;
