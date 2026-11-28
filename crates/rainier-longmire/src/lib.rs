@@ -614,7 +614,8 @@ mod tests {
         );
         let point = |start: &str, count: u64, sum: u64, max: u64| json!({ "bucket_start": start, "count": count, "sum_us": sum, "max_us": max });
         answers.insert(
-            "http://orders.test/_lookout/api/series/request?since=1h&keys=5&histograms=1".to_string(),
+            "http://orders.test/_lookout/api/series/request?since=1h&keys=5&histograms=1"
+                .to_string(),
             (
                 200,
                 json!({ "data": [point("2026-11-27T10:00:00Z", 3, 300, 200)],
@@ -622,7 +623,8 @@ mod tests {
             ),
         );
         answers.insert(
-            "http://billing.test/_lookout/api/series/request?since=1h&keys=5&histograms=1".to_string(),
+            "http://billing.test/_lookout/api/series/request?since=1h&keys=5&histograms=1"
+                .to_string(),
             (
                 200,
                 json!({ "data": [point("2026-11-27T11:00:00+01:00", 1, 900, 900)], "period": 60 }),
