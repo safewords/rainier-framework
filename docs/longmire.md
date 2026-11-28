@@ -110,6 +110,24 @@ kept or not, so the numbers are the real ones:
 | `longmire.map(query)` | who calls whom — below |
 | `longmire.one(source, Endpoint::…, query)` | one source's answer as its Lookout gave it, for a page about one service |
 
+Where a source's Lookout lets the link reach as far as a viewer, Longmire
+reads the rest of what its dashboard shows, from one source or the fleet:
+
+| Call | Answers |
+|---|---|
+| `longmire.batches(query)` | kept batches across every source, newest first (`kind`, `type`, `route`, `user`, `tag`, `trace`, `exception`, `slow`, `q`, `before`, `limit`), each naming its `service`; `next.before` is the cursor |
+| `longmire.entries(type, query)` | one type's entries across every source, newest first (`before`, `limit`, `family`, `key`, `q`). A family id is its type and key, the same everywhere, so `family` follows one query or job across the fleet |
+| `longmire.aggregates(type, query)` | one type's families across every source, ranked by `order` (`max`, `count`, `average`) |
+| `longmire.series(type, query)` | each source's points (`series`) and the fleet's, added up per bucket (`data`) |
+| `longmire.models(query)` / `insights(query)` | models written, most first; what changed, the bad first |
+| `longmire.status()` | every source's settings: store, sample rates, watchers, retention, the link's reach |
+| `longmire.read(source, &Resource::…, query)` | one source's own answer: a batch whole, a family's key, a model's changes, one case, … |
+| `longmire.act_on_case(source, id, action)` | resolve, reopen, ignore or set the severity of a case; Lookout's refusal in its own words |
+
+Merged lists are `{services, data, next}`. Each source is asked with the same
+cursor and the merge keeps the newest `limit`, so a page is exact; two rows
+started in the same microsecond at a page's edge can fall on either page.
+
 `query` is a query string; only each Lookout endpoint's own parameters are
 forwarded (`since`, `until`, `period`, and the endpoint's filters and order —
 see [service health](lookout.md#service-health)), each once, none longer than
@@ -170,9 +188,37 @@ let longmire = Longmire::from_json(&sources)?
   derived from it separately (HKDF-SHA256).
 
 The link reaches what a reader may read — health, requests, RUM, cases,
-aggregates and, with request tracing on, traces — and nothing else. With a
+aggregates and, with request tracing on, traces — and, where a Lookout says
+so, what its own viewers read ([below](#how-far-the-link-reaches)). With a
 link, Longmire sends no other credentials. The protocol is
 `rainier-lookout-link`, which both ends use.
+
+A request with a body (a case action) is signed with the body's SHA-256 too,
+in the header's `body=`, so the body cannot be changed on the way; a request
+without one signs exactly as it always did, so Lookouts that predate bodies
+still recognise every `GET`.
+
+### How far the link reaches
+
+```env
+# On a service whose Lookout the console should see whole
+LOOKOUT_LONGMIRE_REACH=viewer      # reader by default
+```
+
+| Reach | The link may call |
+|---|---|
+| `reader` (default) | the readers' routes: health, requests, queues, RUM, cases, aggregates, series, status, and with request tracing on, traces' shapes. Rollups and timings, never content |
+| `viewer` | also everything the dashboard's own viewers read — kept batches whole (every entry with its content, as recorded and redacted), entries by type, families, models and their changes, insights, one case — and the case actions (`POST /api/cases/{id}`). [`LINK_VIEWER_ROUTES`](lookout.md) lists them |
+
+Never clearing (`DELETE /api/batches`), the live stream or the dashboard's
+shell, whatever the reach. A link request beyond the reach gets the same 404
+as anything else refused, and Longmire lists that source as `unknown` with
+the reason. `GET /api/status` says how far a Lookout lets the link reach
+(`longmire: {linked, reach}`).
+
+Content crosses the wire only sealed, and only to the holder of the fleet's
+key: turn `viewer` on where the console that holds it is one whose people may
+see what the dashboard shows.
 
 ## Routes
 
@@ -194,6 +240,10 @@ app_router.group(GroupAttributes::new().prefix("/ops/longmire"), |r| r.merge(rou
 /health`, `/requests`, `/queues`, `/rum/vitals`, `/rum/errors`, `/cases` and `/map`, each
 answering `{"data": …}`, and `GET /sources/{source}/{health|requests|queues|rum/vitals|rum/errors|cases}`
 answering one source's own answer (a `502` with the reason when it has none);
+`GET /batches`, `/entries/{type}`, `/aggregates/{type}`, `/series/{type}`,
+`/models`, `/insights` and `/status` across the fleet;
+`GET /sources/{source}/{batches[/{id}]|entries/{type}|aggregates/{type}|series/{type}|families/{type}/{id}|models[/{model}]|insights|cases/{id}|status|traces[/{trace}]}`
+and `POST /sources/{source}/cases/{id}` (a case action) for one;
 a malformed trace id is a `400`. An application with
 its own response envelope or access rules can call `trace` and `recent` from
 its own handlers instead.

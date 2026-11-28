@@ -139,12 +139,25 @@ impl LinkKey {
         &self.id
     }
 
-    fn mac(&self, method: &str, path_and_query: &str, ts: u64, nonce: &str) -> [u8; 32] {
+    fn mac(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        ts: u64,
+        nonce: &str,
+        body: Option<&str>,
+    ) -> [u8; 32] {
         let mut mac = HmacSha256::new_from_slice(&self.sign).expect("HMAC takes any key length");
         let method = method.to_ascii_uppercase();
         mac.update(
             format!("{VERSION}\n{}\n{method}\n{path_and_query}\n{ts}\n{nonce}", self.id).as_bytes(),
         );
+        // A body is signed by its digest, on a line of its own. A request
+        // without one signs exactly what it always did, so Lookouts that
+        // predate bodies still recognise every `GET`.
+        if let Some(digest) = body {
+            mac.update(format!("\n{digest}").as_bytes());
+        }
         mac.finalize().into_bytes().into()
     }
 }
@@ -161,11 +174,36 @@ pub struct Signed {
 
 /// Sign a request: `method` and `path_and_query` exactly as they will be
 /// sent (`/_lookout/api/traces?kept=1`), at `now` (seconds since the epoch).
+/// A request with a body is signed with [`sign_request`].
 pub fn sign(key: &LinkKey, method: &str, path_and_query: &str, now: u64) -> Signed {
+    sign_request(key, method, path_and_query, &[], now)
+}
+
+/// Sign a request and its `body`: as [`sign`], and when the body is not
+/// empty, its SHA-256 too (the header's `body=`), so it cannot be changed on
+/// the way. An empty body signs exactly as [`sign`] does.
+pub fn sign_request(
+    key: &LinkKey,
+    method: &str,
+    path_and_query: &str,
+    body: &[u8],
+    now: u64,
+) -> Signed {
     let nonce = B64.encode(random::<18>());
-    let mac = key.mac(method, path_and_query, now, &nonce);
-    let header = format!("{VERSION} key={} ts={now} nonce={nonce} sig={}", key.id, B64.encode(mac));
+    let digest = (!body.is_empty()).then(|| digest(body));
+    let mac = key.mac(method, path_and_query, now, &nonce, digest.as_deref());
+    let mut header = format!("{VERSION} key={} ts={now} nonce={nonce}", key.id);
+    if let Some(digest) = &digest {
+        header.push_str(&format!(" body={digest}"));
+    }
+    header.push_str(&format!(" sig={}", B64.encode(mac)));
     Signed { header, nonce }
+}
+
+/// A body's SHA-256, as the header carries it.
+fn digest(body: &[u8]) -> String {
+    use sha2::Digest as _;
+    B64.encode(Sha256::digest(body))
 }
 
 /// A request [`verify`] recognised: the key it was signed with, and its
@@ -181,12 +219,29 @@ pub struct Verified {
 /// Recognise a signed request: `Some` only when its key is one of `keys`, its
 /// signature matches, its timestamp is within [`MAX_SKEW`] of `now`, and
 /// `guard` has not seen its nonce — which it then remembers. Every failure is
-/// the same `None`: a caller has nothing to tell the sender.
+/// the same `None`: a caller has nothing to tell the sender. A request with
+/// a body is recognised with [`verify_request`]; this one recognises only a
+/// request signed without one.
 pub fn verify(
     header: &str,
     keys: &[LinkKey],
     method: &str,
     path_and_query: &str,
+    now: u64,
+    guard: &ReplayGuard,
+) -> Option<Verified> {
+    verify_request(header, keys, method, path_and_query, &[], now, guard)
+}
+
+/// Recognise a signed request and its `body`: as [`verify`], and the body
+/// must be the one signed — a request whose header names no body must have
+/// none, and one that names a body must carry exactly it.
+pub fn verify_request(
+    header: &str,
+    keys: &[LinkKey],
+    method: &str,
+    path_and_query: &str,
+    body: &[u8],
     now: u64,
     guard: &ReplayGuard,
 ) -> Option<Verified> {
@@ -208,9 +263,16 @@ pub fn verify(
     if nonce.len() < 16 || nonce.len() > 64 || now.abs_diff(ts) > MAX_SKEW {
         return None;
     }
+    let signed_body = fields.get("body").copied();
+    let actual_body = (!body.is_empty()).then(|| digest(body));
+    match (signed_body, actual_body.as_deref()) {
+        (None, None) => {}
+        (Some(signed), Some(actual)) if bool::from(signed.as_bytes().ct_eq(actual.as_bytes())) => {}
+        _ => return None,
+    }
     let key = keys.iter().find(|k| k.id == key_id)?;
     let presented = B64.decode(sig).ok()?;
-    let expected = key.mac(method, path_and_query, ts, nonce);
+    let expected = key.mac(method, path_and_query, ts, nonce, signed_body);
     if !bool::from(presented.as_slice().ct_eq(&expected)) {
         return None;
     }
@@ -331,6 +393,40 @@ mod tests {
         // A forged request does not spend the real one's nonce.
         assert!(verify(&forged, std::slice::from_ref(&k), "GET", PATH, NOW, &guard).is_none());
         assert!(verify(&signed.header, &[k], "GET", PATH, NOW, &guard).is_some());
+    }
+
+    #[test]
+    fn a_body_is_signed_and_cannot_be_changed_on_the_way() {
+        let k = key("a");
+        let body = br#"{"action":"resolve"}"#;
+        let signed = sign_request(&k, "POST", "/_lookout/api/cases/c1", body, NOW);
+        assert!(signed.header.contains(" body="));
+        let v = |header: &str, body: &[u8]| {
+            verify_request(
+                header,
+                std::slice::from_ref(&k),
+                "POST",
+                "/_lookout/api/cases/c1",
+                body,
+                NOW,
+                &ReplayGuard::default(),
+            )
+        };
+        assert!(v(&signed.header, body).is_some());
+        assert!(v(&signed.header, br#"{"action":"ignore"}"#).is_none(), "another body");
+        assert!(v(&signed.header, b"").is_none(), "the body taken off");
+        let unsigned = sign(&k, "POST", "/_lookout/api/cases/c1", NOW);
+        assert!(v(&unsigned.header, body).is_none(), "a body added to a request signed without");
+        let moved = signed.header.replace(" body=", " body=A");
+        assert!(v(&moved, body).is_none(), "a digest altered");
+    }
+
+    #[test]
+    fn a_request_without_a_body_signs_as_it_always_did() {
+        let k = key("a");
+        let signed = sign_request(&k, "GET", PATH, b"", NOW);
+        assert!(!signed.header.contains("body="));
+        assert!(verify(&signed.header, &[k], "GET", PATH, NOW, &ReplayGuard::default()).is_some());
     }
 
     #[test]

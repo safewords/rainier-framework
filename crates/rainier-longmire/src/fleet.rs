@@ -89,28 +89,33 @@ impl Endpoint {
     /// longer than 200 characters. Values pass through still encoded, so
     /// nothing in one can start another parameter.
     pub fn filter(self, raw: &str) -> String {
-        let allowed = self.params();
-        let mut seen: Vec<&str> = Vec::new();
-        let mut out: Vec<String> = Vec::new();
-        for pair in raw.split('&') {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            let Some(name) = allowed.iter().find(|a| **a == key) else { continue };
-            if value.is_empty() || value.len() > MAX_VALUE || seen.contains(name) {
-                continue;
-            }
-            seen.push(name);
-            out.push(format!("{key}={value}"));
-        }
-        out.join("&")
+        filter_params(&self.params(), raw)
     }
 }
 
+/// `raw` with only the `allowed` parameters, each once (the first), none
+/// empty and none longer than 200 characters, still encoded.
+pub(crate) fn filter_params(allowed: &[&str], raw: &str) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for pair in raw.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some(name) = allowed.iter().find(|a| **a == key) else { continue };
+        if value.is_empty() || value.len() > MAX_VALUE || seen.contains(name) {
+            continue;
+        }
+        seen.push(name);
+        out.push(format!("{key}={value}"));
+    }
+    out.join("&")
+}
+
 /// The `data` of one source's answer.
-fn data(body: &Value) -> &Value {
+pub(crate) fn data(body: &Value) -> &Value {
     body.get("data").unwrap_or(&Value::Null)
 }
 
-fn source_row(source: &Source, outcome: &Result<Value, String>) -> Value {
+pub(crate) fn source_row(source: &Source, outcome: &Result<Value, String>) -> Value {
     match outcome {
         Ok(_) => json!({ "id": source.id, "name": source.name, "status": "ok", "reason": null }),
         Err(reason) => {

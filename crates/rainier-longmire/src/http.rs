@@ -8,7 +8,7 @@ use rainier_routing::{Req, Router};
 use rainier_support::{BoxFuture, Error};
 use serde_json::{json, Value};
 
-use crate::{Endpoint, Longmire, RecentQuery};
+use crate::{Endpoint, Longmire, RecentQuery, Resource};
 
 /// Who may read: a check over the request, run before every answer. Anyone
 /// it refuses gets the router's own 404 — the same as a path that does not
@@ -110,6 +110,11 @@ fn fleet_routes(router: &mut Router, longmire: &Arc<Longmire>, gate: &Gate) {
     fleet_route!(router, longmire, gate, "/rum/errors", "longmire.rum.errors", rum_errors);
     fleet_route!(router, longmire, gate, "/cases", "longmire.cases", cases);
     fleet_route!(router, longmire, gate, "/map", "longmire.map", map);
+    fleet_route!(router, longmire, gate, "/batches", "longmire.batches", batches);
+    fleet_route!(router, longmire, gate, "/models", "longmire.models", models);
+    fleet_route!(router, longmire, gate, "/insights", "longmire.insights", insights);
+    typed_routes(router, longmire, gate);
+    resource_routes(router, longmire, gate);
     for endpoint in Endpoint::ALL {
         let (longmire, gate) = (Arc::clone(longmire), Arc::clone(gate));
         router
@@ -128,5 +133,103 @@ fn fleet_routes(router: &mut Router, longmire: &Arc<Longmire>, gate: &Gate) {
                 }) as BoxFuture<'static, Response>
             })
             .name(format!("longmire.source.{}", endpoint.path().replace('/', ".")));
+    }
+}
+
+/// `/entries/{type}`, `/aggregates/{type}`, `/series/{type}` across every
+/// source, and `/status`.
+fn typed_routes(router: &mut Router, longmire: &Arc<Longmire>, gate: &Gate) {
+    for (path, name) in [
+        ("/entries/{type}", "longmire.entries"),
+        ("/aggregates/{type}", "longmire.aggregates"),
+        ("/series/{type}", "longmire.series"),
+        ("/status", "longmire.status"),
+    ] {
+        let (longmire, gate) = (Arc::clone(longmire), Arc::clone(gate));
+        router
+            .get(path, move |request: Req| {
+                let (longmire, gate) = (Arc::clone(&longmire), Arc::clone(&gate));
+                Box::pin(async move {
+                    if !gate(&request).await {
+                        return denied(&request);
+                    }
+                    let t = request.route_param("type").unwrap_or_default().to_string();
+                    let query = request.query_string().to_string();
+                    let answer = match name {
+                        "longmire.entries" => longmire.entries(&t, &query).await,
+                        "longmire.aggregates" => longmire.aggregates(&t, &query).await,
+                        "longmire.series" => longmire.series(&t, &query).await,
+                        _ => longmire.status().await,
+                    };
+                    Response::json(&json!({ "data": answer }))
+                }) as BoxFuture<'static, Response>
+            })
+            .name(name);
+    }
+}
+
+/// `/sources/{source}/…` for every [`Resource`]: one source's own answer, or
+/// a 502 with the reason; and `POST /sources/{source}/cases/{id}`, a case
+/// action.
+fn resource_routes(router: &mut Router, longmire: &Arc<Longmire>, gate: &Gate) {
+    for (pattern, name) in [
+        ("batches", "batches"),
+        ("batches/{a}", "batch"),
+        ("entries/{a}", "entries"),
+        ("aggregates/{a}", "aggregates"),
+        ("series/{a}", "series"),
+        ("families/{a}/{b}", "family"),
+        ("models", "models"),
+        ("models/{a}", "model"),
+        ("insights", "insights"),
+        ("cases/{a}", "case"),
+        ("status", "status"),
+        ("traces", "traces"),
+        ("traces/{a}", "trace"),
+    ] {
+        let (longmire, gate) = (Arc::clone(longmire), Arc::clone(gate));
+        router
+            .get(format!("/sources/{{source}}/{pattern}"), move |request: Req| {
+                let (longmire, gate) = (Arc::clone(&longmire), Arc::clone(&gate));
+                Box::pin(async move {
+                    if !gate(&request).await {
+                        return denied(&request);
+                    }
+                    let segment = |at: &str| request.route_param(at).unwrap_or_default();
+                    let tail = pattern.replace("{a}", segment("a")).replace("{b}", segment("b"));
+                    let Some(resource) = Resource::parse(&tail) else {
+                        return denied(&request);
+                    };
+                    let source = segment("source").to_string();
+                    answer(longmire.read(&source, &resource, request.query_string()).await)
+                }) as BoxFuture<'static, Response>
+            })
+            .name(format!("longmire.source.{name}"));
+    }
+    let (longmire, gate) = (Arc::clone(longmire), Arc::clone(gate));
+    router
+        .post("/sources/{source}/cases/{a}", move |request: Req| {
+            let (longmire, gate) = (Arc::clone(&longmire), Arc::clone(&gate));
+            Box::pin(async move {
+                if !gate(&request).await {
+                    return denied(&request);
+                }
+                let action: Value = match request.json() {
+                    Ok(action) => action,
+                    Err(error) => return error.into_response(),
+                };
+                let source = request.route_param("source").unwrap_or_default().to_string();
+                let case = request.route_param("a").unwrap_or_default().to_string();
+                answer(longmire.act_on_case(&source, &case, &action).await)
+            }) as BoxFuture<'static, Response>
+        })
+        .name("longmire.source.case.act");
+}
+
+fn answer(outcome: Result<Value, String>) -> Response {
+    match outcome {
+        Ok(answer) => Response::json(&answer),
+        Err(reason) => Response::json(&json!({ "message": reason }))
+            .with_status(rainier_http::StatusCode::BAD_GATEWAY),
     }
 }

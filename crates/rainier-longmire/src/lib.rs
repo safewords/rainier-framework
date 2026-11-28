@@ -42,6 +42,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod detail;
 mod fetch;
 mod fleet;
 mod http;
@@ -55,6 +56,7 @@ use rainier_support::{BoxFuture, Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use detail::Resource;
 pub use fleet::Endpoint;
 pub use http::{routes, Gate};
 /// The key Longmire's private link to each Lookout is signed and sealed

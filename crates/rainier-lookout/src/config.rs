@@ -697,10 +697,55 @@ pub struct LookoutConfig {
     #[serde(default)]
     pub request_tracing: RequestTracing,
     /// The keys Longmire's link is recognised by (`LOOKOUT_LONGMIRE_KEYS`):
-    /// a request signed with one may read what a reader may, and its answer
-    /// is sealed. None by default — no link. Never serialised.
+    /// a request signed with one may read what a reader may — or, with
+    /// [`longmire_reach`](Self::longmire_reach) `viewer`, what a viewer
+    /// may — and its answer is sealed. None by default — no link. Never
+    /// serialised.
     #[serde(skip)]
     pub longmire_keys: Vec<rainier_lookout_link::LinkKey>,
+    /// How far Longmire's link reaches (`LOOKOUT_LONGMIRE_REACH`): the
+    /// readers' routes (the default), or everything the dashboard's own
+    /// viewers read and the case actions they take.
+    #[serde(default)]
+    pub longmire_reach: LongmireReach,
+}
+
+/// How far Longmire's link reaches into a Lookout — see
+/// [`LookoutConfig::longmire_reach`] and `docs/longmire.md`, "How far the
+/// link reaches".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LongmireReach {
+    /// What a reader may: health, requests, RUM, cases, aggregates, series,
+    /// status, queues, and with request tracing on, traces' shapes. Rollups
+    /// and timings; never content.
+    #[default]
+    Reader,
+    /// What the dashboard's viewers may: besides the readers' routes, kept
+    /// batches whole (their entries, with content as recorded and redacted),
+    /// entries by type, families, models, insights, one case, and the case
+    /// actions (resolve, reopen, ignore, severity). Never clearing, never
+    /// the live stream.
+    Viewer,
+}
+
+impl LongmireReach {
+    /// `reader` or `viewer`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::Viewer => "viewer",
+        }
+    }
+
+    /// The reach named `value` (`reader`, `viewer`; case ignored).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "reader" => Some(Self::Reader),
+            "viewer" => Some(Self::Viewer),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for LookoutConfig {
@@ -726,6 +771,7 @@ impl std::fmt::Debug for LookoutConfig {
             .field("rum", &self.rum)
             .field("request_tracing", &self.request_tracing)
             .field("longmire_keys", &self.longmire_keys.iter().map(|k| k.id()).collect::<Vec<_>>())
+            .field("longmire_reach", &self.longmire_reach)
             .finish()
     }
 }
@@ -775,6 +821,7 @@ impl Default for LookoutConfig {
             },
             request_tracing: RequestTracing::default(),
             longmire_keys: Vec::new(),
+            longmire_reach: LongmireReach::Reader,
         }
     }
 }
@@ -1124,6 +1171,11 @@ impl LookoutConfig {
                     "(redacted)",
                     "comma-separated `id:base64-secret`, each secret at least 32 bytes",
                 )
+            })?;
+        }
+        if let Some(v) = get("LOOKOUT_LONGMIRE_REACH") {
+            config.longmire_reach = LongmireReach::parse(&v).ok_or_else(|| {
+                ConfigError::new("LOOKOUT_LONGMIRE_REACH", &v, "`reader` or `viewer`")
             })?;
         }
         if let Some(v) = get("LOOKOUT_RUM_SECRET") {

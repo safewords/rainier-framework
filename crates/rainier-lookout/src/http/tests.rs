@@ -1302,9 +1302,19 @@ fn link_key(id: &str) -> rainier_lookout_link::LinkKey {
 /// The Lookout answering Longmire: request tracing on, the link key held,
 /// and no reader — nothing but the link can read it.
 fn linked(store: Arc<FakeStore>, keys: Vec<rainier_lookout_link::LinkKey>) -> Arc<CompiledRouter> {
+    linked_reaching(store, keys, crate::config::LongmireReach::Reader)
+}
+
+/// [`linked`], with the link reaching as far as `reach`.
+fn linked_reaching(
+    store: Arc<FakeStore>,
+    keys: Vec<rainier_lookout_link::LinkKey>,
+    reach: crate::config::LongmireReach,
+) -> Arc<CompiledRouter> {
     let mut config = LookoutConfig::default().enabled(true);
     config.request_tracing.enabled = true;
     config.longmire_keys = keys;
+    config.longmire_reach = reach;
     let mut router = Router::new();
     router.merge(routes(store, Arc::new(config), LookoutGate::deny_all(), "production"));
     Arc::new(router.compile(&Container::new()).unwrap())
@@ -1326,9 +1336,13 @@ impl rainier_http_client::Transport for Wire {
     > {
         Box::pin(async move {
             let path = request.url.splitn(4, '/').nth(3).unwrap_or_default().to_string();
-            let mut builder = Request::builder().method(Method::GET).uri(format!("/{path}"));
+            let method = Method::from_bytes(request.method.as_bytes()).unwrap();
+            let mut builder = Request::builder().method(method).uri(format!("/{path}"));
             for (name, value) in &request.headers {
                 builder = builder.header(name, value);
+            }
+            if let Some(body) = &request.body {
+                builder = builder.body(body.clone());
             }
             let mut response = self.router.dispatch(builder.build()).await;
             let status = response.status().as_u16();
@@ -1414,6 +1428,111 @@ async fn a_replayed_request_another_key_or_no_link_get_the_404() {
     let wire = Arc::new(Wire { router: unlinked, heard: Default::default() });
     let trace = longmire_over(&wire, link_key("2026-11")).trace(TRACE_ID).await.unwrap();
     assert_eq!(trace["services"][0]["status"], "unknown");
+}
+
+#[tokio::test]
+async fn the_link_reaches_what_a_viewer_reads_only_where_the_lookout_says_so() {
+    use crate::config::LongmireReach;
+    use rainier_longmire::Resource;
+
+    // The readers' reach, the default: batches, entries and case detail stay
+    // the viewers' alone, and Longmire says why it has none.
+    let reader = Arc::new(Wire {
+        router: linked_reaching(sample(), vec![link_key("2026-11")], LongmireReach::Reader),
+        heard: Default::default(),
+    });
+    let longmire = longmire_over(&reader, link_key("2026-11"));
+    let batches = longmire.batches("limit=10").await;
+    assert_eq!(batches["services"][0]["status"], "unknown", "{batches}");
+    assert!(batches["services"][0]["reason"].as_str().unwrap().contains("404"));
+    assert!(longmire.read("orders", &Resource::Status, "").await.is_ok(), "status is a reader's");
+
+    // A viewer's reach: everything the dashboard reads, sealed on the wire.
+    let viewer = Arc::new(Wire {
+        router: linked_reaching(sample(), vec![link_key("2026-11")], LongmireReach::Viewer),
+        heard: Default::default(),
+    });
+    let longmire = longmire_over(&viewer, link_key("2026-11"));
+    let batches = longmire.batches("limit=10&evil=1").await;
+    assert_eq!(batches["services"][0]["status"], "ok", "{batches}");
+    let first = &batches["data"][0];
+    assert_eq!(first["service"], "orders");
+    let id = first["id"].as_str().unwrap().to_string();
+
+    let batch = longmire.read("orders", &Resource::Batch(id.clone()), "").await.unwrap();
+    assert_eq!(batch["data"]["id"], id.as_str());
+    assert!(batch["data"]["entries"].as_array().is_some_and(|e| !e.is_empty()), "{batch}");
+    let on_the_wire =
+        String::from_utf8_lossy(&viewer.heard.lock().unwrap().last().unwrap().1).to_string();
+    assert!(!on_the_wire.contains(&id), "sealed");
+
+    let exceptions = longmire.entries("exception", "limit=5").await;
+    assert_eq!(exceptions["services"][0]["status"], "ok", "{exceptions}");
+    assert!(longmire.read("orders", &Resource::Insights, "").await.is_ok());
+    assert!(longmire.read("orders", &Resource::Models, "").await.is_ok());
+
+    // A case: read it, act on it with a signed body, and the refusals come
+    // back in Lookout's words.
+    let cases = longmire.cases("").await;
+    let case = cases["rows"].as_array().or(cases.as_array()).cloned().unwrap_or_default();
+    let case_id = case
+        .first()
+        .and_then(|c| c["id"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("a case: {cases}"));
+    let one = longmire.read("orders", &Resource::Case(case_id.clone()), "").await.unwrap();
+    assert_eq!(one["data"]["status"], "open");
+    let done = longmire
+        .act_on_case(
+            "orders",
+            &case_id,
+            &serde_json::json!({ "action": "resolve", "note": "fixed" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(done["data"]["status"], "resolved");
+    let refused = longmire
+        .act_on_case("orders", &case_id, &serde_json::json!({ "action": "explode" }))
+        .await
+        .unwrap_err();
+    assert!(refused.contains("422") && refused.contains("resolve"), "{refused}");
+
+    // The settings say how far the link reaches.
+    let status = longmire.status().await;
+    assert_eq!(status["services"][0]["settings"]["longmire"]["reach"], "viewer", "{status}");
+
+    // A body changed on the way is not the one signed: the 404.
+    let captured = viewer
+        .heard
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(_, _, sent)| sent.method == "POST")
+        .map(|(_, _, sent)| sent.clone())
+        .unwrap();
+    let mut tampered = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/_lookout/api/cases/{case_id}"))
+        .body(r#"{"action":"ignore"}"#);
+    for (name, value) in &captured.headers {
+        tampered = tampered.header(name, value);
+    }
+    let router = linked_reaching(sample(), vec![link_key("2026-11")], LongmireReach::Viewer);
+    assert_eq!(router.dispatch(tampered.build()).await.status(), StatusCode::NOT_FOUND);
+
+    // Clearing is never the link's, however far it reaches.
+    let clear =
+        rainier_lookout_link::sign(&link_key("2026-11"), "DELETE", "/_lookout/api/batches", {
+            chrono::Utc::now().timestamp() as u64
+        });
+    let request = Request::builder()
+        .method(Method::DELETE)
+        .uri("/_lookout/api/batches")
+        .header(rainier_lookout_link::HEADER, &clear.header)
+        .header("x-lookout", "1")
+        .build();
+    assert_eq!(router.dispatch(request).await.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

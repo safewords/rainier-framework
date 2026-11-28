@@ -495,6 +495,10 @@ pub(crate) fn status_value(
         "n_plus_one": config.n_plus_one,
         "insights": config.insights,
         "log_level": config.log_level,
+        "longmire": {
+            "linked": !config.longmire_keys.is_empty(),
+            "reach": config.longmire_reach.as_str(),
+        },
     })
 }
 

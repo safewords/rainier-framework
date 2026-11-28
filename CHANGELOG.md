@@ -12,6 +12,19 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Longmire sees what Lookout's own dashboard shows** (`rainier-lookout`,
+  `rainier-longmire`, `rainier-lookout-link`): `LOOKOUT_LONGMIRE_REACH=viewer`
+  lets the link reach, besides the readers' routes, kept batches whole,
+  entries by type, families, models, insights, one case and the case actions
+  (`LINK_VIEWER_ROUTES`); `reader`, the default, keeps today's reach. Never
+  clearing, the stream or the shell. Longmire gains `batches`, `entries`,
+  `aggregates`, `series`, `models`, `insights` and `status` across the fleet,
+  `read(source, Resource::…)` for one source, and `act_on_case`, each with a
+  route. The link signs a request's body (`sign_request`/`verify_request`,
+  the header's `body=`); a request without one signs as before, so older
+  Lookouts still recognise every `GET`. `/api/status` says how far the link
+  reaches. See `docs/longmire.md`, "How far the link reaches".
+
 - **Queue inspection in Lookout** (`rainier-queue`, `rainier-lookout`,
   `rainier-longmire`): `GET /api/queues` — each job queue's depth now and
   over the window, jobs running against the workers' slots (concurrency and

@@ -114,7 +114,8 @@ Read at boot through the application's `Env` (so `.env` counts), with
 | `LOOKOUT_REQUEST_TRACING` | [request tracing](#traces-across-services): keep traces that cross services whole, and let readers read their shape | a boolean | `false` |
 | `LOOKOUT_TRACE_SAMPLE_RATE` | in request tracing, the fraction of traces kept whole, decided from the trace id so every service agrees | `0.0..=1.0` | `0.01` |
 | `LOOKOUT_SERVICE` | the name this service goes by in a trace | a string | `APP_NAME` |
-| `LOOKOUT_LONGMIRE_KEYS` | the keys [Longmire's link](longmire.md#the-link) is recognised by: a request signed with one may read what a reader may, answered sealed | comma-separated `id:base64-secret`, each secret 32 bytes or more | none: no link |
+| `LOOKOUT_LONGMIRE_KEYS` | the keys [Longmire's link](longmire.md#the-link) is recognised by: a request signed with one may read what a reader may (or, with `LOOKOUT_LONGMIRE_REACH=viewer`, what a viewer may), answered sealed | comma-separated `id:base64-secret`, each secret 32 bytes or more | none: no link |
+| `LOOKOUT_LONGMIRE_REACH` | how far [the link reaches](longmire.md#how-far-the-link-reaches): `reader` — the readers' routes; `viewer` — also kept batches whole, entries, families, models, insights, one case and the case actions | `reader`, `viewer` | `reader` |
 | `APP_ENV` | `local` when it is `local` | — | — |
 
 Booleans accept `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`; an empty

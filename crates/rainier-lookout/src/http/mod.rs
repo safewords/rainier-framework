@@ -57,6 +57,16 @@
 //! dashboard's shell included, stays the viewers' alone, and a refused
 //! reader gets the same 404 as anyone refused.
 //!
+//! # Longmire's link
+//!
+//! A request signed with one of [`LookoutConfig::longmire_keys`] is
+//! Longmire's, and its answer is sealed for it (`rainier-lookout-link`). It
+//! reaches the readers' routes; with
+//! [`LongmireReach::Viewer`](crate::config::LongmireReach)
+//! (`LOOKOUT_LONGMIRE_REACH=viewer`) also [`LINK_VIEWER_ROUTES`] — what the
+//! dashboard's viewers read, and the case actions, whose body is signed too.
+//! Never clearing, the live stream or the shell.
+//!
 //! # What every response carries
 //!
 //! `Cache-Control: no-store` (the two assets instead: `private`, a year,
@@ -249,6 +259,24 @@ pub const READER_ROUTES: &[&str] = &[
 /// the viewers' alone.
 pub const TRACING_READER_ROUTES: &[&str] = &["/api/traces", "/api/traces/{trace}"];
 
+/// The routes Longmire's link may also call where this Lookout lets it reach
+/// as far as a viewer ([`LongmireReach::Viewer`](crate::config::LongmireReach)),
+/// with the method each is called with. Everything a viewer reads, and the
+/// case actions; never `DELETE /api/batches`, the live stream or the shell.
+pub const LINK_VIEWER_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/api/batches"),
+    ("GET", "/api/batches/{id}"),
+    ("GET", "/api/entries/{type}"),
+    ("GET", "/api/families/{type}/{id}"),
+    ("GET", "/api/models"),
+    ("GET", "/api/models/{model}"),
+    ("GET", "/api/insights"),
+    ("GET", "/api/cases/{id}"),
+    ("POST", "/api/cases/{id}"),
+    ("GET", "/api/traces"),
+    ("GET", "/api/traces/{trace}"),
+];
+
 /// Whether `environment` is the local one — the only place
 /// [`Dashboard::open_locally`] applies. `testing` is deliberately not: a test
 /// asserting on the gate should see the production behaviour.
@@ -326,21 +354,21 @@ pub fn routes(
         router.get("/assets/lookout.js", guarded(&state, shell::script)).name("assets.js");
         router.get("/assets/lookout.css", guarded(&state, shell::stylesheet)).name("assets.css");
 
-        router.get("/api/batches", guarded(&state, api::batches)).name("api.batches");
+        router.get("/api/batches", viewable(&state, api::batches)).name("api.batches");
         router.delete("/api/batches", guarded(&state, api::clear)).name("api.clear");
-        router.get("/api/batches/{id}", guarded(&state, api::batch)).name("api.batch");
-        router.get("/api/entries/{type}", guarded(&state, api::entries)).name("api.entries");
+        router.get("/api/batches/{id}", viewable(&state, api::batch)).name("api.batch");
+        router.get("/api/entries/{type}", viewable(&state, api::entries)).name("api.entries");
         router
             .get("/api/aggregates/{type}", readable(&state, api::aggregates))
             .name("api.aggregates");
         router.get("/api/series/{type}", readable(&state, api::series)).name("api.series");
-        router.get("/api/families/{type}/{id}", guarded(&state, api::family)).name("api.family");
-        router.get("/api/models", guarded(&state, api::models)).name("api.models");
-        router.get("/api/models/{model}", guarded(&state, api::model)).name("api.model");
-        router.get("/api/insights", guarded(&state, api::insights)).name("api.insights");
+        router.get("/api/families/{type}/{id}", viewable(&state, api::family)).name("api.family");
+        router.get("/api/models", viewable(&state, api::models)).name("api.models");
+        router.get("/api/models/{model}", viewable(&state, api::model)).name("api.model");
+        router.get("/api/insights", viewable(&state, api::insights)).name("api.insights");
         router.get("/api/cases", readable(&state, api::cases)).name("api.cases");
-        router.get("/api/cases/{id}", guarded(&state, api::case)).name("api.case");
-        router.post("/api/cases/{id}", guarded(&state, api::act_on_case)).name("api.case.act");
+        router.get("/api/cases/{id}", viewable(&state, api::case)).name("api.case");
+        router.post("/api/cases/{id}", viewable(&state, api::act_on_case)).name("api.case.act");
         router.get("/api/status", readable(&state, api::status)).name("api.status");
         router.get("/api/health", readable(&state, health::health)).name("api.health");
         router.get("/api/requests", readable(&state, health::requests)).name("api.requests");
@@ -354,8 +382,8 @@ pub fn routes(
             router.get("/api/traces", readable(&state, traces::list)).name("api.traces");
             router.get("/api/traces/{trace}", readable(&state, traces::show)).name("api.trace");
         } else {
-            router.get("/api/traces", guarded(&state, traces::list)).name("api.traces");
-            router.get("/api/traces/{trace}", guarded(&state, traces::show)).name("api.trace");
+            router.get("/api/traces", viewable(&state, traces::list)).name("api.traces");
+            router.get("/api/traces/{trace}", viewable(&state, traces::show)).name("api.trace");
         }
 
         // Real user monitoring: public, because every visitor's browser
@@ -460,8 +488,47 @@ where
     }
 }
 
+/// Wrap a handler the dashboard's viewers call, which Longmire's link may
+/// also call when this Lookout lets it reach that far
+/// ([`LongmireReach::Viewer`](crate::config::LongmireReach)): the link's
+/// request answered sealed, anyone else through the viewers' gate. A link
+/// request where the reach is the readers' gets the same 404 as anything
+/// else refused.
+fn viewable<F, Fut, R>(
+    state: &Arc<Shared>,
+    handler: F,
+) -> impl Fn(Req) -> BoxFuture<'static, Response> + Clone + Send + Sync + 'static
+where
+    F: Fn(Arc<Shared>, Req) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = R> + Send + 'static,
+    R: rainier_http::IntoResponse,
+{
+    let state = Arc::clone(state);
+    move |request: Req| {
+        let state = Arc::clone(&state);
+        let handler = handler.clone();
+        Box::pin(async move {
+            if let Some(header) = request.header(rainier_lookout_link::HEADER) {
+                if state.config.longmire_reach != crate::config::LongmireReach::Viewer {
+                    return denied(&request);
+                }
+                let Some(seen) = recognise_link(&state, &request, header) else {
+                    return denied(&request);
+                };
+                let response = handler(Arc::clone(&state), request).await.into_response();
+                return secure(seal_for_link(&state, &seen, response).await);
+            }
+            if !state.gate.allows(&request, &state.config.dashboard, &state.environment).await {
+                return denied(&request);
+            }
+            secure(handler(state, request).await.into_response())
+        })
+    }
+}
+
 /// A Longmire request, recognised by one of the configured link keys —
-/// signature, freshness, first use. `None` for anything else.
+/// signature (its body's too), freshness, first use. `None` for anything
+/// else.
 fn recognise_link(
     state: &Shared,
     request: &Request,
@@ -473,11 +540,12 @@ fn recognise_link(
     }
     let path_and_query = request.uri().path_and_query().map_or(request.path(), |p| p.as_str());
     let now = chrono::Utc::now().timestamp().max(0) as u64;
-    rainier_lookout_link::verify(
+    rainier_lookout_link::verify_request(
         header,
         keys,
         request.method().as_str(),
         path_and_query,
+        request.body(),
         now,
         &state.replay,
     )
