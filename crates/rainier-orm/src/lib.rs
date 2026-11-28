@@ -134,7 +134,7 @@ pub use entity::Entity;
 pub use entity::SingleKey;
 pub use executor::{ExecOutcome, Executor};
 pub use key::{key_condition, key_route, row_key_condition};
-pub use pool::PoolConfig;
+pub use pool::{PoolConfig, PoolUsage, ServerConnections};
 pub use query::Query;
 pub use row::{FromColumn, Row, ToColumn};
 pub use sharding::{IdAllocator, ShardingSettings};

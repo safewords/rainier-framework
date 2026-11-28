@@ -126,6 +126,12 @@ pub trait Connection: Send + Sync + 'static {
         params: Vec<Value>,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn Row>>>>;
 
+    /// What the pool holds now — see [`rainier_orm::PoolUsage`]. `None` by
+    /// default, for a backend with no pool.
+    fn pool_usage(&self) -> BoxFuture<'_, Option<rainier_orm::PoolUsage>> {
+        Box::pin(async { None })
+    }
+
     /// Begin a transaction on this backend. See [`Database::transaction`].
     ///
     /// Refused by default: a backend that cannot hold one connection across
@@ -204,6 +210,15 @@ macro_rules! bind_executor {
 
             fn allocate_id(&self, shard_key: u64) -> ::std::option::Option<u64> {
                 $crate::reexport::Executor::allocate_id(self, shard_key)
+            }
+
+            fn pool_usage(
+                &self,
+            ) -> $crate::reexport::BoxFuture<
+                '_,
+                ::std::option::Option<$crate::reexport::PoolUsage>,
+            > {
+                ::std::boxed::Box::pin($crate::reexport::Executor::pool_usage(self))
             }
 
             fn fetch<'a>(
@@ -629,6 +644,15 @@ impl Database {
     /// for clones, derived handles and a transaction's handle; false for two
     /// connections opened separately, even to the same database.
     ///
+    /// What the writer's pool holds now, and what the server says about this
+    /// application's connections — see [`rainier_orm::PoolUsage`]. `None` for
+    /// a backend with no pool. Never waits for a connection: under a pool
+    /// with none idle the server's half is left out (`server_error: busy`)
+    /// rather than queued behind the requests that are waiting.
+    pub async fn pool_usage(&self) -> Option<rainier_orm::PoolUsage> {
+        self.connection.pool_usage().await
+    }
+
     /// What lets something subscribing to several handles — every connection
     /// a [`DatabaseManager`](crate::DatabaseManager) holds, where the default
     /// is also registered by name — subscribe to each feed once.

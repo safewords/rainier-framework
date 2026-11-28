@@ -12,6 +12,19 @@ the release as a whole and names the crate it landed in.
 
 ### Added
 
+- **Database connections in Lookout** (`rainier-orm`, `rainier-drivers`,
+  `rainier-database`, `rainier-lookout`, `rainier-longmire`,
+  `rainier-framework`): `GET {lookout}/api/database` answers each
+  connection's pool across every process, and on MySQL/MariaDB the user's
+  connections against its `MAX_USER_CONNECTIONS` (read from its own
+  `SHOW GRANTS`) and the server's against `max_connections`, with a status.
+  Readers may call it; Longmire reaches it as `Endpoint::Database`. The
+  framework samples every connection every 15 s beside Lookout's writer
+  (`db.pool.sample`, `PoolSampled`), from `Executor::pool_usage` /
+  `Database::pool_usage`: the pool's own counts need no connection, and the
+  server is asked on an idle connection only, never queued behind requests on
+  a full pool. New rollup `database_facet`.
+
 - **Longmire sees what Lookout's own dashboard shows** (`rainier-lookout`,
   `rainier-longmire`, `rainier-lookout-link`): `LOOKOUT_LONGMIRE_REACH=viewer`
   lets the link reach, besides the readers' routes, kept batches whole,

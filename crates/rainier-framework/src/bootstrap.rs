@@ -1503,6 +1503,10 @@ impl Rainier {
         if let Some((lookout, _)) = lookout {
             if tokio::runtime::Handle::try_current().is_ok() {
                 app.instance(crate::lookout::Writer::new(lookout.start_writer()));
+                // Each process's database pools, beside it (`lookout::start_pool_sampler`).
+                if let Some(sampler) = crate::lookout::start_pool_sampler(&app) {
+                    app.instance(sampler);
+                }
             }
         }
 

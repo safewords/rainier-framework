@@ -238,7 +238,7 @@ app_router.group(GroupAttributes::new().prefix("/ops/longmire"), |r| r.merge(rou
 
 `GET /traces` (`kept`, `before`, `limit`), `GET /traces/{trace}`, `GET
 /health`, `/requests`, `/queues`, `/rum/vitals`, `/rum/errors`, `/cases` and `/map`, each
-answering `{"data": …}`, and `GET /sources/{source}/{health|requests|queues|rum/vitals|rum/errors|cases}`
+answering `{"data": …}`, and `GET /sources/{source}/{health|requests|queues|database|rum/vitals|rum/errors|cases}`
 answering one source's own answer (a `502` with the reason when it has none);
 `GET /batches`, `/entries/{type}`, `/aggregates/{type}`, `/series/{type}`,
 `/models`, `/insights` and `/status` across the fleet;

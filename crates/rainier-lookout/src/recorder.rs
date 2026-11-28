@@ -3204,6 +3204,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_processs_pool_sample_is_counted_outside_every_batch() {
+        let rig = rig(production());
+        {
+            let _bus = rainier_events::set_default(Arc::clone(&rig.events));
+            Did::new("db.pool.sample")
+                .with("db.system.name", "mysql")
+                .with("rainier.db.connection", "mysql")
+                .with("rainier.db.pool.open", 8u64)
+                .with("rainier.db.pool.idle", 3u64)
+                .with("rainier.db.pool.max", 10u64)
+                .with("rainier.db.interval_ms", 15_000u64)
+                .with("rainier.db.server.user", 19u64)
+                .with("rainier.db.server.user_limit", 20u64)
+                .with("rainier.db.server.total", 22u64)
+                .with("rainier.db.server.max", 151u64)
+                .publish();
+            // A full pool: the server was not asked.
+            Did::new("db.pool.sample")
+                .with("rainier.db.connection", "mysql")
+                .with("rainier.db.pool.open", 10u64)
+                .with("rainier.db.pool.idle", 0u64)
+                .with("rainier.db.pool.max", 10u64)
+                .with("rainier.db.interval_ms", 15_000u64)
+                .with("rainier.db.server.error", "busy")
+                .publish();
+        }
+        rig.flush().await;
+        assert!(rig.store.all().is_empty(), "a sample is no batch");
+        let rows = rig
+            .store
+            .aggregate_rows(EntryType::DatabaseFacet, 60, Utc::now() - chrono::Duration::minutes(2))
+            .await
+            .expect("rows");
+        let value =
+            |key: &str| rows.iter().find(|r| r.key == key).map(|r| (r.count, r.sum_us, r.max_us));
+        assert_eq!(value("in_use mysql"), Some((2, 15 * 15_000_000, 10 * 15_000_000)));
+        assert_eq!(value("user mysql"), Some((1, 19, 19)));
+        assert_eq!(value("user_limit mysql"), Some((1, 20, 20)));
+        assert_eq!(value("saturation mysql"), Some((2, 150, 100)));
+        assert_eq!(value("unanswered mysql").map(|v| v.0), Some(1));
+    }
+
+    #[tokio::test]
     async fn model_changes_are_counted_when_their_batch_is_not_kept() {
         let rig = rig(production());
         let probe = rig.lookout.clone();

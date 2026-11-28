@@ -73,7 +73,7 @@ aws-dynamodb = ["aws", "dep:aws-sdk-dynamodb"]
 # without one of them, so it brings no dependency: each executor names its own.
 sql = []
 # Native MySQL / Postgres / SQLite. Not available on wasm32.
-sea-orm-executor = ["sql", "dep:rainier-orm", "dep:chrono", "dep:sea-orm", "dep:rust_decimal", "dep:log"]
+sea-orm-executor = ["sql", "dep:rainier-orm", "dep:chrono", "dep:sea-orm", "dep:rust_decimal", "dep:log", "dep:tokio"]
 # Cloudflare D1 over the HTTP /query API.
 d1-http = ["sql", "dep:rainier-orm", "dep:chrono", "dep:serde_json"]
 # Turso / libSQL over the Hrana HTTP /v2/pipeline API. Blobs travel as base64.

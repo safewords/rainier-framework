@@ -30,6 +30,7 @@ pub mod cases;
 pub mod client;
 pub mod commands;
 pub mod config;
+pub mod database;
 pub mod entry;
 pub mod facets;
 pub mod http;

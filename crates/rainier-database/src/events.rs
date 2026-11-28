@@ -45,6 +45,52 @@ use rainier_support::Result;
 use crate::model::{Model, ModelAction, ModelChanged};
 use crate::telemetry;
 
+// --- PoolSampled -------------------------------------------------------------
+
+/// One process's look at one connection's pool, on the framework's sampling
+/// interval: kind `db.pool.sample`.
+///
+/// Published outside every unit of work, never on a query's path. Every
+/// replica samples its own pool, so a reader adds the replicas' pools
+/// together (each sample says how long it stands for, `interval`), and reads
+/// the server's numbers — the same server, seen by each — as one value.
+#[derive(Debug, Clone)]
+pub struct PoolSampled {
+    /// The connection's name (`mysql`, `primary`), or `default`.
+    pub connection: String,
+    /// The backend.
+    pub dialect: Dialect,
+    /// What the pool and the server said.
+    pub usage: rainier_orm::PoolUsage,
+    /// How long this sample stands for.
+    pub interval: Duration,
+}
+
+impl Activity for PoolSampled {
+    fn kind(&self) -> &'static str {
+        "db.pool.sample"
+    }
+
+    fn fields(&self, fields: &mut Fields) {
+        let server = self.usage.server.as_ref();
+        fields
+            .set("db.system.name", telemetry::system(self.dialect))
+            .set("rainier.db.connection", self.connection.clone())
+            .set("rainier.db.pool.open", u64::from(self.usage.open))
+            .set("rainier.db.pool.idle", u64::from(self.usage.idle))
+            .set("rainier.db.pool.max", u64::from(self.usage.max))
+            .set(
+                "rainier.db.interval_ms",
+                u64::try_from(self.interval.as_millis()).unwrap_or(u64::MAX),
+            )
+            .maybe("rainier.db.server.user", server.map(|s| s.user))
+            .maybe("rainier.db.server.user_limit", server.and_then(|s| s.user_limit))
+            .maybe("rainier.db.server.total", server.map(|s| s.total))
+            .maybe("rainier.db.server.max", server.map(|s| s.max))
+            .maybe("rainier.db.server.error", self.usage.server_error.clone());
+    }
+}
+
 // --- QueryExecuted -----------------------------------------------------------
 
 /// One statement run through a [`Database`](crate::Database) handle: kind

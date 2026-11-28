@@ -28,6 +28,9 @@ pub enum Endpoint {
     /// `/api/queues`: each job queue's depth, concurrency, throughput and
     /// waits.
     Queues,
+    /// `/api/database`: each database connection's pool, the user's
+    /// connections against its cap, and the server's.
+    Database,
 }
 
 const WINDOW: [&str; 3] = ["since", "until", "period"];
@@ -37,13 +40,14 @@ const MAX_VALUE: usize = 200;
 
 impl Endpoint {
     /// Every endpoint.
-    pub const ALL: [Endpoint; 6] = [
+    pub const ALL: [Endpoint; 7] = [
         Endpoint::Health,
         Endpoint::Requests,
         Endpoint::RumVitals,
         Endpoint::RumErrors,
         Endpoint::Cases,
         Endpoint::Queues,
+        Endpoint::Database,
     ];
 
     /// Its path under `{lookout}/api/`.
@@ -55,6 +59,7 @@ impl Endpoint {
             Self::RumErrors => "rum/errors",
             Self::Cases => "cases",
             Self::Queues => "queues",
+            Self::Database => "database",
         }
     }
 
@@ -80,6 +85,7 @@ impl Endpoint {
             }
             Self::Cases => return vec!["status", "severity", "q", "limit"],
             Self::Queues => params.extend(["queue", "order", "limit", "series"]),
+            Self::Database => {}
         }
         params
     }

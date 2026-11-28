@@ -8,7 +8,9 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 use rainier_orm::sea_query::Value;
-use rainier_orm::{Dialect, Error, ExecOutcome, Executor, PoolConfig, Result, Row};
+use rainier_orm::{
+    Dialect, Error, ExecOutcome, Executor, PoolConfig, PoolUsage, Result, Row, ServerConnections,
+};
 use std::sync::{Arc, Mutex};
 
 use sea_orm::{
@@ -304,9 +306,85 @@ impl Executor for SeaOrmTransaction {
     }
 }
 
+/// How long [`Executor::pool_usage`] waits for a connection the pool has
+/// room to open.
+const SAMPLE_ACQUIRE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What MySQL or MariaDB says about this user's connections, asked on
+/// `connection`: what the user may see of itself with no privilege beyond
+/// logging in — its own threads in the process list (every process that
+/// connects as it), its grant's `MAX_USER_CONNECTIONS`, and the server's
+/// `Threads_connected` and `max_connections`.
+async fn mysql_connections(
+    connection: &mut sea_orm::sqlx::pool::PoolConnection<sea_orm::sqlx::MySql>,
+) -> std::result::Result<ServerConnections, sea_orm::sqlx::Error> {
+    use sea_orm::sqlx;
+    let (user, max): (i64, i64) = sqlx::query_as(
+        "SELECT CAST(COUNT(*) AS SIGNED), CAST(@@max_connections AS SIGNED) \
+         FROM information_schema.PROCESSLIST WHERE USER = SUBSTRING_INDEX(CURRENT_USER(), '@', 1)",
+    )
+    .fetch_one(&mut **connection)
+    .await?;
+    let status: Vec<(String, String)> =
+        sqlx::query_as("SHOW GLOBAL STATUS LIKE 'Threads_connected'")
+            .fetch_all(&mut **connection)
+            .await?;
+    let total = status.first().and_then(|(_, v)| v.trim().parse().ok()).unwrap_or(0);
+    let grants: Vec<(String,)> = sqlx::query_as("SHOW GRANTS").fetch_all(&mut **connection).await?;
+    let user_limit = grants.iter().find_map(|(g,)| rainier_orm::pool::max_user_connections_in(g));
+    let count = |n: i64| u64::try_from(n).unwrap_or(0);
+    Ok(ServerConnections { user: count(user), user_limit, total, max: count(max) })
+}
+
 impl Executor for SeaOrmExecutor {
     fn dialect(&self) -> Dialect {
         self.dialect
+    }
+
+    async fn pool_usage(&self) -> Option<PoolUsage> {
+        let counts = |open: u32, idle: usize, max: u32| PoolUsage {
+            open,
+            idle: u32::try_from(idle).unwrap_or(u32::MAX),
+            max,
+            server: None,
+            server_error: None,
+        };
+        Some(match self.dialect {
+            Dialect::MySql => {
+                let pool = self.db.get_mysql_connection_pool();
+                let mut usage =
+                    counts(pool.size(), pool.num_idle(), pool.options().get_max_connections());
+                // An idle connection, or a new one while the pool has room
+                // for it — never a place in the queue behind requests waiting
+                // on a full pool, which is when this is needed least.
+                let connection = match pool.try_acquire() {
+                    Some(connection) => Some(connection),
+                    None if usage.open < usage.max => {
+                        tokio::time::timeout(SAMPLE_ACQUIRE, pool.acquire())
+                            .await
+                            .ok()
+                            .and_then(std::result::Result::ok)
+                    }
+                    None => None,
+                };
+                match connection {
+                    None => usage.server_error = Some("busy".to_string()),
+                    Some(mut connection) => match mysql_connections(&mut connection).await {
+                        Ok(server) => usage.server = Some(server),
+                        Err(e) => usage.server_error = Some(e.to_string()),
+                    },
+                }
+                usage
+            }
+            Dialect::Postgres => {
+                let pool = self.db.get_postgres_connection_pool();
+                counts(pool.size(), pool.num_idle(), pool.options().get_max_connections())
+            }
+            Dialect::Sqlite => {
+                let pool = self.db.get_sqlite_connection_pool();
+                counts(pool.size(), pool.num_idle(), pool.options().get_max_connections())
+            }
+        })
     }
 
     async fn fetch_all(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Box<dyn Row>>> {

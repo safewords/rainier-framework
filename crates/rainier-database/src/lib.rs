@@ -94,7 +94,7 @@ pub use databases::{
     DatabaseConfig, DatabaseCredentials, DatabaseDriver, DatabaseRole, Databases, DsnDatabase,
     PoolSettings, ServerDatabase, SqliteDatabase,
 };
-pub use events::{ModelSubscription, OnModel, QueryExecuted};
+pub use events::{ModelSubscription, OnModel, PoolSampled, QueryExecuted};
 pub use expression::{Expression, Predicate, SubSelect};
 pub use factory::{Factory, HasFactory};
 pub use manager::DatabaseManager;
@@ -127,7 +127,7 @@ pub use rainier_orm::{
 pub mod reexport {
     pub use crate::row::{ColumnRequest, OwnedRow};
     pub use rainier_orm::sea_query::Value;
-    pub use rainier_orm::{Dialect, ExecOutcome, Executor, Row, ShardRoute};
+    pub use rainier_orm::{Dialect, ExecOutcome, Executor, PoolUsage, Row, ShardRoute};
     pub use rainier_support::{BoxFuture, Error, LocalBoxFuture, Result};
     // What `concurrently!` expands to.
     pub use futures_util::try_join;

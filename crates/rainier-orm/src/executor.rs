@@ -68,6 +68,14 @@ pub trait Executor {
         None
     }
 
+    /// What the pool holds now and what the server says about this user's
+    /// connections — see [`PoolUsage`](crate::PoolUsage). `None`, the
+    /// default, for a backend with no pool to describe (an HTTP-fronted
+    /// database). Never waits for a connection.
+    async fn pool_usage(&self) -> Option<crate::PoolUsage> {
+        None
+    }
+
     /// Run a query and return every row. Parameters are bound positionally in
     /// the order sea-query emitted them.
     async fn fetch_all(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Box<dyn Row>>>;

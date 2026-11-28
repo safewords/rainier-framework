@@ -218,6 +218,34 @@ pub(crate) async fn queues_value(state: &Shared, query: &Value) -> Result<Value>
     }}))
 }
 
+/// `GET /api/database`.
+pub(crate) async fn database(state: Arc<Shared>, request: Req) -> Result<Response> {
+    Ok(Response::json(&database_value(&state, request.query()).await?))
+}
+
+/// Every database connection over the window: each process's pool added up,
+/// the user's connections against its cap, the server's against its own, and
+/// a status. See `docs/lookout.md`, "Database connections".
+pub(crate) async fn database_value(state: &Shared, query: &Value) -> Result<Value> {
+    let mut params = Params::new(query);
+    let window = params::window(&mut params, Utc::now());
+    params.finish()?;
+    let rows =
+        state.store.aggregate_rows(EntryType::DatabaseFacet, window.period_s, window.since).await?;
+    let (rows, totals) = crate::database::summarize(
+        &rows,
+        window.period_s,
+        window.since,
+        window.until,
+        window.minutes(),
+    );
+    Ok(json!({ "data": {
+        "window": window.json(),
+        "rows": rows,
+        "totals": totals,
+    }}))
+}
+
 /// The RUM filters, shared by vitals and errors.
 fn rum_filter(params: &mut Params<'_>) -> RumFilter {
     let mut filter = RumFilter::default();

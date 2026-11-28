@@ -247,3 +247,71 @@ mod tests {
         assert!(pool.idle_timeout.is_some());
     }
 }
+
+/// What a pool holds right now, and — on MySQL and MariaDB — what the server
+/// says about this application's connections. See
+/// [`Executor::pool_usage`](crate::Executor::pool_usage).
+///
+/// The pool's half costs nothing: it is the pool's own bookkeeping, read
+/// without a connection, so it is there even when every connection is
+/// checked out — which is when it matters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PoolUsage {
+    /// Connections the pool has open, checked out or idle.
+    pub open: u32,
+    /// Of those, how many are idle.
+    pub idle: u32,
+    /// How many it may open (`max_connections`).
+    pub max: u32,
+    /// What the server says, when it was asked and answered.
+    pub server: Option<ServerConnections>,
+    /// Why the server was not asked or did not answer: no idle connection
+    /// to ask on (`busy`), or the error. `None` when it answered, and for a
+    /// backend with nothing to ask.
+    pub server_error: Option<String>,
+}
+
+/// One server's connections, as this application's user sees them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerConnections {
+    /// Connections open as this user, from every process that connects as it.
+    pub user: u64,
+    /// The user's cap (`MAX_USER_CONNECTIONS`), when it has one; `None` is
+    /// none, which leaves only the server's.
+    pub user_limit: Option<u64>,
+    /// Connections open on the server, every user's (`Threads_connected`).
+    pub total: u64,
+    /// The server's cap (`max_connections`).
+    pub max: u64,
+}
+
+/// The cap in a `SHOW GRANTS` line (`… WITH MAX_USER_CONNECTIONS 20`), or
+/// `None` without one or at `0` (no cap).
+pub fn max_user_connections_in(grant: &str) -> Option<u64> {
+    let upper = grant.to_ascii_uppercase();
+    let at = upper.find("MAX_USER_CONNECTIONS")?;
+    let n: u64 = upper[at + "MAX_USER_CONNECTIONS".len()..]
+        .trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    (n > 0).then_some(n)
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::max_user_connections_in;
+
+    #[test]
+    fn the_cap_is_read_from_a_grant() {
+        let grant = "GRANT USAGE ON *.* TO `dungeon`@`%` IDENTIFIED BY PASSWORD '*AB' WITH MAX_USER_CONNECTIONS 20";
+        assert_eq!(max_user_connections_in(grant), Some(20));
+        assert_eq!(max_user_connections_in("GRANT USAGE ON *.* TO `x`@`%` WITH MAX_QUERIES_PER_HOUR 5 MAX_USER_CONNECTIONS 100"), Some(100));
+        assert_eq!(max_user_connections_in("GRANT ALL PRIVILEGES ON `x`.* TO `x`@`%`"), None);
+        assert_eq!(
+            max_user_connections_in("GRANT USAGE ON *.* TO `x`@`%` WITH MAX_USER_CONNECTIONS 0"),
+            None
+        );
+    }
+}

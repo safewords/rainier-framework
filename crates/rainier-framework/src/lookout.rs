@@ -595,6 +595,68 @@ impl Writer {
     }
 }
 
+/// How often each process samples its database pools for Lookout.
+pub const POOL_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The running pool sampler, kept in the container for the life of the
+/// process. See [`start_pool_sampler`].
+pub(crate) struct PoolSampler(Mutex<Option<tokio::task::JoinHandle<()>>>);
+
+/// Every distinct database connection, named — `default` for one with no
+/// name of its own.
+fn named_connections(
+    databases: &rainier_database::DatabaseManager,
+) -> Vec<(String, rainier_database::Database)> {
+    let mut out: Vec<(String, rainier_database::Database)> = Vec::new();
+    for name in databases.connection_names() {
+        let Some(db) = databases.connection(name) else { continue };
+        if !out.iter().any(|(_, seen)| seen.shares_changes_with(db)) {
+            out.push((name.to_string(), db.clone()));
+        }
+    }
+    let default = databases.default_connection();
+    if !out.iter().any(|(_, seen)| seen.shares_changes_with(default)) {
+        out.insert(0, ("default".to_string(), default.clone()));
+    }
+    out
+}
+
+/// Sample every database connection's pool on [`POOL_SAMPLE_INTERVAL`] and
+/// publish each as a `db.pool.sample` activity, which Lookout rolls into its
+/// `database_facet` aggregates (`GET {lookout}/api/database`).
+///
+/// A sample reads the pool's own counts, which need no connection, and on
+/// MySQL and MariaDB asks the server — on an idle connection only, never one a
+/// request is waiting for — how many connections the application's user holds
+/// against its `MAX_USER_CONNECTIONS` and the server against
+/// `max_connections`. `None` without a database manager or a bus.
+pub(crate) fn start_pool_sampler(app: &Application) -> Option<PoolSampler> {
+    let databases = app.resolve::<rainier_database::DatabaseManager>().ok()?;
+    let events = app.resolve::<rainier_events::Dispatcher>().ok()?;
+    let connections = named_connections(&databases);
+    if connections.is_empty() {
+        return None;
+    }
+    let handle = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(POOL_SAMPLE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            for (name, db) in &connections {
+                let Some(usage) = db.pool_usage().await else { continue };
+                let dialect = db.dialect();
+                events.publish_activity_with(|| rainier_database::PoolSampled {
+                    connection: name.clone(),
+                    dialect,
+                    usage,
+                    interval: POOL_SAMPLE_INTERVAL,
+                });
+            }
+        }
+    });
+    Some(PoolSampler(Mutex::new(Some(handle))))
+}
+
 /// Write everything Lookout has closed so far. Does nothing when Lookout is
 /// not enabled. `serve`, `queue:work` and `schedule:run` call it as they
 /// finish.
@@ -617,6 +679,11 @@ pub async fn flush(app: &Application) {
 /// gone — so it is the last thing a process does.
 pub async fn shutdown(app: &Application) {
     let Ok(lookout) = app.resolve::<Lookout>() else { return };
+    if let Ok(sampler) = app.resolve::<PoolSampler>() {
+        if let Some(handle) = sampler.0.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            handle.abort();
+        }
+    }
     lookout.flush().await;
     let handle = app
         .resolve::<Writer>()

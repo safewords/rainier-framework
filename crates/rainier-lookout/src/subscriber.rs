@@ -91,6 +91,30 @@ pub(crate) fn classify(kind: &str) -> Option<(EntryType, Option<BatchKind>)> {
 }
 
 impl Inner {
+    /// A `db.pool.sample`, rolled into the connection's facet.
+    fn on_pool_sample(&self, activity: &dyn Activity, cx: &Context) {
+        let fields = activity.collect_fields();
+        let number = |name: &str| match fields.get(name) {
+            Some(FieldValue::U64(n)) => Some(*n),
+            Some(FieldValue::I64(n)) => u64::try_from(*n).ok(),
+            _ => None,
+        };
+        let sample = crate::database::Sample {
+            connection: fields.text("rainier.db.connection").unwrap_or("default").to_string(),
+            system: fields.text("db.system.name").map(str::to_string),
+            open: number("rainier.db.pool.open").unwrap_or(0),
+            idle: number("rainier.db.pool.idle").unwrap_or(0),
+            max: number("rainier.db.pool.max").unwrap_or(0),
+            interval_us: number("rainier.db.interval_ms").unwrap_or(0).saturating_mul(1000),
+            user: number("rainier.db.server.user"),
+            user_limit: number("rainier.db.server.user_limit"),
+            server: number("rainier.db.server.total"),
+            server_max: number("rainier.db.server.max"),
+            server_error: fields.text("rainier.db.server.error").map(str::to_string),
+        };
+        self.count(crate::database::sample_rows(&sample, DateTime::<Utc>::from(cx.at())));
+    }
+
     /// A `queue.sample`, rolled into the queue's facet.
     fn on_queue_sample(&self, activity: &dyn Activity, cx: &Context) {
         let fields = activity.collect_fields();
@@ -141,6 +165,11 @@ impl Inner {
         // into the counts (`queues`).
         if activity.kind() == "queue.sample" {
             self.on_queue_sample(activity, cx);
+            return;
+        }
+        // Likewise a process's look at its database pools (`database`).
+        if activity.kind() == "db.pool.sample" {
+            self.on_pool_sample(activity, cx);
             return;
         }
         let Some(unit) = cx.unit() else { return };

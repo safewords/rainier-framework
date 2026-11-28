@@ -1222,6 +1222,50 @@ A worker without the event bus — one built by hand without
 `Worker::with_events` — still has its runs counted, but its queues have no
 depth or concurrency. `queue:work` always wires the bus when one is bound.
 
+### Database connections
+
+`GET {lookout}/api/database` answers, for every database connection the
+application holds, how full its pool is across every process, and on MySQL
+and MariaDB how many connections the application's user holds on the server
+against its `MAX_USER_CONNECTIONS`, and the server against `max_connections`.
+Readers may call it (it is in `READER_ROUTES`), so a sibling reads it through
+Longmire as `Endpoint::Database`.
+
+It reads the `database_facet` rollup, which only samples write. The framework
+starts a sampler beside Lookout's writer: every 15 seconds
+(`lookout::POOL_SAMPLE_INTERVAL`) each process publishes a `db.pool.sample`
+activity per distinct connection (`rainier_database::PoolSampled`), and
+Lookout counts it straight into its aggregates. A sample is
+`Database::pool_usage`:
+
+- **The pool's own counts** — open, idle, `max_connections`. These need no
+  connection, so a pool with every connection checked out still reports
+  itself full.
+- **What the server says**, on MySQL and MariaDB, asked as the application's
+  own user with nothing granted beyond logging in: its threads in the process
+  list (every process connecting as it), the cap in its `SHOW GRANTS`, and
+  the server's `Threads_connected` and `max_connections`. Asked on an idle
+  connection, or a new one while the pool has room for it (up to 2 s); never
+  in the queue behind requests waiting on a full pool. When it cannot ask, the
+  sample is `unanswered` with the reason (`busy`, or the error).
+
+Each row, busiest first:
+
+| Field | |
+|---|---|
+| `connection` | the connection's name, `default` for an unnamed one |
+| `status` | `failing` at 95% of any cap below, `degraded` at 80%, else `ok` |
+| `processes` | processes sampling it, on average over the window |
+| `pool.in_use`, `pool.open`, `pool.capacity` | every process's pool added up, averaged over the window |
+| `pool.utilisation` | `in_use / capacity` |
+| `pool.peak_saturation_pct` | the fullest any one process's pool got, in percent |
+| `user.connections`, `user.max`, `user.limit`, `user.share` | the user's connections on the server (average, maximum), its cap, and `max / limit` |
+| `server.connections`, `server.max`, `server.limit`, `server.share` | the same for the server and `max_connections` |
+| `unanswered` | samples the server did not answer |
+| `latest` | the newest minute: `user`, `server`, `saturation_pct` |
+
+`totals` is `{connections, status}`, the worst row's status.
+
 ### Over MCP
 
 With the framework's `mcp` feature and `MCP_ENABLED=true`, an AI assistant

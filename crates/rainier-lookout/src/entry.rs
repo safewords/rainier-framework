@@ -80,6 +80,10 @@ pub enum EntryType {
     /// waits, its dispatches, and the workers' samples of its depth, running
     /// jobs and slots. See [`queues`](crate::queues).
     QueueFacet,
+    /// Rolled up, never an entry: every process's samples of its database
+    /// pools, and what the server says about the application's connections.
+    /// See [`database`](crate::database).
+    DatabaseFacet,
 }
 
 impl EntryType {
@@ -111,6 +115,7 @@ impl EntryType {
         EntryType::RumError,
         EntryType::CallFacet,
         EntryType::QueueFacet,
+        EntryType::DatabaseFacet,
     ];
 
     /// The types that exist only as aggregate rows — no watcher records an
@@ -124,6 +129,7 @@ impl EntryType {
         EntryType::RumError,
         EntryType::CallFacet,
         EntryType::QueueFacet,
+        EntryType::DatabaseFacet,
     ];
 
     /// Whether this type exists only as aggregate rows. See
@@ -161,6 +167,7 @@ impl EntryType {
             EntryType::RumError => "rum_error",
             EntryType::CallFacet => "call_facet",
             EntryType::QueueFacet => "queue_facet",
+            EntryType::DatabaseFacet => "database_facet",
         }
     }
 
