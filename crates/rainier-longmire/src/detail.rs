@@ -353,7 +353,9 @@ impl Longmire {
     /// added up per bucket under `data` — counts and time summed, the worst
     /// time the worst, the average the sum over the count. Ask with the same
     /// `since` and `period` everywhere (they are forwarded) so the buckets
-    /// line up. `{services, data, series, period}`.
+    /// line up. `{services, data, series, period}`; each source's entry in
+    /// `series` is its answer whole (`data`, `forecast`, `period`, and with
+    /// `keys=N` a series per busiest key under `keys`).
     pub async fn series(&self, entry_type: &str, raw_query: &str) -> Value {
         let resource = Resource::Series(entry_type.to_string());
         let Some(tail) = resource.tail() else {
@@ -382,10 +384,9 @@ impl Longmire {
                 bucket.1 += n("sum_us");
                 bucket.2 = bucket.2.max(n("max_us"));
             }
-            per_source.insert(
-                source.id.clone(),
-                json!({ "data": points, "forecast": body.get("forecast").cloned().unwrap_or(json!([])) }),
-            );
+            // Each source's answer whole: its points, its projection, its
+            // period and, asked with `keys`, a series per busiest key.
+            per_source.insert(source.id.clone(), body.clone());
         }
         let fleet: Vec<Value> = buckets
             .into_iter()

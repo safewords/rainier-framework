@@ -591,6 +591,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_fleets_lists_merge_newest_first_and_its_series_adds_up() {
+        let mut answers = BTreeMap::new();
+        answers.insert(
+            "http://orders.test/_lookout/api/batches?limit=2".to_string(),
+            (
+                200,
+                json!({ "data": [
+                { "id": "o2", "started_at": "2026-11-27T10:00:05Z" },
+                { "id": "o1", "started_at": "2026-11-27T10:00:01Z" }
+            ], "next": { "before": "2026-11-27T10:00:01Z" } }),
+            ),
+        );
+        answers.insert(
+            "http://billing.test/_lookout/api/batches?limit=2".to_string(),
+            (
+                200,
+                json!({ "data": [
+                { "id": "b1", "started_at": "2026-11-27T11:00:03+01:00" }
+            ], "next": null }),
+            ),
+        );
+        let point = |start: &str, count: u64, sum: u64, max: u64| json!({ "bucket_start": start, "count": count, "sum_us": sum, "max_us": max });
+        answers.insert(
+            "http://orders.test/_lookout/api/series/request?since=1h&keys=5".to_string(),
+            (
+                200,
+                json!({ "data": [point("2026-11-27T10:00:00Z", 3, 300, 200)],
+                          "keys": { "GET /": [] }, "period": 60 }),
+            ),
+        );
+        answers.insert(
+            "http://billing.test/_lookout/api/series/request?since=1h&keys=5".to_string(),
+            (
+                200,
+                json!({ "data": [point("2026-11-27T11:00:00+01:00", 1, 900, 900)], "period": 60 }),
+            ),
+        );
+        let transport = Arc::new(Lookouts { answers, ..Lookouts::default() });
+        let longmire = Longmire::new([
+            Source::new("orders", "http://orders.test"),
+            Source::new("billing", "http://billing.test"),
+        ])
+        .through(Arc::clone(&transport) as Arc<dyn Transport>);
+
+        let page = longmire.batches("limit=2&bogus=1").await;
+        let ids: Vec<&str> =
+            page["data"].as_array().unwrap().iter().map(|b| b["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["o2", "b1"], "across offsets, newest first, cut to the limit");
+        assert_eq!(page["data"][1]["service"], "billing");
+        assert_eq!(page["next"]["before"], "2026-11-27T11:00:03+01:00");
+
+        let series = longmire.series("request", "since=1h&keys=5").await;
+        assert_eq!(series["data"].as_array().unwrap().len(), 1, "one bucket, both services");
+        assert_eq!(series["data"][0]["count"], 4);
+        assert_eq!(series["data"][0]["max_us"], 900);
+        assert_eq!(series["data"][0]["average_us"], 300);
+        assert!(series["series"]["orders"]["keys"]["GET /"].is_array(), "each answer whole");
+    }
+
+    #[tokio::test]
     async fn a_malformed_id_asks_nobody() {
         let transport = lookouts();
         assert!(longmire(&transport).trace("a/b").await.is_err());
