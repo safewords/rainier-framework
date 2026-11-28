@@ -49,6 +49,11 @@ pub struct Point {
     /// The 99th percentile, in microseconds; absent as `p50_us` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p99_us: Option<u64>,
+    /// The bucket's durations as `{ slot: count }` — only when asked
+    /// ([`series_with_histograms`]), so another view (Longmire, adding many
+    /// services' buckets) can work out percentiles of them all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub histogram: Option<Histogram>,
 }
 
 /// One projected bucket.
@@ -120,6 +125,27 @@ pub fn series(
     since: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Vec<Point> {
+    series_of(rows, period_s, since, now, false)
+}
+
+/// [`series`], each point with its bucket's [`Histogram`] (absent for an
+/// empty bucket).
+pub fn series_with_histograms(
+    rows: &[Aggregate],
+    period_s: u32,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Vec<Point> {
+    series_of(rows, period_s, since, now, true)
+}
+
+fn series_of(
+    rows: &[Aggregate],
+    period_s: u32,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+    histograms: bool,
+) -> Vec<Point> {
     let first = bucket_start(since, period_s);
     let last = bucket_start(now, period_s);
     #[derive(Default)]
@@ -158,6 +184,8 @@ pub fn series(
             p90_us: p(90.0),
             p95_us: p(95.0),
             p99_us: p(99.0),
+            histogram: (histograms && !bucket.histogram.is_empty())
+                .then(|| bucket.histogram.clone()),
         });
         at += step;
     }

@@ -24,6 +24,12 @@ the release as a whole and names the crate it landed in.
   the header's `body=`); a request without one signs as before, so older
   Lookouts still recognise every `GET`. `/api/status` says how far the link
   reaches. See `docs/longmire.md`, "How far the link reaches".
+- **Fleet percentiles, exactly** (`rainier-lookout`, `rainier-longmire`):
+  `GET /api/series/{type}?histograms=1` gives each point its bucket's
+  histogram (`trends::series_with_histograms`), and Longmire's `series` adds
+  them up per bucket and over the range, so the fleet's p50–p99 are those of
+  every duration in every service, read as Lookout reads its own; its
+  `forecast` is the fleet's own line.
 
 - **Queue inspection in Lookout** (`rainier-queue`, `rainier-lookout`,
   `rainier-longmire`): `GET /api/queues` — each job queue's depth now and

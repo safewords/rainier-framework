@@ -118,7 +118,7 @@ reads the rest of what its dashboard shows, from one source or the fleet:
 | `longmire.batches(query)` | kept batches across every source, newest first (`kind`, `type`, `route`, `user`, `tag`, `trace`, `exception`, `slow`, `q`, `before`, `limit`), each naming its `service`; `next.before` is the cursor |
 | `longmire.entries(type, query)` | one type's entries across every source, newest first (`before`, `limit`, `family`, `key`, `q`). A family id is its type and key, the same everywhere, so `family` follows one query or job across the fleet |
 | `longmire.aggregates(type, query)` | one type's families across every source, ranked by `order` (`max`, `count`, `average`) |
-| `longmire.series(type, query)` | each source's points (`series`) and the fleet's, added up per bucket (`data`) |
+| `longmire.series(type, query)` | each source's answer whole (`series`) and the fleet's buckets added up (`data`): counts and time summed, and p50–p99 of every duration in the bucket in every service, from their histograms added together (`histograms=1` is asked of each); `percentiles` and `histogram` over the whole range, and a `forecast` along the fleet's own line, as each Lookout draws its own. `exact` is false where a Lookout too old to send histograms counted something |
 | `longmire.models(query)` / `insights(query)` | models written, most first; what changed, the bad first |
 | `longmire.status()` | every source's settings: store, sample rates, watchers, retention, the link's reach |
 | `longmire.read(source, &Resource::…, query)` | one source's own answer: a batch whole, a family's key, a model's changes, one case, … |

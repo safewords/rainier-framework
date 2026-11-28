@@ -27,7 +27,8 @@ const BATCH_FILTERS: &[&str] =
     &["kind", "type", "route", "user", "tag", "trace", "exception", "slow", "q", "before", "limit"];
 const ENTRY_FILTERS: &[&str] = &["before", "limit", "family", "key", "q"];
 const AGGREGATE_PARAMS: &[&str] = &["period", "since", "until", "order", "limit"];
-const SERIES_PARAMS: &[&str] = &["since", "until", "period", "family", "key", "keys", "forecast"];
+const SERIES_PARAMS: &[&str] =
+    &["since", "until", "period", "family", "key", "keys", "forecast", "histograms"];
 const MODELS_PARAMS: &[&str] = &["since", "period"];
 const MODEL_PARAMS: &[&str] = &["before", "limit"];
 const INSIGHTS_PARAMS: &[&str] = &["window", "min", "change", "forecast", "limit"];
@@ -250,6 +251,134 @@ fn insight_rank(row: &Value) -> (u8, i64) {
     (severity, change)
 }
 
+/// A bucket of the fleet's series, being added up.
+#[derive(Default)]
+struct Bucket {
+    count: u64,
+    sum_us: u64,
+    max_us: u64,
+    histogram: Histogram,
+    /// A source counted something here without a histogram.
+    partial: bool,
+}
+
+/// Lookout's duration histogram: `{slot: count}`, four slots per doubling.
+type Histogram = BTreeMap<u16, u64>;
+
+const PERCENTILES: [(&str, f64); 4] =
+    [("p50_us", 50.0), ("p90_us", 90.0), ("p95_us", 95.0), ("p99_us", 99.0)];
+
+fn histogram_of(object: &Map<String, Value>) -> Histogram {
+    object.iter().filter_map(|(slot, count)| Some((slot.parse().ok()?, count.as_u64()?))).collect()
+}
+
+fn add(into: &mut Histogram, from: &Histogram) {
+    for (&slot, &count) in from {
+        *into.entry(slot).or_insert(0) += count;
+    }
+}
+
+/// The `p`th percentile of `histogram`, never above `max_us` — exactly
+/// Lookout's reading (`rainier_lookout::aggregate::percentile`; a test there
+/// holds the two together): the nearest rank, placed inside its slot
+/// geometrically by how far into the slot's count it falls.
+fn percentile(histogram: &Histogram, p: f64, max_us: u64) -> Option<u64> {
+    const SLOTS_PER_DOUBLING: f64 = 4.0;
+    let total: u64 = histogram.values().sum();
+    if total == 0 {
+        return None;
+    }
+    let rank = ((p.clamp(0.0, 100.0) / 100.0) * total as f64).ceil().max(1.0) as u64;
+    let mut seen = 0;
+    for (&slot, &count) in histogram {
+        if seen + count >= rank {
+            if slot == 0 {
+                return Some(0);
+            }
+            let into = (rank - seen) as f64 / count as f64;
+            let lower = (f64::from(slot - 1) / SLOTS_PER_DOUBLING).exp2();
+            let value = lower * (into / SLOTS_PER_DOUBLING).exp2();
+            return Some((value.round() as u64).min(max_us));
+        }
+        seen += count;
+    }
+    Some(max_us)
+}
+
+/// The least-squares line through `values` over `0..n`: (intercept, slope).
+fn line(values: &[f64]) -> (f64, f64) {
+    let n = values.len() as f64;
+    if values.len() < 2 {
+        return (values.first().copied().unwrap_or(0.0), 0.0);
+    }
+    let mean_x = (n - 1.0) / 2.0;
+    let mean_y = values.iter().sum::<f64>() / n;
+    let (mut num, mut den) = (0.0, 0.0);
+    for (i, y) in values.iter().enumerate() {
+        let dx = i as f64 - mean_x;
+        num += dx * (y - mean_y);
+        den += dx * dx;
+    }
+    let slope = if den == 0.0 { 0.0 } else { num / den };
+    (mean_y - slope * mean_x, slope)
+}
+
+/// `horizon` buckets past the fleet's last, as each Lookout projects its own
+/// (`rainier_lookout::trends::forecast`): the still-filling last bucket left
+/// out of the fit, counts along their line, the average along the line
+/// through the buckets that recorded something. `[{bucket_start, count,
+/// average_us}]`.
+fn forecast(points: &[Value], period: &Value, horizon: usize) -> Vec<Value> {
+    let Some(period_s) = period.as_i64().filter(|p| *p > 0) else { return Vec::new() };
+    let Some(last) = points.last() else { return Vec::new() };
+    let complete = &points[..points.len() - 1];
+    if complete.len() < 2 || horizon == 0 {
+        return Vec::new();
+    }
+    let n = |p: &Value, at: &str| p.get(at).and_then(Value::as_f64).unwrap_or(0.0);
+    let counts: Vec<f64> = complete.iter().map(|p| n(p, "count")).collect();
+    let (c0, c1) = line(&counts);
+    let busy: Vec<(usize, f64)> = complete
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| n(p, "count") > 0.0)
+        .map(|(i, p)| (i, n(p, "average_us")))
+        .collect();
+    let average_at = |x: f64| -> f64 {
+        if busy.len() < 2 {
+            return busy.first().map_or(0.0, |(_, a)| *a);
+        }
+        let xs: Vec<f64> = busy.iter().map(|(i, _)| *i as f64).collect();
+        let mean_x = xs.iter().sum::<f64>() / xs.len() as f64;
+        let mean_y = busy.iter().map(|(_, a)| a).sum::<f64>() / busy.len() as f64;
+        let (mut num, mut den) = (0.0, 0.0);
+        for ((_, y), x) in busy.iter().zip(&xs) {
+            num += (x - mean_x) * (y - mean_y);
+            den += (x - mean_x) * (x - mean_x);
+        }
+        let slope = if den == 0.0 { 0.0 } else { num / den };
+        mean_y + slope * (x - mean_x)
+    };
+    let Some(start) = last
+        .get("bucket_start")
+        .and_then(Value::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+    else {
+        return Vec::new();
+    };
+    (1..=horizon)
+        .map(|k| {
+            let x = (complete.len() + k) as f64;
+            let at = start + chrono::Duration::seconds(period_s * k as i64);
+            json!({
+                "bucket_start": at.with_timezone(&chrono::Utc).to_rfc3339(),
+                "count": (c0 + c1 * x).max(0.0),
+                "average_us": average_at(x).max(0.0),
+            })
+        })
+        .collect()
+}
+
 impl Longmire {
     /// One source's answer for `resource`, as its Lookout gave it. `Err` with
     /// the reason when there is none, when `source` is not one, or when a
@@ -349,27 +478,49 @@ impl Longmire {
     }
 
     /// One type (or, with `family`, one family) over time in every source,
-    /// and the fleet's: each source's points under `series`, and the points
-    /// added up per bucket under `data` — counts and time summed, the worst
-    /// time the worst, the average the sum over the count. Ask with the same
-    /// `since` and `period` everywhere (they are forwarded) so the buckets
-    /// line up. `{services, data, series, period}`; each source's entry in
-    /// `series` is its answer whole (`data`, `forecast`, `period`, and with
-    /// `keys=N` a series per busiest key under `keys`).
+    /// and the fleet's: each source's answer whole under `series`, and the
+    /// buckets added up under `data` — counts and time summed, the worst time
+    /// the worst, the average the sum over the count, and p50 to p99 of every
+    /// duration in the bucket in every service, from their histograms added
+    /// together (a Lookout older than per-bucket histograms leaves its
+    /// buckets' percentiles out, and `exact` says so). `percentiles` and
+    /// `histogram` are the same over the whole range; `forecast` is the
+    /// least-squares line through the fleet's counts and averages, as each
+    /// Lookout draws its own. Ask with the same `since` and `period`
+    /// everywhere (they are forwarded) so the buckets line up.
+    /// `{services, data, series, period, percentiles, histogram, forecast, exact}`;
+    /// each source's entry in `series` is its answer whole (`data`,
+    /// `forecast`, `period`, and with `keys=N` a series per busiest key
+    /// under `keys`).
     pub async fn series(&self, entry_type: &str, raw_query: &str) -> Value {
         let resource = Resource::Series(entry_type.to_string());
         let Some(tail) = resource.tail() else {
             return json!({ "services": [], "data": [], "series": {} });
         };
-        let parts = self.ask_all(&tail, &resource.filter(raw_query)).await;
+        let mut query = resource.filter(raw_query);
+        if param(&query, "histograms").is_none() {
+            query = if query.is_empty() {
+                "histograms=1".into()
+            } else {
+                format!("{query}&histograms=1")
+            };
+        }
+        let horizon = param(raw_query, "forecast").and_then(|f| f.parse::<usize>().ok());
+        let parts = self.ask_all(&tail, &query).await;
         let mut per_source = Map::new();
-        let mut buckets: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
+        let mut buckets: BTreeMap<String, Bucket> = BTreeMap::new();
+        let mut whole = Histogram::new();
+        let mut worst = 0u64;
+        let mut exact = true;
         let mut period = Value::Null;
+        let mut asked_horizon = 0usize;
         for (source, outcome) in &parts {
             let Ok(body) = outcome else { continue };
             if period.is_null() {
                 period = body.get("period").cloned().unwrap_or(Value::Null);
             }
+            let forecast_len = body.get("forecast").and_then(Value::as_array).map_or(0, Vec::len);
+            asked_horizon = asked_horizon.max(forecast_len);
             let points = data(body).as_array().cloned().unwrap_or_default();
             for point in &points {
                 let Some(start) = point.get("bucket_start").and_then(Value::as_str) else {
@@ -380,22 +531,62 @@ impl Longmire {
                     .map(|t| t.with_timezone(&chrono::Utc).to_rfc3339())
                     .unwrap_or_else(|_| start.to_string());
                 let bucket = buckets.entry(key).or_default();
-                bucket.0 += n("count");
-                bucket.1 += n("sum_us");
-                bucket.2 = bucket.2.max(n("max_us"));
+                bucket.count += n("count");
+                bucket.sum_us = bucket.sum_us.saturating_add(n("sum_us"));
+                bucket.max_us = bucket.max_us.max(n("max_us"));
+                worst = worst.max(n("max_us"));
+                match point.get("histogram").and_then(Value::as_object) {
+                    Some(h) => {
+                        let h = histogram_of(h);
+                        add(&mut bucket.histogram, &h);
+                        add(&mut whole, &h);
+                    }
+                    // A bucket that counted something without saying how
+                    // long each took: its percentiles cannot be exact.
+                    None if n("count") > 0 => {
+                        bucket.partial = true;
+                        exact = false;
+                    }
+                    None => {}
+                }
             }
-            // Each source's answer whole: its points, its projection, its
-            // period and, asked with `keys`, a series per busiest key.
-            per_source.insert(source.id.clone(), body.clone());
+            // Each source's answer whole, without the histograms asked for
+            // only to add up here: its points, projection, period and keys.
+            let mut answer = body.clone();
+            if let Some(points) = answer.get_mut("data").and_then(Value::as_array_mut) {
+                for point in points {
+                    if let Some(point) = point.as_object_mut() {
+                        point.remove("histogram");
+                    }
+                }
+            }
+            per_source.insert(source.id.clone(), answer);
         }
         let fleet: Vec<Value> = buckets
             .into_iter()
-            .map(|(start, (count, sum, max))| {
-                json!({ "bucket_start": start, "count": count, "sum_us": sum, "max_us": max,
-                        "average_us": sum.checked_div(count).unwrap_or(0) })
+            .map(|(start, b)| {
+                let mut point = json!({ "bucket_start": start, "count": b.count, "sum_us": b.sum_us,
+                    "max_us": b.max_us, "average_us": b.sum_us.checked_div(b.count).unwrap_or(0) });
+                if !b.partial {
+                    for (name, p) in PERCENTILES {
+                        if let Some(v) = percentile(&b.histogram, p, b.max_us) {
+                            point[name] = json!(v);
+                        }
+                    }
+                }
+                point
             })
             .collect();
-        json!({ "services": services(&parts), "data": fleet, "series": per_source, "period": period })
+        let mut percentiles = Map::new();
+        for (name, p) in PERCENTILES {
+            let v = if exact { percentile(&whole, p, worst) } else { None };
+            percentiles.insert(name.into(), json!(v));
+        }
+        let forecast = forecast(&fleet, &period, horizon.unwrap_or(asked_horizon));
+        let histogram: Map<String, Value> =
+            whole.iter().map(|(slot, count)| (slot.to_string(), json!(count))).collect();
+        json!({ "services": services(&parts), "data": fleet, "series": per_source, "period": period,
+                "percentiles": percentiles, "histogram": histogram, "forecast": forecast, "exact": exact })
     }
 
     /// Every model written across every source (`since`, `period`), most

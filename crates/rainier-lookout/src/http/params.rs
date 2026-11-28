@@ -220,6 +220,8 @@ pub(crate) struct SeriesQuery {
     pub(crate) key: Option<String>,
     /// Also a series for each of the busiest keys, at most this many.
     pub(crate) keys: usize,
+    /// Each point with its bucket's histogram (`histograms=1`).
+    pub(crate) histograms: bool,
     /// Buckets to project past now.
     pub(crate) forecast: usize,
 }
@@ -396,7 +398,9 @@ pub(crate) fn series_query(
     let key = params.raw("key");
     let keys = params.integer("keys", 0, 50).unwrap_or(0) as usize;
     let forecast = params.integer("forecast", 0, 100).map_or(default_forecast, |n| n as usize);
+    let histograms = params.boolean("histograms").unwrap_or(false);
     Some(SeriesQuery {
+        histograms,
         entry_type: entry_type?,
         period_s,
         since,

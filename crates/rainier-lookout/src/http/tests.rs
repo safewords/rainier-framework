@@ -1536,6 +1536,53 @@ async fn the_link_reaches_what_a_viewer_reads_only_where_the_lookout_says_so() {
 }
 
 #[tokio::test]
+async fn longmires_fleet_series_reads_percentiles_and_projections_as_lookout_does() {
+    // One source: the fleet's buckets, percentiles and forecast must be the
+    // source's own, to the microsecond — Longmire's copy of the reading is
+    // Lookout's.
+    let wire = Arc::new(Wire {
+        router: linked(traffic(), vec![link_key("2026-11")]),
+        heard: Default::default(),
+    });
+    let longmire = longmire_over(&wire, link_key("2026-11"));
+    let since = (Utc::now() - chrono::Duration::minutes(30)).to_rfc3339().replace('+', "%2B");
+    let query = format!("since={since}&period=60&forecast=3");
+    let fleet = longmire.series("request", &query).await;
+    assert_eq!(fleet["services"][0]["status"], "ok", "{fleet}");
+    let own = &fleet["series"]["orders"];
+    assert!(own["data"][0].get("histogram").is_none(), "asked for here, not passed on");
+    let busy: Vec<&Value> =
+        own["data"].as_array().unwrap().iter().filter(|p| p["count"] != 0).collect();
+    assert!(!busy.is_empty(), "{own}");
+    for point in own["data"].as_array().unwrap() {
+        let at = point["bucket_start"].as_str().unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339(at).unwrap().with_timezone(&Utc).to_rfc3339();
+        let mine =
+            fleet["data"].as_array().unwrap().iter().find(|p| p["bucket_start"] == at.as_str());
+        let mine = mine.unwrap_or_else(|| panic!("bucket {at} in {fleet}"));
+        for field in
+            ["count", "sum_us", "max_us", "average_us", "p50_us", "p90_us", "p95_us", "p99_us"]
+        {
+            assert_eq!(mine.get(field), point.get(field), "{field} at {at}");
+        }
+    }
+    assert_eq!(fleet["percentiles"], own["percentiles"]);
+    assert_eq!(fleet["exact"], true);
+    let theirs: Vec<f64> =
+        own["forecast"].as_array().unwrap().iter().map(|p| p["count"].as_f64().unwrap()).collect();
+    let ours: Vec<f64> = fleet["forecast"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["count"].as_f64().unwrap())
+        .collect();
+    assert_eq!(theirs.len(), 3);
+    for (a, b) in theirs.iter().zip(&ours) {
+        assert!((a - b).abs() < 1e-6, "{theirs:?} vs {ours:?}");
+    }
+}
+
+#[tokio::test]
 async fn a_reader_reads_the_rollups_as_aggregates() {
     let router = app_with(traffic(), readers(), "production");
     let auth = [("authorization", TOKEN)];

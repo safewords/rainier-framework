@@ -276,7 +276,11 @@ pub(crate) async fn series_value(state: &Shared, entry_type: &str, query: &Value
     let end = query.until.unwrap_or(now).min(now);
     let last = aggregate::bucket_start(end, query.period_s);
     rows.retain(|r| r.bucket_start <= last);
-    let points = trends::series(&rows, query.period_s, query.since, end);
+    let points = if query.histograms {
+        trends::series_with_histograms(&rows, query.period_s, query.since, end)
+    } else {
+        trends::series(&rows, query.period_s, query.since, end)
+    };
     let forecast = trends::forecast(&points, query.period_s, query.forecast);
 
     // Over the whole range: every bucket's histogram added, so p50 to p99

@@ -13,7 +13,7 @@
 //! | `GET` | `/api/batches/{id}` | `lookout.api.batch` | One [`Batch`](crate::entry::Batch), with entries |
 //! | `GET` | `/api/entries/{type}` | `lookout.api.entries` | [`Entry`](crate::entry::Entry) list; `family` is a 16-hex id |
 //! | `GET` | `/api/aggregates/{type}` | `lookout.api.aggregates` | [`Aggregate`](crate::entry::Aggregate) list; `until` ends the window |
-//! | `GET` | `/api/series/{type}` | `lookout.api.series` | Zero-filled points per bucket from `since` to `until` (or now), a forecast, and per-key series with `keys=N`; `family` is a 16-hex id |
+//! | `GET` | `/api/series/{type}` | `lookout.api.series` | Zero-filled points per bucket from `since` to `until` (or now), a forecast, and per-key series with `keys=N`; `family` is a 16-hex id; `histograms=1` adds each bucket's histogram |
 //! | `GET` | `/api/models` | `lookout.api.models` | Every model written since `since`, with its writes per action ([`ModelSummary`](crate::watchers::models::ModelSummary)) |
 //! | `GET` | `/api/models/{model}` | `lookout.api.model` | One model's recorded changes, newest first; `before` pages |
 //! | `GET` | `/api/insights` | `lookout.api.insights` | What changed since the previous window ([`trends`](crate::trends)) |
